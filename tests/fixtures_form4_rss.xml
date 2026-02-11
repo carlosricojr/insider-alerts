@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>SEC Current Events</title>
+    <item>
+      <title>4 - Apple Inc (0000320193) (Reporting)</title>
+      <link>https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/xslF345X05/wk-form4_123456.xml</link>
+      <guid>0000320193-24-000123</guid>
+      <pubDate>Tue, 11 Feb 2026 01:01:00 GMT</pubDate>
+      <description>FORM 4; CIK 0000320193; accession 0000320193-24-000123</description>
+    </item>
+    <item>
+      <title>4/A - Example Co (0000789019)</title>
+      <link>https://www.sec.gov/Archives/edgar/data/789019/000078901924000987/xslF345X05/wk-form4_987654.xml</link>
+      <guid>0000789019-24-000987</guid>
+      <pubDate>Tue, 11 Feb 2026 01:03:00 GMT</pubDate>
+      <description>FORM 4/A; CIK 0000789019; accession 0000789019-24-000987</description>
+    </item>
+    <item>
+      <title>Malformed item missing key pieces</title>
+      <link>https://www.sec.gov/Archives/edgar/data/nope</link>
+      <pubDate>Tue, 11 Feb 2026 01:05:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

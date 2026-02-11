@@ -14,9 +14,8 @@ Sprint 0/1 scaffold for Insider Alerts.
 ## Quick start
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
-pip install -e .[dev]
+uv sync --dev
+uv run python -m insider_alerts.cli --help
 ```
 
 ## Configuration
@@ -31,16 +30,28 @@ NTFY_TIMEOUT_SECONDS=10.0
 NTFY_RETRY_ATTEMPTS=3
 NTFY_RETRY_MIN_SECONDS=0.5
 NTFY_RETRY_MAX_SECONDS=3.0
+
+SEC_RSS_URL=https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&start=-1&count=40&output=rss
+SEC_USER_AGENT=insider-alerts/0.2 (contact: sec-access@example.com)
+SEC_RATE_LIMIT_PER_SECOND=5
+SEC_TIMEOUT_SECONDS=15
+SEC_RETRY_ATTEMPTS=4
+SEC_RETRY_MIN_SECONDS=0.25
+SEC_RETRY_MAX_SECONDS=3.0
+
+DATABASE_PATH=data/insider_alerts.db
 ```
 
 ## CLI
 
 ```bash
-insider-alerts --help
-insider-alerts notify test
+uv run python -m insider_alerts.cli --help
+uv run python -m insider_alerts.cli notify test
+uv run python -m insider_alerts.cli sec poll --once --max-items 40
 ```
 
-`notify test` sends a test NTFY message using configured environment values.
+- `notify test` sends a test NTFY message using configured environment values.
+- `sec poll` ingests SEC Form 4 RSS references and writes idempotently to SQLite.
 
 ## Notes
 

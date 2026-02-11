@@ -9,6 +9,11 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("NTFY_RETRY_ATTEMPTS", raising=False)
     monkeypatch.delenv("NTFY_RETRY_MIN_SECONDS", raising=False)
     monkeypatch.delenv("NTFY_RETRY_MAX_SECONDS", raising=False)
+    monkeypatch.delenv("SEC_RSS_URL", raising=False)
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    monkeypatch.delenv("SEC_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("SEC_RATE_LIMIT_PER_SECOND", raising=False)
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -20,3 +25,5 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.ntfy_retry_attempts == 3
     assert settings.ntfy_retry_min_seconds == 0.5
     assert settings.ntfy_retry_max_seconds == 3.0
+    assert settings.sec_rate_limit_per_second == 5.0
+    assert settings.database_path == "data/insider_alerts.db"
