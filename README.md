@@ -1,15 +1,17 @@
 # insider-alerts
 
-Sprint 0/1 scaffold for Insider Alerts.
+Insider-alert workflow for SEC Form 4 ingestion, XML extraction/parsing, scoring, human review, and notification.
 
-## Features (Sprint 0/1)
+## Implemented scope (Sprints 0-7)
 
-- Production-style `src/` Python package layout
-- Typer CLI with `insider-alerts` entrypoint
-- Environment-based configuration via `pydantic-settings`
-- NTFY notifier with retries, timeout handling, and robust errors
-- Deterministic tests with HTTP mocking (no network calls)
-- CI workflow with lint, type-check, and test/coverage gates
+- SEC RSS poll + idempotent filing storage
+- Filing index/document-page parsing to locate Form 4 XML URLs
+- Robust Form 4 XML parser to canonical facts
+- Deterministic signal scoring + review packet queue
+- Decision apply validation/merge semantics + optional NTFY notification
+- Deadletter listing/replay tooling
+- OpenClaw skill docs (`skills/ntfy-notify`, `skills/insider-review`)
+- Runbook, threat model, and deployment docs
 
 ## Quick start
 
@@ -18,42 +20,20 @@ uv sync --dev
 uv run python -m insider_alerts.cli --help
 ```
 
-## Configuration
-
-Copy `.env.example` to `.env` and adjust values.
-
-```env
-NTFY_BASE_URL=https://ntfy.sh
-NTFY_TOPIC=insider-alerts
-NTFY_TOKEN=
-NTFY_TIMEOUT_SECONDS=10.0
-NTFY_RETRY_ATTEMPTS=3
-NTFY_RETRY_MIN_SECONDS=0.5
-NTFY_RETRY_MAX_SECONDS=3.0
-
-SEC_RSS_URL=https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&start=-1&count=40&output=rss
-SEC_USER_AGENT=insider-alerts/0.2 (contact: sec-access@example.com)
-SEC_RATE_LIMIT_PER_SECOND=5
-SEC_TIMEOUT_SECONDS=15
-SEC_RETRY_ATTEMPTS=4
-SEC_RETRY_MIN_SECONDS=0.25
-SEC_RETRY_MAX_SECONDS=3.0
-
-DATABASE_PATH=data/insider_alerts.db
-```
-
-## CLI
+## Core commands
 
 ```bash
-uv run python -m insider_alerts.cli --help
-uv run python -m insider_alerts.cli notify test
 uv run python -m insider_alerts.cli sec poll --once --max-items 40
+uv run python -m insider_alerts.cli sec enrich --limit 100
+uv run python -m insider_alerts.cli review enqueue --limit 100
+uv run python -m insider_alerts.cli review apply --decision-file decision.json --notify
+uv run python -m insider_alerts.cli ops deadletter-list
+uv run python -m insider_alerts.cli ops deadletter-replay --packet-id <id>
 ```
 
-- `notify test` sends a test NTFY message using configured environment values.
-- `sec poll` ingests SEC Form 4 RSS references and writes idempotently to SQLite.
+## SEC compliance & privacy guardrails
 
-## Notes
-
-- Sprint 0/1 only. Future features should be added incrementally.
-- TODOs for later sprints are intentionally left as placeholders in code.
+- Explicit SEC user-agent and conservative rate-limit controls.
+- Retry/backoff for transient HTTP failures.
+- Decision and notification flows avoid secrets/PII.
+- Deadletter trail preserves auditability for parser/drift failures.

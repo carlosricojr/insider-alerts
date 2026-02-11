@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insider-alerts.local/review-decision.schema.json",
+  "type": "object",
+  "required": ["packet_id", "decision", "analyst", "reason"],
+  "properties": {
+    "packet_id": {"type": "string", "minLength": 3},
+    "decision": {
+      "type": "string",
+      "enum": ["approve", "reject", "escalate", "deadletter"]
+    },
+    "analyst": {"type": "string", "minLength": 1},
+    "reason": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": true
+}
