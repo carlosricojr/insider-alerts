@@ -255,6 +255,96 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
     assert notified[0]["reason"] == "Quant thesis: large insider open-market buy with unusual size."
 
 
+def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -> None:
+    runner = CliRunner()
+    monkeypatch.setattr(
+        cli,
+        "run_sec_poll_once",
+        lambda settings, *, max_items, dry_run: PollResult(
+            fetched=1,
+            inserted=1,
+            skipped_existing=0,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit: EnrichResult(scanned=1, updated=1),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enqueue_review_packets",
+        lambda settings, *, limit: QueueResult(processed=1, enqueued=1),
+    )
+    packet = {
+        "packet_id": "0001467638-26-000004|0000064040|4",
+        "payload": {
+            "issuer_symbol": "SPGI",
+            "owner": "Joly Hubert",
+            "score": 100.0,
+            "rationale": {
+                "net_buy_shares": 2500.0,
+                "open_market_buy_shares": 2500.0,
+                "trade_pct_daily_turnover": 0.0493,
+                "role_tier": "director",
+                "has_10b5_1_plan": False,
+                "has_equity_comp_event": False,
+                "has_tax_withholding_language": False,
+                "owner_is_ten_percent_owner": False,
+                "owner_is_exec": True,
+            },
+        },
+    }
+    monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [packet])
+
+    def fake_quant_decide(  # type: ignore[no-untyped-def]
+        packets, *, quant_agent_id, quant_timeout_seconds, quant_thinking, quant_batch_size
+    ):
+        return (
+            {
+                "0001467638-26-000004|0000064040|4": cli.AutoDecisionRuleResult(
+                    decision="approve",
+                    reason="Quant thesis: director buy.",
+                    source="quant:main",
+                    confidence=0.99,
+                    reason_code="quant_high_edge",
+                )
+            },
+            None,
+        )
+
+    monkeypatch.setattr(cli, "_decide_packets_with_quant", fake_quant_decide)
+
+    applied: list[dict[str, object]] = []
+
+    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+        applied.append(payload)
+        return 1
+
+    monkeypatch.setattr(cli, "apply_decision", fake_apply)
+    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "quant",
+            "--quant-agent-id",
+            "quant-insider",
+            "--decision-limit",
+            "10",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(applied) == 1
+    assert applied[0]["decision"] == "escalate"
+    assert applied[0]["decision_reason_code"] == "safety_low_edge_director"
+
+
 @dataclass
 class _Completed:
     returncode: int
@@ -282,6 +372,15 @@ def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
                 "packet_id": packet["packet_id"],
                 "decision": "escalate",
                 "why": "quant batched",
+                "edge_hypothesis": "no edge",
+                "risk_flags": ["insufficient novelty"],
+                "evidence": {
+                    "role_tier": "director",
+                    "open_market_buy_shares": 0,
+                    "trade_pct_daily_turnover": 0,
+                    "novelty_penalty": 55,
+                    "regime_earnings_shock_flag": False,
+                },
                 "confidence": 0.9,
             }
             for packet in packets
@@ -311,6 +410,47 @@ def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
     assert len(mapped) == 25
     assert set(mapped.keys()) == {packet["packet_id"] for packet in packets}
     assert calls == [10, 10, 5]
+
+
+def test_decide_packets_with_quant_rejects_invalid_schema(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_resolve_openclaw_cmd", lambda: "openclaw.cmd")
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        message = str(args[args.index("--message") + 1])
+        request_json = message.split("Input: ", 1)[1]
+        request = json.loads(request_json)
+        packet_id = request["packets"][0]["packet_id"]
+        decisions = [
+            {
+                "packet_id": packet_id,
+                "decision": "approve",
+                "why": "missing required fields",
+                "confidence": 0.95,
+            }
+        ]
+        inner = json.dumps({"decisions": decisions})
+        outer = json.dumps({"result": {"payloads": [{"text": inner}]}})
+        return _Completed(returncode=0, stdout=outer, stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    packets = [
+        {
+            "packet_id": "0000000000-00-000001|0000000001|4",
+            "payload": {"score": 99.0, "rationale": {"net_buy_shares": 1000.0}},
+        }
+    ]
+    mapped, error = cli._decide_packets_with_quant(
+        packets,
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=30,
+        quant_thinking="low",
+        quant_batch_size=10,
+    )
+
+    assert mapped == {}
+    assert error is not None
+    assert "invalid decision schema" in error
 
 
 def test_cli_ops_autopilot_blocks_main_quant_agent_in_isolated_mode() -> None:

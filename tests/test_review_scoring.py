@@ -1,5 +1,6 @@
 from datetime import date
 
+from insider_alerts.review.market_context import MarketSnapshot
 from insider_alerts.review.scoring import score_form4_signal
 from insider_alerts.sec.form4 import Form4Facts, Form4Transaction
 
@@ -158,3 +159,88 @@ def test_score_form4_signal_penalizes_compensation_vesting_noise() -> None:
     assert result.rationale["open_market_buy_shares"] == 0.0
     assert result.rationale["has_equity_comp_event"] is True
     assert result.rationale["has_tax_withholding_language"] is True
+
+
+def test_score_form4_signal_downweights_director_low_liquidity_buy() -> None:
+    facts = Form4Facts(
+        issuer_cik="0000064040",
+        issuer_name="S&P Global Inc.",
+        issuer_symbol="SPGI",
+        reporting_owner_name="Joly Hubert",
+        reporting_owner_cik="0001467638",
+        is_director=True,
+        is_officer=False,
+        officer_title=None,
+        transactions=[
+            Form4Transaction(
+                transaction_date=date(2026, 2, 11),
+                transaction_code="P",
+                direction="buy",
+                shares=2301.0,
+                price_per_share=398.94,
+                shares_following=2466.0,
+                security_title="Common Stock",
+            ),
+            Form4Transaction(
+                transaction_date=date(2026, 2, 11),
+                transaction_code="P",
+                direction="buy",
+                shares=199.0,
+                price_per_share=399.49,
+                shares_following=2665.0,
+                security_title="Common Stock",
+            ),
+        ],
+    )
+    snapshot = MarketSnapshot(
+        symbol="SPGI",
+        trade_date=date(2026, 2, 11),
+        close=390.76,
+        volume=5_174_841.0,
+        dollar_turnover=390.76 * 5_174_841.0,
+        prior_close=401.08,
+        return_1d=(390.76 / 401.08) - 1.0,
+        earnings_shock_flag=False,
+    )
+    result = score_form4_signal(facts, market_snapshot=snapshot)
+    assert result.score < 90
+    assert result.rationale["role_tier"] == "director"
+    assert result.rationale["trade_pct_daily_turnover"] is not None
+
+
+def test_score_form4_signal_keeps_high_conviction_ceo_buy_high() -> None:
+    facts = Form4Facts(
+        issuer_cik="0000063276",
+        issuer_name="Mattel Inc.",
+        issuer_symbol="MAT",
+        reporting_owner_name="Kreiz Ynon",
+        reporting_owner_cik="0001708842",
+        is_director=True,
+        is_officer=True,
+        officer_title="Chairman & CEO",
+        transactions=[
+            Form4Transaction(
+                transaction_date=date(2026, 2, 12),
+                transaction_code="P",
+                direction="buy",
+                shares=65000.0,
+                price_per_share=15.5277,
+                shares_following=1794217.0,
+                security_title="Common Stock",
+            )
+        ],
+    )
+    snapshot = MarketSnapshot(
+        symbol="MAT",
+        trade_date=date(2026, 2, 12),
+        close=15.85,
+        volume=15_389_174.0,
+        dollar_turnover=15.85 * 15_389_174.0,
+        prior_close=15.8,
+        return_1d=(15.85 / 15.8) - 1.0,
+        earnings_shock_flag=False,
+    )
+    result = score_form4_signal(facts, market_snapshot=snapshot)
+    assert result.score >= 90
+    assert result.rationale["role_tier"] == "chief_exec"
+    assert result.rationale["trade_pct_daily_turnover"] is not None

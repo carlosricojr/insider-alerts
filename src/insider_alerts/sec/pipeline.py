@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 from insider_alerts.config import Settings
+from insider_alerts.review.market_context import (
+    DailyMarketDataClient,
+    MarketContextError,
+    MarketSnapshot,
+    get_market_snapshot,
+    upsert_market_snapshot,
+)
 from insider_alerts.review.queue import enqueue_review_packet, ensure_review_tables
 from insider_alerts.review.scoring import score_form4_signal
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
@@ -107,10 +115,15 @@ def enqueue_review_packets(settings: Settings, *, limit: int) -> QueueResult:
         ).fetchall()
 
     client = SecHttpClient(settings)
+    market_client = DailyMarketDataClient(
+        user_agent=settings.sec_user_agent,
+        timeout_seconds=settings.market_data_timeout_seconds,
+        shock_drop_threshold=settings.market_earnings_shock_drop_threshold,
+    )
+    market_cache: dict[tuple[str, str], MarketSnapshot | None] = {}
     processed = 0
     enqueued = 0
     import json
-    from datetime import datetime
 
     from insider_alerts.sec.models import FilingRef
 
@@ -130,7 +143,36 @@ def enqueue_review_packets(settings: Settings, *, limit: int) -> QueueResult:
             facts = parse_form4_xml(xml_text)
         except (SecHttpError, Form4ParseError):
             continue
-        score = score_form4_signal(facts)
+        market_snapshot: MarketSnapshot | None = None
+        if settings.market_context_enabled and facts.issuer_symbol:
+            trade_dates = [
+                tx.transaction_date for tx in facts.transactions if tx.transaction_date is not None
+            ]
+            fallback_dt = datetime.fromisoformat(str(row["filed_at"])).date()
+            trade_date = max(trade_dates) if trade_dates else fallback_dt
+            symbol = facts.issuer_symbol.upper()
+            cache_key = (symbol, trade_date.isoformat())
+            if cache_key in market_cache:
+                market_snapshot = market_cache[cache_key]
+            else:
+                market_snapshot = get_market_snapshot(
+                    settings.database_path,
+                    symbol=symbol,
+                    trade_date=trade_date,
+                )
+                if market_snapshot is None:
+                    try:
+                        market_snapshot = market_client.fetch_snapshot(
+                            symbol,
+                            trade_date=trade_date,
+                        )
+                    except MarketContextError:
+                        market_snapshot = None
+                    if market_snapshot is not None:
+                        upsert_market_snapshot(settings.database_path, market_snapshot)
+                market_cache[cache_key] = market_snapshot
+
+        score = score_form4_signal(facts, market_snapshot=market_snapshot)
         ref = FilingRef(
             source=str(row["source"]),
             cik=str(row["cik"]),

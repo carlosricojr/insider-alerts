@@ -36,6 +36,18 @@ class Settings(BaseSettings):
     sec_retry_attempts: int = Field(default=4, alias="SEC_RETRY_ATTEMPTS", ge=1)
     sec_retry_min_seconds: float = Field(default=0.25, alias="SEC_RETRY_MIN_SECONDS", ge=0)
     sec_retry_max_seconds: float = Field(default=3.0, alias="SEC_RETRY_MAX_SECONDS", ge=0)
+    market_context_enabled: bool = Field(default=False, alias="MARKET_CONTEXT_ENABLED")
+    market_data_timeout_seconds: float = Field(
+        default=10.0,
+        alias="MARKET_DATA_TIMEOUT_SECONDS",
+        gt=0,
+    )
+    market_earnings_shock_drop_threshold: float = Field(
+        default=0.08,
+        alias="MARKET_EARNINGS_SHOCK_DROP_THRESHOLD",
+        gt=0,
+        lt=1,
+    )
 
     database_path: str = Field(default="data/insider_alerts.db", alias="DATABASE_PATH")
 

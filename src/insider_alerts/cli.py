@@ -45,6 +45,7 @@ class AutoDecisionRuleResult:
     reason: str
     source: str
     confidence: float | None
+    reason_code: str = "general"
 
 
 @dataclass(slots=True)
@@ -63,6 +64,10 @@ class AutoPilotCycleResult:
     escalated: int
     deadlettered: int
     notified: int
+    approved_high_edge: int
+    rejected_low_edge: int
+    escalated_missing_context: int
+    escalated_schema_invalid: int
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -104,6 +109,7 @@ def _auto_decide_packet(
             reason=f"auto rule: packet={packet_id} missing payload",
             source="rules",
             confidence=None,
+            reason_code="rules_missing_payload",
         )
 
     score = _to_float(payload_obj.get("score"))
@@ -134,6 +140,7 @@ def _auto_decide_packet(
             reason=f"auto rule: packet={packet_id} missing score/net_buy_shares",
             source="rules",
             confidence=None,
+            reason_code="rules_missing_features",
         )
 
     if has_10b5_1_plan:
@@ -142,6 +149,7 @@ def _auto_decide_packet(
             reason=f"auto rule: packet={packet_id} flagged as 10b5-1/planned flow",
             source="rules",
             confidence=None,
+            reason_code="reject_planned_flow",
         )
 
     if open_market_buy_shares is None or open_market_buy_shares <= 0:
@@ -150,6 +158,7 @@ def _auto_decide_packet(
             reason=f"auto rule: packet={packet_id} no discretionary open-market buying",
             source="rules",
             confidence=None,
+            reason_code="reject_no_open_market_buy",
         )
 
     if has_equity_comp_event and has_tax_withholding_language:
@@ -158,6 +167,7 @@ def _auto_decide_packet(
             reason=f"auto rule: packet={packet_id} appears compensation/tax-withholding driven",
             source="rules",
             confidence=None,
+            reason_code="reject_comp_tax_flow",
         )
 
     if owner_is_ten_percent_owner and not owner_is_exec:
@@ -166,6 +176,7 @@ def _auto_decide_packet(
             reason=f"auto rule: packet={packet_id} passive ten-percent owner flow",
             source="rules",
             confidence=None,
+            reason_code="reject_passive_owner",
         )
 
     if (
@@ -183,6 +194,7 @@ def _auto_decide_packet(
             ),
             source="rules",
             confidence=None,
+            reason_code="reject_low_edge",
         )
 
     if score >= approve_score_min and net_buy_shares > approve_net_buy_shares_min:
@@ -195,6 +207,7 @@ def _auto_decide_packet(
             ),
             source="rules",
             confidence=None,
+            reason_code="rules_high_edge",
         )
 
     if score <= reject_score_max or net_buy_shares < 0:
@@ -207,6 +220,7 @@ def _auto_decide_packet(
             ),
             source="rules",
             confidence=None,
+            reason_code="reject_low_edge",
         )
 
     return AutoDecisionRuleResult(
@@ -218,6 +232,7 @@ def _auto_decide_packet(
         ),
         source="rules",
         confidence=None,
+        reason_code="rules_ambiguous",
     )
 
 
@@ -264,6 +279,14 @@ def _compact_packet_for_quant(packet: dict[str, object]) -> dict[str, object]:
         "open_market_net_shares": rationale_dict.get("open_market_net_shares"),
         "open_market_gross_value": rationale_dict.get("open_market_gross_value"),
         "holding_change_ratio": rationale_dict.get("holding_change_ratio"),
+        "pre_trade_shares_estimate": rationale_dict.get("pre_trade_shares_estimate"),
+        "post_trade_shares": rationale_dict.get("post_trade_shares"),
+        "trade_pct_daily_volume": rationale_dict.get("trade_pct_daily_volume"),
+        "trade_pct_daily_turnover": rationale_dict.get("trade_pct_daily_turnover"),
+        "role_tier": rationale_dict.get("role_tier"),
+        "regime_earnings_shock_flag": _to_bool(
+            rationale_dict.get("regime_earnings_shock_flag")
+        ),
         "owner_is_exec": _to_bool(rationale_dict.get("owner_is_exec")),
         "owner_is_ten_percent_owner": _to_bool(rationale_dict.get("owner_is_ten_percent_owner")),
         "owner_is_entity": _to_bool(rationale_dict.get("owner_is_entity")),
@@ -351,12 +374,19 @@ def _decide_packets_with_quant(
             "In practice, require discretionary open-market buy evidence "
             "(code P context) to approve. "
             "Very small holding change ratio by non-executive entities is usually not alpha. "
+            "Director-only buys should usually be approved only when "
+            "liquidity impact is meaningful "
+            "(for example, non-trivial percent of daily turnover/volume). "
+            "Post-shock (large down-move) regimes require stronger conviction evidence. "
             "Approve only when there is likely non-routine discretionary conviction buying with "
             "meaningful holdings change and low novelty penalty. "
             "When uncertain choose escalate. "
             "Return ONLY JSON: "
             "{\"decisions\":[{\"packet_id\":\"...\",\"decision\":\"approve, reject, or escalate\","
-            "\"why\":\"max 240 chars\",\"confidence\":0.0}]}. "
+            "\"why\":\"max 240 chars\",\"edge_hypothesis\":\"...\",\"risk_flags\":[\"...\"],"
+            "\"evidence\":{\"role_tier\":\"...\",\"open_market_buy_shares\":0,"
+            "\"trade_pct_daily_turnover\":0,\"novelty_penalty\":0,"
+            "\"regime_earnings_shock_flag\":false},\"confidence\":0.0}]}. "
             f"Input: {json.dumps(request, separators=(',', ':'))}"
         )
 
@@ -423,12 +453,16 @@ def _decide_packets_with_quant(
             errors.append(f"chunk[{start}:{start + len(chunk)}] decisions missing")
             continue
 
+        valid_decisions_in_chunk = 0
         for entry in decisions_obj:
             if not isinstance(entry, dict):
                 continue
             packet_id_obj = entry.get("packet_id")
             decision_obj = entry.get("decision")
             why_obj = entry.get("why")
+            edge_hypothesis_obj = entry.get("edge_hypothesis")
+            risk_flags_obj = entry.get("risk_flags")
+            evidence_obj = entry.get("evidence")
             if not isinstance(packet_id_obj, str) or not packet_id_obj.strip():
                 continue
             original_packet_id = alias_to_packet_id.get(packet_id_obj)
@@ -442,17 +476,47 @@ def _decide_packets_with_quant(
                 continue
             if not isinstance(why_obj, str) or not why_obj.strip():
                 continue
+            if not isinstance(edge_hypothesis_obj, str) or not edge_hypothesis_obj.strip():
+                continue
+            if not isinstance(risk_flags_obj, list) or any(
+                not isinstance(flag, str) for flag in risk_flags_obj
+            ):
+                continue
+            if not isinstance(evidence_obj, dict):
+                continue
+            required_evidence_keys = {
+                "role_tier",
+                "open_market_buy_shares",
+                "trade_pct_daily_turnover",
+                "novelty_penalty",
+                "regime_earnings_shock_flag",
+            }
+            if not required_evidence_keys.issubset(evidence_obj.keys()):
+                continue
 
             confidence = _to_float(entry.get("confidence"))
             if confidence is not None:
                 confidence = max(0.0, min(1.0, confidence))
 
+            reason_code = "quant_decision"
+            if decision_obj == "approve" and (confidence is not None and confidence >= 0.85):
+                reason_code = "quant_high_edge"
+            elif decision_obj == "reject":
+                reason_code = "reject_low_edge"
+            elif decision_obj == "escalate":
+                reason_code = "quant_escalate"
+
             mapped[original_packet_id] = AutoDecisionRuleResult(
                 decision=decision_obj,
-                reason=why_obj.strip()[:240],
+                reason=f"{why_obj.strip()} Edge: {edge_hypothesis_obj.strip()}"[:240],
                 source=f"quant:{quant_agent_id}",
                 confidence=confidence,
+                reason_code=reason_code,
             )
+            valid_decisions_in_chunk += 1
+
+        if valid_decisions_in_chunk == 0:
+            errors.append(f"chunk[{start}:{start + len(chunk)}] invalid decision schema")
 
     if not errors:
         return mapped, None
@@ -480,6 +544,10 @@ def _apply_approve_guardrails(
     score = _to_float(payload_dict.get("score"))
     net_buy_shares = _to_float(rationale_dict.get("net_buy_shares"))
     open_market_buy_shares = _to_float(rationale_dict.get("open_market_buy_shares"))
+    trade_pct_daily_turnover = _to_float(rationale_dict.get("trade_pct_daily_turnover"))
+    regime_earnings_shock_flag = _to_bool(rationale_dict.get("regime_earnings_shock_flag"))
+    role_tier_obj = rationale_dict.get("role_tier")
+    role_tier = str(role_tier_obj).strip().lower() if isinstance(role_tier_obj, str) else ""
     has_10b5_1_plan = _to_bool(rationale_dict.get("has_10b5_1_plan"))
     has_equity_comp_event = _to_bool(rationale_dict.get("has_equity_comp_event"))
     has_tax_withholding_language = _to_bool(rationale_dict.get("has_tax_withholding_language"))
@@ -493,6 +561,7 @@ def _apply_approve_guardrails(
             reason=f"safety block: packet={packet_id} missing score/net_buy_shares for approve",
             source="safety",
             confidence=None,
+            reason_code="safety_missing_core_features",
         )
 
     if open_market_buy_shares is None or open_market_buy_shares <= 0:
@@ -504,6 +573,7 @@ def _apply_approve_guardrails(
             ),
             source="safety",
             confidence=None,
+            reason_code="safety_no_open_market_buy",
         )
 
     if has_10b5_1_plan:
@@ -512,6 +582,7 @@ def _apply_approve_guardrails(
             reason=f"safety block: packet={packet_id} flagged 10b5-1/planned flow",
             source="safety",
             confidence=None,
+            reason_code="safety_planned_flow",
         )
 
     if has_equity_comp_event and has_tax_withholding_language:
@@ -523,6 +594,7 @@ def _apply_approve_guardrails(
             ),
             source="safety",
             confidence=None,
+            reason_code="safety_comp_tax_flow",
         )
 
     if owner_is_ten_percent_owner and not owner_is_exec:
@@ -531,6 +603,7 @@ def _apply_approve_guardrails(
             reason=f"safety block: packet={packet_id} passive ten-percent owner flow",
             source="safety",
             confidence=None,
+            reason_code="safety_passive_owner",
         )
 
     if score < approve_score_min or net_buy_shares <= approve_net_buy_shares_min:
@@ -544,21 +617,63 @@ def _apply_approve_guardrails(
             ),
             source="safety",
             confidence=None,
+            reason_code="safety_threshold_block",
         )
 
-    if (
-        rule.source.startswith("quant:")
-        and rule.confidence is not None
-        and rule.confidence < quant_min_confidence
+    if role_tier == "director" and (
+        trade_pct_daily_turnover is None or trade_pct_daily_turnover < 0.1
     ):
+        reason_code = (
+            "missing_market_context"
+            if trade_pct_daily_turnover is None
+            else "safety_low_edge_director"
+        )
         return AutoDecisionRuleResult(
             decision="escalate",
             reason=(
                 "safety block: "
-                f"quant confidence={rule.confidence:.2f} below {quant_min_confidence:.2f}"
+                f"director signal has low liquidity impact "
+                f"(trade_pct_daily_turnover={trade_pct_daily_turnover})"
             ),
             source="safety",
             confidence=None,
+            reason_code=reason_code,
+        )
+
+    if regime_earnings_shock_flag and (
+        trade_pct_daily_turnover is None or trade_pct_daily_turnover < 0.25
+    ):
+        reason_code = (
+            "missing_market_context"
+            if trade_pct_daily_turnover is None
+            else "safety_shock_regime_block"
+        )
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "safety block: "
+                "post-shock regime requires stronger liquidity conviction "
+                f"(trade_pct_daily_turnover={trade_pct_daily_turnover})"
+            ),
+            source="safety",
+            confidence=None,
+            reason_code=reason_code,
+        )
+
+    if (
+        rule.source.startswith("quant:")
+        and (rule.confidence is None or rule.confidence < quant_min_confidence)
+    ):
+        confidence_text = "missing" if rule.confidence is None else f"{rule.confidence:.2f}"
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "safety block: "
+                f"quant confidence={confidence_text} below {quant_min_confidence:.2f}"
+            ),
+            source="safety",
+            confidence=None,
+            reason_code="safety_low_quant_confidence",
         )
 
     return rule
@@ -580,6 +695,11 @@ def _build_trade_signal_notification(
     open_market_buy = _to_float(rationale_dict.get("open_market_buy_shares"))
     gross = _to_float(rationale_dict.get("gross_value"))
     novelty_penalty = _to_float(rationale_dict.get("novelty_penalty"))
+    role_tier_obj = rationale_dict.get("role_tier")
+    role_tier = str(role_tier_obj) if isinstance(role_tier_obj, str) else "unknown"
+    trade_pct_daily_turnover = _to_float(rationale_dict.get("trade_pct_daily_turnover"))
+    trade_pct_daily_volume = _to_float(rationale_dict.get("trade_pct_daily_volume"))
+    regime_shock = _to_bool(rationale_dict.get("regime_earnings_shock_flag"))
     has_10b5 = _to_bool(rationale_dict.get("has_10b5_1_plan"))
     has_comp_event = _to_bool(rationale_dict.get("has_equity_comp_event"))
     packet_id = str(packet.get("packet_id") or decision_payload["packet_id"])
@@ -605,6 +725,18 @@ def _build_trade_signal_notification(
                 if novelty_penalty is not None
                 else "novelty_penalty=NA"
             ),
+            f"role_tier={role_tier}",
+            (
+                f"trade_pct_daily_turnover={trade_pct_daily_turnover:.4f}"
+                if trade_pct_daily_turnover is not None
+                else "trade_pct_daily_turnover=NA"
+            ),
+            (
+                f"trade_pct_daily_volume={trade_pct_daily_volume:.4f}"
+                if trade_pct_daily_volume is not None
+                else "trade_pct_daily_volume=NA"
+            ),
+            f"regime_earnings_shock_flag={str(regime_shock).lower()}",
             f"has_10b5_1_plan={str(has_10b5).lower()}",
             f"has_equity_comp_event={str(has_comp_event).lower()}",
             f"source={source}",
@@ -936,6 +1068,10 @@ def ops_autopilot(
         escalated = 0
         deadlettered = 0
         notified = 0
+        approved_high_edge = 0
+        rejected_low_edge = 0
+        escalated_missing_context = 0
+        escalated_schema_invalid = 0
         seen_decision_keys: set[str] = set()
 
         for packet in pending:
@@ -950,6 +1086,7 @@ def ops_autopilot(
                     reason=f"safety dedupe: duplicate pending packet key={decision_key}",
                     source="safety",
                     confidence=None,
+                    reason_code="safety_duplicate_packet",
                 )
             else:
                 if decision_key is not None:
@@ -976,6 +1113,13 @@ def ops_autopilot(
                             reason=reason,
                             source="quant-fallback",
                             confidence=None,
+                            reason_code=(
+                                "quant_schema_invalid"
+                                if quant_error and "schema" in quant_error.lower()
+                                else "quant_unavailable"
+                                if quant_error
+                                else "quant_missing_decision"
+                            ),
                         )
                 else:
                     rule = _auto_decide_packet(
@@ -998,6 +1142,7 @@ def ops_autopilot(
                 "analyst": analyst,
                 "reason": rule.reason,
                 "decision_source": rule.source,
+                "decision_reason_code": rule.reason_code,
             }
             if rule.confidence is not None:
                 payload["confidence"] = round(rule.confidence, 4)
@@ -1024,6 +1169,18 @@ def ops_autopilot(
                 deadlettered += 1
             else:
                 escalated += 1
+
+            if (
+                rule.decision == "approve"
+                and rule.reason_code in {"quant_high_edge", "rules_high_edge"}
+            ):
+                approved_high_edge += 1
+            if rule.decision == "reject" and rule.reason_code.startswith("reject_"):
+                rejected_low_edge += 1
+            if rule.decision == "escalate" and rule.reason_code == "missing_market_context":
+                escalated_missing_context += 1
+            if rule.decision == "escalate" and rule.reason_code == "quant_schema_invalid":
+                escalated_schema_invalid += 1
 
             should_notify = notify and (not notify_approve_only or rule.decision == "approve")
             if should_notify:
@@ -1058,6 +1215,10 @@ def ops_autopilot(
             escalated=escalated,
             deadlettered=deadlettered,
             notified=notified,
+            approved_high_edge=approved_high_edge,
+            rejected_low_edge=rejected_low_edge,
+            escalated_missing_context=escalated_missing_context,
+            escalated_schema_invalid=escalated_schema_invalid,
         )
         typer.echo(
             "ops autopilot cycle completed "
@@ -1069,7 +1230,10 @@ def ops_autopilot(
                 f"pending_seen={cycle.pending_seen}, decided={cycle.decided}, "
                 f"approved={cycle.approved}, rejected={cycle.rejected}, "
                 f"escalated={cycle.escalated}, deadlettered={cycle.deadlettered}, "
-                f"notified={cycle.notified})"
+                f"notified={cycle.notified}, approved_high_edge={cycle.approved_high_edge}, "
+                f"rejected_low_edge={cycle.rejected_low_edge}, "
+                f"escalated_missing_context={cycle.escalated_missing_context}, "
+                f"escalated_schema_invalid={cycle.escalated_schema_invalid})"
         )
         return cycle
 
