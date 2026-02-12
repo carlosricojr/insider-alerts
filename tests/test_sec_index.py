@@ -24,3 +24,14 @@ def test_locate_form4_xml_url_preserves_absolute() -> None:
 def test_locate_form4_xml_url_returns_none_when_missing() -> None:
     url = locate_form4_xml_url("<html><body><a href='/a.txt'>a.txt</a></body></html>")
     assert url is None
+
+
+def test_locate_form4_xml_url_prefers_non_xsl_xml() -> None:
+    html = """
+    <html><body>
+      <a href="/Archives/edgar/data/a/0001/xslF345X05/wk-form4_1.xml">xsl</a>
+      <a href="/Archives/edgar/data/a/0001/wk-form4_1.xml">raw</a>
+    </body></html>
+    """
+    url = locate_form4_xml_url(html)
+    assert url == "https://www.sec.gov/Archives/edgar/data/a/0001/wk-form4_1.xml"

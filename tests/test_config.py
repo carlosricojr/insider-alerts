@@ -1,4 +1,4 @@
-from insider_alerts.config import get_settings
+from insider_alerts.config import Settings
 
 
 def test_config_defaults(monkeypatch) -> None:
@@ -15,8 +15,7 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("SEC_RATE_LIMIT_PER_SECOND", raising=False)
     monkeypatch.delenv("DATABASE_PATH", raising=False)
 
-    get_settings.cache_clear()
-    settings = get_settings()
+    settings = Settings(_env_file=None)
 
     assert settings.ntfy_base_url == "https://ntfy.sh"
     assert settings.ntfy_topic == "insider-alerts"

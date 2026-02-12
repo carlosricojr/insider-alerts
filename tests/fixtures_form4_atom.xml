@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>SEC Current Events</title>
+  <entry>
+    <title>4 - Apple Inc (Reporting)</title>
+    <link href="https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/xslF345X05/wk-form4_123456.xml" />
+    <id>tag:sec.gov,2026:accession=000032019324000123</id>
+    <updated>2026-02-11T01:01:00-05:00</updated>
+    <summary>FORM 4; issuer CIK 320193; accession 000032019324000123</summary>
+    <category term="4" />
+  </entry>
+  <entry>
+    <title>4/A - Example Co (0000789019)</title>
+    <link href="https://www.sec.gov/Archives/edgar/data/789019/000078901924000987/xslF345X05/wk-form4_987654.xml" />
+    <id>tag:sec.gov,2026:accession=0000789019-24-000987</id>
+    <published>2026-02-11T01:03:00Z</published>
+    <summary>FORM 4/A; CIK 0000789019; accession 0000789019-24-000987</summary>
+    <category term="4/A" />
+  </entry>
+  <entry>
+    <title>Malformed item missing key pieces</title>
+    <link href="https://www.sec.gov/Archives/edgar/data/nope" />
+    <updated>2026-02-11T01:05:00Z</updated>
+  </entry>
+</feed>
