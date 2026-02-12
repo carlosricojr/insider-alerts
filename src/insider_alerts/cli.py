@@ -77,6 +77,16 @@ def _to_float(value: object) -> float | None:
     return None
 
 
+def _to_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
 def _auto_decide_packet(
     packet: dict[str, object],
     *,
@@ -97,13 +107,78 @@ def _auto_decide_packet(
     score = _to_float(payload_obj.get("score"))
     rationale_obj = payload_obj.get("rationale")
     net_buy_shares = None
+    open_market_buy_shares = None
+    holding_change_ratio = None
+    has_10b5_1_plan = False
+    has_equity_comp_event = False
+    has_tax_withholding_language = False
+    owner_is_ten_percent_owner = False
+    owner_is_exec = False
+    owner_is_entity = False
     if isinstance(rationale_obj, dict):
         net_buy_shares = _to_float(rationale_obj.get("net_buy_shares"))
+        open_market_buy_shares = _to_float(rationale_obj.get("open_market_buy_shares"))
+        holding_change_ratio = _to_float(rationale_obj.get("holding_change_ratio"))
+        has_10b5_1_plan = _to_bool(rationale_obj.get("has_10b5_1_plan"))
+        has_equity_comp_event = _to_bool(rationale_obj.get("has_equity_comp_event"))
+        has_tax_withholding_language = _to_bool(rationale_obj.get("has_tax_withholding_language"))
+        owner_is_ten_percent_owner = _to_bool(rationale_obj.get("owner_is_ten_percent_owner"))
+        owner_is_exec = _to_bool(rationale_obj.get("owner_is_exec"))
+        owner_is_entity = _to_bool(rationale_obj.get("owner_is_entity"))
 
     if score is None or net_buy_shares is None:
         return AutoDecisionRuleResult(
             decision="escalate",
             reason=f"auto rule: packet={packet_id} missing score/net_buy_shares",
+            source="rules",
+            confidence=None,
+        )
+
+    if has_10b5_1_plan:
+        return AutoDecisionRuleResult(
+            decision="reject",
+            reason=f"auto rule: packet={packet_id} flagged as 10b5-1/planned flow",
+            source="rules",
+            confidence=None,
+        )
+
+    if open_market_buy_shares is None or open_market_buy_shares <= 0:
+        return AutoDecisionRuleResult(
+            decision="reject",
+            reason=f"auto rule: packet={packet_id} no discretionary open-market buying",
+            source="rules",
+            confidence=None,
+        )
+
+    if has_equity_comp_event and has_tax_withholding_language:
+        return AutoDecisionRuleResult(
+            decision="reject",
+            reason=f"auto rule: packet={packet_id} appears compensation/tax-withholding driven",
+            source="rules",
+            confidence=None,
+        )
+
+    if owner_is_ten_percent_owner and not owner_is_exec:
+        return AutoDecisionRuleResult(
+            decision="reject",
+            reason=f"auto rule: packet={packet_id} passive ten-percent owner flow",
+            source="rules",
+            confidence=None,
+        )
+
+    if (
+        owner_is_entity
+        and not owner_is_exec
+        and holding_change_ratio is not None
+        and holding_change_ratio < 0.002
+    ):
+        return AutoDecisionRuleResult(
+            decision="reject",
+            reason=(
+                "auto rule: "
+                f"packet={packet_id} low-conviction entity accumulation "
+                f"(holding_change_ratio={holding_change_ratio:.5f})"
+            ),
             source="rules",
             confidence=None,
         )
@@ -182,6 +257,24 @@ def _compact_packet_for_quant(packet: dict[str, object]) -> dict[str, object]:
         "score": payload_dict.get("score"),
         "net_buy_shares": rationale_dict.get("net_buy_shares"),
         "gross_value": rationale_dict.get("gross_value"),
+        "open_market_buy_shares": rationale_dict.get("open_market_buy_shares"),
+        "open_market_sell_shares": rationale_dict.get("open_market_sell_shares"),
+        "open_market_net_shares": rationale_dict.get("open_market_net_shares"),
+        "open_market_gross_value": rationale_dict.get("open_market_gross_value"),
+        "holding_change_ratio": rationale_dict.get("holding_change_ratio"),
+        "owner_is_exec": _to_bool(rationale_dict.get("owner_is_exec")),
+        "owner_is_ten_percent_owner": _to_bool(rationale_dict.get("owner_is_ten_percent_owner")),
+        "owner_is_entity": _to_bool(rationale_dict.get("owner_is_entity")),
+        "has_10b5_1_plan": _to_bool(rationale_dict.get("has_10b5_1_plan")),
+        "has_13d_reference": _to_bool(rationale_dict.get("has_13d_reference")),
+        "has_equity_comp_event": _to_bool(rationale_dict.get("has_equity_comp_event")),
+        "has_tax_withholding_language": _to_bool(
+            rationale_dict.get("has_tax_withholding_language")
+        ),
+        "has_option_exercise": _to_bool(rationale_dict.get("has_option_exercise")),
+        "has_award_code": _to_bool(rationale_dict.get("has_award_code")),
+        "novelty_penalty": rationale_dict.get("novelty_penalty"),
+        "alpha_bonus": rationale_dict.get("alpha_bonus"),
     }
 
 
@@ -248,7 +341,18 @@ def _decide_packets_with_quant(
 
         request = {"packets": compact_packets}
         prompt = (
-            "Decide insider packets. Return ONLY JSON: "
+            "You are filtering for alpha-like insider signals. "
+            "Prioritize novelty and informational edge. "
+            "Reject obvious flows such as planned 10b5-1 activity, passive ten-percent owner "
+            "accumulation, compensation grants/vesting, option exercises, or tax-withholding-only "
+            "sales. "
+            "In practice, require discretionary open-market buy evidence "
+            "(code P context) to approve. "
+            "Very small holding change ratio by non-executive entities is usually not alpha. "
+            "Approve only when there is likely non-routine discretionary conviction buying with "
+            "meaningful holdings change and low novelty penalty. "
+            "When uncertain choose escalate. "
+            "Return ONLY JSON: "
             "{\"decisions\":[{\"packet_id\":\"...\",\"decision\":\"approve, reject, or escalate\","
             "\"why\":\"max 240 chars\",\"confidence\":0.0}]}. "
             f"Input: {json.dumps(request, separators=(',', ':'))}"
@@ -373,12 +477,56 @@ def _apply_approve_guardrails(
 
     score = _to_float(payload_dict.get("score"))
     net_buy_shares = _to_float(rationale_dict.get("net_buy_shares"))
+    open_market_buy_shares = _to_float(rationale_dict.get("open_market_buy_shares"))
+    has_10b5_1_plan = _to_bool(rationale_dict.get("has_10b5_1_plan"))
+    has_equity_comp_event = _to_bool(rationale_dict.get("has_equity_comp_event"))
+    has_tax_withholding_language = _to_bool(rationale_dict.get("has_tax_withholding_language"))
+    owner_is_ten_percent_owner = _to_bool(rationale_dict.get("owner_is_ten_percent_owner"))
+    owner_is_exec = _to_bool(rationale_dict.get("owner_is_exec"))
     packet_id = str(packet.get("packet_id", "unknown"))
 
     if score is None or net_buy_shares is None:
         return AutoDecisionRuleResult(
             decision="escalate",
             reason=f"safety block: packet={packet_id} missing score/net_buy_shares for approve",
+            source="safety",
+            confidence=None,
+        )
+
+    if open_market_buy_shares is None or open_market_buy_shares <= 0:
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "safety block: "
+                f"packet={packet_id} approve requires discretionary open-market buying"
+            ),
+            source="safety",
+            confidence=None,
+        )
+
+    if has_10b5_1_plan:
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=f"safety block: packet={packet_id} flagged 10b5-1/planned flow",
+            source="safety",
+            confidence=None,
+        )
+
+    if has_equity_comp_event and has_tax_withholding_language:
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "safety block: "
+                f"packet={packet_id} appears compensation/tax-withholding driven"
+            ),
+            source="safety",
+            confidence=None,
+        )
+
+    if owner_is_ten_percent_owner and not owner_is_exec:
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=f"safety block: packet={packet_id} passive ten-percent owner flow",
             source="safety",
             confidence=None,
         )
@@ -427,7 +575,11 @@ def _build_trade_signal_notification(
     owner = str(payload_dict.get("owner") or "UNKNOWN")
     score = _to_float(payload_dict.get("score"))
     net_buy = _to_float(rationale_dict.get("net_buy_shares"))
+    open_market_buy = _to_float(rationale_dict.get("open_market_buy_shares"))
     gross = _to_float(rationale_dict.get("gross_value"))
+    novelty_penalty = _to_float(rationale_dict.get("novelty_penalty"))
+    has_10b5 = _to_bool(rationale_dict.get("has_10b5_1_plan"))
+    has_comp_event = _to_bool(rationale_dict.get("has_equity_comp_event"))
     packet_id = str(packet.get("packet_id") or decision_payload["packet_id"])
     why = decision_payload.get("reason", "").strip()
     source = decision_payload.get("decision_source", decision_payload.get("analyst", "quant"))
@@ -440,7 +592,19 @@ def _build_trade_signal_notification(
             f"owner={owner}",
             f"score={score:.2f}" if score is not None else "score=NA",
             f"net_buy_shares={net_buy:.2f}" if net_buy is not None else "net_buy_shares=NA",
+            (
+                f"open_market_buy_shares={open_market_buy:.2f}"
+                if open_market_buy is not None
+                else "open_market_buy_shares=NA"
+            ),
             f"gross_value={gross:.2f}" if gross is not None else "gross_value=NA",
+            (
+                f"novelty_penalty={novelty_penalty:.2f}"
+                if novelty_penalty is not None
+                else "novelty_penalty=NA"
+            ),
+            f"has_10b5_1_plan={str(has_10b5).lower()}",
+            f"has_equity_comp_event={str(has_comp_event).lower()}",
             f"source={source}",
             f"why={why or 'N/A'}",
         ]

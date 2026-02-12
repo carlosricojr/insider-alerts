@@ -86,15 +86,33 @@ def test_cli_ops_autopilot_once(monkeypatch) -> None:
         lambda db_path, limit: [
             {
                 "packet_id": "0000905148-26-000640|0001824653|4",
-                "payload": {"score": 100.0, "rationale": {"net_buy_shares": 4754.0}},
+                "payload": {
+                    "score": 100.0,
+                    "rationale": {
+                        "net_buy_shares": 4754.0,
+                        "open_market_buy_shares": 4754.0,
+                    },
+                },
             },
             {
                 "packet_id": "0001818383-26-000028|0001829946|4",
-                "payload": {"score": 16.0, "rationale": {"net_buy_shares": -12000.0}},
+                "payload": {
+                    "score": 16.0,
+                    "rationale": {
+                        "net_buy_shares": -12000.0,
+                        "open_market_buy_shares": 0.0,
+                    },
+                },
             },
             {
                 "packet_id": "0000950103-26-001988|0001326801|4",
-                "payload": {"score": 58.2, "rationale": {"net_buy_shares": -517.0}},
+                "payload": {
+                    "score": 58.2,
+                    "rationale": {
+                        "net_buy_shares": -517.0,
+                        "open_market_buy_shares": 0.0,
+                    },
+                },
             },
         ],
     )
@@ -167,7 +185,16 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
             "issuer_symbol": "CEG",
             "owner": "Hanson Bryan Craig",
             "score": 100.0,
-            "rationale": {"net_buy_shares": 4754.0, "gross_value": 13268128.95},
+            "rationale": {
+                "net_buy_shares": 4754.0,
+                "gross_value": 13268128.95,
+                "open_market_buy_shares": 4754.0,
+                "has_10b5_1_plan": False,
+                "has_equity_comp_event": False,
+                "has_tax_withholding_language": False,
+                "owner_is_ten_percent_owner": False,
+                "owner_is_exec": True,
+            },
         },
     }
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [packet])
@@ -245,6 +272,9 @@ def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
         request_json = message.split("Input: ", 1)[1]
         request = json.loads(request_json)
         packets = request["packets"]
+        assert "has_10b5_1_plan" in packets[0]
+        assert "owner_is_ten_percent_owner" in packets[0]
+        assert "holding_change_ratio" in packets[0]
         calls.append(len(packets))
         decisions = [
             {
@@ -327,11 +357,23 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
         lambda db_path, limit: [
             {
                 "packet_id": "0000905148-26-000640|0001824653|4",
-                "payload": {"score": 100.0, "rationale": {"net_buy_shares": 4754.0}},
+                "payload": {
+                    "score": 100.0,
+                    "rationale": {
+                        "net_buy_shares": 4754.0,
+                        "open_market_buy_shares": 4754.0,
+                    },
+                },
             },
             {
                 "packet_id": "0000905148-26-000640|0001868275|4",
-                "payload": {"score": 100.0, "rationale": {"net_buy_shares": 4754.0}},
+                "payload": {
+                    "score": 100.0,
+                    "rationale": {
+                        "net_buy_shares": 4754.0,
+                        "open_market_buy_shares": 4754.0,
+                    },
+                },
             },
         ],
     )

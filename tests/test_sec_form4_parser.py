@@ -42,3 +42,50 @@ def test_parse_form4_xml_invalid_payload_raises() -> None:
 def test_parse_form4_xml_missing_issuer_raises() -> None:
     with pytest.raises(Form4ParseError):
         parse_form4_xml("<ownershipDocument><issuer></issuer></ownershipDocument>")
+
+
+def test_parse_form4_xml_extracts_plan_and_strategy_flags() -> None:
+    xml = """
+    <ownershipDocument>
+      <issuer>
+        <issuerCik>0000011544</issuerCik>
+        <issuerTradingSymbol>WRB</issuerTradingSymbol>
+      </issuer>
+      <reportingOwner>
+        <reportingOwnerId>
+          <rptOwnerName>MITSUI SUMITOMO INSURANCE CO LTD</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+          <isDirector>false</isDirector>
+          <isOfficer>false</isOfficer>
+          <isTenPercentOwner>true</isTenPercentOwner>
+          <isOther>false</isOther>
+        </reportingOwnerRelationship>
+      </reportingOwner>
+      <remarks>Parties are subject to agreements disclosed in Schedule 13D.</remarks>
+      <footnotes>
+        <footnote id="F1">
+          Purchases were effected pursuant to a Rule 10b5-1 purchase plan.
+        </footnote>
+        <footnote id="F2">
+          Shares automatically sold to cover tax withholding obligation
+          from settlement of vested restricted stock units.
+        </footnote>
+      </footnotes>
+      <nonDerivativeTable>
+        <nonDerivativeTransaction>
+          <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+          <transactionAmounts>
+            <transactionShares><value>100</value></transactionShares>
+            <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+          </transactionAmounts>
+        </nonDerivativeTransaction>
+      </nonDerivativeTable>
+    </ownershipDocument>
+    """
+    facts = parse_form4_xml(xml)
+    assert facts.is_ten_percent_owner is True
+    assert facts.has_10b5_1_plan is True
+    assert facts.has_13d_reference is True
+    assert facts.has_equity_comp_event is True
+    assert facts.has_tax_withholding_language is True

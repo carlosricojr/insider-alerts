@@ -55,3 +55,106 @@ def test_score_form4_signal_unknown_direction_does_not_change_flow() -> None:
     )
     result = score_form4_signal(facts)
     assert result.rationale["net_buy_shares"] == 0.0
+
+
+def test_score_form4_signal_penalizes_planned_strategic_flow() -> None:
+    facts = Form4Facts(
+        issuer_cik="0000011544",
+        issuer_name="W.R. Berkley Corporation",
+        issuer_symbol="WRB",
+        reporting_owner_name="MITSUI SUMITOMO INSURANCE CO LTD",
+        reporting_owner_cik="0009999999",
+        is_director=False,
+        is_officer=False,
+        officer_title=None,
+        transactions=[
+            Form4Transaction(
+                transaction_date=date(2026, 2, 11),
+                transaction_code="P",
+                direction="buy",
+                shares=97996.0,
+                price_per_share=69.68,
+                shares_following=56556652.0,
+                security_title="Common Stock",
+            )
+        ],
+        is_ten_percent_owner=True,
+        has_10b5_1_plan=True,
+        has_13d_reference=True,
+    )
+    result = score_form4_signal(facts)
+    assert result.score < 45
+    assert result.rationale["has_10b5_1_plan"] is True
+    assert result.rationale["owner_is_ten_percent_owner"] is True
+    assert result.rationale["owner_is_entity"] is True
+
+
+def test_score_form4_signal_rewards_discretionary_exec_buy() -> None:
+    facts = Form4Facts(
+        issuer_cik="0007777777",
+        issuer_name="Example Corp",
+        issuer_symbol="EXM",
+        reporting_owner_name="SMITH JANE",
+        reporting_owner_cik="0002222222",
+        is_director=True,
+        is_officer=True,
+        officer_title="Chief Executive Officer",
+        transactions=[
+            Form4Transaction(
+                transaction_date=date(2026, 2, 11),
+                transaction_code="P",
+                direction="buy",
+                shares=50000.0,
+                price_per_share=25.0,
+                shares_following=250000.0,
+                security_title="Common Stock",
+            )
+        ],
+        is_ten_percent_owner=False,
+        has_10b5_1_plan=False,
+        has_13d_reference=False,
+    )
+    result = score_form4_signal(facts)
+    assert result.score >= 80
+    assert result.rationale["owner_is_exec"] is True
+    assert result.rationale["open_market_buy_shares"] == 50000.0
+
+
+def test_score_form4_signal_penalizes_compensation_vesting_noise() -> None:
+    facts = Form4Facts(
+        issuer_cik="0001631574",
+        issuer_name="Wave Life Sciences Ltd.",
+        issuer_symbol="WVE",
+        reporting_owner_name="Moran Kyle",
+        reporting_owner_cik="0000000001",
+        is_director=False,
+        is_officer=True,
+        officer_title="Chief Financial Officer",
+        transactions=[
+            Form4Transaction(
+                transaction_date=date(2026, 2, 5),
+                transaction_code="A",
+                direction="buy",
+                shares=45625.0,
+                price_per_share=0.0,
+                shares_following=138149.0,
+                security_title="RSU",
+            ),
+            Form4Transaction(
+                transaction_date=date(2026, 2, 9),
+                transaction_code="S",
+                direction="sell",
+                shares=3588.0,
+                price_per_share=13.45,
+                shares_following=134561.0,
+                security_title="Common Stock",
+            ),
+        ],
+        has_equity_comp_event=True,
+        has_tax_withholding_language=True,
+    )
+    result = score_form4_signal(facts)
+    assert result.score < 40
+    assert result.rationale["open_market_buy_shares"] == 0.0
+    assert result.rationale["has_equity_comp_event"] is True
+    assert result.rationale["has_tax_withholding_language"] is True
