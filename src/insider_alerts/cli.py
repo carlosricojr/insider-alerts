@@ -20,11 +20,13 @@ from insider_alerts.review.queue import (
     list_pending_review_packets,
     replay_deadletter,
 )
+from insider_alerts.sec.client import SecHttpError
 from insider_alerts.sec.pipeline import (
     enqueue_review_packets,
     enrich_filings_with_xml_url,
     run_sec_poll_once,
 )
+from insider_alerts.sec.rss import SecRssParseError
 
 app = typer.Typer(help="Insider alerts command-line interface.")
 notify_app = typer.Typer(help="Notification commands.")
@@ -1071,11 +1073,25 @@ def ops_autopilot(
         )
         return cycle
 
-    _run_cycle()
+    def _run_cycle_with_recovery(*, loop_mode: bool) -> AutoPilotCycleResult | None:
+        try:
+            return _run_cycle()
+        except (SecHttpError, SecRssParseError) as exc:
+            typer.secho(
+                "ops autopilot cycle failed "
+                f"(retryable, {type(exc).__name__}: {exc})",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            if loop_mode:
+                return None
+            raise typer.Exit(code=1) from exc
+
+    _run_cycle_with_recovery(loop_mode=not once)
     if not once:
         while True:
             time.sleep(interval)
-            _run_cycle()
+            _run_cycle_with_recovery(loop_mode=True)
 
 
 if __name__ == "__main__":

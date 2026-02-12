@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typer.testing import CliRunner
 
 from insider_alerts import cli
+from insider_alerts.sec.client import SecHttpError
 from insider_alerts.sec.pipeline import EnrichResult, PollResult, QueueResult
 
 
@@ -408,6 +409,82 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
     assert decisions == ["approve", "deadletter"]
     assert notifications == ["approve"]
     assert "deadlettered=1" in result.stdout
+
+
+def test_cli_ops_autopilot_once_exits_on_sec_http_error(monkeypatch) -> None:
+    runner = CliRunner()
+
+    def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
+        raise SecHttpError("dns resolution failed")
+
+    monkeypatch.setattr(cli, "run_sec_poll_once", fake_poll)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "ops autopilot cycle failed" in result.stderr
+    assert "dns resolution failed" in result.stderr
+
+
+def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(monkeypatch) -> None:
+    runner = CliRunner()
+
+    calls = {"poll": 0, "sleep": 0}
+
+    def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
+        calls["poll"] += 1
+        if calls["poll"] == 1:
+            raise SecHttpError("transient dns failure")
+        return PollResult(fetched=0, inserted=0, skipped_existing=0)
+
+    def fake_sleep(seconds: int) -> None:
+        calls["sleep"] += 1
+        if calls["sleep"] >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr(cli, "run_sec_poll_once", fake_poll)
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit: EnrichResult(scanned=0, updated=0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enqueue_review_packets",
+        lambda settings, *, limit: QueueResult(processed=0, enqueued=0),
+    )
+    monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--loop",
+            "--interval",
+            "10",
+            "--decision-engine",
+            "rules",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert "stop-loop" in str(result.exception)
+    assert calls["poll"] == 2
+    assert "ops autopilot cycle failed" in result.stderr
+    assert "transient dns failure" in result.stderr
+    assert "ops autopilot cycle completed" in result.stdout
 
 
 def test_trade_signal_notification_includes_ticker_and_why() -> None:
