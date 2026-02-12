@@ -1,9 +1,17 @@
 import json
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 
 from typer.testing import CliRunner
 
 from insider_alerts import cli
+from insider_alerts.backtest.engine import (
+    BacktestMetrics,
+    BacktestParams,
+    GridSearchResult,
+    WalkForwardResult,
+)
+from insider_alerts.backtest.models import DailyBar, SignalEvent
 from insider_alerts.sec.client import SecHttpError
 from insider_alerts.sec.pipeline import EnrichResult, PollResult, QueueResult
 
@@ -650,3 +658,87 @@ def test_trade_signal_notification_includes_ticker_and_why() -> None:
     assert "why=Quant thesis: high-conviction insider accumulation." in message
     assert "trade-signal" in tags
     assert priority == 4
+
+
+def test_cli_ops_backtest_outputs_report(monkeypatch, tmp_path) -> None:
+    runner = CliRunner()
+    signal = SignalEvent(
+        packet_id="0001708842-26-000005|0000063276|4",
+        symbol="MAT",
+        filed_at=datetime(2026, 2, 12, 20, 39, 47, tzinfo=UTC),
+        score=95.0,
+        open_market_buy_shares=65000.0,
+        open_market_net_shares=65000.0,
+        has_10b5_1_plan=False,
+        has_equity_comp_event=False,
+        has_tax_withholding_language=False,
+        role_tier="chief_exec",
+    )
+    bar = DailyBar(
+        symbol="MAT",
+        trade_date=date(2026, 2, 13),
+        open=16.0,
+        high=16.5,
+        low=15.8,
+        close=16.2,
+        volume=1000000.0,
+    )
+    metrics = BacktestMetrics(
+        trade_count=1,
+        skipped_count=0,
+        mean_return=0.01,
+        median_return=0.01,
+        win_rate=1.0,
+        profit_factor=float("inf"),
+        max_drawdown=0.0,
+        sharpe_like=None,
+        mean_alpha=0.005,
+        median_alpha=0.005,
+        objective_score=0.005,
+    )
+    params = BacktestParams(min_score=90.0, hold_days=5, stop_loss_pct=0.05, take_profit_rr=2.0)
+
+    monkeypatch.setattr(cli, "load_scored_signals", lambda *args, **kwargs: [signal])
+    monkeypatch.setattr(cli, "refresh_price_bars", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "get_price_bars", lambda *args, **kwargs: [bar])
+
+    class _FakePriceClient:
+        def fetch_history(self, symbol):  # type: ignore[no-untyped-def]
+            return [bar]
+
+    monkeypatch.setattr(cli, "StooqPriceClient", lambda **kwargs: _FakePriceClient())
+    monkeypatch.setattr(
+        cli,
+        "evaluate_parameter_grid",
+        lambda *args, **kwargs: [GridSearchResult(params=params, metrics=metrics)],
+    )
+    monkeypatch.setattr(cli, "run_backtest", lambda *args, **kwargs: (metrics, []))
+    monkeypatch.setattr(
+        cli,
+        "run_walk_forward",
+        lambda *args, **kwargs: WalkForwardResult(
+            folds=[],
+            aggregate_test_metrics=metrics,
+            recommended_params=params,
+        ),
+    )
+
+    output_path = tmp_path / "report.json"
+    result = runner.invoke(
+        cli.app,
+        [
+            "ops",
+            "backtest",
+            "--output-json",
+            str(output_path),
+            "--start-date",
+            "2026-02-01",
+            "--end-date",
+            "2026-02-20",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["signals_total"] == 1
+    assert payload["best_in_sample_params"]["min_score"] == 90.0
+    assert output_path.exists()

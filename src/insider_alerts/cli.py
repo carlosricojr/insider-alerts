@@ -5,11 +5,25 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 import typer
 
+from insider_alerts.backtest.data import load_scored_signals
+from insider_alerts.backtest.engine import (
+    BacktestParams,
+    evaluate_parameter_grid,
+    run_backtest,
+    run_walk_forward,
+)
+from insider_alerts.backtest.prices import (
+    PriceDataError,
+    StooqPriceClient,
+    get_price_bars,
+    refresh_price_bars,
+)
 from insider_alerts.config import Settings, get_settings
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.review.queue import (
@@ -92,6 +106,68 @@ def _to_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y"}
     return False
+
+
+def _parse_float_grid(raw: str, *, min_value: float | None = None) -> list[float]:
+    values: list[float] = []
+    seen: set[float] = set()
+    for token in raw.split(","):
+        stripped = token.strip()
+        if not stripped:
+            continue
+        try:
+            value = float(stripped)
+        except ValueError as exc:
+            raise typer.BadParameter(f"invalid numeric value: {stripped}") from exc
+        if min_value is not None and value < min_value:
+            raise typer.BadParameter(f"value {value} must be >= {min_value}")
+        if value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    if not values:
+        raise typer.BadParameter("grid cannot be empty")
+    return sorted(values)
+
+
+def _parse_int_grid(raw: str, *, min_value: int | None = None) -> list[int]:
+    values: list[int] = []
+    seen: set[int] = set()
+    for token in raw.split(","):
+        stripped = token.strip()
+        if not stripped:
+            continue
+        try:
+            value = int(stripped)
+        except ValueError as exc:
+            raise typer.BadParameter(f"invalid integer value: {stripped}") from exc
+        if min_value is not None and value < min_value:
+            raise typer.BadParameter(f"value {value} must be >= {min_value}")
+        if value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    if not values:
+        raise typer.BadParameter("grid cannot be empty")
+    return sorted(values)
+
+
+def _metrics_to_dict(metrics: object) -> dict[str, object]:
+    try:
+        return asdict(metrics)
+    except TypeError:
+        if hasattr(metrics, "__dict__"):
+            return dict(vars(metrics))
+    return {}
+
+
+def _params_to_dict(params: BacktestParams) -> dict[str, object]:
+    return {
+        "min_score": params.min_score,
+        "hold_days": params.hold_days,
+        "stop_loss_pct": params.stop_loss_pct,
+        "take_profit_rr": params.take_profit_rr,
+    }
 
 
 def _auto_decide_packet(
@@ -968,6 +1044,235 @@ def deadletter_replay(packet_id: str = typer.Option(..., "--packet-id")) -> None
     settings = get_settings()
     updated = replay_deadletter(settings.database_path, packet_id)
     typer.echo(f"deadletter replay completed (updated={updated})")
+
+
+@ops_app.command("backtest")
+def ops_backtest(
+    start_date_text: str = typer.Option(
+        "",
+        "--start-date",
+        help="Inclusive YYYY-MM-DD filter on filing date.",
+    ),
+    end_date_text: str = typer.Option(
+        "",
+        "--end-date",
+        help="Inclusive YYYY-MM-DD filter on filing date.",
+    ),
+    min_score_grid_text: str = typer.Option(
+        "70,80,90",
+        "--min-score-grid",
+        help="Comma-separated score thresholds.",
+    ),
+    hold_days_grid_text: str = typer.Option(
+        "3,5,10,20",
+        "--hold-days-grid",
+        help="Comma-separated max hold days (trading days).",
+    ),
+    stop_loss_grid_text: str = typer.Option(
+        "0.03,0.05",
+        "--stop-loss-grid",
+        help="Comma-separated stop-loss fractions (0.03=3%).",
+    ),
+    take_profit_rr_grid_text: str = typer.Option(
+        "1.5,2.0,3.0",
+        "--take-profit-rr-grid",
+        help="Comma-separated take-profit multiples of stop.",
+    ),
+    benchmark_symbol: str = typer.Option("SPY", "--benchmark-symbol"),
+    transaction_cost_bps: float = typer.Option(
+        5.0,
+        "--transaction-cost-bps",
+        min=0.0,
+        help="One-way transaction cost in basis points.",
+    ),
+    slippage_bps: float = typer.Option(
+        5.0,
+        "--slippage-bps",
+        min=0.0,
+        help="One-way slippage in basis points.",
+    ),
+    train_window_days: int = typer.Option(
+        365,
+        "--train-window-days",
+        min=60,
+        help="Walk-forward training window in calendar days.",
+    ),
+    test_window_days: int = typer.Option(
+        90,
+        "--test-window-days",
+        min=20,
+        help="Walk-forward test window in calendar days.",
+    ),
+    min_train_trades: int = typer.Option(
+        15,
+        "--min-train-trades",
+        min=1,
+        help="Minimum training trades per fold to select params.",
+    ),
+    max_signals: int = typer.Option(
+        0,
+        "--max-signals",
+        min=0,
+        help="Optional cap for debug runs (0=all).",
+    ),
+    refresh_prices_enabled: bool = typer.Option(
+        True,
+        "--refresh-prices/--no-refresh-prices",
+        help="Refresh symbol price histories from data provider.",
+    ),
+    output_json_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output-json",
+        help="Optional file path to write JSON report.",
+    ),
+) -> None:
+    """
+    Backtest pre-LLM score-driven insider signals with walk-forward validation.
+    """
+    settings = get_settings()
+
+    start_date = date.fromisoformat(start_date_text) if start_date_text.strip() else None
+    end_date = date.fromisoformat(end_date_text) if end_date_text.strip() else None
+    if start_date and end_date and start_date > end_date:
+        typer.secho("start-date cannot be after end-date", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    signals = load_scored_signals(settings.database_path, start_date=start_date, end_date=end_date)
+    if max_signals > 0:
+        signals = signals[:max_signals]
+    if not signals:
+        typer.secho("no signals found for requested window", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=3)
+
+    min_score_grid = _parse_float_grid(min_score_grid_text, min_value=0.0)
+    hold_days_grid = _parse_int_grid(hold_days_grid_text, min_value=1)
+    stop_loss_grid = _parse_float_grid(stop_loss_grid_text, min_value=0.0)
+    take_profit_rr_grid = _parse_float_grid(take_profit_rr_grid_text, min_value=0.0)
+
+    parameter_grid: list[BacktestParams] = []
+    for min_score in min_score_grid:
+        for hold_days in hold_days_grid:
+            for stop_loss_pct in stop_loss_grid:
+                for take_profit_rr in take_profit_rr_grid:
+                    parameter_grid.append(
+                        BacktestParams(
+                            min_score=min_score,
+                            hold_days=hold_days,
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_rr=take_profit_rr,
+                        )
+                    )
+
+    unique_symbols = sorted({signal.symbol for signal in signals})
+    benchmark = benchmark_symbol.strip().upper()
+    if benchmark:
+        unique_symbols.append(benchmark)
+    unique_symbols = sorted(set(unique_symbols))
+
+    effective_start = min(signal.filed_at.date() for signal in signals)
+    effective_end = max(signal.filed_at.date() for signal in signals)
+    max_hold_days = max(param.hold_days for param in parameter_grid)
+    price_start = effective_start - timedelta(days=10)
+    price_end = effective_end + timedelta(days=max_hold_days + 10)
+
+    price_client = StooqPriceClient(
+        user_agent=settings.sec_user_agent,
+        timeout_seconds=settings.market_data_timeout_seconds,
+    )
+    bars_by_symbol: dict[str, list[object]] = {}
+    price_errors: list[str] = []
+    for symbol in unique_symbols:
+        try:
+            if refresh_prices_enabled:
+                fetched = price_client.fetch_history(symbol)
+                refresh_price_bars(settings.database_path, symbol=symbol, bars=fetched)
+            bars = get_price_bars(
+                settings.database_path,
+                symbol=symbol,
+                start_date=price_start,
+                end_date=price_end,
+            )
+            if bars:
+                bars_by_symbol[symbol] = bars
+            else:
+                price_errors.append(f"{symbol}: no cached bars in requested range")
+        except PriceDataError as exc:
+            price_errors.append(f"{symbol}: {exc}")
+
+    if not bars_by_symbol:
+        typer.secho("no price bars available for backtest", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+
+    grid_results = evaluate_parameter_grid(
+        signals,
+        bars_by_symbol=bars_by_symbol,
+        parameter_grid=parameter_grid,
+        benchmark_symbol=benchmark,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )
+    best_grid = grid_results[0]
+    best_metrics, _ = run_backtest(
+        signals,
+        bars_by_symbol=bars_by_symbol,
+        params=best_grid.params,
+        benchmark_symbol=benchmark,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )
+    walk_forward = run_walk_forward(
+        signals,
+        bars_by_symbol=bars_by_symbol,
+        parameter_grid=parameter_grid,
+        train_window_days=train_window_days,
+        test_window_days=test_window_days,
+        min_train_trades=min_train_trades,
+        benchmark_symbol=benchmark,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )
+
+    report: dict[str, object] = {
+        "signals_total": len(signals),
+        "symbols_total": len({signal.symbol for signal in signals}),
+        "parameter_grid_size": len(parameter_grid),
+        "benchmark_symbol": benchmark,
+        "best_in_sample_params": _params_to_dict(best_grid.params),
+        "best_in_sample_metrics": _metrics_to_dict(best_metrics),
+        "walk_forward_folds": len(walk_forward.folds),
+        "walk_forward_aggregate_metrics": _metrics_to_dict(walk_forward.aggregate_test_metrics),
+        "walk_forward_recommended_params": (
+            _params_to_dict(walk_forward.recommended_params)
+            if walk_forward.recommended_params is not None
+            else None
+        ),
+        "top_grid_results": [
+            {
+                "params": _params_to_dict(result.params),
+                "metrics": _metrics_to_dict(result.metrics),
+            }
+            for result in grid_results[:10]
+        ],
+        "walk_forward_fold_results": [
+            {
+                "train_start": fold.train_start.isoformat(),
+                "train_end": fold.train_end.isoformat(),
+                "test_start": fold.test_start.isoformat(),
+                "test_end": fold.test_end.isoformat(),
+                "selected_params": _params_to_dict(fold.selected_params),
+                "train_metrics": _metrics_to_dict(fold.train_metrics),
+                "test_metrics": _metrics_to_dict(fold.test_metrics),
+            }
+            for fold in walk_forward.folds
+        ],
+        "price_errors": price_errors,
+    }
+
+    if output_json_path is not None:
+        output_json_path.parent.mkdir(parents=True, exist_ok=True)
+        output_json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
 
 @ops_app.command("autopilot")

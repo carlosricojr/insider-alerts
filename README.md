@@ -121,6 +121,7 @@ uv run python -m insider_alerts.cli review pending --limit 50
 uv run python -m insider_alerts.cli review decide --packet-id "0000320193-24-000123|0000320193|4" --decision approve --reason "Quant thesis..." --analyst quant --notify
 uv run python -m insider_alerts.cli ops deadletter-list
 uv run python -m insider_alerts.cli ops deadletter-replay --packet-id <id>
+uv run python -m insider_alerts.cli ops backtest --start-date 2024-01-01 --end-date 2026-12-31 --output-json reports/backtest_latest.json
 ```
 
 ## Troubleshooting
@@ -135,4 +136,5 @@ uv run python -m insider_alerts.cli ops deadletter-replay --packet-id <id>
 ## Further docs
 
 - `docs/runbook/OPERATIONS.md`
+- `docs/runbook/BACKTESTING.md`
 - `skills/insider-review/SKILL.md`
