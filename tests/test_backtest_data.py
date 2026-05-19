@@ -16,8 +16,11 @@ from insider_alerts.sec.store import init_db
 def test_data_type_narrowing_helpers_drop_invalid_shapes() -> None:
     assert _string_keyed_dict(["not", "a", "dict"]) == {}
     assert _string_keyed_dict({"score": "95", 1: "drop"}) == {"score": "95"}
+    assert _string_keyed_dict({}) == {}
 
     assert _optional_float("12.5") == 12.5
+    assert _optional_float(12.5) == 12.5
+    assert _optional_float(42) == 42.0
     assert _optional_float("not-a-number") is None
     assert _optional_float(object()) is None
     assert _optional_float(None) is None
@@ -34,11 +37,13 @@ def test_data_type_narrowing_helpers_drop_invalid_shapes() -> None:
     }
     assert _rationale_float(rationale, "numeric") == 7.5
     assert _rationale_float(rationale, "bad_numeric") == 0.0
+    assert _rationale_float(rationale, "missing_key") == 0.0
     assert _rationale_bool(rationale, "truthy_int") is True
     assert _rationale_bool(rationale, "truthy_str") is True
     assert _rationale_bool(rationale, "nested") is False
     assert _rationale_bool(rationale, "empty_str") is False
     assert _rationale_bool(rationale, "whitespace") is False
+    assert _rationale_bool(rationale, "missing_key") is False
 
 
 def test_load_scored_signals_reads_payload_and_filters_dates(tmp_path) -> None:
