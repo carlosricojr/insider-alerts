@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -13,11 +13,13 @@ import typer
 
 from insider_alerts.backtest.data import load_scored_signals
 from insider_alerts.backtest.engine import (
+    BacktestMetrics,
     BacktestParams,
     evaluate_parameter_grid,
     run_backtest,
     run_walk_forward,
 )
+from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.prices import (
     PriceDataError,
     StooqPriceClient,
@@ -152,13 +154,20 @@ def _parse_int_grid(raw: str, *, min_value: int | None = None) -> list[int]:
     return sorted(values)
 
 
-def _metrics_to_dict(metrics: object) -> dict[str, object]:
-    try:
-        return asdict(metrics)
-    except TypeError:
-        if hasattr(metrics, "__dict__"):
-            return dict(vars(metrics))
-    return {}
+def _metrics_to_dict(metrics: BacktestMetrics) -> dict[str, object]:
+    return {
+        "trade_count": metrics.trade_count,
+        "skipped_count": metrics.skipped_count,
+        "mean_return": metrics.mean_return,
+        "median_return": metrics.median_return,
+        "win_rate": metrics.win_rate,
+        "profit_factor": metrics.profit_factor,
+        "max_drawdown": metrics.max_drawdown,
+        "sharpe_like": metrics.sharpe_like,
+        "mean_alpha": metrics.mean_alpha,
+        "median_alpha": metrics.median_alpha,
+        "objective_score": metrics.objective_score,
+    }
 
 
 def _params_to_dict(params: BacktestParams) -> dict[str, object]:
@@ -1179,7 +1188,7 @@ def ops_backtest(
         user_agent=settings.sec_user_agent,
         timeout_seconds=settings.market_data_timeout_seconds,
     )
-    bars_by_symbol: dict[str, list[object]] = {}
+    bars_by_symbol: dict[str, list[DailyBar]] = {}
     price_errors: list[str] = []
     for symbol in unique_symbols:
         try:

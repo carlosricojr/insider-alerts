@@ -135,7 +135,10 @@ class DailyMarketDataClient:
         )
         try:
             with urlopen(req, timeout=self.timeout_seconds) as response:
-                return response.read().decode("utf-8", "replace")
+                body = response.read()
+                if not isinstance(body, bytes):
+                    raise MarketContextError(f"market data response was not bytes for {symbol}")
+                return body.decode("utf-8", "replace")
         except (OSError, URLError) as exc:
             raise MarketContextError(f"market data request failed for {symbol}: {exc}") from exc
 
@@ -146,7 +149,11 @@ class DailyMarketDataClient:
             return None
 
         indexed: dict[date, dict[str, str]] = {}
-        for row in rows:
+        for raw_row in rows:
+            row: dict[str, str] = {}
+            for raw_key, raw_value in raw_row.items():
+                if isinstance(raw_key, str) and isinstance(raw_value, str):
+                    row[raw_key] = raw_value
             date_text = row.get("Date")
             if not date_text:
                 continue
@@ -156,13 +163,13 @@ class DailyMarketDataClient:
                 continue
             indexed[key] = row
 
-        row = indexed.get(trade_date)
-        if row is None:
+        trade_row = indexed.get(trade_date)
+        if trade_row is None:
             return None
 
         try:
-            close = float(row.get("Close", "0"))
-            volume = float(row.get("Volume", "0"))
+            close = float(trade_row.get("Close", "0"))
+            volume = float(trade_row.get("Volume", "0"))
         except ValueError as exc:
             raise MarketContextError(
                 f"market data parse failed for {symbol} on {trade_date.isoformat()}: {exc}"

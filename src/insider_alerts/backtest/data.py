@@ -9,6 +9,44 @@ from insider_alerts.review.queue import ensure_review_tables
 from insider_alerts.sec.store import init_db
 
 
+def _string_keyed_dict(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+
+    narrowed: dict[str, object] = {}
+    for key, item in value.items():
+        if isinstance(key, str):
+            narrowed[key] = item
+    return narrowed
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _rationale_float(rationale: dict[str, object], name: str) -> float:
+    value = _optional_float(rationale.get(name))
+    return value if value is not None else 0.0
+
+
+def _rationale_bool(rationale: dict[str, object], name: str) -> bool:
+    value = rationale.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
 def _parse_iso_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
@@ -55,38 +93,19 @@ def load_scored_signals(
 
     signals: list[SignalEvent] = []
     for row in rows:
-        payload = json.loads(str(row["payload_json"]))
-        if not isinstance(payload, dict):
+        payload_obj: object = json.loads(str(row["payload_json"]))
+        payload = _string_keyed_dict(payload_obj)
+        if not payload:
             continue
-        rationale = payload.get("rationale")
-        if not isinstance(rationale, dict):
-            rationale = {}
+        rationale = _string_keyed_dict(payload.get("rationale"))
 
         symbol_obj = payload.get("issuer_symbol")
         score_obj = payload.get("score")
         if not isinstance(symbol_obj, str) or not symbol_obj.strip():
             continue
-        try:
-            score = float(score_obj)
-        except (TypeError, ValueError):
+        score = _optional_float(score_obj)
+        if score is None:
             continue
-
-        def _float(name: str, rationale_dict: dict[str, object] = rationale) -> float:
-            value = rationale_dict.get(name)
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return 0.0
-
-        def _bool(name: str, rationale_dict: dict[str, object] = rationale) -> bool:
-            value = rationale_dict.get(name)
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return value != 0
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "y"}
-            return False
 
         role_tier_obj = rationale.get("role_tier")
         role_tier = role_tier_obj if isinstance(role_tier_obj, str) else "unknown"
@@ -97,11 +116,13 @@ def load_scored_signals(
                 symbol=symbol_obj.strip().upper(),
                 filed_at=_parse_iso_datetime(str(row["filed_at"])),
                 score=score,
-                open_market_buy_shares=_float("open_market_buy_shares"),
-                open_market_net_shares=_float("open_market_net_shares"),
-                has_10b5_1_plan=_bool("has_10b5_1_plan"),
-                has_equity_comp_event=_bool("has_equity_comp_event"),
-                has_tax_withholding_language=_bool("has_tax_withholding_language"),
+                open_market_buy_shares=_rationale_float(rationale, "open_market_buy_shares"),
+                open_market_net_shares=_rationale_float(rationale, "open_market_net_shares"),
+                has_10b5_1_plan=_rationale_bool(rationale, "has_10b5_1_plan"),
+                has_equity_comp_event=_rationale_bool(rationale, "has_equity_comp_event"),
+                has_tax_withholding_language=_rationale_bool(
+                    rationale, "has_tax_withholding_language"
+                ),
                 role_tier=role_tier,
             )
         )

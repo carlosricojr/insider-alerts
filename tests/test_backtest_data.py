@@ -2,9 +2,37 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
-from insider_alerts.backtest.data import load_scored_signals
+from insider_alerts.backtest.data import (
+    _optional_float,
+    _rationale_bool,
+    _rationale_float,
+    _string_keyed_dict,
+    load_scored_signals,
+)
 from insider_alerts.review.queue import ensure_review_tables
 from insider_alerts.sec.store import init_db
+
+
+def test_data_type_narrowing_helpers_drop_invalid_shapes() -> None:
+    assert _string_keyed_dict(["not", "a", "dict"]) == {}
+    assert _string_keyed_dict({"score": "95", 1: "drop"}) == {"score": "95"}
+
+    assert _optional_float("12.5") == 12.5
+    assert _optional_float("not-a-number") is None
+    assert _optional_float(object()) is None
+
+    rationale: dict[str, object] = {
+        "numeric": "7.5",
+        "bad_numeric": "not-a-number",
+        "truthy_int": 1,
+        "truthy_str": "yes",
+        "nested": {},
+    }
+    assert _rationale_float(rationale, "numeric") == 7.5
+    assert _rationale_float(rationale, "bad_numeric") == 0.0
+    assert _rationale_bool(rationale, "truthy_int") is True
+    assert _rationale_bool(rationale, "truthy_str") is True
+    assert _rationale_bool(rationale, "nested") is False
 
 
 def test_load_scored_signals_reads_payload_and_filters_dates(tmp_path) -> None:

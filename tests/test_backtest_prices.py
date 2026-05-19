@@ -1,7 +1,11 @@
 from datetime import date
 
+import pytest
+
+from insider_alerts.backtest import prices as prices_module
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.prices import (
+    PriceDataError,
     StooqPriceClient,
     get_price_bars,
     refresh_price_bars,
@@ -27,6 +31,33 @@ def test_stooq_price_client_parses_csv() -> None:
     assert bars[0].symbol == "MAT"
     assert bars[0].trade_date == date(2026, 2, 11)
     assert bars[1].close == 15.835
+
+
+def test_stooq_price_client_download_validates_response_bytes(monkeypatch) -> None:
+    class _Response:
+        def __init__(self, body: object) -> None:
+            self.body = body
+
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def read(self) -> object:
+            return self.body
+
+    client = StooqPriceClient(
+        user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
+        timeout_seconds=5.0,
+    )
+
+    monkeypatch.setattr(prices_module, "urlopen", lambda req, timeout: _Response(b"Date\n"))
+    assert client._download_csv("MAT") == "Date\n"
+
+    monkeypatch.setattr(prices_module, "urlopen", lambda req, timeout: _Response("Date\n"))
+    with pytest.raises(PriceDataError, match="response was not bytes"):
+        client._download_csv("MAT")
 
 
 def test_refresh_and_get_price_bars_round_trip(tmp_path) -> None:
