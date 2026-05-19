@@ -92,6 +92,76 @@ def test_run_backtest_uses_conservative_stop_when_stop_and_take_hit_same_day() -
     assert trades[0].net_return == pytest.approx(-0.05, rel=1e-9)
 
 
+def test_run_backtest_exits_on_stop_only_day() -> None:
+    bars = [
+        DailyBar(
+            symbol="ABC",
+            trade_date=date(2026, 1, 2),
+            open=10.0,
+            high=10.4,
+            low=9.4,
+            close=9.6,
+            volume=1_000_000.0,
+        ),
+        DailyBar(
+            symbol="ABC",
+            trade_date=date(2026, 1, 5),
+            open=9.7,
+            high=9.9,
+            low=9.3,
+            close=9.4,
+            volume=1_000_000.0,
+        ),
+    ]
+    params = BacktestParams(min_score=90.0, hold_days=2, stop_loss_pct=0.05, take_profit_rr=2.0)
+    metrics, trades = run_backtest(
+        [_signal("p1", 1)],
+        bars_by_symbol={"ABC": bars},
+        params=params,
+        benchmark_symbol="",
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+    )
+    assert metrics.trade_count == 1
+    assert trades[0].exit_reason == "stop"
+    assert trades[0].exit_price == pytest.approx(9.5, rel=1e-9)
+
+
+def test_run_backtest_exits_on_take_profit_only_day() -> None:
+    bars = [
+        DailyBar(
+            symbol="ABC",
+            trade_date=date(2026, 1, 2),
+            open=10.0,
+            high=11.1,
+            low=9.8,
+            close=10.9,
+            volume=1_000_000.0,
+        ),
+        DailyBar(
+            symbol="ABC",
+            trade_date=date(2026, 1, 5),
+            open=10.8,
+            high=11.2,
+            low=10.7,
+            close=11.0,
+            volume=1_000_000.0,
+        ),
+    ]
+    params = BacktestParams(min_score=90.0, hold_days=2, stop_loss_pct=0.05, take_profit_rr=2.0)
+    metrics, trades = run_backtest(
+        [_signal("p1", 1)],
+        bars_by_symbol={"ABC": bars},
+        params=params,
+        benchmark_symbol="",
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+    )
+    assert metrics.trade_count == 1
+    assert trades[0].exit_reason == "take_profit"
+    assert trades[0].exit_price == pytest.approx(11.0, rel=1e-9)
+
+
 def test_evaluate_parameter_grid_sorts_by_objective() -> None:
     signals = [_signal("p1", 1), _signal("p2", 2)]
     grid = [

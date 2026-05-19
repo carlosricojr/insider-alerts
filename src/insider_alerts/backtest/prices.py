@@ -57,7 +57,10 @@ class StooqPriceClient:
         )
         try:
             with urlopen(req, timeout=self.timeout_seconds) as response:
-                return response.read().decode("utf-8", "replace")
+                body = response.read()
+                if not isinstance(body, bytes):
+                    raise PriceDataError(f"price response was not bytes for {symbol}")
+                return body.decode("utf-8", "replace")
         except (OSError, URLError) as exc:
             raise PriceDataError(f"price request failed for {symbol}: {exc}") from exc
 
