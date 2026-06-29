@@ -7,9 +7,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($RecoveryIntervalMinutes -lt 1) {
+  throw "RecoveryIntervalMinutes must be greater than or equal to 1."
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
 $launcher = Join-Path $scriptDir "run-insider-autopilot-hidden.ps1"
+$powerShellExe = (Get-Process -Id $PID).Path
 
 if (-not (Test-Path (Join-Path $repoRoot ".venv\Scripts\python.exe"))) {
   throw "Missing virtualenv Python at $repoRoot\.venv\Scripts\python.exe"
@@ -21,7 +26,7 @@ if (-not (Test-Path (Join-Path $repoRoot ".env"))) {
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction `
-  -Execute "powershell.exe" `
+  -Execute $powerShellExe `
   -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$launcher`"" `
   -WorkingDirectory $repoRoot
 
