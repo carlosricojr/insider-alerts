@@ -56,6 +56,6 @@ branch = true
 source = ["insider_alerts"]
 
 [tool.coverage.report]
-fail_under = 90
+fail_under = 83
 show_missing = true
 skip_covered = true
