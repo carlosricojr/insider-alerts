@@ -1,17 +1,118 @@
 from __future__ import annotations
 
-import csv
-import io
+import json
+import logging
+import os
 import sqlite3
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
+from http.client import HTTPException
 from pathlib import Path
-from urllib.error import URLError
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger(__name__)
+
+# Fallback-only HTTP source. Primary is IB Gateway (see _IBBarSource).
+_YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+
+# IB Gateway is the authoritative feed on this host: it is authenticated, always-on, and the
+# same source the rest of the stack trades against. Verified 2026-08-11 to cover the full
+# insider universe including OTC pink sheets (RDGL @ $0.0538) which Yahoo prices as null.
+_IB_HOST = os.environ.get("IB_GATEWAY_HOST", "127.0.0.1")
+_IB_PORT = int(os.environ.get("IB_GATEWAY_PORT", "4001"))
+_IB_CLIENT_ID = int(os.environ.get("INSIDER_IB_CLIENT_ID", "171"))
 
 
 class MarketContextError(RuntimeError):
     """Raised when market context lookup fails."""
+
+
+class _IBBarSource:
+    """Lazy, process-wide IB Gateway connection for daily bars.
+
+    One connection is shared across the whole autopilot loop: reconnecting per symbol would
+    dominate latency and burn client ids. ``ib_insync`` is imported lazily so the module still
+    imports (and the Yahoo fallback still works) on hosts without the dependency or Gateway.
+    """
+
+    _lock = threading.Lock()
+    _ib: Any | None = None
+    _unavailable_reason: str | None = None
+
+    @classmethod
+    def _connect(cls) -> Any | None:
+        if cls._ib is not None and cls._ib.isConnected():
+            return cls._ib
+        try:
+            import asyncio
+
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            from ib_insync import IB
+        except ImportError as exc:  # pragma: no cover - depends on host deps
+            cls._unavailable_reason = f"ib_insync not installed: {exc}"
+            return None
+        try:
+            ib = IB()  # type: ignore[no-untyped-call]
+            ib.connect(_IB_HOST, _IB_PORT, clientId=_IB_CLIENT_ID, timeout=10, readonly=True)
+            ib.reqMarketDataType(1)
+            cls._ib = ib
+            cls._unavailable_reason = None
+            return ib
+        except Exception as exc:  # noqa: BLE001 - any connect failure degrades to fallback
+            cls._unavailable_reason = f"IB Gateway {_IB_HOST}:{_IB_PORT} unreachable: {exc}"
+            cls._ib = None
+            return None
+
+    @classmethod
+    def fetch(cls, symbol: str) -> dict[date, tuple[float, float]]:
+        """Return ``{trade_date: (close, volume)}``; empty dict if IB cannot serve the symbol."""
+        with cls._lock:
+            ib = cls._connect()
+            if ib is None:
+                return {}
+            try:
+                from ib_insync import Stock
+
+                contract = Stock(symbol.upper(), "SMART", "USD")
+                qualified = ib.qualifyContracts(contract)
+                if not qualified or not contract.conId:
+                    return {}
+                bars = ib.reqHistoricalData(
+                    contract,
+                    "",
+                    "10 D",
+                    "1 day",
+                    "TRADES",
+                    useRTH=True,
+                    formatDate=2,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("IB bar fetch failed for %s: %s", symbol, exc)
+                return {}
+        out: dict[date, tuple[float, float]] = {}
+        for bar in bars or []:
+            bar_date = getattr(bar, "date", None)
+            if isinstance(bar_date, datetime):
+                bar_date = bar_date.date()
+            if not isinstance(bar_date, date):
+                continue
+            try:
+                close = float(bar.close)
+                volume = float(bar.volume)
+            except (TypeError, ValueError):
+                continue
+            if close > 0 and volume > 0:
+                out[bar_date] = (close, volume)
+        return out
 
 
 @dataclass(slots=True)
@@ -24,7 +125,7 @@ class MarketSnapshot:
     prior_close: float | None
     return_1d: float | None
     earnings_shock_flag: bool
-    source: str = "stooq"
+    source: str = "ibkr"
 
 
 def ensure_market_snapshots_table(db_path: str) -> None:
@@ -115,17 +216,54 @@ class DailyMarketDataClient:
         *,
         user_agent: str,
         timeout_seconds: float,
+        rate_limit_per_second: float = 1.0,
+        retry_attempts: int = 3,
+        retry_min_seconds: float = 0.5,
+        retry_max_seconds: float = 3.0,
         shock_drop_threshold: float = 0.08,
+        now_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.user_agent = user_agent
         self.timeout_seconds = timeout_seconds
+        self.rate_limit_per_second = rate_limit_per_second
+        self.retry_attempts = max(1, retry_attempts)
+        self.retry_min_seconds = max(0.0, retry_min_seconds)
+        self.retry_max_seconds = max(self.retry_min_seconds, retry_max_seconds)
         self.shock_drop_threshold = shock_drop_threshold
+        self.now_fn = now_fn
+        self.sleep_fn = sleep_fn
+        self._last_request_ts = 0.0
 
-    def _download_csv_text(self, symbol: str) -> str:
-        normalized = symbol.strip().lower()
-        if not normalized:
-            raise MarketContextError("empty symbol")
-        url = f"https://stooq.com/q/d/l/?s={normalized}.us&i=d"
+    def _enforce_rate_limit(self) -> None:
+        interval = 1.0 / self.rate_limit_per_second
+        now = self.now_fn()
+        elapsed = now - self._last_request_ts
+        if elapsed < interval:
+            self.sleep_fn(interval - elapsed)
+        self._last_request_ts = self.now_fn()
+
+    def _retry_delay(self, attempt: int) -> float:
+        if self.retry_min_seconds == 0:
+            return 0.0
+        return float(
+            min(
+                self.retry_min_seconds * (2 ** max(attempt - 1, 0)),
+                self.retry_max_seconds,
+            )
+        )
+
+    @staticmethod
+    def _is_retryable_http_status(status_code: int) -> bool:
+        return status_code in {403, 429} or status_code >= 500
+
+    def _download_text(self, url: str, *, symbol: str) -> str:
+        """GET ``url`` with the configured retry/rate-limit policy and return the body.
+
+        ``symbol`` is carried purely so failures name the instrument rather than a long URL.
+        """
+        if not url.strip():
+            raise MarketContextError(f"empty url for {symbol}")
         req = Request(
             url,
             headers={
@@ -133,47 +271,116 @@ class DailyMarketDataClient:
                 "Accept-Encoding": "gzip, deflate",
             },
         )
+        last_error: Exception | None = None
+        for attempt in range(1, self.retry_attempts + 1):
+            self._enforce_rate_limit()
+            try:
+                with urlopen(req, timeout=self.timeout_seconds) as response:
+                    return str(response.read().decode("utf-8", "replace"))
+            except HTTPError as exc:
+                last_error = exc
+                if (
+                    attempt < self.retry_attempts
+                    and self._is_retryable_http_status(int(exc.code))
+                ):
+                    delay = self._retry_delay(attempt)
+                    if delay > 0:
+                        self.sleep_fn(delay)
+                    continue
+                raise MarketContextError(
+                    f"market data request failed for {symbol}: HTTP {exc.code} {exc.reason}"
+                ) from exc
+            except (OSError, URLError, HTTPException, ValueError) as exc:
+                last_error = exc
+                if attempt < self.retry_attempts:
+                    delay = self._retry_delay(attempt)
+                    if delay > 0:
+                        self.sleep_fn(delay)
+                    continue
+                raise MarketContextError(f"market data request failed for {symbol}: {exc}") from exc
+        if last_error is not None:
+            raise MarketContextError(
+                f"market data request failed for {symbol}: {last_error}"
+            ) from last_error
+        raise MarketContextError(
+            f"market data request failed for {symbol}: unknown network failure"
+        )
+
+    def _fetch_bars(self, symbol: str) -> tuple[dict[date, tuple[float, float]], str]:
+        """Return ``({trade_date: (close, volume)}, source_name)``.
+
+        IB Gateway is primary; the Yahoo chart API is a fallback for the windows when Gateway
+        is down (it needs a manual 2FA re-login weekly). The original stooq CSV feed went dark
+        on 2026-02-12 when stooq put a JavaScript bot-challenge in front of the endpoint: it
+        began returning an HTML "This site requires JavaScript" page with HTTP 200, which the
+        CSV reader silently parsed to zero rows. That produced
+        ``trade_pct_daily_turnover=None`` on 100% of packets for ~6 months and silently
+        disabled every liquidity guard, so exhausting all sources now RAISES instead of
+        returning empty -- a dead feed must never look like a quiet market.
+        """
+        bars = _IBBarSource.fetch(symbol)
+        if bars:
+            return bars, "ibkr"
+        ib_reason = _IBBarSource._unavailable_reason
+        if ib_reason:
+            logger.warning("IB unavailable (%s); falling back to yahoo for %s", ib_reason, symbol)
         try:
-            with urlopen(req, timeout=self.timeout_seconds) as response:
-                body = response.read()
-                if not isinstance(body, bytes):
-                    raise MarketContextError(f"market data response was not bytes for {symbol}")
-                return body.decode("utf-8", "replace")
-        except (OSError, URLError) as exc:
-            raise MarketContextError(f"market data request failed for {symbol}: {exc}") from exc
+            return self._fetch_bars_yahoo(symbol), "yahoo"
+        except MarketContextError:
+            if ib_reason:
+                raise MarketContextError(
+                    f"no market data source available for {symbol}: {ib_reason}; yahoo also failed"
+                ) from None
+            raise
 
-    def fetch_snapshot(self, symbol: str, *, trade_date: date) -> MarketSnapshot | None:
-        text = self._download_csv_text(symbol)
-        rows = list(csv.DictReader(io.StringIO(text)))
-        if not rows:
-            return None
-
-        indexed: dict[date, dict[str, str]] = {}
-        for raw_row in rows:
-            row: dict[str, str] = {}
-            for raw_key, raw_value in raw_row.items():
-                if isinstance(raw_key, str) and isinstance(raw_value, str):
-                    row[raw_key] = raw_value
-            date_text = row.get("Date")
-            if not date_text:
+    def _fetch_bars_yahoo(self, symbol: str) -> dict[date, tuple[float, float]]:
+        url = f"{_YAHOO_CHART_URL}/{symbol.upper()}?{urlencode({'range': '10d', 'interval': '1d'})}"
+        text = self._download_text(url, symbol=symbol)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise MarketContextError(
+                f"market data for {symbol} was not JSON (source may be challenging the client): "
+                f"{text[:120]!r}"
+            ) from exc
+        chart = payload.get("chart") or {}
+        error = chart.get("error")
+        if error:
+            raise MarketContextError(f"market data error for {symbol}: {error}")
+        results = chart.get("result") or []
+        if not results:
+            return {}
+        result = results[0]
+        stamps = result.get("timestamp") or []
+        quote_blocks = (result.get("indicators") or {}).get("quote") or [{}]
+        quote = quote_blocks[0] if quote_blocks else {}
+        closes = quote.get("close") or []
+        volumes = quote.get("volume") or []
+        bars: dict[date, tuple[float, float]] = {}
+        for idx, stamp in enumerate(stamps):
+            if idx >= len(closes) or idx >= len(volumes):
+                break
+            close_obj = closes[idx]
+            volume_obj = volumes[idx]
+            # Yahoo emits null for halted/incomplete sessions; skip rather than coerce to 0.
+            if close_obj is None or volume_obj is None:
                 continue
             try:
-                key = date.fromisoformat(date_text)
-            except ValueError:
+                bar_date = datetime.fromtimestamp(float(stamp), tz=UTC).date()
+                bars[bar_date] = (float(close_obj), float(volume_obj))
+            except (TypeError, ValueError, OSError):
                 continue
-            indexed[key] = row
+        return bars
 
-        trade_row = indexed.get(trade_date)
-        if trade_row is None:
+    def fetch_snapshot(self, symbol: str, *, trade_date: date) -> MarketSnapshot | None:
+        indexed, source_name = self._fetch_bars(symbol)
+        if not indexed:
             return None
 
-        try:
-            close = float(trade_row.get("Close", "0"))
-            volume = float(trade_row.get("Volume", "0"))
-        except ValueError as exc:
-            raise MarketContextError(
-                f"market data parse failed for {symbol} on {trade_date.isoformat()}: {exc}"
-            ) from exc
+        bar = indexed.get(trade_date)
+        if bar is None:
+            return None
+        close, volume = bar
 
         if close <= 0 or volume <= 0:
             return None
@@ -182,11 +389,7 @@ class DailyMarketDataClient:
         return_1d: float | None = None
         prior_dates = sorted(d for d in indexed if d < trade_date)
         if prior_dates:
-            prior_row = indexed[prior_dates[-1]]
-            try:
-                prior_close_value = float(prior_row.get("Close", "0"))
-            except ValueError:
-                prior_close_value = 0.0
+            prior_close_value = indexed[prior_dates[-1]][0]
             if prior_close_value > 0:
                 prior_close = prior_close_value
                 return_1d = (close / prior_close) - 1.0
@@ -203,4 +406,5 @@ class DailyMarketDataClient:
             prior_close=prior_close,
             return_1d=return_1d,
             earnings_shock_flag=earnings_shock_flag,
+            source=source_name,
         )

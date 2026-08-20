@@ -15,6 +15,10 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("SEC_RATE_LIMIT_PER_SECOND", raising=False)
     monkeypatch.delenv("MARKET_CONTEXT_ENABLED", raising=False)
     monkeypatch.delenv("MARKET_DATA_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("MARKET_DATA_RATE_LIMIT_PER_SECOND", raising=False)
+    monkeypatch.delenv("MARKET_DATA_RETRY_ATTEMPTS", raising=False)
+    monkeypatch.delenv("MARKET_DATA_RETRY_MIN_SECONDS", raising=False)
+    monkeypatch.delenv("MARKET_DATA_RETRY_MAX_SECONDS", raising=False)
     monkeypatch.delenv("MARKET_EARNINGS_SHOCK_DROP_THRESHOLD", raising=False)
     monkeypatch.delenv("DATABASE_PATH", raising=False)
 
@@ -30,5 +34,9 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.sec_rate_limit_per_second == 5.0
     assert settings.market_context_enabled is False
     assert settings.market_data_timeout_seconds == 10.0
+    assert settings.market_data_rate_limit_per_second == 1.0
+    assert settings.market_data_retry_attempts == 3
+    assert settings.market_data_retry_min_seconds == 0.5
+    assert settings.market_data_retry_max_seconds == 3.0
     assert settings.market_earnings_shock_drop_threshold == 0.08
     assert settings.database_path == "data/insider_alerts.db"

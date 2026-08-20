@@ -45,3 +45,7 @@
 - Keep `SEC_USER_AGENT` explicit and contactable alias.
 - Respect `SEC_RATE_LIMIT_PER_SECOND <= 10`.
 - Use retries/backoff; avoid tight loops.
+
+## Market data provider guardrails
+- Backtest/market-context price fetches are throttled via `MARKET_DATA_RATE_LIMIT_PER_SECOND`.
+- Keep retries conservative (`MARKET_DATA_RETRY_*`) and rely on cached bars for repeated runs.

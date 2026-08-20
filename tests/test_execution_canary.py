@@ -15,6 +15,7 @@ from insider_alerts.execution.canary import (
     BrokerOrder,
     CanaryConfig,
     CanaryRunner,
+    CanaryStore,
     CommissionPreview,
     broker_token,
     deterministic_rank,
@@ -22,6 +23,8 @@ from insider_alerts.execution.canary import (
     entry_session,
     planned_quantity,
     poll_delay_seconds,
+    runtime_source_fingerprint,
+    status_report,
 )
 
 
@@ -49,6 +52,37 @@ def _bars(end: date, *, close: float = 10.0, volume: float = 100_000.0) -> list[
         DailyBar("TEST", day, close, close * 1.02, close * 0.98, close, volume)
         for day in sorted(days)
     ]
+
+
+def test_runtime_source_fingerprint_detects_source_changes(tmp_path: Path) -> None:
+    source = tmp_path / "module.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    before = runtime_source_fingerprint(tmp_path)
+
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+
+    assert runtime_source_fingerprint(tmp_path) != before
+
+
+def test_status_report_exposes_current_runtime_revision(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.db"
+    store = CanaryStore(str(ledger))
+    now = datetime.now(UTC)
+    fingerprint = runtime_source_fingerprint()
+    store.set_metadata(
+        {
+            "runtime_started_utc": now.isoformat(),
+            "runtime_source_fingerprint": fingerprint,
+            "last_cycle_success_utc": now.isoformat(),
+        },
+        now=now,
+    )
+
+    report = status_report(str(ledger))
+
+    assert report["runtime_source_fingerprint"] == fingerprint
+    assert report["current_source_fingerprint"] == fingerprint
+    assert report["source_revision_current"] is True
 
 
 class FakeBroker:
@@ -153,9 +187,7 @@ def test_eligibility_and_rank_are_frozen_and_deterministic() -> None:
     signal_at = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
     signal = _signal(signal_at)
     config = CanaryConfig(source_db="unused")
-    ok, reason, prior_close, median_dv = eligibility(
-        config, signal, _bars(date(2026, 1, 2))
-    )
+    ok, reason, prior_close, median_dv = eligibility(config, signal, _bars(date(2026, 1, 2)))
     assert ok is True
     assert reason == "eligible_E07_F00"
     assert prior_close == 10.0
@@ -221,6 +253,47 @@ def test_invalid_commission_preview_rejected_in_strict_mode(
     async def invalid_preview(symbol: str, quantity: int) -> CommissionPreview:
         del symbol, quantity
         return CommissionPreview(float("nan"), "USD", commission_valid=False)
+
+    monkeypatch.setattr(broker, "preview_entry", invalid_preview)
+    runner = CanaryRunner(config, broker)
+    runner.store.activation(now - timedelta(hours=1))
+
+    result = asyncio.run(runner.cycle(now))
+    assert result.live_submitted == 0
+    assert broker.submitted == []
+    assert runner.store.rows()[0]["live_state"] == "preflight_rejected"
+
+
+def test_invalid_commission_preview_rejected_by_default(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    signal = _signal(now - timedelta(minutes=30))
+    monkeypatch.setattr(
+        "insider_alerts.execution.canary.load_delivered_signals",
+        lambda *args, **kwargs: [signal],
+    )
+    config = CanaryConfig(
+        source_db=str(tmp_path / "source.db"),
+        ledger_db=str(tmp_path / "ledger.db"),
+        live_requested=True,
+        arm_phrase=ARM_PHRASE,
+    )
+    broker = FakeBroker(
+        [date(2026, 1, 5) + timedelta(days=index) for index in range(15)],
+        _bars(date(2026, 1, 2)),
+        commission=0.35,
+    )
+
+    async def invalid_preview(symbol: str, quantity: int) -> CommissionPreview:
+        del symbol, quantity
+        return CommissionPreview(
+            float("nan"),
+            "USD",
+            commission_valid=False,
+            estimate_source="unavailable",
+        )
 
     monkeypatch.setattr(broker, "preview_entry", invalid_preview)
     runner = CanaryRunner(config, broker)
@@ -339,9 +412,7 @@ def test_non_finite_account_funds_block_live_entry(
         _bars(date(2026, 1, 2)),
         commission=0.35,
     )
-    broker.snapshot = AccountSnapshot(
-        "ACCOUNT", float("nan"), 493.5, float("nan"), {}, 0
-    )
+    broker.snapshot = AccountSnapshot("ACCOUNT", float("nan"), 493.5, float("nan"), {}, 0)
     runner = CanaryRunner(config, broker)
     runner.store.activation(now - timedelta(hours=1))
     result = asyncio.run(runner.cycle(now))
@@ -438,8 +509,9 @@ def test_failed_preflight_does_not_consume_live_capacity(
     )
     monkeypatch.setattr(
         "insider_alerts.execution.canary.deterministic_rank",
-        lambda config, signal, session: ranks[signal.symbol]
-        + ("0" if signal.packet_id == "duplicate-packet" else "1"),
+        lambda config, signal, session: (
+            ranks[signal.symbol] + ("0" if signal.packet_id == "duplicate-packet" else "1")
+        ),
     )
     config = CanaryConfig(
         source_db=str(tmp_path / "source.db"),
@@ -465,10 +537,7 @@ def test_failed_preflight_does_not_consume_live_capacity(
 
     assert result.live_submitted == 2
     assert [submission[0] for submission in broker.submitted] == ["GOOD1", "GOOD2"]
-    states = {
-        str(row["packet_id"]): str(row["live_state"])
-        for row in runner.store.rows()
-    }
+    states = {str(row["packet_id"]): str(row["live_state"]) for row in runner.store.rows()}
     assert states == {
         "bad-packet": "preflight_rejected",
         "duplicate-packet": "submitted",

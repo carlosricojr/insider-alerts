@@ -47,14 +47,12 @@ class CanaryConfig:
     moc_submission_deadline: time = time(15, 45)
     max_one_way_commission: float = 0.75
     max_one_way_commission_bps: float = 50.0
-    invalid_commission_handling: Literal["fallback_to_cap", "reject"] = "fallback_to_cap"
+    invalid_commission_handling: Literal["fallback_to_cap", "reject"] = "reject"
     lottery_salt: str = "E07-F00-live-canary-v1"
 
     def __post_init__(self) -> None:
         if self.invalid_commission_handling not in {"fallback_to_cap", "reject"}:
-            raise ValueError(
-                "invalid_commission_handling must be 'fallback_to_cap' or 'reject'"
-            )
+            raise ValueError("invalid_commission_handling must be 'fallback_to_cap' or 'reject'")
 
     @property
     def live_armed(self) -> bool:
@@ -79,6 +77,9 @@ class CommissionPreview:
     warning: str = ""
     commission_valid: bool = True
     commission_error: str = ""
+    estimate_source: Literal["exact", "range_upper_bound", "unavailable"] = "exact"
+    min_commission: float | None = None
+    max_commission: float | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -202,8 +203,7 @@ def completed_bars(bars: Sequence[DailyBar], signal_at: datetime) -> list[DailyB
     return [
         bar
         for bar in bars
-        if bar.trade_date < local.date()
-        or (same_day_complete and bar.trade_date == local.date())
+        if bar.trade_date < local.date() or (same_day_complete and bar.trade_date == local.date())
     ]
 
 
@@ -242,6 +242,21 @@ def _finite_number_or_none(value: float | None) -> float | None:
     if value is None:
         return None
     return value if math.isfinite(value) else None
+
+
+def runtime_source_fingerprint(package_root: Path | None = None) -> str:
+    """Hash the Python source that the long-running worker loaded at startup."""
+
+    root = package_root or Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 class CanaryStore:
@@ -328,9 +343,7 @@ class CanaryStore:
                 );
                 """
             )
-            columns = {
-                str(row[1]) for row in conn.execute("PRAGMA table_info(candidates)")
-            }
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(candidates)")}
             if "live_entry_commission" not in columns:
                 conn.execute("ALTER TABLE candidates ADD COLUMN live_entry_commission REAL")
             if "live_exit_commission" not in columns:
@@ -339,9 +352,7 @@ class CanaryStore:
 
     def activation(self, now: datetime) -> datetime:
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT value FROM metadata WHERE key='activation_utc'"
-            ).fetchone()
+            row = conn.execute("SELECT value FROM metadata WHERE key='activation_utc'").fetchone()
             if row is not None:
                 return datetime.fromisoformat(str(row["value"])).astimezone(UTC)
             value = now.astimezone(UTC).isoformat()
@@ -352,11 +363,26 @@ class CanaryStore:
             conn.commit()
             return datetime.fromisoformat(value)
 
+    def set_metadata(self, values: dict[str, str], *, now: datetime) -> None:
+        timestamp = now.astimezone(UTC).isoformat()
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO metadata(key,value,updated_at) VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                [(key, value, timestamp) for key, value in values.items()],
+            )
+            conn.commit()
+
     def has_candidate(self, packet_id: str) -> bool:
         with self.connect() as conn:
-            return conn.execute(
-                "SELECT 1 FROM candidates WHERE packet_id=?", (packet_id,)
-            ).fetchone() is not None
+            return (
+                conn.execute("SELECT 1 FROM candidates WHERE packet_id=?", (packet_id,)).fetchone()
+                is not None
+            )
 
     def insert_candidate(
         self,
@@ -496,6 +522,11 @@ class CanaryRunner:
         self.config = config
         self.broker = broker
         self.store = CanaryStore(config.ledger_db)
+        self.runtime_started_at = datetime.now(UTC)
+        self.runtime_fingerprint = runtime_source_fingerprint()
+
+    def source_revision_changed(self) -> bool:
+        return runtime_source_fingerprint() != self.runtime_fingerprint
 
     async def cycle(
         self,
@@ -505,9 +536,17 @@ class CanaryRunner:
     ) -> CycleResult:
         wall_clock_mode = now is None
         now = (now or datetime.now(UTC)).astimezone(UTC)
-        activation = self.store.activation(now)
-        await self.broker.connect(readonly=not self.config.live_armed)
+        self.store.set_metadata(
+            {
+                "runtime_started_utc": self.runtime_started_at.isoformat(),
+                "runtime_source_fingerprint": self.runtime_fingerprint,
+                "last_cycle_started_utc": now.isoformat(),
+            },
+            now=now,
+        )
         try:
+            activation = self.store.activation(now)
+            await self.broker.connect(readonly=not self.config.live_armed)
             sessions = await self.broker.sessions(around=now, count=120)
             result = await self._discover(activation, sessions, now)
             shadow_opened, shadow_closed = await self._settle_shadow(sessions, now)
@@ -519,13 +558,35 @@ class CanaryRunner:
                 }
             )
             if not self.config.live_armed:
-                return CycleResult(**{**asdict(result), "live_gate": "shadow_only_not_armed"})
-            return await self._run_live(
-                result,
-                sessions,
-                datetime.now(UTC) if wall_clock_mode else now,
-                enforce_wall_clock=wall_clock_mode,
+                final_result = CycleResult(
+                    **{**asdict(result), "live_gate": "shadow_only_not_armed"}
+                )
+            else:
+                final_result = await self._run_live(
+                    result,
+                    sessions,
+                    datetime.now(UTC) if wall_clock_mode else now,
+                    enforce_wall_clock=wall_clock_mode,
+                )
+            success_time = datetime.now(UTC)
+            self.store.set_metadata(
+                {
+                    "last_cycle_success_utc": success_time.isoformat(),
+                    "last_cycle_error": "",
+                },
+                now=success_time,
             )
+            return final_result
+        except Exception as exc:
+            failure_time = datetime.now(UTC)
+            self.store.set_metadata(
+                {
+                    "last_cycle_error_utc": failure_time.isoformat(),
+                    "last_cycle_error": f"{type(exc).__name__}: {exc}",
+                },
+                now=failure_time,
+            )
+            raise
         finally:
             if disconnect_after:
                 self.broker.disconnect()
@@ -552,21 +613,15 @@ class CanaryRunner:
             if ok and (target_session is None or quantity < 1):
                 ok = False
                 reason = (
-                    "no_future_entry_session"
-                    if target_session is None
-                    else "zero_whole_shares"
+                    "no_future_entry_session" if target_session is None else "zero_whole_shares"
                 )
             if ok and target_session is not None:
-                scheduled_horizon = [
-                    session for session in sessions if session >= target_session
-                ]
+                scheduled_horizon = [session for session in sessions if session >= target_session]
                 if len(scheduled_horizon) < self.config.max_sessions:
                     ok = False
                     reason = "insufficient_exchange_schedule_for_time_exit"
             rank = (
-                deterministic_rank(self.config, signal, target_session)
-                if target_session
-                else None
+                deterministic_rank(self.config, signal, target_session) if target_session else None
             )
             self.store.insert_candidate(
                 signal,
@@ -620,9 +675,7 @@ class CanaryRunner:
             for row in queued_rows:
                 symbol = str(row["symbol"])
                 if symbol in existing_symbols:
-                    self.store.update(
-                        str(row["packet_id"]), shadow_state="overlap_suppressed"
-                    )
+                    self.store.update(str(row["packet_id"]), shadow_state="overlap_suppressed")
                     continue
                 existing_symbols.add(symbol)
                 unique_queued.append(row)
@@ -743,9 +796,7 @@ class CanaryRunner:
                 status=order.status,
             )
         exit_suffixes = ("TIME", "OVERDUE", "QTYFAIL")
-        for row in self.store.rows(
-            "live_state='open' AND timed_exit_order_id IS NULL"
-        ):
+        for row in self.store.rows("live_state='open' AND timed_exit_order_id IS NULL"):
             token = broker_token(str(row["packet_id"]))
             order = next(
                 (
@@ -790,14 +841,14 @@ class CanaryRunner:
             for row in self.store.rows("live_state IN ('submitted','open','closing')")
         }
         unexpected = {
-            symbol for symbol, quantity in account.positions.items()
+            symbol
+            for symbol, quantity in account.positions.items()
             if quantity != 0 and symbol not in known_open_symbols
         }
         if unexpected:
             return "unexpected_broker_position"
         expected_position_symbols = {
-            str(row["symbol"])
-            for row in self.store.rows("live_state IN ('open','closing')")
+            str(row["symbol"]) for row in self.store.rows("live_state IN ('open','closing')")
         }
         if any(account.positions.get(symbol, 0.0) == 0 for symbol in expected_position_symbols):
             return "expected_broker_position_missing"
@@ -855,9 +906,7 @@ class CanaryRunner:
             selected.append(row)
         for index, row in enumerate(selected):
             if submitted >= capacity:
-                self.store.update(
-                    str(row["packet_id"]), live_state="capacity_suppressed"
-                )
+                self.store.update(str(row["packet_id"]), live_state="capacity_suppressed")
                 continue
             quantity = int(row["planned_quantity"])
             reference = float(row["prior_close"])
@@ -884,12 +933,13 @@ class CanaryRunner:
                     warning=rejection_warning,
                     commission_bps=None,
                     commission_mode="invalid_rejected",
+                    commission_estimate_source=preview.estimate_source,
+                    min_commission=preview.min_commission,
+                    max_commission=preview.max_commission,
                 )
                 continue
             preview_warning = preview.warning or ""
-            warning_is_real = bool(
-                preview_warning and preview_warning != preview.commission_error
-            )
+            warning_is_real = bool(preview_warning and preview_warning != preview.commission_error)
             planned_commission = (
                 preview.commission
                 if preview.commission_valid
@@ -897,9 +947,7 @@ class CanaryRunner:
             )
             commission_bps = planned_commission / planned_notional * 10_000.0
             commission_currency = (
-                preview.currency.upper()
-                if preview.commission_valid and preview.currency
-                else "USD"
+                preview.currency.upper() if preview.commission_valid and preview.currency else "USD"
             )
             if (
                 commission_currency != "USD"
@@ -919,8 +967,10 @@ class CanaryRunner:
                     commission_mode=(
                         "fallback_to_cap"
                         if not preview.commission_valid
-                        else "ibkr"
+                        else preview.estimate_source
                     ),
+                    min_commission=preview.min_commission,
+                    max_commission=preview.max_commission,
                 )
                 continue
             token = broker_token(str(row["packet_id"]))
@@ -961,10 +1011,10 @@ class CanaryRunner:
                 reference_price=reference,
                 commission_preview=planned_commission,
                 commission_mode=(
-                    "fallback_to_cap"
-                    if not preview.commission_valid
-                    else "ibkr"
+                    "fallback_to_cap" if not preview.commission_valid else preview.estimate_source
                 ),
+                min_commission=preview.min_commission,
+                max_commission=preview.max_commission,
             )
             settled_available -= planned_notional * (1.0 + self.config.market_order_cushion)
             submitted += 1
@@ -1047,34 +1097,24 @@ class CanaryRunner:
         for row in self.store.rows("live_state IN ('open','closing')"):
             token = broker_token(str(row["packet_id"]))
             parent = (
-                by_id.get(int(row["parent_order_id"]))
-                if row["parent_order_id"]
-                else None
+                by_id.get(int(row["parent_order_id"])) if row["parent_order_id"] else None
             ) or by_ref.get(f"IA-E07-{token}-ENTRY")
             if (
                 row["live_entry_commission"] is None
                 and parent is not None
                 and parent.commission is not None
             ):
-                self.store.update(
-                    str(row["packet_id"]), live_entry_commission=parent.commission
-                )
+                self.store.update(str(row["packet_id"]), live_entry_commission=parent.commission)
             if str(row["packet_id"]) in newly_protected:
                 continue
             target = (
-                by_id.get(int(row["target_order_id"]))
-                if row["target_order_id"]
-                else None
+                by_id.get(int(row["target_order_id"])) if row["target_order_id"] else None
             ) or by_ref.get(f"IA-E07-{token}-TARGET")
             stop = (
-                by_id.get(int(row["stop_order_id"]))
-                if row["stop_order_id"]
-                else None
+                by_id.get(int(row["stop_order_id"])) if row["stop_order_id"] else None
             ) or by_ref.get(f"IA-E07-{token}-STOP")
             timed = (
-                by_id.get(int(row["timed_exit_order_id"]))
-                if row["timed_exit_order_id"]
-                else None
+                by_id.get(int(row["timed_exit_order_id"])) if row["timed_exit_order_id"] else None
             )
             filled_exit = next(
                 (order for order in (stop, target, timed) if order and order.filled > 0),
@@ -1130,12 +1170,9 @@ class CanaryRunner:
                         "pendingcancel",
                     }
                     target_present = (
-                        target is not None
-                        and target.status.lower() in protective_statuses
+                        target is not None and target.status.lower() in protective_statuses
                     )
-                    stop_present = (
-                        stop is not None and stop.status.lower() in protective_statuses
-                    )
+                    stop_present = stop is not None and stop.status.lower() in protective_statuses
                     if not target_present or not stop_present:
                         entry_price = float(row["live_entry_price"] or 0.0)
                         if entry_price <= 0:
@@ -1174,8 +1211,10 @@ class CanaryRunner:
                             stop_order_id=stop_id,
                         )
                 continue
-            reason = "stop" if filled_exit.kind == "stop" else (
-                "target" if filled_exit.kind == "target" else "time"
+            reason = (
+                "stop"
+                if filled_exit.kind == "stop"
+                else ("target" if filled_exit.kind == "target" else "time")
             )
             self.store.update(
                 str(row["packet_id"]),
@@ -1262,8 +1301,7 @@ class CanaryRunner:
         local = now.astimezone(NEW_YORK)
         count = 0
         for row in self.store.rows(
-            "live_state='open' AND live_exit_session<=? AND "
-            "timed_exit_order_id IS NULL",
+            "live_state='open' AND live_exit_session<=? AND timed_exit_order_id IS NULL",
             (local.date().isoformat(),),
         ):
             due_date = date.fromisoformat(str(row["live_exit_session"]))
@@ -1308,6 +1346,10 @@ def status_report(ledger_db: str) -> dict[str, Any]:
         activation = conn.execute(
             "SELECT value FROM metadata WHERE key='activation_utc'"
         ).fetchone()
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in conn.execute("SELECT key,value FROM metadata")
+        }
         candidate_counts = {
             str(row["live_state"]): int(row["count"])
             for row in conn.execute(
@@ -1322,8 +1364,18 @@ def status_report(ledger_db: str) -> dict[str, Any]:
                 "FROM events ORDER BY id DESC LIMIT 20"
             )
         ]
+    current_fingerprint = runtime_source_fingerprint()
+    runtime_fingerprint = metadata.get("runtime_source_fingerprint")
     return {
         "activation_utc": str(activation["value"]) if activation else None,
+        "runtime_started_utc": metadata.get("runtime_started_utc"),
+        "last_cycle_started_utc": metadata.get("last_cycle_started_utc"),
+        "last_cycle_success_utc": metadata.get("last_cycle_success_utc"),
+        "last_cycle_error_utc": metadata.get("last_cycle_error_utc"),
+        "last_cycle_error": metadata.get("last_cycle_error") or None,
+        "runtime_source_fingerprint": runtime_fingerprint,
+        "current_source_fingerprint": current_fingerprint,
+        "source_revision_current": runtime_fingerprint == current_fingerprint,
         "live_states": candidate_counts,
         "closed_shadow_trades": shadow_count,
         "recent_events": recent_events,

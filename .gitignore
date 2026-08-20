@@ -10,10 +10,27 @@ dist/
 venv/
 
 .pytest_cache/
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 .coverage
 coverage.xml
+
+.tmp*/
+.temp*/
+pytest-cache-files-*/
+temp_pytest_*/
+.uv-cache/
+.uvcache/
+
+data/
+logs/
+reports/*.csv
+reports/*.json
+reports/*.log
+
+ops/quant-insider-workspace/.openclaw/
+ops/quant-insider-workspace/openclaw-workspace-state.json
 
 .env
 

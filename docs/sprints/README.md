@@ -16,3 +16,4 @@ Use this folder for pre-implementation sprint reviews and post-sprint summaries.
 - `SPRINT-06-REVIEW.md` - OpenClaw skills plus decision apply plus notify integration.
 - `SPRINT-07-REVIEW.md` - hardening docs plus deadletter/replay plus deployment.
 - `SPRINT-08-REVIEW.md` - alpha edge filtering plus decision quality hardening.
+- `SPRINT-09-REVIEW.md` - out-of-sample event study and alpha validation quality gates.

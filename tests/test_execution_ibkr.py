@@ -66,6 +66,83 @@ def test_preview_entry_marks_sentinel_commission_invalid() -> None:
     assert result.warning == ""
 
 
+def test_preview_entry_uses_tiered_range_upper_bound() -> None:
+    broker = _mk_broker()
+
+    async def _what_if(*args, **kwargs):  # noqa: ARG001
+        return _State(
+            commission=sys.float_info.max,
+            minCommission=0.33577225,
+            maxCommission=0.36627225,
+            commissionCurrency="USD",
+            warningText="",
+        )
+
+    broker.ib.whatIfOrderAsync = _what_if
+
+    result = asyncio.run(broker.preview_entry("TEST", 5))
+
+    assert result.commission_valid is True
+    assert result.commission == pytest.approx(0.36627225)
+    assert result.min_commission == pytest.approx(0.33577225)
+    assert result.max_commission == pytest.approx(0.36627225)
+    assert result.estimate_source == "range_upper_bound"
+    assert result.commission_error == ""
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum"),
+    [
+        (0.40, 0.35),
+        (float("nan"), 0.35),
+        (0.35, sys.float_info.max),
+        (None, 0.35),
+    ],
+)
+def test_preview_entry_rejects_malformed_tiered_range(
+    minimum: float | None,
+    maximum: float,
+) -> None:
+    broker = _mk_broker()
+
+    async def _what_if(*args, **kwargs):  # noqa: ARG001
+        return _State(
+            commission=sys.float_info.max,
+            minCommission=minimum,
+            maxCommission=maximum,
+            commissionCurrency="USD",
+            warningText="",
+        )
+
+    broker.ib.whatIfOrderAsync = _what_if
+
+    result = asyncio.run(broker.preview_entry("TEST", 5))
+
+    assert result.commission_valid is False
+    assert result.estimate_source == "unavailable"
+
+
+def test_preview_entry_prefers_exact_commission_over_range() -> None:
+    broker = _mk_broker()
+
+    async def _what_if(*args, **kwargs):  # noqa: ARG001
+        return _State(
+            commission=0.34,
+            minCommission=0.30,
+            maxCommission=0.38,
+            commissionCurrency="USD",
+            warningText="",
+        )
+
+    broker.ib.whatIfOrderAsync = _what_if
+
+    result = asyncio.run(broker.preview_entry("TEST", 5))
+
+    assert result.commission_valid is True
+    assert result.commission == pytest.approx(0.34)
+    assert result.estimate_source == "exact"
+
+
 def test_preview_entry_captures_broker_error_warning() -> None:
     broker = _mk_broker()
 

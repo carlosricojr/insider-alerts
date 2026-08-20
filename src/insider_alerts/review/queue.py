@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
 from insider_alerts.sec.models import FilingRef
@@ -42,6 +42,18 @@ def ensure_review_tables(db_path: str) -> None:
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_review_packets_accession_form_type
+            ON review_packets (accession_number, form_type)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_review_packets_status_created_at
+            ON review_packets (status, created_at DESC)
             """
         )
         conn.commit()
@@ -87,6 +99,44 @@ def enqueue_review_packet(db_path: str, ref: FilingRef, packet: Mapping[str, obj
         )
         conn.commit()
     return cursor.rowcount == 1
+
+
+def enqueue_review_packets_batch(
+    db_path: str,
+    packets: Sequence[tuple[FilingRef, Mapping[str, object]]],
+) -> int:
+    ensure_review_tables(db_path)
+    if not packets:
+        return 0
+
+    now = datetime.now(tz=UTC).isoformat()
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
+    for ref, packet in packets:
+        rows.append(
+            (
+                packet_id_for_ref(ref),
+                ref.accession_number,
+                ref.cik,
+                ref.form_type,
+                json.dumps(packet, separators=(",", ":"), sort_keys=True),
+                now,
+                now,
+            )
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO review_packets (
+                packet_id, accession_number, cik, form_type, payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+        inserted = conn.total_changes - before
+    return int(inserted)
 
 
 def _validate_decision_payload(payload: Mapping[str, object]) -> None:

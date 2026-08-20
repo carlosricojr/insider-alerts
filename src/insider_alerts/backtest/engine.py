@@ -112,26 +112,25 @@ def _simulate_trade(
 
     for idx in range(entry_idx, last_idx + 1):
         bar = bars[idx]
-        hit_stop_price = stop_price if stop_price is not None and bar.low <= stop_price else None
-        hit_take_price = (
-            take_profit_price
-            if take_profit_price is not None and bar.high >= take_profit_price
-            else None
-        )
-        if hit_stop_price is not None and hit_take_price is not None:
+        hit_stop = stop_price is not None and bar.low <= stop_price
+        hit_take = take_profit_price is not None and bar.high >= take_profit_price
+        if hit_stop and hit_take:
             # Conservative assumption when daily bars cannot resolve intraday order.
+            assert stop_price is not None
             exit_idx = idx
-            exit_price = hit_stop_price
+            exit_price = stop_price
             exit_reason = "stop_and_take_same_day_stop_assumed"
             break
-        if hit_stop_price is not None:
+        if hit_stop:
+            assert stop_price is not None
             exit_idx = idx
-            exit_price = hit_stop_price
+            exit_price = stop_price
             exit_reason = "stop"
             break
-        if hit_take_price is not None:
+        if hit_take:
+            assert take_profit_price is not None
             exit_idx = idx
-            exit_price = hit_take_price
+            exit_price = take_profit_price
             exit_reason = "take_profit"
             break
 

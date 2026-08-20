@@ -7,13 +7,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-au
 ```
 
 The default task is a non-elevated per-user watchdog named `Insider Alerts
-Autopilot Watchdog`. It starts at user logon and has a five-minute recovery
+Autopilot Watchdog`. It starts at user logon and has a one-minute recovery
 trigger. Multiple instances are ignored, so recovery triggers do not start a
 second worker while the long-running loop is already alive.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
 highest-privilege execution.
 
-The worker reads `.env`, writes to `logs\autopilot.out.log` and
+The task launches the virtualenv's `pythonw.exe` directly, so it never creates a
+console window and Task Scheduler retains ownership of the complete worker process
+chain. The worker reads `.env`, writes to `logs\autopilot.out.log` and
 `logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
 default.
+
+Install the separate IBKR canary watchdog with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-live-canary-task.ps1 -Start
+```
+
+It runs the live canary invisibly at user logon with one-minute watchdog recovery. Passing
+`-Start` stops any existing instance before starting the registered definition, ensuring deployed
+source changes are loaded. The worker also fingerprints its Python source and exits for an
+invisible watchdog restart if the source later changes. The live policy and broker gates are
+documented in `docs/runbook/LIVE_CANARY.md`.

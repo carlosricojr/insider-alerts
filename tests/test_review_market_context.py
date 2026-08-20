@@ -1,4 +1,8 @@
-from datetime import date
+import json
+from datetime import UTC, date, datetime
+from http.client import InvalidURL
+from types import TracebackType
+from urllib.error import HTTPError
 
 import pytest
 
@@ -34,14 +38,52 @@ def test_market_snapshot_round_trip(tmp_path) -> None:
     assert loaded.earnings_shock_flag is False
 
 
+def _yahoo_body(rows: list[tuple[date, float, float]]) -> bytes:
+    """Build a Yahoo chart-API payload for the fallback HTTP path."""
+    stamps = [
+        int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp()) for d, _, _ in rows
+    ]
+    return json.dumps(
+        {
+            "chart": {
+                "error": None,
+                "result": [
+                    {
+                        "timestamp": stamps,
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "close": [c for _, c, _ in rows],
+                                    "volume": [v for _, _, v in rows],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+        }
+    ).encode()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_ib(monkeypatch):
+    """Keep these unit tests hermetic: never touch the real IB Gateway on this host."""
+    monkeypatch.setattr(
+        market_context_module._IBBarSource, "fetch", classmethod(lambda cls, symbol: {})
+    )
+    monkeypatch.setattr(market_context_module._IBBarSource, "_unavailable_reason", None)
+
+
 def test_daily_market_data_client_marks_shock_day() -> None:
     class _FakeClient(DailyMarketDataClient):
-        def _download_csv_text(self, symbol: str) -> str:
+        def _fetch_bars(self, symbol: str):
             assert symbol == "SPGI"
             return (
-                "Date,Open,High,Low,Close,Volume\n"
-                "2026-02-10,418.97,424.80,395.88,401.08,10888451,ignored\n"
-                "2026-02-11,406.70,413.99,390.73,390.76,5174841,ignored\n"
+                {
+                    date(2026, 2, 10): (401.08, 10888451.0),
+                    date(2026, 2, 11): (390.76, 5174841.0),
+                },
+                "test",
             )
 
     client = _FakeClient(
@@ -57,28 +99,105 @@ def test_daily_market_data_client_marks_shock_day() -> None:
     assert snapshot.earnings_shock_flag is True
 
 
-def test_daily_market_data_client_download_validates_response_bytes(monkeypatch) -> None:
-    class _Response:
-        def __init__(self, body: object) -> None:
-            self.body = body
-
-        def __enter__(self) -> "_Response":
+def test_daily_market_data_client_url_encodes_symbol_with_spaces(monkeypatch) -> None:
+    class _FakeResponse:
+        def __enter__(self) -> "_FakeResponse":
             return self
 
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> None:
             return None
 
-        def read(self) -> object:
-            return self.body
+        def read(self) -> bytes:
+            return _yahoo_body(
+                [
+                    (date(2026, 2, 10), 40.0, 100.0),
+                    (date(2026, 2, 11), 41.0, 200.0),
+                ]
+            )
 
+    captured: dict[str, object] = {}
+
+    def _fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(market_context_module, "urlopen", _fake_urlopen)
+    client = DailyMarketDataClient(
+        user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
+        timeout_seconds=3.0,
+        shock_drop_threshold=0.08,
+    )
+    snapshot = client.fetch_snapshot("Z AND ZG", trade_date=date(2026, 2, 11))
+    assert captured["url"] == (
+        "https://query1.finance.yahoo.com/v8/finance/chart/Z AND ZG?range=10d&interval=1d"
+    )
+    assert captured["timeout"] == 3.0
+    assert snapshot is not None
+    assert snapshot.symbol == "Z AND ZG"
+    assert snapshot.source == "yahoo"
+
+
+def test_daily_market_data_client_wraps_invalid_url_error(monkeypatch) -> None:
+    def _fake_urlopen(req, timeout):
+        raise InvalidURL("bad url")
+
+    monkeypatch.setattr(market_context_module, "urlopen", _fake_urlopen)
     client = DailyMarketDataClient(
         user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
         timeout_seconds=5.0,
     )
+    with pytest.raises(MarketContextError, match="market data request failed for MAT"):
+        client.fetch_snapshot("MAT", trade_date=date(2026, 2, 11))
 
-    monkeypatch.setattr(market_context_module, "urlopen", lambda req, timeout: _Response(b"Date\n"))
-    assert client._download_csv_text("SPGI") == "Date\n"
 
-    monkeypatch.setattr(market_context_module, "urlopen", lambda req, timeout: _Response("Date\n"))
-    with pytest.raises(MarketContextError, match="response was not bytes"):
-        client._download_csv_text("SPGI")
+def test_daily_market_data_client_retries_retryable_http_error(monkeypatch) -> None:
+    class _FakeResponse:
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return _yahoo_body(
+                [
+                    (date(2026, 2, 10), 40.0, 100.0),
+                    (date(2026, 2, 11), 41.0, 200.0),
+                ]
+            )
+
+    calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def _fake_urlopen(req, timeout):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise HTTPError(req.full_url, 429, "Too Many Requests", hdrs=None, fp=None)
+        return _FakeResponse()
+
+    monkeypatch.setattr(market_context_module, "urlopen", _fake_urlopen)
+    client = DailyMarketDataClient(
+        user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
+        timeout_seconds=5.0,
+        rate_limit_per_second=100.0,
+        retry_attempts=2,
+        retry_min_seconds=0.5,
+        retry_max_seconds=0.5,
+        now_fn=iter([0.0, 1.0, 2.0, 3.0]).__next__,
+        sleep_fn=sleeps.append,
+    )
+    snapshot = client.fetch_snapshot("MAT", trade_date=date(2026, 2, 11))
+    assert snapshot is not None
+    assert calls["count"] == 2
+    assert 0.5 in sleeps

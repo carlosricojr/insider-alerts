@@ -4,7 +4,7 @@ import asyncio
 import math
 import sys
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.execution.canary import (
@@ -158,13 +158,10 @@ class IbkrBroker:
             if value.currency in {"USD", ""}
         }
         position_rows = [
-            position
-            for position in self.ib.positions(account)
-            if float(position.position) != 0
+            position for position in self.ib.positions(account) if float(position.position) != 0
         ]
         positions = {
-            str(position.contract.symbol): float(position.position)
-            for position in position_rows
+            str(position.contract.symbol): float(position.position) for position in position_rows
         }
         average_costs = {
             str(position.contract.symbol): float(position.avgCost)
@@ -204,6 +201,7 @@ class IbkrBroker:
                 warning="; ".join(error_messages),
                 commission_valid=False,
                 commission_error="what-if preview timed out",
+                estimate_source="unavailable",
             )
         except Exception as exc:  # noqa: BLE001
             error_messages = [f"what-if preview failed: {exc}"]
@@ -213,15 +211,14 @@ class IbkrBroker:
                 warning="; ".join(error_messages),
                 commission_valid=False,
                 commission_error="what-if preview failed",
+                estimate_source="unavailable",
             )
 
         errors = [message for _, code, message in self._errors if code >= 100]
         warning = "; ".join(part for part in [getattr(state, "warningText", ""), *errors] if part)
         if not hasattr(state, "commission"):
             error_messages = [
-                part
-                for part in [warning, "what-if payload was not an order state"]
-                if part
+                part for part in [warning, "what-if payload was not an order state"] if part
             ]
             return CommissionPreview(
                 commission=float("nan"),
@@ -229,21 +226,51 @@ class IbkrBroker:
                 warning="; ".join(error_messages),
                 commission_valid=False,
                 commission_error="unexpected what-if payload",
+                estimate_source="unavailable",
             )
-        commission = float(state.commission)
-        is_valid = (
-            math.isfinite(commission)
-            and commission >= 0
-            and commission < (sys.float_info.max / 2)
+
+        def valid_commission(value: Any) -> float | None:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(parsed) or parsed < 0 or parsed >= (sys.float_info.max / 2):
+                return None
+            return parsed
+
+        exact_commission = valid_commission(getattr(state, "commission", None))
+        min_commission = valid_commission(getattr(state, "minCommission", None))
+        max_commission = valid_commission(getattr(state, "maxCommission", None))
+        range_is_valid = (
+            min_commission is not None
+            and max_commission is not None
+            and min_commission <= max_commission
         )
+        estimate_source: Literal["exact", "range_upper_bound", "unavailable"]
+        if exact_commission is not None:
+            commission = exact_commission
+            estimate_source = "exact"
+        elif range_is_valid:
+            # Tiered pricing can leave the exact value unset while providing the
+            # route-dependent execution range. Budget against its upper bound.
+            assert max_commission is not None
+            commission = max_commission
+            estimate_source = "range_upper_bound"
+        else:
+            commission = float("nan")
+            estimate_source = "unavailable"
+        is_valid = exact_commission is not None or range_is_valid
         commission_error = "" if is_valid else "invalid IBKR commission preview for preflight"
         currency = str(state.commissionCurrency or "USD")
         return CommissionPreview(
-            commission=commission if is_valid else float("nan"),
+            commission=commission,
             currency=currency,
             warning=warning,
             commission_valid=is_valid,
             commission_error=commission_error,
+            estimate_source=estimate_source,
+            min_commission=min_commission,
+            max_commission=max_commission,
         )
 
     async def submit_market_on_open(self, symbol: str, quantity: int, order_ref: str) -> int:

@@ -42,6 +42,28 @@ class Settings(BaseSettings):
         alias="MARKET_DATA_TIMEOUT_SECONDS",
         gt=0,
     )
+    market_data_rate_limit_per_second: float = Field(
+        default=1.0,
+        alias="MARKET_DATA_RATE_LIMIT_PER_SECOND",
+        gt=0,
+        le=5,
+    )
+    market_data_retry_attempts: int = Field(
+        default=3,
+        alias="MARKET_DATA_RETRY_ATTEMPTS",
+        ge=1,
+        le=10,
+    )
+    market_data_retry_min_seconds: float = Field(
+        default=0.5,
+        alias="MARKET_DATA_RETRY_MIN_SECONDS",
+        ge=0,
+    )
+    market_data_retry_max_seconds: float = Field(
+        default=3.0,
+        alias="MARKET_DATA_RETRY_MAX_SECONDS",
+        ge=0,
+    )
     market_earnings_shock_drop_threshold: float = Field(
         default=0.08,
         alias="MARKET_EARNINGS_SHOCK_DROP_THRESHOLD",
