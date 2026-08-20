@@ -258,6 +258,18 @@ def compute_event_forward_returns(
         entry_price = entry_bar.open
 
         trailing_median_dollar_volume: float | None = None
+        if entry_price <= 0:
+            observations.extend(
+                _skip_observation(
+                    event=event,
+                    horizon_days=horizon,
+                    reason="invalid_entry_price",
+                    entry_date=entry_bar.trade_date,
+                    entry_price=entry_price,
+                )
+                for horizon in selected_horizons
+            )
+            continue
         if tradability_cfg.min_price > 0 and entry_price < tradability_cfg.min_price:
             observations.extend(
                 _skip_observation(
@@ -537,6 +549,12 @@ def bootstrap_mean_alpha_ci(
     )
 
 
+def _monte_carlo_p_value(successes: int, iterations: int) -> float:
+    if iterations <= 0:
+        raise ValueError("iterations must be > 0")
+    return float((successes + 1) / (iterations + 1))
+
+
 def _positive_alpha_p_value(
     values: Sequence[float],
     *,
@@ -555,7 +573,7 @@ def _positive_alpha_p_value(
         mean_value = float(statistics.fmean(sample))
         if mean_value <= 0:
             count_non_positive += 1
-    return float(count_non_positive / iterations)
+    return _monte_carlo_p_value(count_non_positive, iterations)
 
 
 def _rank_values(values: Sequence[float]) -> list[float]:
@@ -612,15 +630,17 @@ def _spearman_positive_p_value_proxy(
     rng = random.Random(random_seed)
     y_list = list(y_values)
     greater_or_equal = 0
+    evaluated = 0
     for _ in range(iterations):
         shuffled = y_list[:]
         rng.shuffle(shuffled)
         permuted = _spearman_rho(x_values, shuffled)
         if permuted is None:
             continue
+        evaluated += 1
         if permuted >= observed:
             greater_or_equal += 1
-    return float(greater_or_equal / iterations)
+    return _monte_carlo_p_value(greater_or_equal, evaluated) if evaluated > 0 else None
 
 
 def compute_score_bucket_monotonicity(
@@ -809,9 +829,9 @@ def _build_negative_control(
         if actual_mean is None:
             p_value_proxy = None
         else:
-            p_value_proxy = float(
-                sum(1 for value in null_distribution if value >= actual_mean)
-                / len(null_distribution)
+            p_value_proxy = _monte_carlo_p_value(
+                sum(1 for value in null_distribution if value >= actual_mean),
+                len(null_distribution),
             )
         summaries.append(
             NegativeControlSummary(

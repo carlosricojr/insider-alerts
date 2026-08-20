@@ -92,6 +92,8 @@ class StooqPriceClient:
         self._last_request_ts = 0.0
 
     def _enforce_rate_limit(self) -> None:
+        if self.rate_limit_per_second <= 0:
+            return
         interval = 1.0 / self.rate_limit_per_second
         now = self.now_fn()
         elapsed = now - self._last_request_ts

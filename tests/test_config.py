@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from insider_alerts.config import Settings
 
 
@@ -39,4 +42,32 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.market_data_retry_min_seconds == 0.5
     assert settings.market_data_retry_max_seconds == 3.0
     assert settings.market_earnings_shock_drop_threshold == 0.08
+    assert settings.ib_gateway_host == "127.0.0.1"
+    assert settings.ib_gateway_port == 4001
+    assert settings.insider_ib_client_id == 171
     assert settings.database_path == "data/insider_alerts.db"
+
+
+def test_config_loads_ib_gateway_from_env_file(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "IB_GATEWAY_HOST=custom-gateway\n"
+        "IB_GATEWAY_PORT=4999\n"
+        "INSIDER_IB_CLIENT_ID=222\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=env_file)
+
+    assert settings.ib_gateway_host == "custom-gateway"
+    assert settings.ib_gateway_port == 4999
+    assert settings.insider_ib_client_id == 222
+
+
+def test_config_rejects_inverted_market_data_retry_bounds() -> None:
+    with pytest.raises(ValidationError, match="cannot exceed"):
+        Settings(
+            _env_file=None,
+            MARKET_DATA_RETRY_MIN_SECONDS=2.0,
+            MARKET_DATA_RETRY_MAX_SECONDS=1.0,
+        )

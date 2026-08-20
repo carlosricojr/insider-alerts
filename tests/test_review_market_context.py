@@ -100,6 +100,20 @@ def test_daily_market_data_client_marks_shock_day() -> None:
     assert snapshot.earnings_shock_flag is True
 
 
+def test_daily_market_data_client_configures_ib_endpoint() -> None:
+    DailyMarketDataClient(
+        user_agent="test",
+        timeout_seconds=1.0,
+        ib_gateway_host="custom-gateway",
+        ib_gateway_port=4999,
+        ib_client_id=222,
+    )
+
+    assert market_context_module._IBBarSource._host == "custom-gateway"
+    assert market_context_module._IBBarSource._port == 4999
+    assert market_context_module._IBBarSource._client_id == 222
+
+
 def test_daily_market_data_client_url_encodes_symbol_with_spaces(monkeypatch) -> None:
     class _FakeResponse:
         def __enter__(self) -> "_FakeResponse":
@@ -136,7 +150,7 @@ def test_daily_market_data_client_url_encodes_symbol_with_spaces(monkeypatch) ->
     )
     snapshot = client.fetch_snapshot("Z AND ZG", trade_date=date(2026, 2, 11))
     assert captured["url"] == (
-        "https://query1.finance.yahoo.com/v8/finance/chart/Z AND ZG?range=10d&interval=1d"
+        "https://query1.finance.yahoo.com/v8/finance/chart/Z%20AND%20ZG?range=10d&interval=1d"
     )
     assert captured["timeout"] == 3.0
     assert snapshot is not None
@@ -175,6 +189,39 @@ def test_daily_market_data_client_decodes_gzip_response(monkeypatch) -> None:
 
     assert snapshot is not None
     assert snapshot.source == "yahoo"
+
+
+def test_daily_market_data_client_applies_retry_policy_to_ib(monkeypatch) -> None:
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_fetch(cls, symbol):  # type: ignore[no-untyped-def]
+        calls.append(symbol)
+        if len(calls) == 1:
+            cls._unavailable_reason = "transient IB failure"
+            return {}
+        cls._unavailable_reason = None
+        return {date(2026, 2, 11): (41.0, 200.0)}
+
+    ticks = iter(float(value) for value in range(20))
+    monkeypatch.setattr(market_context_module._IBBarSource, "fetch", classmethod(_fake_fetch))
+    client = DailyMarketDataClient(
+        user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
+        timeout_seconds=3.0,
+        rate_limit_per_second=100.0,
+        retry_attempts=2,
+        retry_min_seconds=0.5,
+        retry_max_seconds=0.5,
+        now_fn=ticks.__next__,
+        sleep_fn=sleeps.append,
+    )
+
+    bars, source = client._fetch_bars("SPGI")
+
+    assert calls == ["SPGI", "SPGI"]
+    assert source == "ibkr"
+    assert bars[date(2026, 2, 11)] == (41.0, 200.0)
+    assert 0.5 in sleeps
 
 
 def test_daily_market_data_client_wraps_invalid_url_error(monkeypatch) -> None:
@@ -221,6 +268,13 @@ def test_daily_market_data_client_retries_retryable_http_error(monkeypatch) -> N
         return _FakeResponse()
 
     monkeypatch.setattr(market_context_module, "urlopen", _fake_urlopen)
+    tick = 0
+
+    def _now() -> float:
+        nonlocal tick
+        tick += 1
+        return float(tick)
+
     client = DailyMarketDataClient(
         user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
         timeout_seconds=5.0,
@@ -228,7 +282,7 @@ def test_daily_market_data_client_retries_retryable_http_error(monkeypatch) -> N
         retry_attempts=2,
         retry_min_seconds=0.5,
         retry_max_seconds=0.5,
-        now_fn=iter([0.0, 1.0, 2.0, 3.0]).__next__,
+        now_fn=_now,
         sleep_fn=sleeps.append,
     )
     snapshot = client.fetch_snapshot("MAT", trade_date=date(2026, 2, 11))

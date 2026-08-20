@@ -39,7 +39,10 @@ class _ClusterAccumulator:
 
 
 def _build_candidate_event(row: sqlite3.Row) -> CanonicalEvent | None:
-    payload_obj = json.loads(str(row["payload_json"]))
+    try:
+        payload_obj = json.loads(str(row["payload_json"]))
+    except (TypeError, ValueError):
+        return None
     if not isinstance(payload_obj, dict):
         return None
     symbol_obj = payload_obj.get("issuer_symbol")
@@ -57,7 +60,10 @@ def _build_candidate_event(row: sqlite3.Row) -> CanonicalEvent | None:
         return None
     rationale_obj = payload_obj.get("rationale")
     rationale = rationale_obj if isinstance(rationale_obj, dict) else {}
-    filed_at = _parse_iso_datetime(str(row["filed_at"]))
+    try:
+        filed_at = _parse_iso_datetime(str(row["filed_at"]))
+    except ValueError:
+        return None
     return CanonicalEvent(
         packet_id=str(row["packet_id"]),
         accession_number=str(row["accession_number"]),

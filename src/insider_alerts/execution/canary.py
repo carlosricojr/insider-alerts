@@ -7,8 +7,9 @@ import sqlite3
 import statistics
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,10 @@ from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
 
 NEW_YORK = ZoneInfo("America/New_York")
+_FINGERPRINT_CACHE: dict[
+    Path,
+    tuple[tuple[tuple[str, int, int], ...], str],
+] = {}
 ARM_PHRASE = "I_ACCEPT_LIVE_CANARY_RISK"
 
 
@@ -175,21 +180,38 @@ def poll_delay_seconds(config: CanaryConfig, now: datetime) -> int:
     """Poll rapidly around the opening auction so fills receive prompt protection."""
 
     local = now.astimezone(NEW_YORK)
-    if local.weekday() < 5 and time(9, 15) <= local.time() <= time(9, 35):
+    window_start = (
+        datetime.combine(local.date(), config.entry_submission_start, tzinfo=NEW_YORK)
+        - timedelta(minutes=5)
+    ).time()
+    window_end = (
+        datetime.combine(local.date(), config.entry_submission_deadline, tzinfo=NEW_YORK)
+        + timedelta(minutes=15)
+    ).time()
+    if local.weekday() < 5 and window_start <= local.time() <= window_end:
         return min(config.poll_seconds, 2)
     return config.poll_seconds
 
 
-def entry_session(signal_at: datetime, sessions: Sequence[date], *, now: datetime) -> date | None:
+def entry_session(
+    config: CanaryConfig,
+    signal_at: datetime,
+    sessions: Sequence[date],
+    *,
+    now: datetime,
+) -> date | None:
     """Choose the first executable RTH open without chasing a missed auction."""
 
     local_signal = signal_at.astimezone(NEW_YORK)
     local_now = now.astimezone(NEW_YORK)
     candidates = [session for session in sorted(set(sessions)) if session >= local_signal.date()]
     for session in candidates:
-        if session == local_signal.date() and local_signal.time() >= time(9, 30):
+        if (
+            session == local_signal.date()
+            and local_signal.time() >= config.entry_submission_deadline
+        ):
             continue
-        if session == local_now.date() and local_now.time() >= time(9, 20):
+        if session == local_now.date() and local_now.time() >= config.entry_submission_deadline:
             continue
         if session < local_now.date():
             continue
@@ -248,15 +270,29 @@ def runtime_source_fingerprint(package_root: Path | None = None) -> str:
     """Hash the Python source that the long-running worker loaded at startup."""
 
     root = package_root or Path(__file__).resolve().parents[1]
+    paths = sorted(root.rglob("*.py"), key=lambda item: item.as_posix())
+    signature = tuple(
+        (
+            path.relative_to(root).as_posix(),
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in paths
+    )
+    cached = _FINGERPRINT_CACHE.get(root)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*.py"), key=lambda item: item.as_posix()):
+    for path in paths:
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         content = path.read_bytes()
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-    return digest.hexdigest()
+    fingerprint = digest.hexdigest()
+    _FINGERPRINT_CACHE[root] = (signature, fingerprint)
+    return fingerprint
 
 
 class CanaryStore:
@@ -524,9 +560,16 @@ class CanaryRunner:
         self.store = CanaryStore(config.ledger_db)
         self.runtime_started_at = datetime.now(UTC)
         self.runtime_fingerprint = runtime_source_fingerprint()
+        self._last_source_check_monotonic = 0.0
+        self._source_changed = False
 
     def source_revision_changed(self) -> bool:
-        return runtime_source_fingerprint() != self.runtime_fingerprint
+        checked_at = monotonic()
+        if checked_at - self._last_source_check_monotonic < 15.0:
+            return self._source_changed
+        self._last_source_check_monotonic = checked_at
+        self._source_changed = runtime_source_fingerprint() != self.runtime_fingerprint
+        return self._source_changed
 
     async def cycle(
         self,
@@ -608,7 +651,9 @@ class CanaryRunner:
             detected += 1
             bars = await self.broker.daily_bars(signal.symbol)
             ok, reason, prior_close, median_dv = eligibility(self.config, signal, bars)
-            target_session = entry_session(signal.signal_at, sessions, now=now) if ok else None
+            target_session = (
+                entry_session(self.config, signal.signal_at, sessions, now=now) if ok else None
+            )
             quantity = planned_quantity(self.config, prior_close or 0.0) if ok else 0
             if ok and (target_session is None or quantity < 1):
                 ok = False
@@ -709,12 +754,12 @@ class CanaryRunner:
                     if stop_hit:
                         outcome = (
                             bar,
-                            stop,
+                            min(stop, bar.open),
                             "stop_and_target_same_day_stop_assumed" if target_hit else "stop",
                         )
                         break
                     if target_hit:
-                        outcome = (bar, target, "target")
+                        outcome = (bar, max(target, bar.open), "target")
                         break
                     if index == self.config.max_sessions - 1:
                         outcome = (bar, bar.close, "time")
@@ -911,7 +956,11 @@ class CanaryRunner:
             quantity = int(row["planned_quantity"])
             reference = float(row["prior_close"])
             planned_notional = quantity * reference
-            if planned_notional * (1.0 + self.config.market_order_cushion) > settled_available:
+            conservative_required_cash = (
+                planned_notional * (1.0 + self.config.market_order_cushion)
+                + (2.0 * self.config.max_one_way_commission)
+            )
+            if conservative_required_cash > settled_available:
                 self.store.update(str(row["packet_id"]), live_state="cash_suppressed")
                 continue
             preview = await self.broker.preview_entry(str(row["symbol"]), quantity)
@@ -949,13 +998,26 @@ class CanaryRunner:
             commission_currency = (
                 preview.currency.upper() if preview.commission_valid and preview.currency else "USD"
             )
+            required_cash = (
+                planned_notional * (1.0 + self.config.market_order_cushion)
+                + planned_commission
+                + self.config.max_one_way_commission
+            )
             if (
                 commission_currency != "USD"
                 or warning_is_real
                 or planned_commission > self.config.max_one_way_commission
                 or commission_bps > self.config.max_one_way_commission_bps
+                or required_cash > settled_available
             ):
-                self.store.update(str(row["packet_id"]), live_state="preflight_rejected")
+                self.store.update(
+                    str(row["packet_id"]),
+                    live_state=(
+                        "cash_suppressed"
+                        if required_cash > settled_available
+                        else "preflight_rejected"
+                    ),
+                )
                 self.store.event(
                     "entry_preflight_rejected",
                     packet_id=str(row["packet_id"]),
@@ -1016,7 +1078,7 @@ class CanaryRunner:
                 min_commission=preview.min_commission,
                 max_commission=preview.max_commission,
             )
-            settled_available -= planned_notional * (1.0 + self.config.market_order_cushion)
+            settled_available -= required_cash
             submitted += 1
         return submitted
 
@@ -1097,7 +1159,9 @@ class CanaryRunner:
         for row in self.store.rows("live_state IN ('open','closing')"):
             token = broker_token(str(row["packet_id"]))
             parent = (
-                by_id.get(int(row["parent_order_id"])) if row["parent_order_id"] else None
+                by_id.get(int(row["parent_order_id"]))
+                if row["parent_order_id"] is not None
+                else None
             ) or by_ref.get(f"IA-E07-{token}-ENTRY")
             if (
                 row["live_entry_commission"] is None
@@ -1108,13 +1172,19 @@ class CanaryRunner:
             if str(row["packet_id"]) in newly_protected:
                 continue
             target = (
-                by_id.get(int(row["target_order_id"])) if row["target_order_id"] else None
+                by_id.get(int(row["target_order_id"]))
+                if row["target_order_id"] is not None
+                else None
             ) or by_ref.get(f"IA-E07-{token}-TARGET")
             stop = (
-                by_id.get(int(row["stop_order_id"])) if row["stop_order_id"] else None
+                by_id.get(int(row["stop_order_id"]))
+                if row["stop_order_id"] is not None
+                else None
             ) or by_ref.get(f"IA-E07-{token}-STOP")
             timed = (
-                by_id.get(int(row["timed_exit_order_id"])) if row["timed_exit_order_id"] else None
+                by_id.get(int(row["timed_exit_order_id"]))
+                if row["timed_exit_order_id"] is not None
+                else None
             )
             current_position_quantity = account.positions.get(str(row["symbol"]), 0.0)
             filled_exit = next(
@@ -1239,7 +1309,9 @@ class CanaryRunner:
             closed += 1
         today = now.astimezone(NEW_YORK).date()
         for row in self.store.rows("live_state='submitted'"):
-            parent_id = int(row["parent_order_id"]) if row["parent_order_id"] else None
+            parent_id = (
+                int(row["parent_order_id"]) if row["parent_order_id"] is not None else None
+            )
             if (
                 date.fromisoformat(str(row["entry_session"])) < today
                 and parent_id not in by_id

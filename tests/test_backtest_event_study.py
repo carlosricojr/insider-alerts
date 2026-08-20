@@ -155,6 +155,30 @@ def test_compute_event_forward_returns_reports_tradability_and_exit_skips() -> N
     assert h5.skip_reason == "missing_exit"
 
 
+def test_compute_event_forward_returns_rejects_nonpositive_entry_with_filter_disabled() -> None:
+    event = _event(
+        "0000000001-25-000001|0000000001|4",
+        datetime(2025, 1, 1, 12, 0, tzinfo=UTC),
+    )
+    bars_by_symbol = {
+        "MAT": [_bar("2025-01-02", open_=0.0, close=1.0)],
+        "SPY": [_spy_bar("2025-01-02", open_=100.0, close=100.0)],
+    }
+
+    observations = compute_event_forward_returns(
+        [event],
+        bars_by_symbol=bars_by_symbol,
+        horizons=[1],
+        benchmark_symbol="SPY",
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        tradability=TradabilityConfig(min_price=0.0, min_median_dollar_volume_20d=0.0),
+    )
+
+    assert observations[0].trade_executed is False
+    assert observations[0].skip_reason == "invalid_entry_price"
+
+
 def test_compute_event_forward_returns_reports_missing_benchmark() -> None:
     event = _event("0000000001-25-000001|0000000001|4", datetime(2025, 1, 1, 12, 0, tzinfo=UTC))
     bars_by_symbol = {

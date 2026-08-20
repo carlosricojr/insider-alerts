@@ -208,6 +208,32 @@ def test_moving_block_null_p_value_is_deterministic_and_detects_large_positive_m
     assert first < 0.01
 
 
+def test_simulate_daily_rule_stop_gap_fills_at_worse_open() -> None:
+    signal = _signal(datetime(2026, 5, 1, 20, 0, tzinfo=UTC))
+    symbol_bars = [
+        DailyBar("MAT", date(2026, 5, 4), 10.0, 10.2, 9.8, 10.0, 1_000_000.0),
+        DailyBar("MAT", date(2026, 5, 5), 8.0, 8.2, 7.8, 8.0, 1_000_000.0),
+    ] + [_bar("MAT", date(2026, 5, 6) + timedelta(days=offset), 8.0) for offset in range(8)]
+    benchmark_bars = [
+        DailyBar("SPY", date(2026, 5, 4), 100.0, 101.0, 99.0, 100.0, 1_000_000.0),
+        DailyBar("SPY", date(2026, 5, 5), 100.0, 101.0, 99.0, 100.0, 1_000_000.0),
+    ] + [_bar("SPY", date(2026, 5, 6) + timedelta(days=offset), 100.0) for offset in range(8)]
+
+    result = simulate_daily_rule(
+        signal,
+        rule=DAILY_EXECUTION_RULES[6],
+        symbol_bars=symbol_bars,
+        benchmark_bars=benchmark_bars,
+        cost_fraction=0.0,
+        min_price=0.0,
+        min_median_dollar_volume_20d=0.0,
+    )
+
+    assert result is not None
+    assert result.exit_reason == "stop"
+    assert result.exit_price == 8.0
+
+
 def test_simulate_intraday_rule_enters_first_bar_after_delay() -> None:
     signal = _signal(datetime(2026, 5, 4, 14, 0, 30, tzinfo=UTC))
     daily = [_bar("MAT", date(2026, 5, 1), 10.0), _bar("MAT", date(2026, 5, 4), 10.0)]

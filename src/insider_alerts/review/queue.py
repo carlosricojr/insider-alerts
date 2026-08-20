@@ -136,14 +136,22 @@ def enqueue_review_packets_batch(
 
     with sqlite3.connect(db_path) as conn:
         before = conn.total_changes
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO review_packets (
-                packet_id, accession_number, cik, form_type, payload_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO review_packets (
+                    packet_id, accession_number, cik, form_type,
+                    payload_json, created_at, updated_at
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM review_packets
+                    WHERE accession_number = ? AND form_type = ?
+                )
+                """,
+                (*row, row[1], row[3]),
+            )
         conn.commit()
         inserted = conn.total_changes - before
     return int(inserted)

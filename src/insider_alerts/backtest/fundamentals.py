@@ -92,30 +92,32 @@ def refresh_companyfacts(
     force: bool = False,
 ) -> dict[str, object]:
     ensure_companyfacts_table(db_path)
-    cached = load_cached_companyfacts(db_path)
     requested_ciks = sorted(set(ciks))
     fetched = 0
     reused = 0
     errors: list[str] = []
-    for raw_cik in requested_ciks:
-        digits = "".join(char for char in str(raw_cik) if char.isdigit())
-        if not digits:
-            errors.append(f"{raw_cik}: invalid CIK")
-            continue
-        normalized = digits.zfill(10)
-        if normalized in cached and not force:
-            reused += 1
-            continue
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{normalized}.json"
-        try:
-            payload_text = client.get_text(url)
-            payload = json.loads(payload_text)
-            if not isinstance(payload, dict):
-                raise ValueError("companyfacts payload is not an object")
-        except (SecHttpError, json.JSONDecodeError, ValueError) as exc:
-            errors.append(f"{normalized}: {exc}")
-            continue
-        with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path) as conn:
+        cached_ciks = {
+            str(row[0]) for row in conn.execute("SELECT cik FROM sec_companyfacts_cache").fetchall()
+        }
+        for raw_cik in requested_ciks:
+            digits = "".join(char for char in str(raw_cik) if char.isdigit())
+            if not digits:
+                errors.append(f"{raw_cik}: invalid CIK")
+                continue
+            normalized = digits.zfill(10)
+            if normalized in cached_ciks and not force:
+                reused += 1
+                continue
+            url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{normalized}.json"
+            try:
+                payload_text = client.get_text(url)
+                payload = json.loads(payload_text)
+                if not isinstance(payload, dict):
+                    raise ValueError("companyfacts payload is not an object")
+            except (SecHttpError, json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"{normalized}: {exc}")
+                continue
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sec_companyfacts_cache (cik, payload_json, fetched_at)
@@ -128,8 +130,8 @@ def refresh_companyfacts(
                 ),
             )
             conn.commit()
-        cached[normalized] = payload
-        fetched += 1
+            cached_ciks.add(normalized)
+            fetched += 1
     return {
         "requested": len(requested_ciks),
         "fetched": fetched,

@@ -89,7 +89,10 @@ def load_scored_signals(
 
     signals: list[SignalEvent] = []
     for row in rows:
-        payload = _string_keyed_dict(json.loads(str(row["payload_json"])))
+        try:
+            payload = _string_keyed_dict(json.loads(str(row["payload_json"])))
+        except json.JSONDecodeError:
+            continue
         if not payload:
             continue
         rationale = _string_keyed_dict(payload.get("rationale"))

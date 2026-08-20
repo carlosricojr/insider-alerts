@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -70,8 +70,19 @@ class Settings(BaseSettings):
         gt=0,
         lt=1,
     )
+    ib_gateway_host: str = Field(default="127.0.0.1", alias="IB_GATEWAY_HOST")
+    ib_gateway_port: int = Field(default=4001, alias="IB_GATEWAY_PORT", ge=1, le=65535)
+    insider_ib_client_id: int = Field(default=171, alias="INSIDER_IB_CLIENT_ID", ge=0)
 
     database_path: str = Field(default="data/insider_alerts.db", alias="DATABASE_PATH")
+
+    @model_validator(mode="after")
+    def validate_retry_bounds(self) -> "Settings":
+        if self.market_data_retry_min_seconds > self.market_data_retry_max_seconds:
+            raise ValueError(
+                "MARKET_DATA_RETRY_MIN_SECONDS cannot exceed MARKET_DATA_RETRY_MAX_SECONDS"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

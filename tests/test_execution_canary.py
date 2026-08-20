@@ -171,9 +171,12 @@ def test_entry_session_does_not_chase_after_submission_cutoff() -> None:
     monday = date(2026, 1, 5)
     sessions = [monday, monday + timedelta(days=1)]
     before_open = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)  # 07:00 ET
-    assert entry_session(before_open, sessions, now=before_open) == monday
+    config = CanaryConfig(source_db="unused")
+    assert entry_session(config, before_open, sessions, now=before_open) == monday
     after_cutoff = datetime(2026, 1, 5, 14, 25, tzinfo=UTC)  # 09:25 ET
-    assert entry_session(before_open, sessions, now=after_cutoff) == monday + timedelta(days=1)
+    assert entry_session(config, before_open, sessions, now=after_cutoff) == monday + timedelta(
+        days=1
+    )
 
 
 def test_polling_accelerates_only_around_weekday_open() -> None:
@@ -225,6 +228,38 @@ def test_fixed_commission_preview_rejects_live_entry(
     assert result.live_submitted == 0
     assert broker.submitted == []
     assert runner.store.rows()[0]["live_state"] == "preflight_rejected"
+
+
+def test_live_entry_reserves_entry_and_exit_commissions(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    signal = _signal(now - timedelta(minutes=30))
+    monkeypatch.setattr(
+        "insider_alerts.execution.canary.load_delivered_signals",
+        lambda *args, **kwargs: [signal],
+    )
+    config = CanaryConfig(
+        source_db=str(tmp_path / "source.db"),
+        ledger_db=str(tmp_path / "ledger.db"),
+        live_requested=True,
+        arm_phrase=ARM_PHRASE,
+    )
+    broker = FakeBroker(
+        [date(2026, 1, 5) + timedelta(days=index) for index in range(15)],
+        _bars(date(2026, 1, 2)),
+        commission=0.35,
+    )
+    broker.snapshot = AccountSnapshot("ACCOUNT", 228.0, 228.0, 228.0, {}, 0)
+    runner = CanaryRunner(config, broker)
+    runner.store.activation(now - timedelta(hours=1))
+
+    result = asyncio.run(runner.cycle(now))
+
+    assert result.live_submitted == 0
+    assert broker.submitted == []
+    assert runner.store.rows()[0]["live_state"] == "cash_suppressed"
 
 
 def test_invalid_commission_preview_rejected_in_strict_mode(
@@ -454,7 +489,7 @@ def test_tiered_preview_submits_then_fill_gets_oca_protection(
     broker.order_values = [
         BrokerOrder(
             101,
-            "IA-E07-packet-001-ENTRY",
+            f"IA-E07-{broker_token('packet-001')}-ENTRY",
             "TEST",
             "entry",
             "Filled",

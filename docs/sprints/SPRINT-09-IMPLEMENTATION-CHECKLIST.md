@@ -12,7 +12,9 @@ Reference: `docs/sprints/SPRINT-09-REVIEW.md`
 - Use workspace-local cache to avoid permission issues:
   - PowerShell: `$env:UV_CACHE_DIR='.uvcache'`
 - Use a dedicated DB copy for research runs:
-  - `data/insider_alerts_actionable.db`
+  - `data/insider_alerts_research_2026-08-17.db`
+  - verify and record its SHA-256 before each reproduction run; do not substitute the mutable
+    service database.
 
 ## Ticket Order (Atomic)
 1. `S09-001` readiness audit
@@ -29,7 +31,7 @@ Reference: `docs/sprints/SPRINT-09-REVIEW.md`
    - Extend tests in `tests/test_backtest_event_study.py`
 5. `S09-005` inference + false-positive controls
    - Add/extend stats utilities in backtest modules
-   - Add tests for bootstrap/FDR/negative controls
+   - Add tests for bootstrap/exploratory FDR/negative controls
 6. `S09-006` CLI command + report schema
    - Extend: `src/insider_alerts/cli.py`
    - Extend tests: `tests/test_cli_extended.py`
@@ -50,9 +52,11 @@ Reference: `docs/sprints/SPRINT-09-REVIEW.md`
   - dedupe diagnostics,
   - skip diagnostics,
   - fold-level and aggregate OOS outputs,
-  - confidence + FDR + negative-control results,
+  - confidence + exploratory FDR + negative-control results,
   - explicit go/no-go verdict.
 - Gate thresholds and run metadata are present in report output.
+- This command is an exploratory OOS diagnostic. It cannot replace or modify the locked
+  168-hypothesis Bonferroni/Holm result in the preregistered `ops signal-study` workflow.
 
 ## First Command Set (Start S09-001)
 ```powershell

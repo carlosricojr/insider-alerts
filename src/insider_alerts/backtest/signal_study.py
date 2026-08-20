@@ -420,13 +420,13 @@ def simulate_daily_rule(
         if hit_stop:
             assert stop is not None
             exit_index = index
-            exit_price = stop
+            exit_price = min(stop, bar.open)
             exit_reason = "stop_and_target_same_day_stop_assumed" if hit_target else "stop"
             break
         if hit_target:
             assert target is not None
             exit_index = index
-            exit_price = target
+            exit_price = max(target, bar.open)
             exit_reason = "target"
             break
     exit_bar = symbol_bars[exit_index]

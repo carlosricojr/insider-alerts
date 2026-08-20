@@ -118,19 +118,19 @@ def _simulate_trade(
             # Conservative assumption when daily bars cannot resolve intraday order.
             assert stop_price is not None
             exit_idx = idx
-            exit_price = stop_price
+            exit_price = min(stop_price, bar.open)
             exit_reason = "stop_and_take_same_day_stop_assumed"
             break
         if hit_stop:
             assert stop_price is not None
             exit_idx = idx
-            exit_price = stop_price
+            exit_price = min(stop_price, bar.open)
             exit_reason = "stop"
             break
         if hit_take:
             assert take_profit_price is not None
             exit_idx = idx
-            exit_price = take_profit_price
+            exit_price = max(take_profit_price, bar.open)
             exit_reason = "take_profit"
             break
 

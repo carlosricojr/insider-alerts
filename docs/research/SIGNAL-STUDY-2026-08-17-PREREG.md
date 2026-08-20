@@ -110,15 +110,26 @@ unless timestamped snapshots already existed; a chain fetched today cannot descr
 
 ## Robustness and falsification gates
 
-A statistically surviving rule must also:
+A statistically surviving rule must also pass the following frozen, executable checks. All
+resampling uses seed `7`; control tests use `5,000` iterations and the same mean post-cost
+SPY-relative alpha statistic as the primary test.
 
 1. remain positive at 50 bps round-trip friction;
 2. have positive mean alpha both before and after 2026-07-01;
 3. remain positive after removing its best trade and its best calendar month;
 4. avoid a single-symbol contribution above 25% of total P&L;
-5. beat shuffled signal-date and random matched-entry controls;
-6. exhibit a stable neighborhood rather than an isolated stop/target optimum; and
-7. pass a chronological portfolio replay with no overlapping same-symbol positions.
+5. beat both controls at one-sided `p < 0.05`: (a) permute entry dates as blocks among eligible
+   signal dates while preserving each signal's symbol, and (b) draw one eligible entry date
+   uniformly without replacement from the same symbol's covered history for every trade;
+6. exhibit a stable neighborhood: at least two of `E05`, `E06`, and `E08` must have positive
+   post-50-bps mean alpha when `E07` is the candidate, with the same filter and eligibility rules;
+7. pass a chronological 20-slot equal-notional replay with no overlapping same-symbol positions,
+   positive realized return, and no calendar month contributing more than 50% of total P&L.
+
+The before/after split is fixed at `2026-07-01`. Best-trade and best-month removal are computed
+from the candidate's realized trade returns. Symbol contribution uses positive P&L by symbol
+divided by total positive P&L. Missing coverage or an uncomputable control fails the robustness
+gate; it is never silently omitted.
 
 If no hypothesis passes the family-wise threshold and these gates, the conclusion is **no
 demonstrated tradable edge**, not proof that the true effect is exactly zero. The forward action is

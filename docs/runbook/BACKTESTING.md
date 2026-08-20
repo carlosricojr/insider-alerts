@@ -101,8 +101,12 @@ What this command does:
   - `no_go`
   - `non_decision_grade` (hard gates failed).
 
+This command is explicitly exploratory and reports
+`analysis_class=exploratory_oos_diagnostic`. Its adjustable parameters and FDR values cannot
+override the locked 168-hypothesis Bonferroni/Holm result from `ops signal-study`.
+
 Hard gate behavior:
-- `ops event-study` exits non-zero when the run is not decision-grade.
+- `ops event-study` exits with code `3` when the run is not decision-grade.
 - This is intentional; do not proceed to strategy tuning when hard gates fail.
 
 ## Interpretation Matrix

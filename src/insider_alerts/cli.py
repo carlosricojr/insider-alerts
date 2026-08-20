@@ -2638,6 +2638,8 @@ def ops_event_study(
     db_hash = _file_sha256(db_path) if db_path.exists() else None
     db_size_bytes = db_path.stat().st_size if db_path.exists() else None
     report: dict[str, object] = {
+        "analysis_class": "exploratory_oos_diagnostic",
+        "confirmatory_eligible": False,
         "run_timestamp_utc": datetime.now(tz=UTC).isoformat(),
         "database_metadata": {
             "database_path": settings.database_path,

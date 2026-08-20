@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Iterable, Sequence
+import time as time_module
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
@@ -142,6 +143,8 @@ def refresh_ibkr_minute_bars(
     host: str = "127.0.0.1",
     port: int = 4001,
     client_id: int = 172,
+    pacing_seconds: float = 0.4,
+    sleep_fn: Callable[[float], None] = time_module.sleep,
 ) -> dict[str, object]:
     """Fetch one RTH one-minute session per request through the local IB Gateway."""
 
@@ -150,17 +153,19 @@ def refresh_ibkr_minute_bars(
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
-    from ib_insync import IB, Stock
+    from ib_async import IB, Stock
 
-    ib = IB()  # type: ignore[no-untyped-call]
+    ib = IB()
+    ib.RaiseRequestErrors = True
     fetched = 0
     reused = 0
     errors: list[str] = []
     contracts: dict[str, Any] = {}
     try:
         ib.connect(host, port, clientId=client_id, timeout=10, readonly=True)
+        request_count = 0
         for symbol, session_date in requested:
-            if _cached_session_count(db_path, symbol=symbol, session_date=session_date) >= 300:
+            if _cached_session_count(db_path, symbol=symbol, session_date=session_date) > 0:
                 reused += 1
                 continue
             contract = contracts.get(symbol)
@@ -177,6 +182,9 @@ def refresh_ibkr_minute_bars(
                 contract = qualified[0]
                 contracts[symbol] = contract
             try:
+                if request_count > 0 and pacing_seconds > 0:
+                    sleep_fn(pacing_seconds)
+                request_count += 1
                 raw_bars = ib.reqHistoricalData(
                     contract,
                     datetime.combine(session_date, time(23, 59), tzinfo=UTC),
@@ -210,7 +218,7 @@ def refresh_ibkr_minute_bars(
             fetched += 1
     finally:
         if ib.isConnected():
-            ib.disconnect()  # type: ignore[no-untyped-call]
+            ib.disconnect()
     return {
         "requested": len(requested),
         "fetched": fetched,

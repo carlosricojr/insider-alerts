@@ -80,11 +80,11 @@ All study symbols were refetched into the isolated research snapshot after this 
 
 | Rule | Trades | Mean net return | Mean SPY alpha | Profit factor | Raw p | Bonferroni p |
 |---|---:|---:|---:|---:|---:|---:|
-| Next open, exit first-session close (`E01|F00`) | 104 | -0.835% | -0.670% | 0.50 | 0.977 | 1.000 |
-| 0-minute entry, exit same-session close (`E09|F00`) | 96 | -0.556% | -0.438% | 0.63 | 0.898 | 1.000 |
-| 5-minute entry, exit same-session close (`E10|F00`) | 95 | -0.081% | +0.028% | 0.92 | 0.461 | 1.000 |
-| 15-minute entry, exit same-session close (`E11|F00`) | 94 | +0.098% | +0.163% | 1.11 | 0.287 | 1.000 |
-| 30-minute entry, exit same-session close (`E12|F00`) | 95 | -0.201% | -0.138% | 0.80 | 0.732 | 1.000 |
+| Next open, exit first-session close (`E01\|F00`) | 104 | -0.835% | -0.670% | 0.50 | 0.977 | 1.000 |
+| 0-minute entry, exit same-session close (`E09\|F00`) | 96 | -0.556% | -0.438% | 0.63 | 0.898 | 1.000 |
+| 5-minute entry, exit same-session close (`E10\|F00`) | 95 | -0.081% | +0.028% | 0.92 | 0.461 | 1.000 |
+| 15-minute entry, exit same-session close (`E11\|F00`) | 94 | +0.098% | +0.163% | 1.11 | 0.287 | 1.000 |
+| 30-minute entry, exit same-session close (`E12\|F00`) | 95 | -0.201% | -0.138% | 0.80 | 0.732 | 1.000 |
 
 There is no statistically or economically usable same-day edge. The superficially best 15-minute
 rule becomes negative at 50 bps friction and loses its best month.
@@ -219,6 +219,5 @@ uv run --extra dev python -m insider_alerts.cli ops signal-study `
   --output-json reports/historical_approval_replay_2025-02-11_2026-02-11.json
 ```
 
-Validation: 144 tests pass. Full lint currently has eight unrelated pre-existing errors in the
-uncommitted Sprint 9/service worktree (including one overlong existing comment); the new backtest
-modules and their tests pass targeted Ruff checks.
+Validation at PR revision `cd70ca4`: Ruff and strict mypy pass; 188 tests pass on Windows and the
+cross-platform coverage gate is 71%. Later review-remediation commits must repeat these gates.

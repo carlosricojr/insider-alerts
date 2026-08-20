@@ -1,9 +1,15 @@
 # Sprint 9 Review - Out-of-Sample Event Study for Alpha Validation
 
-Status: **READY FOR IMPLEMENTATION (Pending Sign-off)**
+Status: **IMPLEMENTED AS AN EXPLORATORY DIAGNOSTIC**
+
+Protocol boundary: this sprint does not alter or replace the locked confirmatory study in
+`docs/research/SIGNAL-STUDY-2026-08-17-PREREG.md`. The `ops event-study` score/conviction buckets,
+free CLI parameters, horizons, and Benjamini-Hochberg values are exploratory only. Confirmatory
+claims come exclusively from `ops signal-study` on the frozen database, all 12 execution rules,
+all 14 filters, and Bonferroni/Holm correction across the fixed family of 168 hypotheses.
 
 ## Objective
-Establish a decision-grade, out-of-sample (OOS) alpha validation workflow for Form 4 signals that:
+Establish a data-readiness and out-of-sample (OOS) diagnostic workflow for Form 4 signals that:
 - avoids parameter overfitting,
 - quantifies whether signal strength maps to forward excess returns,
 - and produces clear go/no-go evidence for live strategy development.
@@ -30,7 +36,8 @@ Scope clarifier:
 ## Out of Scope
 - Changing live decision policy thresholds in this sprint.
 - Position sizing / portfolio construction optimization.
-- Intraday execution model upgrades beyond existing daily-bar assumptions.
+- Confirmatory testing or changes to the 12-rule execution family.
+- Intraday execution model upgrades beyond the preregistered `ops signal-study` implementation.
 - LLM policy/prompt changes.
 
 ## Verified Constraints From Current Codebase
@@ -86,10 +93,12 @@ Goal:
 
 Implementation:
 - Add canonical event extractor `src/insider_alerts/backtest/event_data.py`.
-- Define deterministic event key:
+- Define deterministic exploratory event key:
   - baseline key: `(accession_number, normalized_symbol, filed_date)`.
-- For duplicate packets under same key:
-  - keep deterministic representative (highest score, then stable tie-break by packet_id),
+- For duplicate packets under that exploratory key:
+  - keep deterministic representative (highest score, then stable tie-break by packet_id).
+  - This differs from the frozen confirmatory cohort's earliest-decision representative and
+    therefore cannot be substituted into the 168-hypothesis family.
   - record dedupe diagnostics.
 - Preserve cluster signal:
   - add `cluster_packet_count` and `cluster_max_score` fields to canonical event outputs so dedupe does not discard potential multi-insider information.
@@ -110,11 +119,12 @@ Goal:
 Implementation:
 - Add `src/insider_alerts/backtest/event_study.py`.
 - Add explicit tradability eligibility filter (configurable):
-  - default filters: `entry_close >= 2.00`, `median_dollar_volume_20d >= 500000`.
+  - default filters: actual next-session `entry_open >= 2.00`,
+    `median_dollar_volume_20d >= 500000`.
   - include filter pass/fail reason in event-level output.
 - Ensure no hidden survivorship/leakage behavior:
   - return calculations use bars available as-of event date only,
-  - 20-day median dollar volume is computed from trailing bars ending at entry date.
+  - 20-day median dollar volume uses only completed sessions strictly before the entry session.
 - Reuse existing entry convention:
   - entry = next trading day open after filing date.
   - filing-time granularity policy is fixed and conservative: regardless of intraday timestamp presence/absence, never allow same-day entry.
@@ -161,7 +171,8 @@ Tests (write first):
 - fold skip rules for insufficient sample size.
 
 Acceptance:
-- At least one fold required for "decision-grade" output; otherwise report explicitly non-decision-grade.
+- At least three folds are required for a data-ready exploratory output; otherwise report is
+  explicitly non-decision-grade. This label never confers confirmatory significance.
 
 ### S09-005 Statistical Inference and Robustness Outputs
 Goal:
@@ -178,7 +189,8 @@ Implementation:
   - per-bucket execution coverage rate,
   - per-bucket benchmark-availability rate.
 - Add false-positive controls:
-  - multiple-testing adjustment across bucket/horizon combinations (Benjamini-Hochberg FDR),
+  - exploratory multiple-testing adjustment across bucket/horizon combinations
+    (Benjamini-Hochberg FDR),
   - negative-control baseline (label permutation or shuffled event dates within fold) to estimate chance-level alpha.
 
 Tests (write first):
@@ -262,13 +274,20 @@ Acceptance:
 - Minimum events per test fold and per top bucket/horizon.
 - Execution coverage guard: skipped-for-missing-price events <= 25% in every evaluated horizon.
 - Canonical sample-size guards (`min_total_canonical_events`, `min_monthly_canonical_events`) pass.
+- At least three non-overlapping OOS folds pass their sample floors.
 
-### Gate E: Edge Decision Gates (for "promising edge" label)
+### Gate E: Exploratory Edge Flags (for "promising edge" label)
 - Positive OOS mean alpha in top bucket for at least 2 core horizons (`5d`, `10d`).
 - 95% bootstrap CI lower bound for top-bucket alpha is > -25 bps for those core horizons.
 - Bucket monotonicity check is non-negative in aggregate OOS evidence for majority of horizons.
 - FDR-adjusted significance for top-bucket alpha passes configured threshold (default `q <= 0.10`) in at least one core horizon.
 - Top-bucket alpha materially exceeds negative-control baseline in core horizons.
+
+Gate E is diagnostic only. Promotion still requires the locked `ops signal-study` gates: 30
+entry-date clusters, 40 trades, positive 50-bps results, best-trade and best-month removal,
+symbol concentration below 25%, both 5,000-iteration controls, a stable execution-rule
+neighborhood, chronological 20-slot replay, and Bonferroni/Holm significance across all 168
+hypotheses. Any missing item is non-confirmatory.
 - All gate thresholds are emitted in report metadata (no hidden criteria).
 
 ## TDD Protocol (Strict)
@@ -324,4 +343,4 @@ Sprint is done when `ops event-study` can run end-to-end on a prepared DB and ou
 - and an objective go/no-go label backed by explicit gates.
 
 ## Outcome
-Pending implementation.
+Implemented as an exploratory OOS diagnostic; it is not a confirmatory promotion gate.

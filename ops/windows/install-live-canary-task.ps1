@@ -14,8 +14,8 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
 $pythonExe = Join-Path $repoRoot ".venv\Scripts\pythonw.exe"
 
-if (-not (Test-Path (Join-Path $repoRoot ".venv\Scripts\python.exe"))) {
-  throw "Missing virtualenv Python at $repoRoot\.venv\Scripts\python.exe"
+if (-not (Test-Path $pythonExe)) {
+  throw "Missing windowless virtualenv Python at $pythonExe"
 }
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name

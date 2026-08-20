@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 from insider_alerts.config import Settings
 from insider_alerts.review.market_context import (
@@ -183,6 +183,9 @@ def enqueue_review_packets(
         retry_min_seconds=settings.market_data_retry_min_seconds,
         retry_max_seconds=settings.market_data_retry_max_seconds,
         shock_drop_threshold=settings.market_earnings_shock_drop_threshold,
+        ib_gateway_host=settings.ib_gateway_host,
+        ib_gateway_port=settings.ib_gateway_port,
+        ib_client_id=settings.insider_ib_client_id,
     )
     market_cache: dict[tuple[str, str], MarketSnapshot | None] = {}
     processed = 0
@@ -287,7 +290,7 @@ def backfill_form4_filings(
     start_date: date,
     end_date: date,
 ) -> BackfillResult:
-    effective_end = min(end_date, date.today())
+    effective_end = min(end_date, datetime.now(UTC).date())
     if start_date > effective_end:
         return BackfillResult(
             requested_quarters=0,

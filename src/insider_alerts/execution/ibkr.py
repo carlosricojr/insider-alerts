@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import sys
+from collections import deque
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
@@ -33,7 +34,7 @@ class IbkrBroker:
         self.configured_account = account
         self.ib: Any = None
         self._contracts: dict[str, Any] = {}
-        self._errors: list[tuple[int, int, str]] = []
+        self._errors: deque[tuple[int, int, str]] = deque(maxlen=100)
         self._all_open_trades: list[Any] = []
         self._all_orders_checked_at = 0.0
 
@@ -44,6 +45,7 @@ class IbkrBroker:
 
         self.ib = IB()
         self.ib.errorEvent += self._on_error
+        self._errors.clear()
         try:
             await self.ib.connectAsync(
                 self.host,
@@ -54,6 +56,11 @@ class IbkrBroker:
             )
             self.ib.reqMarketDataType(1)
         except Exception as exc:  # noqa: BLE001
+            try:
+                self.ib.errorEvent -= self._on_error
+                self.ib.disconnect()
+            except Exception:  # noqa: BLE001 - preserve the original connection failure
+                pass
             self.ib = None
             raise IbkrExecutionError(
                 f"IB Gateway unavailable at {self.host}:{self.port}: {exc}"
@@ -66,6 +73,7 @@ class IbkrBroker:
         self._contracts.clear()
         self._all_open_trades = []
         self._all_orders_checked_at = 0.0
+        self._errors.clear()
 
     def _on_error(self, req_id: int, code: int, message: str, contract: Any) -> None:
         if code not in {2104, 2106, 2107, 2108, 2158}:
@@ -187,7 +195,6 @@ class IbkrBroker:
         contract = await self._contract(symbol)
         self._errors.clear()
         order = MarketOrder("BUY", quantity, tif="OPG", account=self._account())
-        order.allOrNone = True
         try:
             state = await asyncio.wait_for(
                 self.ib.whatIfOrderAsync(contract, order),
@@ -259,9 +266,17 @@ class IbkrBroker:
         else:
             commission = float("nan")
             estimate_source = "unavailable"
-        is_valid = exact_commission is not None or range_is_valid
-        commission_error = "" if is_valid else "invalid IBKR commission preview for preflight"
-        currency = str(state.commissionCurrency or "USD")
+        currency_value = getattr(state, "commissionCurrency", None)
+        currency = str(currency_value or "USD")
+        has_currency = isinstance(currency_value, str) and bool(currency_value.strip())
+        is_valid = (exact_commission is not None or range_is_valid) and has_currency
+        commission_error = (
+            ""
+            if is_valid
+            else "invalid IBKR commission preview for preflight"
+            if has_currency
+            else "IBKR commission preview missing currency"
+        )
         return CommissionPreview(
             commission=commission,
             currency=currency,
@@ -288,7 +303,6 @@ class IbkrBroker:
             orderRef=order_ref,
             transmit=True,
         )
-        order.allOrNone = True
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(0.5)
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:

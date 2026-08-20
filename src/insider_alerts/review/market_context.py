@@ -3,18 +3,19 @@ from __future__ import annotations
 import gzip
 import json
 import logging
-import os
 import sqlite3
 import threading
 import time
 import zlib
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote as url_quote
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -26,11 +27,6 @@ _YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 # IB Gateway is the authoritative feed on this host: it is authenticated, always-on, and the
 # same source the rest of the stack trades against. Verified 2026-08-11 to cover the full
 # insider universe including OTC pink sheets (RDGL @ $0.0538) which Yahoo prices as null.
-_IB_HOST = os.environ.get("IB_GATEWAY_HOST", "127.0.0.1")
-_IB_PORT = int(os.environ.get("IB_GATEWAY_PORT", "4001"))
-_IB_CLIENT_ID = int(os.environ.get("INSIDER_IB_CLIENT_ID", "171"))
-
-
 class MarketContextError(RuntimeError):
     """Raised when market context lookup fails."""
 
@@ -39,13 +35,27 @@ class _IBBarSource:
     """Lazy, process-wide IB Gateway connection for daily bars.
 
     One connection is shared across the whole autopilot loop: reconnecting per symbol would
-    dominate latency and burn client ids. ``ib_insync`` is imported lazily so the module still
+    dominate latency and burn client ids. ``ib_async`` is imported lazily so the module still
     imports (and the Yahoo fallback still works) on hosts without the dependency or Gateway.
     """
 
     _lock = threading.Lock()
     _ib: Any | None = None
     _unavailable_reason: str | None = None
+    _host = "127.0.0.1"
+    _port = 4001
+    _client_id = 171
+
+    @classmethod
+    def configure(cls, *, host: str, port: int, client_id: int) -> None:
+        endpoint = (host, int(port), int(client_id))
+        if endpoint == (cls._host, cls._port, cls._client_id):
+            return
+        if cls._ib is not None:
+            with suppress(Exception):
+                cls._ib.disconnect()
+        cls._ib = None
+        cls._host, cls._port, cls._client_id = endpoint
 
     @classmethod
     def _connect(cls) -> Any | None:
@@ -58,19 +68,31 @@ class _IBBarSource:
                 asyncio.get_event_loop()
             except RuntimeError:
                 asyncio.set_event_loop(asyncio.new_event_loop())
-            from ib_insync import IB
+            from ib_async import IB
         except ImportError as exc:  # pragma: no cover - depends on host deps
-            cls._unavailable_reason = f"ib_insync not installed: {exc}"
+            cls._unavailable_reason = f"ib_async not installed: {exc}"
             return None
+        ib: Any | None = None
         try:
-            ib = IB()  # type: ignore[no-untyped-call]
-            ib.connect(_IB_HOST, _IB_PORT, clientId=_IB_CLIENT_ID, timeout=10, readonly=True)
+            ib = IB()
+            ib.connect(
+                cls._host,
+                cls._port,
+                clientId=cls._client_id,
+                timeout=10,
+                readonly=True,
+            )
             ib.reqMarketDataType(1)
             cls._ib = ib
             cls._unavailable_reason = None
             return ib
         except Exception as exc:  # noqa: BLE001 - any connect failure degrades to fallback
-            cls._unavailable_reason = f"IB Gateway {_IB_HOST}:{_IB_PORT} unreachable: {exc}"
+            try:
+                if ib is not None:
+                    ib.disconnect()
+            except Exception:  # noqa: BLE001 - preserve the original failure
+                pass
+            cls._unavailable_reason = f"IB Gateway {cls._host}:{cls._port} unreachable: {exc}"
             cls._ib = None
             return None
 
@@ -82,11 +104,12 @@ class _IBBarSource:
             if ib is None:
                 return {}
             try:
-                from ib_insync import Stock
+                from ib_async import Stock
 
                 contract = Stock(symbol.upper(), "SMART", "USD")
                 qualified = ib.qualifyContracts(contract)
                 if not qualified or not contract.conId:
+                    cls._unavailable_reason = None
                     return {}
                 bars = ib.reqHistoricalData(
                     contract,
@@ -99,7 +122,9 @@ class _IBBarSource:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("IB bar fetch failed for %s: %s", symbol, exc)
+                cls._unavailable_reason = f"IB bar request failed: {exc}"
                 return {}
+        cls._unavailable_reason = None
         out: dict[date, tuple[float, float]] = {}
         for bar in bars or []:
             bar_date = getattr(bar, "date", None)
@@ -223,6 +248,9 @@ class DailyMarketDataClient:
         retry_min_seconds: float = 0.5,
         retry_max_seconds: float = 3.0,
         shock_drop_threshold: float = 0.08,
+        ib_gateway_host: str = "127.0.0.1",
+        ib_gateway_port: int = 4001,
+        ib_client_id: int = 171,
         now_fn: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -236,6 +264,11 @@ class DailyMarketDataClient:
         self.now_fn = now_fn
         self.sleep_fn = sleep_fn
         self._last_request_ts = 0.0
+        _IBBarSource.configure(
+            host=ib_gateway_host,
+            port=ib_gateway_port,
+            client_id=ib_client_id,
+        )
 
     def _enforce_rate_limit(self) -> None:
         interval = 1.0 / self.rate_limit_per_second
@@ -328,9 +361,17 @@ class DailyMarketDataClient:
         disabled every liquidity guard, so exhausting all sources now RAISES instead of
         returning empty -- a dead feed must never look like a quiet market.
         """
-        bars = _IBBarSource.fetch(symbol)
-        if bars:
-            return bars, "ibkr"
+        bars: dict[date, tuple[float, float]] = {}
+        for attempt in range(1, self.retry_attempts + 1):
+            self._enforce_rate_limit()
+            bars = _IBBarSource.fetch(symbol)
+            if bars:
+                return bars, "ibkr"
+            if _IBBarSource._unavailable_reason is None or attempt >= self.retry_attempts:
+                break
+            delay = self._retry_delay(attempt)
+            if delay > 0:
+                self.sleep_fn(delay)
         ib_reason = _IBBarSource._unavailable_reason
         if ib_reason:
             logger.warning("IB unavailable (%s); falling back to yahoo for %s", ib_reason, symbol)
@@ -344,7 +385,8 @@ class DailyMarketDataClient:
             raise
 
     def _fetch_bars_yahoo(self, symbol: str) -> dict[date, tuple[float, float]]:
-        url = f"{_YAHOO_CHART_URL}/{symbol.upper()}?{urlencode({'range': '10d', 'interval': '1d'})}"
+        encoded_symbol = url_quote(symbol.upper(), safe="")
+        url = f"{_YAHOO_CHART_URL}/{encoded_symbol}?{urlencode({'range': '10d', 'interval': '1d'})}"
         text = self._download_text(url, symbol=symbol)
         try:
             payload = json.loads(text)
