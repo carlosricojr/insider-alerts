@@ -60,6 +60,8 @@ NTFY_BASE_URL=https://ntfy.sh
 NTFY_TOPIC=insider-alerts-0808
 NTFY_TOKEN=
 SEC_USER_AGENT=insider-alerts/0.2 (contact: your-email@example.com)
+MARKET_DATA_RATE_LIMIT_PER_SECOND=1.0
+MARKET_DATA_RETRY_ATTEMPTS=3
 DATABASE_PATH=data/insider_alerts.db
 ```
 
@@ -121,7 +123,12 @@ uv run python -m insider_alerts.cli review pending --limit 50
 uv run python -m insider_alerts.cli review decide --packet-id "0000320193-24-000123|0000320193|4" --decision approve --reason "Quant thesis..." --analyst quant --notify
 uv run python -m insider_alerts.cli ops deadletter-list
 uv run python -m insider_alerts.cli ops deadletter-replay --packet-id <id>
-uv run python -m insider_alerts.cli ops backtest --start-date 2024-01-01 --end-date 2026-12-31 --output-json reports/backtest_latest.json
+# Historical SEC filing reference backfill for a specific window:
+uv run python -m insider_alerts.cli sec backfill --start-date 2025-01-01 --end-date 2025-12-31
+# Default window is last 365 days ending today.
+uv run python -m insider_alerts.cli ops backtest --output-json reports/backtest_latest.json
+# Optional explicit window (must provide both dates together):
+uv run python -m insider_alerts.cli ops backtest --start-date 2025-02-13 --end-date 2026-02-13 --output-json reports/backtest_latest.json
 ```
 
 ## Troubleshooting
@@ -137,4 +144,5 @@ uv run python -m insider_alerts.cli ops backtest --start-date 2024-01-01 --end-d
 
 - `docs/runbook/OPERATIONS.md`
 - `docs/runbook/BACKTESTING.md`
+- `docs/runbook/LIVE_CANARY.md`
 - `skills/insider-review/SKILL.md`

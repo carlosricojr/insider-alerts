@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, date, datetime
 
 from insider_alerts.backtest.models import SignalEvent
+from insider_alerts.backtest.prices import normalize_backtest_symbol
 from insider_alerts.review.queue import ensure_review_tables
 from insider_alerts.sec.store import init_db
 
@@ -12,12 +13,7 @@ from insider_alerts.sec.store import init_db
 def _string_keyed_dict(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
-
-    narrowed: dict[str, object] = {}
-    for key, item in value.items():
-        if isinstance(key, str):
-            narrowed[key] = item
-    return narrowed
+    return {key: item for key, item in value.items() if isinstance(key, str)}
 
 
 def _optional_float(value: object) -> float | None:
@@ -63,7 +59,10 @@ def load_scored_signals(
     init_db(db_path)
     ensure_review_tables(db_path)
 
-    where_parts = ["json_extract(rp.payload_json, '$.issuer_symbol') IS NOT NULL"]
+    where_parts = [
+        "json_valid(rp.payload_json)",
+        "json_extract(rp.payload_json, '$.issuer_symbol') IS NOT NULL",
+    ]
     params: list[str] = []
     if start_date is not None:
         where_parts.append("date(f.filed_at) >= ?")
@@ -93,8 +92,10 @@ def load_scored_signals(
 
     signals: list[SignalEvent] = []
     for row in rows:
-        payload_obj: object = json.loads(str(row["payload_json"]))
-        payload = _string_keyed_dict(payload_obj)
+        try:
+            payload = _string_keyed_dict(json.loads(str(row["payload_json"])))
+        except json.JSONDecodeError:
+            continue
         if not payload:
             continue
         rationale = _string_keyed_dict(payload.get("rationale"))
@@ -102,6 +103,9 @@ def load_scored_signals(
         symbol_obj = payload.get("issuer_symbol")
         score_obj = payload.get("score")
         if not isinstance(symbol_obj, str) or not symbol_obj.strip():
+            continue
+        normalized_symbol = normalize_backtest_symbol(symbol_obj)
+        if normalized_symbol is None:
             continue
         score = _optional_float(score_obj)
         if score is None:
@@ -113,7 +117,7 @@ def load_scored_signals(
         signals.append(
             SignalEvent(
                 packet_id=str(row["packet_id"]),
-                symbol=symbol_obj.strip().upper(),
+                symbol=normalized_symbol,
                 filed_at=_parse_iso_datetime(str(row["filed_at"])),
                 score=score,
                 open_market_buy_shares=_rationale_float(rationale, "open_market_buy_shares"),

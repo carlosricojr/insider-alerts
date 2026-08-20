@@ -127,6 +127,30 @@ def test_run_backtest_exits_on_stop_only_day() -> None:
     assert trades[0].exit_price == pytest.approx(9.5, rel=1e-9)
 
 
+def test_run_backtest_stop_gap_fills_at_worse_open() -> None:
+    bars = [
+        DailyBar("ABC", date(2026, 1, 2), 10.0, 10.2, 9.8, 10.0, 1_000_000.0),
+        DailyBar("ABC", date(2026, 1, 5), 8.0, 8.2, 7.8, 8.0, 1_000_000.0),
+    ]
+    _, trades = run_backtest(
+        [_signal("p1", 1)],
+        bars_by_symbol={"ABC": bars},
+        params=BacktestParams(
+            min_score=90.0,
+            hold_days=2,
+            stop_loss_pct=0.05,
+            take_profit_rr=2.0,
+        ),
+        benchmark_symbol="",
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert trades[0].exit_reason == "stop"
+    assert trades[0].exit_price == 8.0
+    assert trades[0].net_return == pytest.approx(-0.2)
+
+
 def test_run_backtest_exits_on_take_profit_only_day() -> None:
     bars = [
         DailyBar(

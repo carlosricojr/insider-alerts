@@ -1,48 +1,104 @@
 from __future__ import annotations
 
+import asyncio
+import csv
+import hashlib
 import json
+import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import time
-from dataclasses import dataclass
-from datetime import date, timedelta
+from bisect import bisect_right
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Literal, cast
 
 import typer
 
 from insider_alerts.backtest.data import load_scored_signals
 from insider_alerts.backtest.engine import (
-    BacktestMetrics,
     BacktestParams,
     evaluate_parameter_grid,
     run_backtest,
     run_walk_forward,
 )
+from insider_alerts.backtest.event_data import load_canonical_events
+from insider_alerts.backtest.event_study import (
+    CONVICTION_FEATURE_WEIGHTS,
+    TradabilityConfig,
+    run_oos_event_study,
+)
+from insider_alerts.backtest.fundamentals import (
+    load_cached_companyfacts,
+    refresh_companyfacts,
+    shares_outstanding_as_of,
+)
+from insider_alerts.backtest.intraday_prices import (
+    build_intraday_requests,
+    completed_minute_bar_sessions,
+    filter_completed_minute_bars,
+    get_minute_bars,
+    refresh_ibkr_minute_bars,
+)
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.prices import (
     PriceDataError,
     StooqPriceClient,
+    get_price_bar_bounds,
     get_price_bars,
     refresh_price_bars,
 )
+from insider_alerts.backtest.readiness import (
+    EventStudyReadinessConfig,
+    audit_event_study_readiness,
+)
+from insider_alerts.backtest.signal_study import (
+    CONFIRMATORY_FAMILY_SIZE,
+    DAILY_EXECUTION_RULES,
+    collect_daily_strategy_observations,
+    compute_point_in_time_features,
+    evaluate_daily_hypothesis_family,
+    fixed_slot_portfolio_summary,
+    load_delivered_signals,
+    load_historical_approved_replay,
+    matched_random_date_control,
+)
 from insider_alerts.config import Settings, get_settings
+from insider_alerts.execution.canary import (
+    ARM_PHRASE,
+    CanaryConfig,
+    CanaryRunner,
+    poll_delay_seconds,
+)
+from insider_alerts.execution.canary import (
+    status_report as live_canary_status_report,
+)
+from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
+from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.review.queue import (
     DecisionValidationError,
     apply_decision,
+    ensure_review_tables,
     get_review_packet,
     list_deadletters,
     list_pending_review_packets,
+    mark_notification_delivered,
     replay_deadletter,
 )
-from insider_alerts.sec.client import SecHttpError
+from insider_alerts.sec.client import SecHttpClient, SecHttpError
 from insider_alerts.sec.pipeline import (
+    BackfillResult,
+    backfill_form4_filings,
     enqueue_review_packets,
     enrich_filings_with_xml_url,
     run_sec_poll_once,
 )
 from insider_alerts.sec.rss import SecRssParseError
+from insider_alerts.sec.store import get_filing_date_bounds
 
 app = typer.Typer(help="Insider alerts command-line interface.")
 notify_app = typer.Typer(help="Notification commands.")
@@ -62,6 +118,10 @@ class AutoDecisionRuleResult:
     source: str
     confidence: float | None
     reason_code: str = "general"
+    conviction_score: float | None = None
+    conviction_holding_pct: float | None = None
+    conviction_value_pct: float | None = None
+    conviction_liquidity_pct: float | None = None
 
 
 @dataclass(slots=True)
@@ -84,9 +144,22 @@ class AutoPilotCycleResult:
     rejected_low_edge: int
     escalated_missing_context: int
     escalated_schema_invalid: int
+    notify_suppressed_duplicate: int = 0
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_CONVICTION_METRICS = (
+    "holding_change_ratio",
+    "open_market_gross_value",
+    "trade_pct_daily_turnover",
+)
+
+
+@dataclass(slots=True)
+class ConvictionHistory:
+    by_role: dict[str, dict[str, list[float]]]
+    global_metrics: dict[str, list[float]]
+    sample_count: int
 
 
 def _to_float(value: object) -> float | None:
@@ -154,20 +227,166 @@ def _parse_int_grid(raw: str, *, min_value: int | None = None) -> list[int]:
     return sorted(values)
 
 
-def _metrics_to_dict(metrics: BacktestMetrics) -> dict[str, object]:
-    return {
-        "trade_count": metrics.trade_count,
-        "skipped_count": metrics.skipped_count,
-        "mean_return": metrics.mean_return,
-        "median_return": metrics.median_return,
-        "win_rate": metrics.win_rate,
-        "profit_factor": metrics.profit_factor,
-        "max_drawdown": metrics.max_drawdown,
-        "sharpe_like": metrics.sharpe_like,
-        "mean_alpha": metrics.mean_alpha,
-        "median_alpha": metrics.median_alpha,
-        "objective_score": metrics.objective_score,
-    }
+def _normalize_role_tier(value: object) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return "unknown"
+
+
+def _empty_conviction_history() -> ConvictionHistory:
+    return ConvictionHistory(
+        by_role={},
+        global_metrics={metric: [] for metric in _CONVICTION_METRICS},
+        sample_count=0,
+    )
+
+
+def _load_conviction_history(
+    db_path: str,
+    *,
+    as_of_date: date,
+    lookback_days: int,
+) -> ConvictionHistory:
+    start_date = as_of_date - timedelta(days=max(lookback_days, 1))
+    history = _empty_conviction_history()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    json_extract(rp.payload_json, '$.rationale.role_tier') AS role_tier,
+                    json_extract(
+                        rp.payload_json,
+                        '$.rationale.holding_change_ratio'
+                    ) AS holding_change_ratio,
+                    json_extract(
+                        rp.payload_json,
+                        '$.rationale.open_market_gross_value'
+                    ) AS open_market_gross_value,
+                    json_extract(
+                        rp.payload_json,
+                        '$.rationale.trade_pct_daily_turnover'
+                    ) AS trade_pct_daily_turnover,
+                    json_extract(
+                        rp.payload_json,
+                        '$.rationale.open_market_buy_shares'
+                    ) AS open_market_buy_shares,
+                    json_extract(
+                        rp.payload_json,
+                        '$.rationale.open_market_net_shares'
+                    ) AS open_market_net_shares
+                FROM review_packets AS rp
+                INNER JOIN filings AS f
+                    ON f.accession_number = rp.accession_number
+                    AND f.cik = rp.cik
+                    AND f.form_type = rp.form_type
+                WHERE date(f.filed_at) >= ?
+                  AND date(f.filed_at) < ?
+                """,
+                (start_date.isoformat(), as_of_date.isoformat()),
+            ).fetchall()
+    except sqlite3.Error:
+        return history
+
+    for row in rows:
+        open_market_buy_shares = _to_float(row["open_market_buy_shares"])
+        open_market_net_shares = _to_float(row["open_market_net_shares"])
+        if (
+            open_market_buy_shares is None
+            or open_market_buy_shares <= 0
+            or open_market_net_shares is None
+            or open_market_net_shares <= 0
+        ):
+            continue
+
+        role_tier = _normalize_role_tier(row["role_tier"])
+        role_entry = history.by_role.setdefault(
+            role_tier,
+            {metric: [] for metric in _CONVICTION_METRICS},
+        )
+        any_metric = False
+        for metric in _CONVICTION_METRICS:
+            value = _to_float(row[metric])
+            if value is None:
+                continue
+            role_entry[metric].append(value)
+            history.global_metrics[metric].append(value)
+            any_metric = True
+        if any_metric:
+            history.sample_count += 1
+
+    for metric in _CONVICTION_METRICS:
+        history.global_metrics[metric].sort()
+    for role_values in history.by_role.values():
+        for metric in _CONVICTION_METRICS:
+            role_values[metric].sort()
+    return history
+
+
+def _percentile_rank(sorted_values: list[float], value: float | None) -> float | None:
+    if value is None or not sorted_values:
+        return None
+    rank = bisect_right(sorted_values, value)
+    return (rank / len(sorted_values)) * 100.0
+
+
+def _compute_conviction_metrics(
+    packet: dict[str, object],
+    *,
+    history: ConvictionHistory,
+    min_role_samples: int,
+) -> tuple[float | None, float | None, float | None, float | None, int]:
+    payload = packet.get("payload")
+    payload_dict = payload if isinstance(payload, dict) else {}
+    rationale = payload_dict.get("rationale")
+    rationale_dict = rationale if isinstance(rationale, dict) else {}
+
+    role_tier = _normalize_role_tier(rationale_dict.get("role_tier"))
+    role_metrics = history.by_role.get(role_tier, {})
+
+    def _resolve_distribution(metric: str) -> list[float]:
+        role_dist = role_metrics.get(metric, [])
+        if len(role_dist) >= min_role_samples:
+            return role_dist
+        global_dist = history.global_metrics.get(metric, [])
+        if global_dist:
+            return global_dist
+        return role_dist
+
+    holding_ratio = _to_float(rationale_dict.get("holding_change_ratio"))
+    value_gross = _to_float(rationale_dict.get("open_market_gross_value"))
+    liquidity_impact = _to_float(rationale_dict.get("trade_pct_daily_turnover"))
+
+    holding_pct = _percentile_rank(_resolve_distribution("holding_change_ratio"), holding_ratio)
+    value_pct = _percentile_rank(_resolve_distribution("open_market_gross_value"), value_gross)
+    liquidity_pct = _percentile_rank(
+        _resolve_distribution("trade_pct_daily_turnover"),
+        liquidity_impact,
+    )
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for metric_pct, weight in (
+        (holding_pct, CONVICTION_FEATURE_WEIGHTS["holding_change_ratio"]),
+        (value_pct, CONVICTION_FEATURE_WEIGHTS["open_market_gross_value"]),
+        (liquidity_pct, CONVICTION_FEATURE_WEIGHTS["trade_pct_daily_turnover"]),
+    ):
+        if metric_pct is None:
+            continue
+        weighted_sum += metric_pct * weight
+        weight_total += weight
+    conviction_score = (weighted_sum / weight_total) if weight_total > 0 else None
+    missing_count = sum(metric is None for metric in (holding_pct, value_pct, liquidity_pct))
+    return conviction_score, holding_pct, value_pct, liquidity_pct, missing_count
+
+
+def _metrics_to_dict(metrics: object) -> dict[str, object]:
+    if is_dataclass(metrics) and not isinstance(metrics, type):
+        return cast(dict[str, object], asdict(metrics))
+    if hasattr(metrics, "__dict__"):
+        return cast(dict[str, object], dict(vars(metrics)))
+    return {}
 
 
 def _params_to_dict(params: BacktestParams) -> dict[str, object]:
@@ -176,6 +395,324 @@ def _params_to_dict(params: BacktestParams) -> dict[str, object]:
         "hold_days": params.hold_days,
         "stop_loss_pct": params.stop_loss_pct,
         "take_profit_rr": params.take_profit_rr,
+    }
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as file_obj:
+            while True:
+                chunk = file_obj.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _write_event_study_csv(
+    output_csv_path: Path,
+    *,
+    aggregate_bucket_metrics: list[dict[str, object]],
+) -> None:
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "horizon_days",
+        "bucket_index",
+        "bucket_count",
+        "bucket_score_min",
+        "bucket_score_max",
+        "total_events",
+        "executed_events",
+        "benchmark_available_events",
+        "execution_coverage_rate",
+        "benchmark_coverage_rate",
+        "mean_alpha",
+        "median_alpha",
+        "win_rate",
+        "mean_alpha_ci_low",
+        "mean_alpha_ci_high",
+        "alpha_p_value",
+        "alpha_q_value",
+    ]
+    with output_csv_path.open("w", newline="", encoding="utf-8") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+        writer.writeheader()
+        for metric in aggregate_bucket_metrics:
+            writer.writerow({field: metric.get(field) for field in fieldnames})
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _load_confirmatory_gate(
+    report_path: Path | None,
+    *,
+    candidate_hypothesis: str,
+    expected_database_path: Path,
+) -> dict[str, object]:
+    if report_path is None:
+        return {
+            "pass": False,
+            "reason": "confirmatory_report_required",
+            "candidate_hypothesis": candidate_hypothesis,
+        }
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "pass": False,
+            "reason": f"confirmatory_report_unreadable:{type(exc).__name__}",
+            "candidate_hypothesis": candidate_hypothesis,
+            "report_path": str(report_path),
+        }
+    if not isinstance(payload, dict):
+        return {
+            "pass": False,
+            "reason": "confirmatory_report_not_object",
+            "candidate_hypothesis": candidate_hypothesis,
+            "report_path": str(report_path),
+        }
+    survivors = payload.get("surviving_hypotheses")
+    family_size = payload.get("family_size")
+    schema_version = payload.get("schema_version")
+    cohort = payload.get("cohort")
+    requested_start_date = payload.get("requested_start_date")
+    requested_end_date = payload.get("requested_end_date")
+    reported_database_path = payload.get("database_path")
+    reported_database_sha256 = payload.get("database_sha256")
+    family_valid = family_size == CONFIRMATORY_FAMILY_SIZE
+    schema_valid = schema_version == "signal-study-v1"
+    cohort_valid = cohort == "live"
+    date_window_valid = (
+        requested_start_date == "2026-02-11" and requested_end_date == "2026-08-17"
+    )
+    expected_database_exists = expected_database_path.is_file()
+    try:
+        database_path_valid = (
+            isinstance(reported_database_path, str)
+            and Path(reported_database_path).resolve() == expected_database_path.resolve()
+        )
+    except OSError:
+        database_path_valid = False
+    expected_database_sha256 = (
+        _file_sha256(expected_database_path) if expected_database_exists else None
+    )
+    database_hash_valid = (
+        isinstance(reported_database_sha256, str)
+        and reported_database_sha256 == expected_database_sha256
+    )
+    candidate_survived = (
+        isinstance(survivors, list)
+        and candidate_hypothesis in {str(item) for item in survivors}
+    )
+    passed = all(
+        (
+            family_valid,
+            schema_valid,
+            cohort_valid,
+            date_window_valid,
+            expected_database_exists,
+            database_path_valid,
+            database_hash_valid,
+            candidate_survived,
+        )
+    )
+    return {
+        "pass": passed,
+        "reason": "passed" if passed else "locked_confirmatory_result_failed",
+        "candidate_hypothesis": candidate_hypothesis,
+        "report_path": str(report_path),
+        "family_size": family_size,
+        "family_size_valid": family_valid,
+        "schema_version": schema_version,
+        "schema_valid": schema_valid,
+        "cohort": cohort,
+        "cohort_valid": cohort_valid,
+        "requested_start_date": requested_start_date,
+        "requested_end_date": requested_end_date,
+        "date_window_valid": date_window_valid,
+        "expected_database_path": str(expected_database_path.resolve()),
+        "expected_database_exists": expected_database_exists,
+        "database_path": reported_database_path,
+        "database_path_valid": database_path_valid,
+        "expected_database_sha256": expected_database_sha256,
+        "database_sha256": reported_database_sha256,
+        "database_hash_valid": database_hash_valid,
+        "candidate_survived": candidate_survived,
+    }
+
+
+def _evaluate_event_study_gates(
+    *,
+    readiness: object,
+    event_study: object,
+    bucket_count: int,
+    min_fold_count: int,
+    min_test_events: int,
+    max_missing_price_skip_rate: float,
+    core_horizons: tuple[int, ...],
+    ci_lower_bound_bps: float,
+    fdr_q_threshold: float,
+    confirmatory_gate: dict[str, object],
+) -> dict[str, object]:
+    readiness_ready = bool(getattr(readiness, "is_ready", False))
+    folds = list(getattr(event_study, "folds", []))
+    aggregate_bucket_metrics = list(getattr(event_study, "aggregate_bucket_metrics", []))
+    monotonicity = list(getattr(event_study, "monotonicity", []))
+    negative_control = list(getattr(event_study, "negative_control", []))
+
+    fold_count_pass = len(folds) >= min_fold_count
+    fold_test_min_pass = all(
+        int(getattr(fold, "test_event_count", 0)) >= min_test_events for fold in folds
+    )
+    available_horizons = sorted(
+        {int(getattr(metric, "horizon_days", 0)) for metric in aggregate_bucket_metrics}
+    )
+    core_horizons_present = [horizon for horizon in core_horizons if horizon in available_horizons]
+
+    top_metrics_by_horizon: dict[int, object] = {}
+    for metric in aggregate_bucket_metrics:
+        horizon = int(getattr(metric, "horizon_days", 0))
+        bucket_index = int(getattr(metric, "bucket_index", 0))
+        if bucket_index == bucket_count:
+            top_metrics_by_horizon[horizon] = metric
+
+    top_bucket_min_events_pass = all(
+        int(getattr(top_metrics_by_horizon.get(horizon), "total_events", 0)) >= min_test_events
+        for horizon in core_horizons_present
+    )
+
+    coverage_by_horizon: dict[str, float] = {}
+    execution_coverage_guard = True
+    for horizon in available_horizons:
+        metrics_for_horizon = [
+            metric
+            for metric in aggregate_bucket_metrics
+            if int(getattr(metric, "horizon_days", 0)) == horizon
+        ]
+        total_events = sum(
+            int(getattr(metric, "total_events", 0)) for metric in metrics_for_horizon
+        )
+        executed_events = sum(
+            int(getattr(metric, "executed_events", 0)) for metric in metrics_for_horizon
+        )
+        coverage = (executed_events / total_events) if total_events > 0 else 0.0
+        coverage_by_horizon[str(horizon)] = coverage
+        missing_rate = 1.0 - coverage
+        if missing_rate > max_missing_price_skip_rate:
+            execution_coverage_guard = False
+
+    diagnostic_ready = (
+        readiness_ready
+        and fold_count_pass
+        and fold_test_min_pass
+        and top_bucket_min_events_pass
+        and execution_coverage_guard
+    )
+    confirmatory_pass = bool(confirmatory_gate.get("pass", False))
+    decision_grade = diagnostic_ready and confirmatory_pass
+
+    ci_floor = ci_lower_bound_bps / 10000.0
+    positive_core_count = 0
+    ci_core_count = 0
+    q_pass_core = False
+    negative_control_pass_count = 0
+    for horizon in core_horizons_present:
+        metric = top_metrics_by_horizon.get(horizon)
+        if metric is None:
+            continue
+        mean_alpha = getattr(metric, "mean_alpha", None)
+        if mean_alpha is not None and float(mean_alpha) > 0:
+            positive_core_count += 1
+        ci_low = getattr(metric, "mean_alpha_ci_low", None)
+        if ci_low is not None and float(ci_low) > ci_floor:
+            ci_core_count += 1
+        q_value = getattr(metric, "alpha_q_value", None)
+        if q_value is not None and float(q_value) <= fdr_q_threshold:
+            q_pass_core = True
+
+        neg = next(
+            (item for item in negative_control if int(getattr(item, "horizon_days", 0)) == horizon),
+            None,
+        )
+        if neg is None:
+            continue
+        actual = getattr(neg, "actual_top_bucket_mean_alpha", None)
+        null_high = getattr(neg, "null_ci_high", None)
+        null_mean = getattr(neg, "null_mean_alpha", None)
+        if actual is None:
+            continue
+        reference = null_high if null_high is not None else null_mean
+        if reference is None:
+            continue
+        if float(actual) > float(reference):
+            negative_control_pass_count += 1
+
+    monotonic_non_negative_count = sum(
+        1 for item in monotonicity if bool(getattr(item, "non_negative", False))
+    )
+    monotonicity_majority_pass = len(monotonicity) > 0 and monotonic_non_negative_count > (
+        len(monotonicity) / 2
+    )
+
+    required_core_horizons = 2
+    positive_core_pass = positive_core_count >= required_core_horizons
+    ci_core_pass = ci_core_count >= required_core_horizons
+    negative_control_pass = negative_control_pass_count >= required_core_horizons
+    edge_pass = (
+        decision_grade
+        and positive_core_pass
+        and ci_core_pass
+        and monotonicity_majority_pass
+        and q_pass_core
+        and negative_control_pass
+    )
+
+    label = "promising_edge" if edge_pass else "no_go"
+    if not diagnostic_ready:
+        label = "non_decision_grade"
+    elif not confirmatory_pass:
+        label = "confirmatory_gate_failed"
+    return {
+        "label": label,
+        "decision_grade": decision_grade,
+        "edge_pass": edge_pass,
+        "hard_gates": {
+            "diagnostic_ready": diagnostic_ready,
+            "locked_confirmatory_result_pass": confirmatory_pass,
+            "readiness_pass": readiness_ready,
+            "min_fold_count_pass": fold_count_pass,
+            "min_test_events_per_fold_pass": fold_test_min_pass,
+            "top_bucket_min_events_pass": top_bucket_min_events_pass,
+            "execution_coverage_guard_pass": execution_coverage_guard,
+        },
+        "edge_gates": {
+            "positive_top_bucket_core_horizons_count": positive_core_count,
+            "positive_top_bucket_core_horizons_pass": positive_core_pass,
+            "ci_lower_bound_core_horizons_count": ci_core_count,
+            "ci_lower_bound_core_horizons_pass": ci_core_pass,
+            "monotonicity_majority_pass": monotonicity_majority_pass,
+            "fdr_top_bucket_core_pass": q_pass_core,
+            "negative_control_core_horizons_count": negative_control_pass_count,
+            "negative_control_core_horizons_pass": negative_control_pass,
+        },
+        "coverage_by_horizon": coverage_by_horizon,
+        "thresholds": {
+            "min_fold_count": min_fold_count,
+            "min_test_events": min_test_events,
+            "max_missing_price_skip_rate": max_missing_price_skip_rate,
+            "core_horizons": list(core_horizons),
+            "ci_lower_bound_bps": ci_lower_bound_bps,
+            "fdr_q_threshold": fdr_q_threshold,
+        },
     }
 
 
@@ -321,6 +858,175 @@ def _auto_decide_packet(
     )
 
 
+def _apply_conviction_baseline(
+    preliminary_rule: AutoDecisionRuleResult,
+    packet: dict[str, object],
+    *,
+    history: ConvictionHistory,
+    min_history_samples: int,
+    min_role_samples: int,
+    conviction_min_score: float,
+    conviction_reject_max: float,
+    conviction_value_pct_min: float,
+    conviction_holding_pct_min: float,
+    conviction_liquidity_pct_min: float,
+    director_turnover_min: float,
+    shock_turnover_min: float,
+) -> AutoDecisionRuleResult:
+    if preliminary_rule.decision != "approve":
+        return preliminary_rule
+
+    payload = packet.get("payload")
+    payload_dict = payload if isinstance(payload, dict) else {}
+    rationale = payload_dict.get("rationale")
+    rationale_dict = rationale if isinstance(rationale, dict) else {}
+    packet_id = str(packet.get("packet_id", "unknown"))
+
+    trade_pct_daily_turnover = _to_float(rationale_dict.get("trade_pct_daily_turnover"))
+    regime_earnings_shock_flag = _to_bool(rationale_dict.get("regime_earnings_shock_flag"))
+    role_tier = _normalize_role_tier(rationale_dict.get("role_tier"))
+
+    if role_tier == "director" and (
+        trade_pct_daily_turnover is None or trade_pct_daily_turnover < director_turnover_min
+    ):
+        reason_code = (
+            "missing_market_context"
+            if trade_pct_daily_turnover is None
+            else "safety_low_edge_director"
+        )
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "baseline rule: "
+                "director signal has low liquidity impact "
+                f"(trade_pct_daily_turnover={trade_pct_daily_turnover})"
+            ),
+            source="rules",
+            confidence=None,
+            reason_code=reason_code,
+        )
+
+    if regime_earnings_shock_flag and (
+        trade_pct_daily_turnover is None or trade_pct_daily_turnover < shock_turnover_min
+    ):
+        reason_code = (
+            "missing_market_context"
+            if trade_pct_daily_turnover is None
+            else "safety_shock_regime_block"
+        )
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "baseline rule: "
+                "post-shock regime requires stronger liquidity conviction "
+                f"(trade_pct_daily_turnover={trade_pct_daily_turnover})"
+            ),
+            source="rules",
+            confidence=None,
+            reason_code=reason_code,
+        )
+
+    if history.sample_count < min_history_samples:
+        return preliminary_rule
+
+    (
+        conviction_score,
+        holding_pct,
+        value_pct,
+        liquidity_pct,
+        missing_count,
+    ) = _compute_conviction_metrics(
+        packet,
+        history=history,
+        min_role_samples=min_role_samples,
+    )
+
+    if missing_count >= 2:
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=(
+                "baseline rule: insufficient conviction dimensions "
+                f"(missing={missing_count}, packet={packet_id})"
+            ),
+            source="rules",
+            confidence=None,
+            reason_code="rules_missing_conviction_data",
+            conviction_score=conviction_score,
+            conviction_holding_pct=holding_pct,
+            conviction_value_pct=value_pct,
+            conviction_liquidity_pct=liquidity_pct,
+        )
+
+    if conviction_score is None:
+        return AutoDecisionRuleResult(
+            decision="escalate",
+            reason=f"baseline rule: conviction score unavailable (packet={packet_id})",
+            source="rules",
+            confidence=None,
+            reason_code="rules_missing_conviction_data",
+            conviction_holding_pct=holding_pct,
+            conviction_value_pct=value_pct,
+            conviction_liquidity_pct=liquidity_pct,
+        )
+
+    value_gate = value_pct is not None and value_pct >= conviction_value_pct_min
+    holding_gate = holding_pct is not None and holding_pct >= conviction_holding_pct_min
+    liquidity_gate = liquidity_pct is not None and liquidity_pct >= conviction_liquidity_pct_min
+
+    if conviction_score < conviction_reject_max:
+        return AutoDecisionRuleResult(
+            decision="reject",
+            reason=(
+                "baseline rule: low conviction "
+                f"(conviction={conviction_score:.1f}, "
+                f"holding_pct={holding_pct}, value_pct={value_pct}, "
+                f"liquidity_pct={liquidity_pct})"
+            ),
+            source="rules",
+            confidence=None,
+            reason_code="reject_low_edge",
+            conviction_score=conviction_score,
+            conviction_holding_pct=holding_pct,
+            conviction_value_pct=value_pct,
+            conviction_liquidity_pct=liquidity_pct,
+        )
+
+    if conviction_score >= conviction_min_score and value_gate and (holding_gate or liquidity_gate):
+        return AutoDecisionRuleResult(
+            decision="approve",
+            reason=(
+                "baseline rule: pass "
+                f"(conviction={conviction_score:.1f}, "
+                f"holding_pct={holding_pct}, value_pct={value_pct}, "
+                f"liquidity_pct={liquidity_pct})"
+            ),
+            source="rules",
+            confidence=None,
+            reason_code="rules_high_edge",
+            conviction_score=conviction_score,
+            conviction_holding_pct=holding_pct,
+            conviction_value_pct=value_pct,
+            conviction_liquidity_pct=liquidity_pct,
+        )
+
+    return AutoDecisionRuleResult(
+        decision="escalate",
+        reason=(
+            "baseline rule: insufficient conviction to approve "
+            f"(conviction={conviction_score:.1f}, "
+            f"holding_pct={holding_pct}, value_pct={value_pct}, "
+            f"liquidity_pct={liquidity_pct})"
+        ),
+        source="rules",
+        confidence=None,
+        reason_code="rules_ambiguous",
+        conviction_score=conviction_score,
+        conviction_holding_pct=holding_pct,
+        conviction_value_pct=value_pct,
+        conviction_liquidity_pct=liquidity_pct,
+    )
+
+
 def _extract_json_object(text: str) -> dict[str, object] | None:
     try:
         parsed = json.loads(text)
@@ -369,9 +1075,7 @@ def _compact_packet_for_quant(packet: dict[str, object]) -> dict[str, object]:
         "trade_pct_daily_volume": rationale_dict.get("trade_pct_daily_volume"),
         "trade_pct_daily_turnover": rationale_dict.get("trade_pct_daily_turnover"),
         "role_tier": rationale_dict.get("role_tier"),
-        "regime_earnings_shock_flag": _to_bool(
-            rationale_dict.get("regime_earnings_shock_flag")
-        ),
+        "regime_earnings_shock_flag": _to_bool(rationale_dict.get("regime_earnings_shock_flag")),
         "owner_is_exec": _to_bool(rationale_dict.get("owner_is_exec")),
         "owner_is_ten_percent_owner": _to_bool(rationale_dict.get("owner_is_ten_percent_owner")),
         "owner_is_entity": _to_bool(rationale_dict.get("owner_is_entity")),
@@ -386,6 +1090,83 @@ def _compact_packet_for_quant(packet: dict[str, object]) -> dict[str, object]:
         "novelty_penalty": rationale_dict.get("novelty_penalty"),
         "alpha_bonus": rationale_dict.get("alpha_bonus"),
     }
+
+
+def _economic_event_key(packet: dict[str, object]) -> str | None:
+    """Identify the underlying TRADE, independent of which reporting person filed it.
+
+    A group/joint Form 4 reports ONE economic event under N reporting persons. On
+    2026-08-10 a single MKZR purchase (33,400 sh, 66,600 -> 100,000, $53,340) arrived as
+    three filings by three different owners and produced three separate alerts -- 3 of that
+    day's 7 approvals were the same trade. ``_packet_decision_key`` cannot catch this: it is
+    keyed on accession, and each co-filer has its own accession.
+
+    Different owners sharing an identical *pre-trade* holding as well as an identical
+    purchase is the signature of a jointly-reported position, so pre-trade shares are part
+    of the key. Two genuinely independent insiders would have to hold the same position to
+    the share for this to collapse a real signal.
+    """
+    payload = packet.get("payload")
+    payload_dict = payload if isinstance(payload, dict) else {}
+    symbol_obj = payload_dict.get("issuer_symbol")
+    if not isinstance(symbol_obj, str) or not symbol_obj.strip():
+        return None
+    rationale = payload_dict.get("rationale")
+    rationale_dict = rationale if isinstance(rationale, dict) else {}
+
+    parts: list[str] = [symbol_obj.strip().upper()]
+    for field in (
+        "net_buy_shares",
+        "pre_trade_shares_estimate",
+        "post_trade_shares",
+        "gross_value",
+    ):
+        value = _to_float(rationale_dict.get(field))
+        if value is None:
+            # Without the full economic fingerprint we cannot prove two filings are the same
+            # trade, so fail open (alert) rather than risk suppressing a distinct signal.
+            return None
+        parts.append(f"{value:.4f}")
+    return "|".join(parts)
+
+
+def _recent_alerted_event_keys(
+    db_path: str,
+    *,
+    lookback_days: int = 7,
+) -> set[str]:
+    """Economic-event keys with a confirmed notification delivery in the recent window.
+
+    Group co-filings can land in different autopilot cycles minutes apart, so an in-cycle
+    set is not enough -- the MKZR trio arrived across three cycles. The window is bounded so
+    a legitimate repeat purchase in the same name weeks later still alerts.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=lookback_days)).isoformat()
+    keys: set[str] = set()
+    try:
+        ensure_review_tables(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT packet_id, payload_json
+                FROM review_packets
+                WHERE notification_sent_at >= ?
+                  AND json_extract(decision_json, '$.decision') = 'approve'
+                """,
+                (cutoff,),
+            ).fetchall()
+    except sqlite3.Error:
+        return keys
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        key = _economic_event_key({"packet_id": row["packet_id"], "payload": payload})
+        if key is not None:
+            keys.add(key)
+    return keys
 
 
 def _packet_decision_key(packet: dict[str, object]) -> str | None:
@@ -405,17 +1186,120 @@ def _packet_decision_key(packet: dict[str, object]) -> str | None:
     return None
 
 
-def _resolve_openclaw_cmd() -> str | None:
-    cmd = shutil.which("openclaw.cmd")
-    if cmd:
-        return cmd
-    cmd = shutil.which("openclaw")
-    if cmd:
-        return cmd
-    appdata = Path.home() / "AppData" / "Roaming" / "npm" / "openclaw.cmd"
-    if appdata.exists():
-        return str(appdata)
+QUANT_SYSTEM_PROMPT = (
+    "You are a quantitative analyst filtering SEC Form 4 insider filings for alpha-like "
+    "signals. You classify only; you never browse, never call tools, and never ask questions.\n"
+    "\n"
+    "APPROVE only when there is likely non-routine discretionary conviction buying with a "
+    "meaningful holdings change and a low novelty penalty. In practice this requires "
+    "discretionary open-market buy evidence (transaction code P context).\n"
+    "\n"
+    "REJECT obvious non-signal flow: planned 10b5-1 activity, passive ten-percent owner "
+    "accumulation, compensation grants or vesting, option exercises, and tax-withholding-only "
+    "sales. A very small holding-change ratio by a non-executive entity is usually not alpha.\n"
+    "\n"
+    "Director-only buys should be approved only when liquidity impact is meaningful (a "
+    "non-trivial percent of daily turnover/volume). Post-shock (large down-move) regimes "
+    "require stronger conviction evidence.\n"
+    "\n"
+    "When uncertain, choose escalate rather than guessing.\n"
+    "\n"
+    "Respond with ONLY a single JSON object and no prose, no markdown fences, and no "
+    "commentary. Emit exactly one entry per input packet_id, reusing the given packet_id "
+    "verbatim."
+)
+
+# Local decision CLIs, in preference order. OpenClaw is no longer supported.
+_QUANT_CLI_CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("claude.cmd", "claude"),
+    ("claude", "claude"),
+    ("codex.cmd", "codex"),
+    ("codex", "codex"),
+)
+
+
+def _resolve_quant_cmd() -> tuple[str, str] | None:
+    """Return ``(executable, flavor)`` for the local quant decision CLI.
+
+    ``flavor`` is ``claude`` or ``codex`` and selects argument construction plus
+    response-envelope handling. Returns ``None`` when no supported CLI is installed.
+    """
+    for name, flavor in _QUANT_CLI_CANDIDATES:
+        found = shutil.which(name)
+        if found:
+            return found, flavor
+    for candidate, flavor in (
+        (Path.home() / ".local" / "bin" / "claude.cmd", "claude"),
+        (Path.home() / ".local" / "bin" / "claude", "claude"),
+        (Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd", "claude"),
+        (Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd", "codex"),
+    ):
+        if candidate.exists():
+            return str(candidate), flavor
     return None
+
+
+def _build_quant_args(
+    cmd: str,
+    flavor: str,
+    prompt: str,
+    *,
+    quant_timeout_seconds: int,
+) -> list[str]:
+    """Build the argv for a single-shot, tool-free classification call."""
+    model = os.environ.get("INSIDER_QUANT_MODEL", "").strip()
+    if flavor == "claude":
+        args = [
+            cmd,
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            "--system-prompt",
+            QUANT_SYSTEM_PROMPT,
+            # Pure reasoning: no tools, single turn. Keeps the call hermetic and fast.
+            "--allowedTools",
+            "",
+            "--max-turns",
+            "1",
+        ]
+        if model:
+            args += ["--model", model]
+        return args
+    # codex: exec runs a single non-interactive turn and prints the reply on stdout.
+    args = [cmd, "exec", "--skip-git-repo-check", f"{QUANT_SYSTEM_PROMPT}\n\n{prompt}"]
+    if model:
+        args += ["--model", model]
+    return args
+
+
+def _extract_quant_response_text(flavor: str, stdout: str) -> tuple[str | None, str | None]:
+    """Pull the model's reply text out of a CLI-specific envelope.
+
+    Returns ``(text, error)``; exactly one is non-None.
+    """
+    if flavor == "claude":
+        outer = _extract_json_object(stdout)
+        if outer is None:
+            return None, "invalid JSON envelope"
+        if outer.get("is_error") is True:
+            detail = outer.get("result") or outer.get("error") or "unknown"
+            return None, f"cli reported error: {str(detail)[:160]}"
+        result_obj = outer.get("result")
+        if isinstance(result_obj, str) and result_obj.strip():
+            return result_obj, None
+        # Defensive: some versions nest the reply under result.payloads[].text
+        if isinstance(result_obj, dict):
+            payloads = result_obj.get("payloads")
+            if isinstance(payloads, list) and payloads:
+                first = payloads[0]
+                if isinstance(first, dict) and isinstance(first.get("text"), str):
+                    return str(first["text"]), None
+        return None, "missing result text"
+    # codex prints the assistant reply directly; the JSON extractor tolerates surrounding prose.
+    if stdout and stdout.strip():
+        return stdout, None
+    return None, "empty response"
 
 
 def _decide_packets_with_quant(
@@ -426,9 +1310,10 @@ def _decide_packets_with_quant(
     quant_thinking: str,
     quant_batch_size: int,
 ) -> tuple[dict[str, AutoDecisionRuleResult], str | None]:
-    openclaw_cmd = _resolve_openclaw_cmd()
-    if openclaw_cmd is None:
-        return {}, "openclaw CLI not found"
+    resolved = _resolve_quant_cmd()
+    if resolved is None:
+        return {}, "no local quant CLI found (looked for claude, codex)"
+    quant_cmd, quant_flavor = resolved
     mapped: dict[str, AutoDecisionRuleResult] = {}
     errors: list[str] = []
     batch_size = max(1, quant_batch_size)
@@ -451,43 +1336,25 @@ def _decide_packets_with_quant(
 
         request = {"packets": compact_packets}
         prompt = (
-            "You are filtering for alpha-like insider signals. "
-            "Prioritize novelty and informational edge. "
-            "Reject obvious flows such as planned 10b5-1 activity, passive ten-percent owner "
-            "accumulation, compensation grants/vesting, option exercises, or tax-withholding-only "
-            "sales. "
-            "In practice, require discretionary open-market buy evidence "
-            "(code P context) to approve. "
-            "Very small holding change ratio by non-executive entities is usually not alpha. "
-            "Director-only buys should usually be approved only when "
-            "liquidity impact is meaningful "
-            "(for example, non-trivial percent of daily turnover/volume). "
-            "Post-shock (large down-move) regimes require stronger conviction evidence. "
-            "Approve only when there is likely non-routine discretionary conviction buying with "
-            "meaningful holdings change and low novelty penalty. "
-            "When uncertain choose escalate. "
-            "Return ONLY JSON: "
-            "{\"decisions\":[{\"packet_id\":\"...\",\"decision\":\"approve, reject, or escalate\","
-            "\"why\":\"max 240 chars\",\"edge_hypothesis\":\"...\",\"risk_flags\":[\"...\"],"
-            "\"evidence\":{\"role_tier\":\"...\",\"open_market_buy_shares\":0,"
-            "\"trade_pct_daily_turnover\":0,\"novelty_penalty\":0,"
-            "\"regime_earnings_shock_flag\":false},\"confidence\":0.0}]}. "
+            "Classify each Form 4 packet below.\n"
+            "Return ONLY this JSON shape:\n"
+            # NB: no shell metacharacters (| < > & % ^) anywhere in argv --
+            # claude.cmd/codex.cmd are batch shims and Windows routes .cmd through
+            # cmd.exe, so those characters are injection-prone.
+            '{"decisions":[{"packet_id":"...","decision":"approve, reject, or escalate",'
+            '"why":"max 240 chars","edge_hypothesis":"...","risk_flags":["..."],'
+            '"evidence":{"role_tier":"...","open_market_buy_shares":0,'
+            '"trade_pct_daily_turnover":0,"novelty_penalty":0,'
+            '"regime_earnings_shock_flag":false},"confidence":0.0}]}\n'
             f"Input: {json.dumps(request, separators=(',', ':'))}"
         )
 
-        args = [
-            openclaw_cmd,
-            "agent",
-            "--agent",
-            quant_agent_id,
-            "--message",
+        args = _build_quant_args(
+            quant_cmd,
+            quant_flavor,
             prompt,
-            "--json",
-            "--timeout",
-            str(quant_timeout_seconds),
-            "--thinking",
-            quant_thinking,
-        ]
+            quant_timeout_seconds=quant_timeout_seconds,
+        )
 
         try:
             completed = subprocess.run(
@@ -506,26 +1373,9 @@ def _decide_packets_with_quant(
             errors.append(f"chunk[{start}:{start + len(chunk)}] non-zero: {stderr}")
             continue
 
-        outer = _extract_json_object(completed.stdout)
-        if outer is None:
-            errors.append(f"chunk[{start}:{start + len(chunk)}] invalid JSON envelope")
-            continue
-
-        result_obj = outer.get("result")
-        if not isinstance(result_obj, dict):
-            errors.append(f"chunk[{start}:{start + len(chunk)}] missing result")
-            continue
-        payloads_obj = result_obj.get("payloads")
-        if not isinstance(payloads_obj, list) or not payloads_obj:
-            errors.append(f"chunk[{start}:{start + len(chunk)}] missing payloads")
-            continue
-        first_payload = payloads_obj[0]
-        if not isinstance(first_payload, dict):
-            errors.append(f"chunk[{start}:{start + len(chunk)}] payload malformed")
-            continue
-        text_obj = first_payload.get("text")
-        if not isinstance(text_obj, str):
-            errors.append(f"chunk[{start}:{start + len(chunk)}] response text missing")
+        text_obj, envelope_error = _extract_quant_response_text(quant_flavor, completed.stdout)
+        if text_obj is None:
+            errors.append(f"chunk[{start}:{start + len(chunk)}] {envelope_error}")
             continue
 
         inner = _extract_json_object(text_obj)
@@ -674,8 +1524,7 @@ def _apply_approve_guardrails(
         return AutoDecisionRuleResult(
             decision="escalate",
             reason=(
-                "safety block: "
-                f"packet={packet_id} appears compensation/tax-withholding driven"
+                f"safety block: packet={packet_id} appears compensation/tax-withholding driven"
             ),
             source="safety",
             confidence=None,
@@ -745,16 +1594,14 @@ def _apply_approve_guardrails(
             reason_code=reason_code,
         )
 
-    if (
-        rule.source.startswith("quant:")
-        and (rule.confidence is None or rule.confidence < quant_min_confidence)
+    if rule.source.startswith("quant:") and (
+        rule.confidence is None or rule.confidence < quant_min_confidence
     ):
         confidence_text = "missing" if rule.confidence is None else f"{rule.confidence:.2f}"
         return AutoDecisionRuleResult(
             decision="escalate",
             reason=(
-                "safety block: "
-                f"quant confidence={confidence_text} below {quant_min_confidence:.2f}"
+                f"safety block: quant confidence={confidence_text} below {quant_min_confidence:.2f}"
             ),
             source="safety",
             confidence=None,
@@ -780,6 +1627,10 @@ def _build_trade_signal_notification(
     open_market_buy = _to_float(rationale_dict.get("open_market_buy_shares"))
     gross = _to_float(rationale_dict.get("gross_value"))
     novelty_penalty = _to_float(rationale_dict.get("novelty_penalty"))
+    conviction_score = _to_float(decision_payload.get("conviction_score"))
+    conviction_holding_pct = _to_float(decision_payload.get("conviction_holding_pct"))
+    conviction_value_pct = _to_float(decision_payload.get("conviction_value_pct"))
+    conviction_liquidity_pct = _to_float(decision_payload.get("conviction_liquidity_pct"))
     role_tier_obj = rationale_dict.get("role_tier")
     role_tier = str(role_tier_obj) if isinstance(role_tier_obj, str) else "unknown"
     trade_pct_daily_turnover = _to_float(rationale_dict.get("trade_pct_daily_turnover"))
@@ -809,6 +1660,26 @@ def _build_trade_signal_notification(
                 f"novelty_penalty={novelty_penalty:.2f}"
                 if novelty_penalty is not None
                 else "novelty_penalty=NA"
+            ),
+            (
+                f"conviction_score={conviction_score:.1f}"
+                if conviction_score is not None
+                else "conviction_score=NA"
+            ),
+            (
+                f"conviction_holding_pct={conviction_holding_pct:.1f}"
+                if conviction_holding_pct is not None
+                else "conviction_holding_pct=NA"
+            ),
+            (
+                f"conviction_value_pct={conviction_value_pct:.1f}"
+                if conviction_value_pct is not None
+                else "conviction_value_pct=NA"
+            ),
+            (
+                f"conviction_liquidity_pct={conviction_liquidity_pct:.1f}"
+                if conviction_liquidity_pct is not None
+                else "conviction_liquidity_pct=NA"
             ),
             f"role_tier={role_tier}",
             (
@@ -932,16 +1803,102 @@ def sec_enrich(
     typer.echo(f"sec enrich completed (scanned={result.scanned}, updated={result.updated})")
 
 
+@sec_app.command("backfill")
+def sec_backfill(
+    start_date_text: str = typer.Option(..., "--start-date", help="Inclusive YYYY-MM-DD start."),
+    end_date_text: str = typer.Option(..., "--end-date", help="Inclusive YYYY-MM-DD end."),
+) -> None:
+    """Backfill historical Form 4 filing references from SEC master index files."""
+    settings = get_settings()
+    try:
+        start_date = date.fromisoformat(start_date_text)
+        end_date = date.fromisoformat(end_date_text)
+    except ValueError as exc:
+        typer.secho(
+            "invalid date format; expected YYYY-MM-DD",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2) from exc
+
+    if start_date > end_date:
+        typer.secho("start-date cannot be after end-date", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    result = backfill_form4_filings(
+        settings,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    typer.echo(
+        "sec backfill completed "
+        f"(requested_quarters={result.requested_quarters}, "
+        f"fetched_quarters={result.fetched_quarters}, "
+        f"matched_filings={result.matched_filings}, "
+        f"inserted={result.inserted}, "
+        f"skipped_existing={result.skipped_existing})"
+    )
+
+
 @review_app.command("enqueue")
 def review_enqueue(
     limit: int = typer.Option(50, "--limit", min=1, max=1000, help="Max filings to process."),
+    oldest_first: bool = typer.Option(
+        False,
+        "--oldest-first/--newest-first",
+        help="Process oldest filings first (useful for historical backfills).",
+    ),
+    start_date_text: str = typer.Option(
+        "",
+        "--start-date",
+        help="Optional inclusive filing-date lower bound (YYYY-MM-DD).",
+    ),
+    end_date_text: str = typer.Option(
+        "",
+        "--end-date",
+        help="Optional inclusive filing-date upper bound (YYYY-MM-DD).",
+    ),
 ) -> None:
     """Build scored review packets from filings that have Form 4 XML URLs."""
     settings = get_settings()
-    result = enqueue_review_packets(settings, limit=limit)
+    start_supplied = bool(start_date_text.strip())
+    end_supplied = bool(end_date_text.strip())
+    if start_supplied != end_supplied:
+        typer.secho(
+            "must provide both --start-date and --end-date, or neither",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    start_date: date | None = None
+    end_date: date | None = None
+    if start_supplied and end_supplied:
+        try:
+            start_date = date.fromisoformat(start_date_text)
+            end_date = date.fromisoformat(end_date_text)
+        except ValueError as exc:
+            typer.secho(
+                "invalid date format; expected YYYY-MM-DD",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
+        if start_date > end_date:
+            typer.secho("start-date cannot be after end-date", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2)
+
+    result = enqueue_review_packets(
+        settings,
+        limit=limit,
+        oldest_first=oldest_first,
+        start_date=start_date,
+        end_date=end_date,
+    )
     typer.echo(
         "review enqueue completed "
-        f"(processed={result.processed}, enqueued={result.enqueued})"
+        f"(processed={result.processed}, enqueued={result.enqueued}, "
+        f"skipped_existing={result.skipped_existing}, "
+        f"http_failed={result.http_failed}, parse_failed={result.parse_failed})"
     )
 
 
@@ -992,6 +1949,7 @@ def review_decide(
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items()}
         _send_review_notification(settings, notify_payload, packet=packet)
+        mark_notification_delivered(settings.database_path, packet_id)
 
 
 @review_app.command("apply")
@@ -1037,6 +1995,8 @@ def review_apply(
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items() if isinstance(k, str)}
         _send_review_notification(settings, notify_payload, packet=packet)
+        if isinstance(packet_id_obj, str):
+            mark_notification_delivered(settings.database_path, packet_id_obj)
 
 
 @ops_app.command("deadletter-list")
@@ -1060,12 +2020,12 @@ def ops_backtest(
     start_date_text: str = typer.Option(
         "",
         "--start-date",
-        help="Inclusive YYYY-MM-DD filter on filing date.",
+        help="Inclusive YYYY-MM-DD start. Must be provided with --end-date.",
     ),
     end_date_text: str = typer.Option(
         "",
         "--end-date",
-        help="Inclusive YYYY-MM-DD filter on filing date.",
+        help="Inclusive YYYY-MM-DD end. Must be provided with --start-date.",
     ),
     min_score_grid_text: str = typer.Option(
         "70,80,90",
@@ -1127,7 +2087,7 @@ def ops_backtest(
     refresh_prices_enabled: bool = typer.Option(
         True,
         "--refresh-prices/--no-refresh-prices",
-        help="Refresh symbol price histories from data provider.",
+        help="Request missing/stale symbol price history from data provider.",
     ),
     output_json_path: Path | None = typer.Option(  # noqa: B008
         None,
@@ -1140,17 +2100,158 @@ def ops_backtest(
     """
     settings = get_settings()
 
-    start_date = date.fromisoformat(start_date_text) if start_date_text.strip() else None
-    end_date = date.fromisoformat(end_date_text) if end_date_text.strip() else None
-    if start_date and end_date and start_date > end_date:
+    start_supplied = bool(start_date_text.strip())
+    end_supplied = bool(end_date_text.strip())
+    if start_supplied != end_supplied:
+        typer.secho(
+            "must provide both --start-date and --end-date, or neither",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if start_supplied and end_supplied:
+        try:
+            start_date = date.fromisoformat(start_date_text)
+            end_date = date.fromisoformat(end_date_text)
+        except ValueError as exc:
+            typer.secho(
+                "invalid date format; expected YYYY-MM-DD",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
+        date_window_mode = "explicit"
+    else:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=365)
+        date_window_mode = "default_last_year"
+
+    if start_date > end_date:
         typer.secho("start-date cannot be after end-date", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
+    bootstrap_refresh: dict[str, int] | None = None
     signals = load_scored_signals(settings.database_path, start_date=start_date, end_date=end_date)
+    filing_min_date, filing_max_date = get_filing_date_bounds(settings.database_path)
+    effective_coverage_end = min(end_date, date.today())
+    coverage_gap_detected = (
+        filing_min_date is None
+        or filing_max_date is None
+        or filing_min_date > start_date
+        or filing_max_date < effective_coverage_end
+    )
+    should_bootstrap = coverage_gap_detected or not signals
+    if should_bootstrap:
+        try:
+            backfill_result: BackfillResult = backfill_form4_filings(
+                settings,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+            bootstrap_batch_limit = 1000
+
+            enrich_scanned_total = 0
+            enrich_updated_total = 0
+            enrich_batches = 0
+            while True:
+                enrich_result = enrich_filings_with_xml_url(settings, limit=bootstrap_batch_limit)
+                enrich_batches += 1
+                enrich_scanned_total += enrich_result.scanned
+                enrich_updated_total += enrich_result.updated
+                if enrich_result.scanned < bootstrap_batch_limit:
+                    break
+                if enrich_result.updated == 0:
+                    break
+
+            enqueue_processed_total = 0
+            enqueue_enqueued_total = 0
+            enqueue_skipped_existing_total = 0
+            enqueue_http_failed_total = 0
+            enqueue_parse_failed_total = 0
+            enqueue_batches = 0
+            enqueue_stalled_batches = 0
+            while True:
+                try:
+                    enqueue_result = enqueue_review_packets(
+                        settings,
+                        limit=bootstrap_batch_limit,
+                        oldest_first=True,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                except TypeError:
+                    # Backward-compatibility for monkeypatched test doubles.
+                    enqueue_result = enqueue_review_packets(settings, limit=bootstrap_batch_limit)
+                enqueue_batches += 1
+                enqueue_processed_total += enqueue_result.processed
+                enqueue_enqueued_total += enqueue_result.enqueued
+                enqueue_skipped_existing_total += enqueue_result.skipped_existing
+                enqueue_http_failed_total += enqueue_result.http_failed
+                enqueue_parse_failed_total += enqueue_result.parse_failed
+                if enqueue_result.processed == 0:
+                    break
+                if enqueue_result.processed < bootstrap_batch_limit:
+                    break
+                if enqueue_result.enqueued == 0:
+                    enqueue_stalled_batches += 1
+                else:
+                    enqueue_stalled_batches = 0
+                if enqueue_stalled_batches >= 3:
+                    typer.secho(
+                        "warning: enqueue made no progress for 3 consecutive batches; "
+                        "continuing with currently available signal packets",
+                        fg=typer.colors.YELLOW,
+                        err=True,
+                    )
+                    break
+
+            bootstrap_refresh = {
+                "coverage_gap_detected": int(coverage_gap_detected),
+                "backfill_requested_quarters": backfill_result.requested_quarters,
+                "backfill_fetched_quarters": backfill_result.fetched_quarters,
+                "backfill_matched_filings": backfill_result.matched_filings,
+                "backfill_inserted": backfill_result.inserted,
+                "backfill_skipped_existing": backfill_result.skipped_existing,
+                "enrich_batches": enrich_batches,
+                "enrich_scanned": enrich_scanned_total,
+                "enrich_updated": enrich_updated_total,
+                "enqueue_batches": enqueue_batches,
+                "enqueue_processed": enqueue_processed_total,
+                "enqueue_enqueued": enqueue_enqueued_total,
+                "enqueue_skipped_existing": enqueue_skipped_existing_total,
+                "enqueue_http_failed": enqueue_http_failed_total,
+                "enqueue_parse_failed": enqueue_parse_failed_total,
+            }
+            signals = load_scored_signals(
+                settings.database_path,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            typer.secho(
+                "warning: sqlite database is locked during bootstrap refresh; "
+                "continuing with currently available signals",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+        except SecHttpError as exc:
+            typer.secho(
+                f"warning: unable to refresh missing signal data before backtest: {exc}",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
     if max_signals > 0:
         signals = signals[:max_signals]
     if not signals:
-        typer.secho("no signals found for requested window", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "no signals found for requested window; ingest more filings before backtesting",
+            fg=typer.colors.RED,
+            err=True,
+        )
         raise typer.Exit(code=3)
 
     min_score_grid = _parse_float_grid(min_score_grid_text, min_value=0.0)
@@ -1172,7 +2273,17 @@ def ops_backtest(
                         )
                     )
 
-    unique_symbols = sorted({signal.symbol for signal in signals})
+    min_grid_score = min(param.min_score for param in parameter_grid)
+    price_candidate_signals = [
+        signal
+        for signal in signals
+        if signal.score >= min_grid_score
+        and signal.open_market_buy_shares > 0
+        and signal.open_market_net_shares > 0
+        and not signal.has_10b5_1_plan
+        and not (signal.has_equity_comp_event and signal.has_tax_withholding_language)
+    ]
+    unique_symbols = sorted({signal.symbol for signal in price_candidate_signals})
     benchmark = benchmark_symbol.strip().upper()
     if benchmark:
         unique_symbols.append(benchmark)
@@ -1187,26 +2298,47 @@ def ops_backtest(
     price_client = StooqPriceClient(
         user_agent=settings.sec_user_agent,
         timeout_seconds=settings.market_data_timeout_seconds,
+        rate_limit_per_second=settings.market_data_rate_limit_per_second,
+        retry_attempts=settings.market_data_retry_attempts,
+        retry_min_seconds=settings.market_data_retry_min_seconds,
+        retry_max_seconds=settings.market_data_retry_max_seconds,
+        prefer_yahoo=True,
     )
     bars_by_symbol: dict[str, list[DailyBar]] = {}
     price_errors: list[str] = []
     for symbol in unique_symbols:
+        fetch_error: str | None = None
+        cache_start, cache_end = get_price_bar_bounds(settings.database_path, symbol=symbol)
+        needs_refresh = refresh_prices_enabled and (
+            cache_start is None
+            or cache_end is None
+            or cache_start > price_start
+            or cache_end < price_end
+        )
         try:
-            if refresh_prices_enabled:
+            if needs_refresh:
                 fetched = price_client.fetch_history(symbol)
                 refresh_price_bars(settings.database_path, symbol=symbol, bars=fetched)
-            bars = get_price_bars(
-                settings.database_path,
-                symbol=symbol,
-                start_date=price_start,
-                end_date=price_end,
-            )
-            if bars:
-                bars_by_symbol[symbol] = bars
+        except PriceDataError as exc:
+            fetch_error = f"{symbol}: {exc}"
+        except Exception as exc:  # Defensive: keep one bad symbol from aborting entire run.
+            fetch_error = f"{symbol}: unexpected price refresh error: {exc}"
+
+        bars = get_price_bars(
+            settings.database_path,
+            symbol=symbol,
+            start_date=price_start,
+            end_date=price_end,
+        )
+        if bars:
+            bars_by_symbol[symbol] = bars
+        elif fetch_error is None:
+            if needs_refresh:
+                price_errors.append(f"{symbol}: no valid price bars after refresh")
             else:
                 price_errors.append(f"{symbol}: no cached bars in requested range")
-        except PriceDataError as exc:
-            price_errors.append(f"{symbol}: {exc}")
+        if fetch_error is not None:
+            price_errors.append(fetch_error)
 
     if not bars_by_symbol:
         typer.secho("no price bars available for backtest", fg=typer.colors.RED, err=True)
@@ -1242,6 +2374,10 @@ def ops_backtest(
     )
 
     report: dict[str, object] = {
+        "requested_start_date": start_date.isoformat(),
+        "requested_end_date": end_date.isoformat(),
+        "date_window_mode": date_window_mode,
+        "bootstrap_refresh": bootstrap_refresh,
         "signals_total": len(signals),
         "symbols_total": len({signal.symbol for signal in signals}),
         "parameter_grid_size": len(parameter_grid),
@@ -1279,9 +2415,457 @@ def ops_backtest(
 
     if output_json_path is not None:
         output_json_path.parent.mkdir(parents=True, exist_ok=True)
-        output_json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        output_json_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=_json_default),
+            encoding="utf-8",
+        )
 
-    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    typer.echo(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+
+
+@ops_app.command("event-study")
+def ops_event_study(
+    database_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--database-path",
+        help="Database snapshot to evaluate and bind to the confirmatory report.",
+    ),
+    start_date_text: str = typer.Option(
+        "",
+        "--start-date",
+        help="Inclusive YYYY-MM-DD start. Must be provided with --end-date.",
+    ),
+    end_date_text: str = typer.Option(
+        "",
+        "--end-date",
+        help="Inclusive YYYY-MM-DD end. Must be provided with --start-date.",
+    ),
+    horizons_text: str = typer.Option(
+        "1,3,5,10,20",
+        "--horizons",
+        help="Comma-separated forward-return horizons in trading days.",
+    ),
+    bucket_count: int = typer.Option(
+        5,
+        "--bucket-count",
+        min=2,
+        help="Number of score quantile buckets per fold.",
+    ),
+    train_window_days: int = typer.Option(
+        365,
+        "--train-window-days",
+        min=30,
+        help="Train window size in calendar days.",
+    ),
+    test_window_days: int = typer.Option(
+        90,
+        "--test-window-days",
+        min=10,
+        help="Test window size in calendar days.",
+    ),
+    min_train_events: int = typer.Option(
+        100,
+        "--min-train-events",
+        min=1,
+        help="Minimum canonical events required in each train fold.",
+    ),
+    min_test_events: int = typer.Option(
+        25,
+        "--min-test-events",
+        min=1,
+        help="Minimum canonical events required in each test fold.",
+    ),
+    min_total_canonical_events: int = typer.Option(
+        500,
+        "--min-total-canonical-events",
+        min=1,
+    ),
+    min_monthly_canonical_events: int = typer.Option(
+        20,
+        "--min-monthly-canonical-events",
+        min=1,
+    ),
+    benchmark_symbol: str = typer.Option("SPY", "--benchmark-symbol"),
+    transaction_cost_bps: float = typer.Option(
+        5.0,
+        "--transaction-cost-bps",
+        min=0.0,
+    ),
+    slippage_bps: float = typer.Option(
+        5.0,
+        "--slippage-bps",
+        min=0.0,
+    ),
+    min_price: float = typer.Option(
+        2.0,
+        "--min-price",
+        min=0.0,
+        help="Minimum entry price for tradability filter.",
+    ),
+    min_median_dollar_volume_20d: float = typer.Option(
+        500_000.0,
+        "--min-median-dollar-volume-20d",
+        min=0.0,
+    ),
+    conviction_feature_coverage_min: float = typer.Option(
+        0.80,
+        "--conviction-feature-coverage-min",
+        min=0.0,
+        max=1.0,
+    ),
+    random_seed: int = typer.Option(7, "--random-seed"),
+    bootstrap_iterations: int = typer.Option(
+        1000,
+        "--bootstrap-iterations",
+        min=100,
+    ),
+    monotonicity_iterations: int = typer.Option(
+        1000,
+        "--monotonicity-iterations",
+        min=100,
+    ),
+    negative_control_iterations: int = typer.Option(
+        500,
+        "--negative-control-iterations",
+        min=100,
+    ),
+    min_fold_count: int = typer.Option(
+        3,
+        "--min-fold-count",
+        min=1,
+        help="Minimum folds required for decision-grade output.",
+    ),
+    max_missing_price_skip_rate: float = typer.Option(
+        0.25,
+        "--max-missing-price-skip-rate",
+        min=0.0,
+        max=1.0,
+    ),
+    ci_lower_bound_bps: float = typer.Option(
+        -25.0,
+        "--ci-lower-bound-bps",
+        help="Minimum acceptable 95% CI lower bound (basis points) for top bucket.",
+    ),
+    fdr_q_threshold: float = typer.Option(
+        0.10,
+        "--fdr-q-threshold",
+        min=0.0,
+        max=1.0,
+    ),
+    confirmatory_report_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--confirmatory-report",
+        help="Locked ops signal-study JSON required for any decision-grade result.",
+    ),
+    candidate_hypothesis: str = typer.Option(
+        "E07|F00",
+        "--candidate-hypothesis",
+        help="Frozen signal-study hypothesis that this diagnostic is intended to support.",
+    ),
+    refresh_prices_enabled: bool = typer.Option(
+        True,
+        "--refresh-prices/--no-refresh-prices",
+    ),
+    output_json_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output-json",
+        help="Optional file path to write JSON report.",
+    ),
+    output_csv_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output-csv",
+        help="Optional file path to write aggregate CSV report.",
+    ),
+) -> None:
+    """
+    Run OOS event-study alpha validation for Form 4 signals.
+    """
+    settings = get_settings()
+    selected_db = database_path or Path(settings.database_path)
+    start_supplied = bool(start_date_text.strip())
+    end_supplied = bool(end_date_text.strip())
+    if start_supplied != end_supplied:
+        typer.secho(
+            "must provide both --start-date and --end-date, or neither",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if start_supplied and end_supplied:
+        try:
+            start_date = date.fromisoformat(start_date_text)
+            end_date = date.fromisoformat(end_date_text)
+        except ValueError as exc:
+            typer.secho(
+                "invalid date format; expected YYYY-MM-DD",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
+        date_window_mode = "explicit"
+    else:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=365)
+        date_window_mode = "default_last_year"
+
+    if start_date > end_date:
+        typer.secho("start-date cannot be after end-date", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    horizons = _parse_int_grid(horizons_text, min_value=1)
+    benchmark = benchmark_symbol.strip().upper() or "SPY"
+    canonical_events = load_canonical_events(
+        str(selected_db),
+        start_date=start_date,
+        end_date=end_date,
+    )
+    raw_signals = load_scored_signals(
+        str(selected_db),
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    unique_symbols = sorted({event.symbol for event in canonical_events})
+    if benchmark:
+        unique_symbols.append(benchmark)
+    unique_symbols = sorted(set(unique_symbols))
+
+    if canonical_events:
+        signal_min_date = min(event.filed_at.date() for event in canonical_events)
+        signal_max_date = max(event.filed_at.date() for event in canonical_events)
+    else:
+        signal_min_date = start_date
+        signal_max_date = end_date
+
+    max_horizon = max(horizons)
+    price_start = signal_min_date - timedelta(days=40)
+    price_end = signal_max_date + timedelta(days=max_horizon + 10)
+    price_client = StooqPriceClient(
+        user_agent=settings.sec_user_agent,
+        timeout_seconds=settings.market_data_timeout_seconds,
+        rate_limit_per_second=settings.market_data_rate_limit_per_second,
+        retry_attempts=settings.market_data_retry_attempts,
+        retry_min_seconds=settings.market_data_retry_min_seconds,
+        retry_max_seconds=settings.market_data_retry_max_seconds,
+        prefer_yahoo=True,
+    )
+    bars_by_symbol: dict[str, list[DailyBar]] = {}
+    price_errors: list[str] = []
+    for symbol in unique_symbols:
+        fetch_error: str | None = None
+        cache_start, cache_end = get_price_bar_bounds(str(selected_db), symbol=symbol)
+        needs_refresh = refresh_prices_enabled and (
+            cache_start is None
+            or cache_end is None
+            or cache_start > price_start
+            or cache_end < price_end
+        )
+        try:
+            if needs_refresh:
+                fetched = price_client.fetch_history(symbol)
+                refresh_price_bars(str(selected_db), symbol=symbol, bars=fetched)
+        except PriceDataError as exc:
+            fetch_error = f"{symbol}: {exc}"
+        except Exception as exc:  # Defensive: keep one symbol error from aborting.
+            fetch_error = f"{symbol}: unexpected price refresh error: {exc}"
+
+        bars = get_price_bars(
+            str(selected_db),
+            symbol=symbol,
+            start_date=price_start,
+            end_date=price_end,
+        )
+        if bars:
+            bars_by_symbol[symbol] = bars
+        elif fetch_error is None:
+            if needs_refresh:
+                price_errors.append(f"{symbol}: no valid price bars after refresh")
+            else:
+                price_errors.append(f"{symbol}: no cached bars in requested range")
+        if fetch_error is not None:
+            price_errors.append(fetch_error)
+
+    # Price coverage is part of readiness. Audit only after the optional refresh so a
+    # successful first run cannot report the stale pre-refresh state.
+    readiness = audit_event_study_readiness(
+        str(selected_db),
+        start_date=start_date,
+        end_date=end_date,
+        canonical_events=[asdict(event) for event in canonical_events],
+        config=EventStudyReadinessConfig(
+            min_total_canonical_events=min_total_canonical_events,
+            min_monthly_canonical_events=min_monthly_canonical_events,
+            conviction_feature_coverage_min=conviction_feature_coverage_min,
+        ),
+    )
+
+    event_study = run_oos_event_study(
+        canonical_events,
+        bars_by_symbol=bars_by_symbol,
+        horizons=horizons,
+        bucket_count=bucket_count,
+        train_window_days=train_window_days,
+        test_window_days=test_window_days,
+        min_train_events=min_train_events,
+        min_test_events=min_test_events,
+        benchmark_symbol=benchmark,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+        tradability=TradabilityConfig(
+            min_price=min_price,
+            min_median_dollar_volume_20d=min_median_dollar_volume_20d,
+        ),
+        random_seed=random_seed,
+        bootstrap_iterations=bootstrap_iterations,
+        monotonicity_iterations=monotonicity_iterations,
+        negative_control_iterations=negative_control_iterations,
+    )
+    conviction_event_study = (
+        run_oos_event_study(
+            canonical_events,
+            bars_by_symbol=bars_by_symbol,
+            horizons=horizons,
+            bucket_count=bucket_count,
+            train_window_days=train_window_days,
+            test_window_days=test_window_days,
+            min_train_events=min_train_events,
+            min_test_events=min_test_events,
+            benchmark_symbol=benchmark,
+            transaction_cost_bps=transaction_cost_bps,
+            slippage_bps=slippage_bps,
+            tradability=TradabilityConfig(
+                min_price=min_price,
+                min_median_dollar_volume_20d=min_median_dollar_volume_20d,
+            ),
+            random_seed=random_seed,
+            bootstrap_iterations=bootstrap_iterations,
+            monotonicity_iterations=monotonicity_iterations,
+            negative_control_iterations=negative_control_iterations,
+            bucket_dimension="conviction",
+        )
+        if readiness.conviction_feature_coverage_ready
+        else None
+    )
+
+    confirmatory_gate = _load_confirmatory_gate(
+        confirmatory_report_path,
+        candidate_hypothesis=candidate_hypothesis,
+        expected_database_path=selected_db,
+    )
+    go_no_go = _evaluate_event_study_gates(
+        readiness=readiness,
+        event_study=event_study,
+        bucket_count=bucket_count,
+        min_fold_count=min_fold_count,
+        min_test_events=min_test_events,
+        max_missing_price_skip_rate=max_missing_price_skip_rate,
+        core_horizons=(5, 10),
+        ci_lower_bound_bps=ci_lower_bound_bps,
+        fdr_q_threshold=fdr_q_threshold,
+        confirmatory_gate=confirmatory_gate,
+    )
+
+    total_cluster_packets = sum(event.cluster_packet_count for event in canonical_events)
+    canonical_count = len(canonical_events)
+    db_path = selected_db
+    db_hash = _file_sha256(db_path) if db_path.exists() else None
+    db_size_bytes = db_path.stat().st_size if db_path.exists() else None
+    report: dict[str, object] = {
+        "analysis_class": "exploratory_oos_diagnostic",
+        "confirmatory_eligible": False,
+        "run_timestamp_utc": datetime.now(tz=UTC).isoformat(),
+        "database_metadata": {
+            "database_path": str(selected_db.resolve()),
+            "database_sha256": db_hash,
+            "database_size_bytes": db_size_bytes,
+        },
+        "requested_start_date": start_date.isoformat(),
+        "requested_end_date": end_date.isoformat(),
+        "date_window_mode": date_window_mode,
+        "benchmark_symbol": benchmark,
+        "horizons": horizons,
+        "bucket_count": bucket_count,
+        "dedupe_diagnostics": {
+            "raw_scored_signals": len(raw_signals),
+            "canonical_events": canonical_count,
+            "collapsed_duplicate_count": max(0, len(raw_signals) - canonical_count),
+            "cluster_packet_total": total_cluster_packets,
+            "cluster_packet_average": (
+                total_cluster_packets / canonical_count if canonical_count > 0 else 0.0
+            ),
+        },
+        "readiness": _metrics_to_dict(readiness),
+        "skip_diagnostics": {
+            "aggregate": event_study.aggregate_skip_diagnostics,
+            "aggregate_by_horizon": event_study.aggregate_skip_diagnostics_by_horizon,
+        },
+        "folds": [_metrics_to_dict(fold) for fold in event_study.folds],
+        "skipped_folds": [_metrics_to_dict(fold) for fold in event_study.skipped_folds],
+        "aggregate_bucket_metrics": [
+            _metrics_to_dict(metric) for metric in event_study.aggregate_bucket_metrics
+        ],
+        "monotonicity": [_metrics_to_dict(item) for item in event_study.monotonicity],
+        "negative_control": [_metrics_to_dict(item) for item in event_study.negative_control],
+        "conviction_bucket_analysis": {
+            "available": conviction_event_study is not None,
+            "unavailable_reason": (
+                None
+                if conviction_event_study is not None
+                else "conviction_feature_coverage_below_threshold"
+            ),
+            "folds": (
+                [_metrics_to_dict(fold) for fold in conviction_event_study.folds]
+                if conviction_event_study is not None
+                else []
+            ),
+            "skipped_folds": (
+                [_metrics_to_dict(fold) for fold in conviction_event_study.skipped_folds]
+                if conviction_event_study is not None
+                else []
+            ),
+            "aggregate_bucket_metrics": (
+                [
+                    _metrics_to_dict(metric)
+                    for metric in conviction_event_study.aggregate_bucket_metrics
+                ]
+                if conviction_event_study is not None
+                else []
+            ),
+            "monotonicity": (
+                [_metrics_to_dict(item) for item in conviction_event_study.monotonicity]
+                if conviction_event_study is not None
+                else []
+            ),
+            "negative_control": (
+                [_metrics_to_dict(item) for item in conviction_event_study.negative_control]
+                if conviction_event_study is not None
+                else []
+            ),
+        },
+        "confirmatory_gate": confirmatory_gate,
+        "price_errors": price_errors,
+        "go_no_go": go_no_go,
+    }
+
+    if output_json_path is not None:
+        output_json_path.parent.mkdir(parents=True, exist_ok=True)
+        output_json_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=_json_default),
+            encoding="utf-8",
+        )
+    if output_csv_path is not None:
+        _write_event_study_csv(
+            output_csv_path,
+            aggregate_bucket_metrics=cast(
+                list[dict[str, object]],
+                report["aggregate_bucket_metrics"],
+            ),
+        )
+
+    typer.echo(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+    if not bool(go_no_go.get("decision_grade", False)):
+        raise typer.Exit(code=3)
 
 
 @ops_app.command("autopilot")
@@ -1305,6 +2889,31 @@ def ops_autopilot(
     approve_score_min: float = typer.Option(90.0, "--approve-score-min"),
     approve_net_buy_shares_min: float = typer.Option(0.0, "--approve-net-buy-shares-min"),
     reject_score_max: float = typer.Option(35.0, "--reject-score-max"),
+    conviction_lookback_days: int = typer.Option(
+        365,
+        "--conviction-lookback-days",
+        min=60,
+        max=3650,
+    ),
+    conviction_min_history_samples: int = typer.Option(
+        200,
+        "--conviction-min-history-samples",
+        min=10,
+        max=100000,
+    ),
+    conviction_min_role_samples: int = typer.Option(
+        40,
+        "--conviction-min-role-samples",
+        min=5,
+        max=10000,
+    ),
+    conviction_min_score: float = typer.Option(70.0, "--conviction-min-score"),
+    conviction_reject_max: float = typer.Option(30.0, "--conviction-reject-max"),
+    conviction_value_pct_min: float = typer.Option(50.0, "--conviction-value-pct-min"),
+    conviction_holding_pct_min: float = typer.Option(60.0, "--conviction-holding-pct-min"),
+    conviction_liquidity_pct_min: float = typer.Option(65.0, "--conviction-liquidity-pct-min"),
+    director_turnover_min: float = typer.Option(0.1, "--director-turnover-min"),
+    shock_turnover_min: float = typer.Option(0.25, "--shock-turnover-min"),
     quant_agent_id: str = typer.Option("quant-insider", "--quant-agent-id"),
     quant_thinking: str = typer.Option("low", "--quant-thinking"),
     quant_timeout_seconds: int = typer.Option(120, "--quant-timeout-seconds", min=10, max=900),
@@ -1324,11 +2933,25 @@ def ops_autopilot(
         True,
         "--notify-approve-only/--notify-all-decisions",
     ),
+    output_log_path: Path | None = typer.Option(  # noqa: B008
+        None, "--output-log", hidden=True
+    ),
+    error_log_path: Path | None = typer.Option(  # noqa: B008
+        None, "--error-log", hidden=True
+    ),
 ) -> None:
     """
     Run SEC ingestion + auto-decision loop and notify for approved signals by default.
     """
     settings = get_settings()
+
+    def append_process_log(path: Path | None, message: str) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(message.rstrip() + "\n")
+
     decision_engine = decision_engine.strip().lower()
     if decision_engine not in {"quant", "rules"}:
         typer.secho(
@@ -1341,6 +2964,53 @@ def ops_autopilot(
     if quant_thinking not in {"off", "minimal", "low", "medium", "high"}:
         typer.secho(
             "invalid --quant-thinking (expected off|minimal|low|medium|high)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if conviction_min_score < 0 or conviction_min_score > 100:
+        typer.secho(
+            "invalid --conviction-min-score (expected 0..100)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if conviction_reject_max < 0 or conviction_reject_max > 100:
+        typer.secho(
+            "invalid --conviction-reject-max (expected 0..100)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if conviction_reject_max > conviction_min_score:
+        typer.secho(
+            "--conviction-reject-max cannot exceed --conviction-min-score",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    for option_name, threshold in (
+        ("--conviction-value-pct-min", conviction_value_pct_min),
+        ("--conviction-holding-pct-min", conviction_holding_pct_min),
+        ("--conviction-liquidity-pct-min", conviction_liquidity_pct_min),
+    ):
+        if threshold < 0 or threshold > 100:
+            typer.secho(
+                f"invalid {option_name} (expected 0..100)",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
+    if director_turnover_min < 0:
+        typer.secho(
+            "invalid --director-turnover-min (expected >= 0)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if shock_turnover_min < 0:
+        typer.secho(
+            "invalid --shock-turnover-min (expected >= 0)",
             fg=typer.colors.RED,
             err=True,
         )
@@ -1365,16 +3035,85 @@ def ops_autopilot(
         enrich_result = enrich_filings_with_xml_url(settings, limit=enrich_limit)
         enqueue_result = enqueue_review_packets(settings, limit=enqueue_limit)
         pending = list_pending_review_packets(settings.database_path, limit=decision_limit)
+        conviction_history = _load_conviction_history(
+            settings.database_path,
+            as_of_date=date.today(),
+            lookback_days=conviction_lookback_days,
+        )
+        baseline_rules: dict[str, AutoDecisionRuleResult] = {}
+        for packet in pending:
+            packet_id_obj = packet.get("packet_id")
+            if not isinstance(packet_id_obj, str):
+                continue
+            baseline_rule = _auto_decide_packet(
+                packet,
+                approve_score_min=approve_score_min,
+                approve_net_buy_shares_min=approve_net_buy_shares_min,
+                reject_score_max=reject_score_max,
+            )
+            baseline_rules[packet_id_obj] = _apply_conviction_baseline(
+                baseline_rule,
+                packet,
+                history=conviction_history,
+                min_history_samples=conviction_min_history_samples,
+                min_role_samples=conviction_min_role_samples,
+                conviction_min_score=conviction_min_score,
+                conviction_reject_max=conviction_reject_max,
+                conviction_value_pct_min=conviction_value_pct_min,
+                conviction_holding_pct_min=conviction_holding_pct_min,
+                conviction_liquidity_pct_min=conviction_liquidity_pct_min,
+                director_turnover_min=director_turnover_min,
+                shock_turnover_min=shock_turnover_min,
+            )
         quant_decisions: dict[str, AutoDecisionRuleResult] = {}
         quant_error: str | None = None
         if decision_engine == "quant" and pending:
+            quant_candidates = [
+                packet
+                for packet in pending
+                if isinstance(packet.get("packet_id"), str)
+                and baseline_rules.get(str(packet.get("packet_id"))) is not None
+                # Route BOTH baseline approvals and baseline escalations to the quant judge.
+                # "escalate" is the baseline explicitly saying it cannot decide -- that is exactly
+                # the case a stronger judge exists for. Before 2026-08-10 only approvals were sent,
+                # so when baseline approvals dried up (last one 2026-07-10) the judge was starved to
+                # zero candidates and every ambiguous filing was silently dropped: 167 escalations
+                # accumulated in Aug 2026 alone, including one scoring 82.67. Hard baseline rejects
+                # still never reach the judge, which keeps the LLM cost on the ambiguous minority.
+                and baseline_rules[str(packet.get("packet_id"))].decision in ("approve", "escalate")
+            ]
             quant_decisions, quant_error = _decide_packets_with_quant(
-                pending,
+                quant_candidates,
                 quant_agent_id=quant_agent_id,
                 quant_timeout_seconds=quant_timeout_seconds,
                 quant_thinking=quant_thinking,
                 quant_batch_size=quant_batch_size,
             )
+            # OBSERVABILITY (2026-08-10): quant_error used to be consumed silently by the
+            # fallback-to-baseline branch, so a dead decision engine looked identical to a quiet
+            # market. That is how the judge stayed broken from ~May to Aug 2026 with a clean
+            # error log. Always surface it; the counters alone cannot distinguish the two.
+            if quant_error is not None:
+                quant_message = (
+                    f"quant decision engine degraded ({len(quant_decisions)}/"
+                    f"{len(quant_candidates)} decided): {quant_error}"
+                )
+                typer.secho(
+                    quant_message,
+                    fg=typer.colors.YELLOW,
+                    err=True,
+                )
+                append_process_log(error_log_path, quant_message)
+            elif quant_candidates:
+                quant_message = (
+                    f"quant decided {len(quant_decisions)}/{len(quant_candidates)} candidates"
+                )
+                typer.secho(
+                    quant_message,
+                    fg=typer.colors.GREEN,
+                    err=True,
+                )
+                append_process_log(output_log_path, quant_message)
 
         decided = 0
         approved = 0
@@ -1382,6 +3121,10 @@ def ops_autopilot(
         escalated = 0
         deadlettered = 0
         notified = 0
+        notify_suppressed_duplicate = 0
+        # Seeded from recent approvals so co-filings landing in LATER cycles are still caught,
+        # then extended in-cycle so co-filings inside a single batch collapse too.
+        alerted_event_keys = _recent_alerted_event_keys(settings.database_path)
         approved_high_edge = 0
         rejected_low_edge = 0
         escalated_missing_context = 0
@@ -1406,37 +3149,57 @@ def ops_autopilot(
                 if decision_key is not None:
                     seen_decision_keys.add(decision_key)
                 if decision_engine == "quant":
-                    quant_rule = quant_decisions.get(packet_id_obj)
-                    if quant_rule is not None:
-                        rule = quant_rule
-                    elif quant_error is not None and quant_fallback_to_rules:
-                        rule = _auto_decide_packet(
-                            packet,
-                            approve_score_min=approve_score_min,
-                            approve_net_buy_shares_min=approve_net_buy_shares_min,
-                            reject_score_max=reject_score_max,
-                        )
+                    packet_baseline_rule = baseline_rules.get(packet_id_obj)
+                    # Only hard baseline REJECTS short-circuit the judge; approvals and escalations
+                    # are both adjudicated by quant (see the quant_candidates note above).
+                    if packet_baseline_rule is not None and packet_baseline_rule.decision not in (
+                        "approve",
+                        "escalate",
+                    ):
+                        rule = packet_baseline_rule
                     else:
-                        reason = (
-                            f"quant unavailable for packet={packet_id_obj}: {quant_error}"
-                            if quant_error
-                            else f"quant missing decision for packet={packet_id_obj}"
-                        )
-                        rule = AutoDecisionRuleResult(
-                            decision="escalate",
-                            reason=reason,
-                            source="quant-fallback",
-                            confidence=None,
-                            reason_code=(
-                                "quant_schema_invalid"
-                                if quant_error and "schema" in quant_error.lower()
-                                else "quant_unavailable"
+                        quant_rule = quant_decisions.get(packet_id_obj)
+                        if quant_rule is not None:
+                            if packet_baseline_rule is not None:
+                                quant_rule.conviction_score = packet_baseline_rule.conviction_score
+                                quant_rule.conviction_holding_pct = (
+                                    packet_baseline_rule.conviction_holding_pct
+                                )
+                                quant_rule.conviction_value_pct = (
+                                    packet_baseline_rule.conviction_value_pct
+                                )
+                                quant_rule.conviction_liquidity_pct = (
+                                    packet_baseline_rule.conviction_liquidity_pct
+                                )
+                            rule = quant_rule
+                        elif quant_error is not None and quant_fallback_to_rules:
+                            rule = packet_baseline_rule or _auto_decide_packet(
+                                packet,
+                                approve_score_min=approve_score_min,
+                                approve_net_buy_shares_min=approve_net_buy_shares_min,
+                                reject_score_max=reject_score_max,
+                            )
+                        else:
+                            reason = (
+                                f"quant unavailable for packet={packet_id_obj}: {quant_error}"
                                 if quant_error
-                                else "quant_missing_decision"
-                            ),
-                        )
+                                else f"quant missing decision for packet={packet_id_obj}"
+                            )
+                            rule = AutoDecisionRuleResult(
+                                decision="escalate",
+                                reason=reason,
+                                source="quant-fallback",
+                                confidence=None,
+                                reason_code=(
+                                    "quant_schema_invalid"
+                                    if quant_error and "schema" in quant_error.lower()
+                                    else "quant_unavailable"
+                                    if quant_error
+                                    else "quant_missing_decision"
+                                ),
+                            )
                 else:
-                    rule = _auto_decide_packet(
+                    rule = baseline_rules.get(packet_id_obj) or _auto_decide_packet(
                         packet,
                         approve_score_min=approve_score_min,
                         approve_net_buy_shares_min=approve_net_buy_shares_min,
@@ -1449,6 +3212,15 @@ def ops_autopilot(
                     approve_net_buy_shares_min=approve_net_buy_shares_min,
                     quant_min_confidence=quant_min_confidence,
                 )
+                if rule.conviction_score is None:
+                    packet_baseline_rule = baseline_rules.get(packet_id_obj)
+                    if packet_baseline_rule is not None:
+                        rule.conviction_score = packet_baseline_rule.conviction_score
+                        rule.conviction_holding_pct = packet_baseline_rule.conviction_holding_pct
+                        rule.conviction_value_pct = packet_baseline_rule.conviction_value_pct
+                        rule.conviction_liquidity_pct = (
+                            packet_baseline_rule.conviction_liquidity_pct
+                        )
 
             payload: dict[str, object] = {
                 "packet_id": packet_id_obj,
@@ -1460,15 +3232,28 @@ def ops_autopilot(
             }
             if rule.confidence is not None:
                 payload["confidence"] = round(rule.confidence, 4)
+            if rule.conviction_score is not None:
+                payload["conviction_score"] = round(rule.conviction_score, 2)
+            if rule.conviction_holding_pct is not None:
+                payload["conviction_holding_pct"] = round(rule.conviction_holding_pct, 2)
+            if rule.conviction_value_pct is not None:
+                payload["conviction_value_pct"] = round(rule.conviction_value_pct, 2)
+            if rule.conviction_liquidity_pct is not None:
+                payload["conviction_liquidity_pct"] = round(
+                    rule.conviction_liquidity_pct,
+                    2,
+                )
 
             try:
                 updated = apply_decision(settings.database_path, payload)
             except DecisionValidationError as exc:
+                failure_message = f"autopilot decision failed for packet={packet_id_obj}: {exc}"
                 typer.secho(
-                    f"autopilot decision failed for packet={packet_id_obj}: {exc}",
+                    failure_message,
                     fg=typer.colors.RED,
                     err=True,
                 )
+                append_process_log(error_log_path, failure_message)
                 continue
 
             if updated != 1:
@@ -1484,10 +3269,10 @@ def ops_autopilot(
             else:
                 escalated += 1
 
-            if (
-                rule.decision == "approve"
-                and rule.reason_code in {"quant_high_edge", "rules_high_edge"}
-            ):
+            if rule.decision == "approve" and rule.reason_code in {
+                "quant_high_edge",
+                "rules_high_edge",
+            }:
                 approved_high_edge += 1
             if rule.decision == "reject" and rule.reason_code.startswith("reject_"):
                 rejected_low_edge += 1
@@ -1498,6 +3283,21 @@ def ops_autopilot(
 
             should_notify = notify and (not notify_approve_only or rule.decision == "approve")
             if should_notify:
+                event_key = _economic_event_key(packet)
+                if event_key is not None and event_key in alerted_event_keys:
+                    notify_suppressed_duplicate += 1
+                    duplicate_message = (
+                        f"suppressing duplicate alert for packet={packet_id_obj}: "
+                        f"same economic event already alerted ({event_key})"
+                    )
+                    typer.secho(
+                        duplicate_message,
+                        fg=typer.colors.YELLOW,
+                        err=True,
+                    )
+                    append_process_log(output_log_path, duplicate_message)
+                    should_notify = False
+            if should_notify:
                 try:
                     notify_payload = {k: str(v) for k, v in payload.items()}
                     _send_review_notification(
@@ -1506,13 +3306,20 @@ def ops_autopilot(
                         packet=packet,
                         dry_message=rule.reason,
                     )
+                    mark_notification_delivered(settings.database_path, packet_id_obj)
+                    if event_key is not None:
+                        alerted_event_keys.add(event_key)
                     notified += 1
                 except NtfyNotificationError as exc:
+                    failure_message = (
+                        f"autopilot notification failed for packet={packet_id_obj}: {exc}"
+                    )
                     typer.secho(
-                        f"autopilot notification failed for packet={packet_id_obj}: {exc}",
+                        failure_message,
                         fg=typer.colors.RED,
                         err=True,
                     )
+                    append_process_log(error_log_path, failure_message)
 
         cycle = AutoPilotCycleResult(
             fetched=poll_result.fetched,
@@ -1533,43 +3340,471 @@ def ops_autopilot(
             rejected_low_edge=rejected_low_edge,
             escalated_missing_context=escalated_missing_context,
             escalated_schema_invalid=escalated_schema_invalid,
+            notify_suppressed_duplicate=notify_suppressed_duplicate,
         )
-        typer.echo(
+        cycle_message = (
             "ops autopilot cycle completed "
             f"(fetched={cycle.fetched}, inserted={cycle.inserted}, "
             f"skipped_existing={cycle.skipped_existing}, "
             f"enrich_scanned={cycle.enriched_scanned}, enrich_updated={cycle.enriched_updated}, "
             f"enqueue_processed={cycle.enqueue_processed}, "
             f"enqueue_enqueued={cycle.enqueue_enqueued}, "
-                f"pending_seen={cycle.pending_seen}, decided={cycle.decided}, "
-                f"approved={cycle.approved}, rejected={cycle.rejected}, "
-                f"escalated={cycle.escalated}, deadlettered={cycle.deadlettered}, "
-                f"notified={cycle.notified}, approved_high_edge={cycle.approved_high_edge}, "
-                f"rejected_low_edge={cycle.rejected_low_edge}, "
-                f"escalated_missing_context={cycle.escalated_missing_context}, "
-                f"escalated_schema_invalid={cycle.escalated_schema_invalid})"
+            f"pending_seen={cycle.pending_seen}, decided={cycle.decided}, "
+            f"approved={cycle.approved}, rejected={cycle.rejected}, "
+            f"escalated={cycle.escalated}, deadlettered={cycle.deadlettered}, "
+            f"notified={cycle.notified}, approved_high_edge={cycle.approved_high_edge}, "
+            f"rejected_low_edge={cycle.rejected_low_edge}, "
+            f"escalated_missing_context={cycle.escalated_missing_context}, "
+            f"escalated_schema_invalid={cycle.escalated_schema_invalid}, "
+            f"notify_suppressed_duplicate={cycle.notify_suppressed_duplicate})"
         )
+        typer.echo(cycle_message)
+        append_process_log(output_log_path, cycle_message)
         return cycle
 
     def _run_cycle_with_recovery(*, loop_mode: bool) -> AutoPilotCycleResult | None:
         try:
             return _run_cycle()
         except (SecHttpError, SecRssParseError) as exc:
+            failure_message = f"ops autopilot cycle failed (retryable, {type(exc).__name__}: {exc})"
             typer.secho(
-                "ops autopilot cycle failed "
-                f"(retryable, {type(exc).__name__}: {exc})",
+                failure_message,
                 fg=typer.colors.RED,
                 err=True,
             )
+            append_process_log(error_log_path, failure_message)
             if loop_mode:
                 return None
             raise typer.Exit(code=1) from exc
 
-    _run_cycle_with_recovery(loop_mode=not once)
-    if not once:
-        while True:
-            time.sleep(interval)
-            _run_cycle_with_recovery(loop_mode=True)
+    try:
+        _run_cycle_with_recovery(loop_mode=not once)
+        if not once:
+            while True:
+                time.sleep(interval)
+                _run_cycle_with_recovery(loop_mode=True)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        failure_message = f"autopilot process failed ({type(exc).__name__}: {exc})"
+        append_process_log(error_log_path, failure_message)
+        raise
+
+
+@ops_app.command("signal-study")
+def ops_signal_study(
+    database_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--database-path",
+        help="SQLite snapshot to analyze. Defaults to DATABASE_PATH.",
+    ),
+    cohort: str = typer.Option(
+        "live",
+        "--cohort",
+        help="live or historical-replay",
+    ),
+    start_date_text: str = typer.Option("2026-02-11", "--start-date"),
+    end_date_text: str = typer.Option("2026-08-17", "--end-date"),
+    bootstrap_iterations: int = typer.Option(10_000, "--bootstrap-iterations", min=100),
+    refresh_companyfacts_enabled: bool = typer.Option(
+        False,
+        "--refresh-companyfacts/--no-refresh-companyfacts",
+    ),
+    refresh_intraday_enabled: bool = typer.Option(
+        False,
+        "--refresh-intraday/--no-refresh-intraday",
+        help="Fetch missing one-minute RTH sessions from the local IB Gateway.",
+    ),
+    ib_client_id: int = typer.Option(172, "--ib-client-id", min=1),
+    matched_control_iterations: int = typer.Option(
+        0,
+        "--matched-control-iterations",
+        min=0,
+        help="Optional same-symbol random-date falsification iterations for E07.",
+    ),
+    output_json_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output-json",
+    ),
+) -> None:
+    """Evaluate the preregistered strategy family on delivered live approvals."""
+
+    try:
+        start_date = date.fromisoformat(start_date_text)
+        end_date = date.fromisoformat(end_date_text)
+    except ValueError as exc:
+        typer.secho("invalid date format; expected YYYY-MM-DD", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    if start_date > end_date:
+        typer.secho("start-date cannot be after end-date", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    settings = get_settings()
+    selected_db = database_path or Path(settings.database_path)
+    normalized_cohort = cohort.strip().lower()
+    if normalized_cohort == "live":
+        signals = load_delivered_signals(
+            str(selected_db),
+            start_date=start_date,
+            end_date=end_date,
+        )
+    elif normalized_cohort == "historical-replay":
+        signals = load_historical_approved_replay(
+            str(selected_db),
+            start_date=start_date,
+            end_date=end_date,
+        )
+    else:
+        typer.secho("cohort must be live or historical-replay", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    price_start = start_date - timedelta(days=120)
+    price_end = end_date + timedelta(days=40)
+    symbols = sorted({signal.symbol for signal in signals} | {"SPY"})
+    bars_by_symbol = {
+        symbol: get_price_bars(
+            str(selected_db),
+            symbol=symbol,
+            start_date=price_start,
+            end_date=price_end,
+        )
+        for symbol in symbols
+    }
+    companyfacts_refresh: dict[str, object] = {
+        "requested": 0,
+        "fetched": 0,
+        "reused": 0,
+        "errors": [],
+    }
+    if refresh_companyfacts_enabled:
+        companyfacts_refresh = refresh_companyfacts(
+            str(selected_db),
+            ciks=[signal.cik for signal in signals],
+            client=SecHttpClient(settings=settings),
+        )
+    cached_companyfacts = load_cached_companyfacts(str(selected_db))
+    market_caps: dict[str, float] = {}
+    for signal in signals:
+        normalized_cik = "".join(char for char in signal.cik if char.isdigit()).zfill(10)
+        payload = cached_companyfacts.get(normalized_cik)
+        shares = (
+            shares_outstanding_as_of(payload, as_of=signal.signal_at.date())
+            if payload is not None
+            else None
+        )
+        if shares is None:
+            continue
+        features = compute_point_in_time_features(
+            signal,
+            symbol_bars=bars_by_symbol.get(signal.symbol, ()),
+            benchmark_bars=bars_by_symbol.get("SPY", ()),
+        )
+        if features.prior_close is not None:
+            market_caps[signal.packet_id] = shares * features.prior_close
+    intraday_requests = (
+        build_intraday_requests(
+            signals,
+            benchmark_daily_bars=bars_by_symbol.get("SPY", ()),
+        )
+        if normalized_cohort == "live"
+        else []
+    )
+    intraday_refresh: dict[str, object] = {
+        "requested": len(intraday_requests),
+        "fetched": 0,
+        "reused": 0,
+        "errors": [],
+    }
+    if refresh_intraday_enabled and normalized_cohort == "live":
+        intraday_refresh = refresh_ibkr_minute_bars(
+            str(selected_db),
+            requests=intraday_requests,
+            client_id=ib_client_id,
+        )
+    minute_bars_by_symbol = (
+        {symbol: get_minute_bars(str(selected_db), symbol=symbol) for symbol in symbols}
+        if normalized_cohort == "live"
+        else {}
+    )
+    cached_intraday_pairs = completed_minute_bar_sessions(
+        str(selected_db),
+        requests=intraday_requests,
+    )
+    verified_minute_bars_by_symbol = filter_completed_minute_bars(
+        minute_bars_by_symbol,
+        completed_sessions=cached_intraday_pairs,
+    )
+    minute_bars_payload = (
+        verified_minute_bars_by_symbol
+        if any(verified_minute_bars_by_symbol.values())
+        else None
+    )
+    report = evaluate_daily_hypothesis_family(
+        signals,
+        bars_by_symbol=bars_by_symbol,
+        bootstrap_iterations=bootstrap_iterations,
+        market_caps=market_caps,
+        minute_bars_by_symbol=minute_bars_payload,
+        robustness_split_date=(
+            date(2026, 7, 1)
+            if normalized_cohort == "live"
+            else start_date + timedelta(days=(end_date - start_date).days // 2)
+        ),
+    )
+    candidate_diagnostics: dict[str, object] = {}
+    for candidate_filter in ("F00", "F06"):
+        candidate_id = f"E07|{candidate_filter}"
+        candidate_observations = collect_daily_strategy_observations(
+            signals,
+            rule=DAILY_EXECUTION_RULES[6],
+            filter_id=candidate_filter,
+            bars_by_symbol=bars_by_symbol,
+            market_caps=market_caps,
+        )
+        candidate_block: dict[str, object] = {
+            "portfolio_20_slots": fixed_slot_portfolio_summary(
+                candidate_observations,
+                slots=20,
+            )
+        }
+        if matched_control_iterations > 0:
+            candidate_block["same_symbol_random_date_control"] = matched_random_date_control(
+                signals,
+                rule=DAILY_EXECUTION_RULES[6],
+                filter_id=candidate_filter,
+                bars_by_symbol=bars_by_symbol,
+                study_start=start_date,
+                study_end=end_date,
+                iterations=matched_control_iterations,
+            )
+        candidate_diagnostics[candidate_id] = candidate_block
+    report.update(
+        {
+            "run_timestamp_utc": datetime.now(UTC).isoformat(),
+            "cohort": normalized_cohort,
+            "database_path": str(selected_db.resolve()),
+            "database_sha256": _file_sha256(selected_db) if selected_db.is_file() else None,
+            "database_size_bytes": selected_db.stat().st_size if selected_db.is_file() else None,
+            "requested_start_date": start_date.isoformat(),
+            "requested_end_date": end_date.isoformat(),
+            "symbols_requested": len(symbols),
+            "symbols_with_prices": sum(bool(bars) for bars in bars_by_symbol.values()),
+            "companyfacts_refresh": companyfacts_refresh,
+            "point_in_time_market_cap_coverage": (
+                len(market_caps) / len(signals) if signals else 0.0
+            ),
+            "intraday_refresh": intraday_refresh,
+            "intraday_cached_request_coverage": {
+                "requested": len(intraday_requests),
+                "covered": sum(request in cached_intraday_pairs for request in intraday_requests),
+                "coverage_rate": (
+                    sum(request in cached_intraday_pairs for request in intraday_requests)
+                    / len(intraday_requests)
+                    if intraday_requests
+                    else None
+                ),
+            },
+            "candidate_diagnostics": candidate_diagnostics,
+            "preregistration": "docs/research/SIGNAL-STUDY-2026-08-17-PREREG.md",
+        }
+    )
+    if output_json_path is not None:
+        output_json_path.parent.mkdir(parents=True, exist_ok=True)
+        output_json_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "conclusion": report["conclusion"],
+                "signal_count": report["signal_count"],
+                "surviving_hypotheses": report["surviving_hypotheses"],
+                "daily_execution_coverage": report["daily_execution_coverage"],
+                "output_json": str(output_json_path) if output_json_path else None,
+            },
+            indent=2,
+        )
+    )
+
+
+@ops_app.command("live-canary")
+def ops_live_canary(
+    database_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--database-path",
+        help="Live insider-alerts SQLite database. Defaults to DATABASE_PATH.",
+    ),
+    ledger_path: Path = typer.Option(  # noqa: B008
+        Path("data/live_canary.db"),
+        "--ledger-path",
+        help="Separate append-oriented canary ledger.",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(4001, "--port", min=1, max=65535),
+    client_id: int = typer.Option(173, "--client-id", min=1),
+    account: str | None = typer.Option(
+        None,
+        "--account",
+        help="Required if the Gateway login exposes more than one account.",
+    ),
+    live: bool = typer.Option(
+        False,
+        "--live/--shadow-only",
+        help="Permit live orders only when INSIDER_LIVE_ARM also exactly matches the arm phrase.",
+    ),
+    arm_phrase_option: str | None = typer.Option(
+        None,
+        "--arm-phrase",
+        hidden=True,
+    ),
+    loop: bool = typer.Option(False, "--loop/--once"),
+    interval: int = typer.Option(60, "--interval", min=15),
+    notify: bool = typer.Option(False, "--notify/--no-notify"),
+    invalid_commission_handling: str = typer.Option(
+        "reject",
+        "--invalid-commission-handling",
+        help=(
+            "How to handle previews with neither an exact commission nor a valid IBKR "
+            "range: reject (default) or fallback_to_cap."
+        ),
+    ),
+    output_log_path: Path | None = typer.Option(  # noqa: B008
+        None, "--output-log", hidden=True
+    ),
+    error_log_path: Path | None = typer.Option(  # noqa: B008
+        None, "--error-log", hidden=True
+    ),
+) -> None:
+    """Run the prospective E07/F00 shadow book and the capped IBKR live canary."""
+
+    settings = get_settings()
+    selected_db = database_path or Path(settings.database_path)
+    arm_phrase = arm_phrase_option or os.environ.get("INSIDER_LIVE_ARM", "")
+    config = CanaryConfig(
+        source_db=str(selected_db),
+        ledger_db=str(ledger_path),
+        host=host,
+        port=port,
+        client_id=client_id,
+        account=account,
+        live_requested=live,
+        arm_phrase=arm_phrase,
+        poll_seconds=interval,
+        invalid_commission_handling=cast(
+            Literal["fallback_to_cap", "reject"], invalid_commission_handling
+        ),
+    )
+    if live and arm_phrase != ARM_PHRASE:
+        typer.secho(
+            "live requested but INSIDER_LIVE_ARM is absent or incorrect; running shadow-only",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    runner = CanaryRunner(
+        config,
+        IbkrBroker(host=host, port=port, client_id=client_id, account=account),
+    )
+    notifier = NtfyNotifier(settings) if notify else None
+
+    def append_process_log(path: Path | None, message: str) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(message.rstrip() + "\n")
+
+    async def run() -> None:
+        try:
+            while True:
+                if runner.source_revision_changed():
+                    message = (
+                        "live canary source changed; exiting so the hidden watchdog "
+                        "can restart the worker"
+                    )
+                    typer.secho(message, fg=typer.colors.YELLOW, err=True)
+                    append_process_log(error_log_path, message)
+                    return
+                try:
+                    result = await runner.cycle(disconnect_after=not loop)
+                    result_line = json.dumps(asdict(result), sort_keys=True)
+                    typer.echo(result_line)
+                    append_process_log(output_log_path, result_line)
+                    if notifier is not None and any(
+                        (
+                            result.live_submitted,
+                            result.live_opened,
+                            result.live_closed,
+                        )
+                    ):
+                        try:
+                            notifier.send(
+                                "IBKR insider canary activity",
+                                (
+                                    f"submitted={result.live_submitted}, "
+                                    f"opened={result.live_opened}, "
+                                    f"closed={result.live_closed}; "
+                                    f"gate={result.live_gate}"
+                                ),
+                                tags=["chart_with_upwards_trend"],
+                                priority=4,
+                            )
+                        except NtfyNotificationError as exc:
+                            typer.secho(
+                                f"canary notification failed: {exc}",
+                                fg=typer.colors.YELLOW,
+                                err=True,
+                            )
+                            append_process_log(
+                                error_log_path,
+                                f"canary notification failed: {exc}",
+                            )
+                except (IbkrExecutionError, OSError, sqlite3.Error, ValueError) as exc:
+                    typer.secho(
+                        f"live canary cycle failed closed: {exc}",
+                        fg=typer.colors.RED,
+                        err=True,
+                    )
+                    append_process_log(error_log_path, f"live canary cycle failed closed: {exc}")
+                    if not loop:
+                        raise typer.Exit(code=1) from exc
+                if not loop:
+                    return
+                await asyncio.sleep(poll_delay_seconds(config, datetime.now(UTC)))
+        finally:
+            runner.broker.disconnect()
+
+    asyncio.run(run())
+
+
+@ops_app.command("live-canary-status")
+def ops_live_canary_status(
+    ledger_path: Path = typer.Option(  # noqa: B008
+        Path("data/live_canary.db"),
+        "--ledger-path",
+    ),
+) -> None:
+    """Show canary state without connecting to IBKR or changing broker state."""
+
+    typer.echo(json.dumps(live_canary_status_report(str(ledger_path)), indent=2, sort_keys=True))
+
+
+@ops_app.command("live-canary-watchdog")
+def ops_live_canary_watchdog(
+    worker_task_name: str = typer.Option(..., "--worker-task-name"),
+    ledger_path: Path = typer.Option(Path("data/live_canary.db"), "--ledger-path"),  # noqa: B008
+    stale_seconds: int = typer.Option(120, "--stale-seconds", min=30),
+    output_log_path: Path = typer.Option(  # noqa: B008
+        Path("logs/live-canary-watchdog.log"),
+        "--output-log",
+    ),
+) -> None:
+    """Restart the hidden canary worker when its durable heartbeat is stale."""
+
+    result = run_scheduled_task_watchdog(
+        ledger_db=str(ledger_path),
+        worker_task_name=worker_task_name,
+        stale_seconds=stale_seconds,
+    )
+    append_watchdog_log(output_log_path, result)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
 from insider_alerts.sec.models import FilingRef
@@ -33,6 +33,16 @@ def ensure_review_tables(db_path: str) -> None:
             )
             """
         )
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(review_packets)").fetchall()
+        }
+        if "notification_sent_at" not in columns:
+            try:
+                conn.execute("ALTER TABLE review_packets ADD COLUMN notification_sent_at TEXT")
+            except sqlite3.OperationalError as exc:
+                # A second service can finish this additive migration after our PRAGMA.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS deadletter_events (
@@ -42,6 +52,18 @@ def ensure_review_tables(db_path: str) -> None:
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_review_packets_accession_form_type
+            ON review_packets (accession_number, form_type)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_review_packets_status_created_at
+            ON review_packets (status, created_at DESC)
             """
         )
         conn.commit()
@@ -87,6 +109,52 @@ def enqueue_review_packet(db_path: str, ref: FilingRef, packet: Mapping[str, obj
         )
         conn.commit()
     return cursor.rowcount == 1
+
+
+def enqueue_review_packets_batch(
+    db_path: str,
+    packets: Sequence[tuple[FilingRef, Mapping[str, object]]],
+) -> int:
+    ensure_review_tables(db_path)
+    if not packets:
+        return 0
+
+    now = datetime.now(tz=UTC).isoformat()
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
+    for ref, packet in packets:
+        rows.append(
+            (
+                packet_id_for_ref(ref),
+                ref.accession_number,
+                ref.cik,
+                ref.form_type,
+                json.dumps(packet, separators=(",", ":"), sort_keys=True),
+                now,
+                now,
+            )
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        before = conn.total_changes
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO review_packets (
+                    packet_id, accession_number, cik, form_type,
+                    payload_json, created_at, updated_at
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM review_packets
+                    WHERE accession_number = ? AND form_type = ?
+                )
+                """,
+                (*row, row[1], row[3]),
+            )
+        conn.commit()
+        inserted = conn.total_changes - before
+    return int(inserted)
 
 
 def _validate_decision_payload(payload: Mapping[str, object]) -> None:
@@ -140,6 +208,23 @@ def apply_decision(db_path: str, payload: Mapping[str, object]) -> int:
                 (packet_id, str(payload["reason"]), encoded, now),
             )
 
+        conn.commit()
+    return int(cursor.rowcount)
+
+
+def mark_notification_delivered(db_path: str, packet_id: str) -> int:
+    """Record delivery only after the notification provider returns successfully."""
+    ensure_review_tables(db_path)
+    delivered_at = datetime.now(tz=UTC).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE review_packets
+            SET notification_sent_at = ?
+            WHERE packet_id = ?
+            """,
+            (delivered_at, packet_id),
+        )
         conn.commit()
     return int(cursor.rowcount)
 
