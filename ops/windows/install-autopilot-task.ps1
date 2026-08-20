@@ -61,6 +61,18 @@ Register-ScheduledTask `
   -Force | Out-Null
 
 if ($Start) {
+  $task = Get-ScheduledTask -TaskName $TaskName
+  if ($task.State -eq "Running") {
+    Stop-ScheduledTask -TaskName $TaskName
+    $deadline = (Get-Date).AddSeconds(15)
+    do {
+      Start-Sleep -Milliseconds 250
+      $task = Get-ScheduledTask -TaskName $TaskName
+    } while ($task.State -eq "Running" -and (Get-Date) -lt $deadline)
+    if ($task.State -eq "Running") {
+      throw "Timed out stopping the existing $TaskName worker."
+    }
+  }
   Start-ScheduledTask -TaskName $TaskName
 }
 

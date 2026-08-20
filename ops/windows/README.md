@@ -18,7 +18,9 @@ The task launches the virtualenv's `pythonw.exe` directly, so it never creates a
 console window and Task Scheduler retains ownership of the complete worker process
 chain. The worker reads `.env`, writes to `logs\autopilot.out.log` and
 `logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
-default.
+default. Passing `-Start` performs a controlled restart so deployed source changes
+are loaded immediately. The optional manual hidden launcher also invokes
+`pythonw.exe` directly and never routes through `cmd.exe`.
 
 Install the separate IBKR canary watchdog with:
 

@@ -10,6 +10,39 @@ from insider_alerts.review.queue import ensure_review_tables
 from insider_alerts.sec.store import init_db
 
 
+def _string_keyed_dict(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if isinstance(key, str)}
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _rationale_float(rationale: dict[str, object], name: str) -> float:
+    value = _optional_float(rationale.get(name))
+    return value if value is not None else 0.0
+
+
+def _rationale_bool(rationale: dict[str, object], name: str) -> bool:
+    value = rationale.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
 def _parse_iso_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
@@ -56,15 +89,10 @@ def load_scored_signals(
 
     signals: list[SignalEvent] = []
     for row in rows:
-        payload = json.loads(str(row["payload_json"]))
-        if not isinstance(payload, dict):
+        payload = _string_keyed_dict(json.loads(str(row["payload_json"])))
+        if not payload:
             continue
-        rationale = payload.get("rationale")
-        if not isinstance(rationale, dict):
-            rationale = {}
-        typed_rationale: dict[str, object] = {
-            str(key): value for key, value in rationale.items()
-        }
+        rationale = _string_keyed_dict(payload.get("rationale"))
 
         symbol_obj = payload.get("issuer_symbol")
         score_obj = payload.get("score")
@@ -73,35 +101,9 @@ def load_scored_signals(
         normalized_symbol = normalize_backtest_symbol(symbol_obj)
         if normalized_symbol is None:
             continue
-        if not isinstance(score_obj, (int, float, str)):
+        score = _optional_float(score_obj)
+        if score is None:
             continue
-        try:
-            score = float(score_obj)
-        except (TypeError, ValueError):
-            continue
-
-        def _float(
-            name: str, rationale_dict: dict[str, object] = typed_rationale
-        ) -> float:
-            value = rationale_dict.get(name)
-            if not isinstance(value, (int, float, str)):
-                return 0.0
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return 0.0
-
-        def _bool(
-            name: str, rationale_dict: dict[str, object] = typed_rationale
-        ) -> bool:
-            value = rationale_dict.get(name)
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return value != 0
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "y"}
-            return False
 
         role_tier_obj = rationale.get("role_tier")
         role_tier = role_tier_obj if isinstance(role_tier_obj, str) else "unknown"
@@ -112,11 +114,13 @@ def load_scored_signals(
                 symbol=normalized_symbol,
                 filed_at=_parse_iso_datetime(str(row["filed_at"])),
                 score=score,
-                open_market_buy_shares=_float("open_market_buy_shares"),
-                open_market_net_shares=_float("open_market_net_shares"),
-                has_10b5_1_plan=_bool("has_10b5_1_plan"),
-                has_equity_comp_event=_bool("has_equity_comp_event"),
-                has_tax_withholding_language=_bool("has_tax_withholding_language"),
+                open_market_buy_shares=_rationale_float(rationale, "open_market_buy_shares"),
+                open_market_net_shares=_rationale_float(rationale, "open_market_net_shares"),
+                has_10b5_1_plan=_rationale_bool(rationale, "has_10b5_1_plan"),
+                has_equity_comp_event=_rationale_bool(rationale, "has_equity_comp_event"),
+                has_tax_withholding_language=_rationale_bool(
+                    rationale, "has_tax_withholding_language"
+                ),
                 role_tier=role_tier,
             )
         )

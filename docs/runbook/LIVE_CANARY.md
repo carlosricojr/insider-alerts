@@ -47,12 +47,6 @@ Read-only one-cycle validation:
 .\.venv\Scripts\python.exe -m insider_alerts.cli ops live-canary --once
 ```
 
-Live background process (the checked-in launcher supplies the explicit arm phrase):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run-insider-live-canary-hidden.ps1
-```
-
 Install or refresh the invisible per-user Windows watchdog (logon start plus one-minute recovery):
 
 ```powershell
