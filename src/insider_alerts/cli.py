@@ -75,9 +75,11 @@ from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.review.queue import (
     DecisionValidationError,
     apply_decision,
+    ensure_review_tables,
     get_review_packet,
     list_deadletters,
     list_pending_review_packets,
+    mark_notification_delivered,
     replay_deadletter,
 )
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
@@ -1021,7 +1023,7 @@ def _recent_alerted_event_keys(
     *,
     lookback_days: int = 7,
 ) -> set[str]:
-    """Economic-event keys already approved (and therefore alerted) in the recent window.
+    """Economic-event keys with a confirmed notification delivery in the recent window.
 
     Group co-filings can land in different autopilot cycles minutes apart, so an in-cycle
     set is not enough -- the MKZR trio arrived across three cycles. The window is bounded so
@@ -1030,13 +1032,14 @@ def _recent_alerted_event_keys(
     cutoff = (datetime.now(UTC) - timedelta(days=lookback_days)).isoformat()
     keys: set[str] = set()
     try:
+        ensure_review_tables(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
                 SELECT packet_id, payload_json
                 FROM review_packets
-                WHERE updated_at >= ?
+                WHERE notification_sent_at >= ?
                   AND json_extract(decision_json, '$.decision') = 'approve'
                 """,
                 (cutoff,),
@@ -1834,6 +1837,7 @@ def review_decide(
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items()}
         _send_review_notification(settings, notify_payload, packet=packet)
+        mark_notification_delivered(settings.database_path, packet_id)
 
 
 @review_app.command("apply")
@@ -1879,6 +1883,8 @@ def review_apply(
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items() if isinstance(k, str)}
         _send_review_notification(settings, notify_payload, packet=packet)
+        if isinstance(packet_id_obj, str):
+            mark_notification_delivered(settings.database_path, packet_id_obj)
 
 
 @ops_app.command("deadletter-list")
@@ -2492,18 +2498,6 @@ def ops_event_study(
         end_date=end_date,
     )
 
-    readiness = audit_event_study_readiness(
-        settings.database_path,
-        start_date=start_date,
-        end_date=end_date,
-        canonical_events=[asdict(event) for event in canonical_events],
-        config=EventStudyReadinessConfig(
-            min_total_canonical_events=min_total_canonical_events,
-            min_monthly_canonical_events=min_monthly_canonical_events,
-            conviction_feature_coverage_min=conviction_feature_coverage_min,
-        ),
-    )
-
     unique_symbols = sorted({event.symbol for event in canonical_events})
     if benchmark:
         unique_symbols.append(benchmark)
@@ -2564,6 +2558,20 @@ def ops_event_study(
         if fetch_error is not None:
             price_errors.append(fetch_error)
 
+    # Price coverage is part of readiness. Audit only after the optional refresh so a
+    # successful first run cannot report the stale pre-refresh state.
+    readiness = audit_event_study_readiness(
+        settings.database_path,
+        start_date=start_date,
+        end_date=end_date,
+        canonical_events=[asdict(event) for event in canonical_events],
+        config=EventStudyReadinessConfig(
+            min_total_canonical_events=min_total_canonical_events,
+            min_monthly_canonical_events=min_monthly_canonical_events,
+            conviction_feature_coverage_min=conviction_feature_coverage_min,
+        ),
+    )
+
     event_study = run_oos_event_study(
         canonical_events,
         bars_by_symbol=bars_by_symbol,
@@ -2584,6 +2592,32 @@ def ops_event_study(
         bootstrap_iterations=bootstrap_iterations,
         monotonicity_iterations=monotonicity_iterations,
         negative_control_iterations=negative_control_iterations,
+    )
+    conviction_event_study = (
+        run_oos_event_study(
+            canonical_events,
+            bars_by_symbol=bars_by_symbol,
+            horizons=horizons,
+            bucket_count=bucket_count,
+            train_window_days=train_window_days,
+            test_window_days=test_window_days,
+            min_train_events=min_train_events,
+            min_test_events=min_test_events,
+            benchmark_symbol=benchmark,
+            transaction_cost_bps=transaction_cost_bps,
+            slippage_bps=slippage_bps,
+            tradability=TradabilityConfig(
+                min_price=min_price,
+                min_median_dollar_volume_20d=min_median_dollar_volume_20d,
+            ),
+            random_seed=random_seed,
+            bootstrap_iterations=bootstrap_iterations,
+            monotonicity_iterations=monotonicity_iterations,
+            negative_control_iterations=negative_control_iterations,
+            bucket_dimension="conviction",
+        )
+        if readiness.conviction_feature_coverage_ready
+        else None
     )
 
     go_no_go = _evaluate_event_study_gates(
@@ -2637,6 +2671,42 @@ def ops_event_study(
         ],
         "monotonicity": [_metrics_to_dict(item) for item in event_study.monotonicity],
         "negative_control": [_metrics_to_dict(item) for item in event_study.negative_control],
+        "conviction_bucket_analysis": {
+            "available": conviction_event_study is not None,
+            "unavailable_reason": (
+                None
+                if conviction_event_study is not None
+                else "conviction_feature_coverage_below_threshold"
+            ),
+            "folds": (
+                [_metrics_to_dict(fold) for fold in conviction_event_study.folds]
+                if conviction_event_study is not None
+                else []
+            ),
+            "skipped_folds": (
+                [_metrics_to_dict(fold) for fold in conviction_event_study.skipped_folds]
+                if conviction_event_study is not None
+                else []
+            ),
+            "aggregate_bucket_metrics": (
+                [
+                    _metrics_to_dict(metric)
+                    for metric in conviction_event_study.aggregate_bucket_metrics
+                ]
+                if conviction_event_study is not None
+                else []
+            ),
+            "monotonicity": (
+                [_metrics_to_dict(item) for item in conviction_event_study.monotonicity]
+                if conviction_event_study is not None
+                else []
+            ),
+            "negative_control": (
+                [_metrics_to_dict(item) for item in conviction_event_study.negative_control]
+                if conviction_event_study is not None
+                else []
+            ),
+        },
         "price_errors": price_errors,
         "go_no_go": go_no_go,
     }
@@ -3090,8 +3160,6 @@ def ops_autopilot(
                     )
                     append_process_log(output_log_path, duplicate_message)
                     should_notify = False
-                elif event_key is not None:
-                    alerted_event_keys.add(event_key)
             if should_notify:
                 try:
                     notify_payload = {k: str(v) for k, v in payload.items()}
@@ -3101,6 +3169,9 @@ def ops_autopilot(
                         packet=packet,
                         dry_message=rule.reason,
                     )
+                    mark_notification_delivered(settings.database_path, packet_id_obj)
+                    if event_key is not None:
+                        alerted_event_keys.add(event_key)
                     notified += 1
                 except NtfyNotificationError as exc:
                     failure_message = (

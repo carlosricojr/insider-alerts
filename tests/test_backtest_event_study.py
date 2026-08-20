@@ -294,6 +294,49 @@ def test_run_oos_event_study_uses_train_only_scores_for_bucket_edges() -> None:
     assert edges[0] < 50.0
 
 
+def test_run_oos_event_study_builds_conviction_buckets_from_training_fold() -> None:
+    events = [
+        _event(
+            f"00000000{day:02d}-25-000001|0000000001|4",
+            datetime(2025, 1, day, 12, 0, tzinfo=UTC),
+            score=50.0,
+        )
+        for day in range(1, 7)
+    ]
+    for index, event in enumerate(events, start=1):
+        scale = float(index if index <= 4 else index * 100)
+        event.rationale = {
+            "holding_change_ratio": scale,
+            "open_market_gross_value": scale * 1_000.0,
+            "trade_pct_daily_turnover": scale / 10.0,
+        }
+    bars_by_symbol = {
+        "MAT": _build_daily_bars_for_month("MAT"),
+        "SPY": _build_daily_bars_for_month("SPY"),
+    }
+
+    result = run_oos_event_study(
+        events,
+        bars_by_symbol=bars_by_symbol,
+        horizons=[1],
+        bucket_count=2,
+        train_window_days=4,
+        test_window_days=2,
+        min_train_events=4,
+        min_test_events=2,
+        benchmark_symbol="SPY",
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        tradability=TradabilityConfig(min_price=0.0, min_median_dollar_volume_20d=0.0),
+        bucket_dimension="conviction",
+    )
+
+    assert len(result.folds) == 1
+    assert result.folds[0].score_bucket_edges == [62.5]
+    top = next(metric for metric in result.folds[0].bucket_metrics if metric.bucket_index == 2)
+    assert top.total_events == 2
+
+
 def test_run_oos_event_study_skips_fold_when_samples_are_too_small() -> None:
     events = [
         _event(

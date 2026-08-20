@@ -1,3 +1,4 @@
+import gzip
 import json
 from datetime import UTC, date, datetime
 from http.client import InvalidURL
@@ -140,6 +141,39 @@ def test_daily_market_data_client_url_encodes_symbol_with_spaces(monkeypatch) ->
     assert captured["timeout"] == 3.0
     assert snapshot is not None
     assert snapshot.symbol == "Z AND ZG"
+    assert snapshot.source == "yahoo"
+
+
+def test_daily_market_data_client_decodes_gzip_response(monkeypatch) -> None:
+    payload = _yahoo_body(
+        [
+            (date(2026, 2, 10), 40.0, 100.0),
+            (date(2026, 2, 11), 41.0, 200.0),
+        ]
+    )
+
+    class _FakeResponse:
+        headers = {"Content-Encoding": "gzip"}
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return gzip.compress(payload)
+
+    monkeypatch.setattr(market_context_module, "urlopen", lambda *args, **kwargs: _FakeResponse())
+    client = DailyMarketDataClient(
+        user_agent="insider-alerts/0.2 (contact: sec-access@example.com)",
+        timeout_seconds=3.0,
+        shock_drop_threshold=0.08,
+    )
+
+    snapshot = client.fetch_snapshot("SPGI", trade_date=date(2026, 2, 11))
+
+    assert snapshot is not None
     assert snapshot.source == "yahoo"
 
 

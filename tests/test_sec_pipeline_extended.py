@@ -56,6 +56,50 @@ def test_enrich_filings_updates_missing_xml(httpx_mock: HTTPXMock, tmp_path) -> 
     assert result.updated == 1
 
 
+def test_enrich_filings_preserves_successes_when_later_detail_fetch_fails(
+    httpx_mock: HTTPXMock, tmp_path
+) -> None:
+    settings = Settings(
+        DATABASE_PATH=str(tmp_path / "db.sqlite3"),
+        SEC_RATE_LIMIT_PER_SECOND=10,
+        SEC_RETRY_MIN_SECONDS=0,
+        SEC_RETRY_MAX_SECONDS=0,
+    )
+    good = FilingRef(
+        source="sec_rss",
+        cik="1",
+        accession_number="0000000001-26-000001",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 2, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/good.xml",
+        primary_doc_url=None,
+        raw_rss_entry={},
+    )
+    bad = FilingRef(
+        source="sec_rss",
+        cik="2",
+        accession_number="0000000002-26-000002",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 1, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/missing-index.htm",
+        primary_doc_url=None,
+        raw_rss_entry={},
+    )
+    upsert_filing_refs(settings.database_path, [good, bad])
+    httpx_mock.add_response(url=bad.filing_detail_url, status_code=404)
+
+    result = enrich_filings_with_xml_url(settings, limit=10)
+
+    assert result.scanned == 2
+    assert result.updated == 1
+    with sqlite3.connect(settings.database_path) as conn:
+        value = conn.execute(
+            "SELECT form4_xml_url FROM filings WHERE accession_number = ?",
+            (good.accession_number,),
+        ).fetchone()
+    assert value == (good.filing_detail_url,)
+
+
 def test_enqueue_review_packets_from_xml_urls(httpx_mock: HTTPXMock, tmp_path) -> None:
     rss = Path("tests/fixtures_form4_rss.xml").read_text(encoding="utf-8")
     form4 = Path("tests/fixtures_form4.xml").read_text(encoding="utf-8")

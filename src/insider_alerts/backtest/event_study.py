@@ -11,6 +11,12 @@ from datetime import date, timedelta
 from insider_alerts.backtest.event_data import CanonicalEvent
 from insider_alerts.backtest.models import DailyBar
 
+_CONVICTION_FEATURE_WEIGHTS = {
+    "holding_change_ratio": 0.4,
+    "open_market_gross_value": 0.4,
+    "trade_pct_daily_turnover": 0.2,
+}
+
 
 @dataclass(slots=True, frozen=True)
 class TradabilityConfig:
@@ -419,6 +425,44 @@ def _assign_bucket(score: float, *, edges: Sequence[float]) -> int:
     return bucket
 
 
+def _finite_rationale_value(event: CanonicalEvent, feature: str) -> float | None:
+    value = event.rationale.get(feature)
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _conviction_distributions(events: Sequence[CanonicalEvent]) -> dict[str, list[float]]:
+    distributions: dict[str, list[float]] = {}
+    for feature in _CONVICTION_FEATURE_WEIGHTS:
+        values = [
+            value
+            for event in events
+            if (value := _finite_rationale_value(event, feature)) is not None
+        ]
+        distributions[feature] = sorted(values)
+    return distributions
+
+
+def _conviction_score(
+    event: CanonicalEvent,
+    *,
+    training_distributions: dict[str, list[float]],
+) -> float | None:
+    """Training-fold percentile composite matching the live conviction weights."""
+    weighted_score = 0.0
+    for feature, weight in _CONVICTION_FEATURE_WEIGHTS.items():
+        value = _finite_rationale_value(event, feature)
+        distribution = training_distributions.get(feature, [])
+        if value is None or not distribution:
+            return None
+        rank = sum(1 for item in distribution if item <= value) / len(distribution)
+        weighted_score += rank * 100.0 * weight
+    return weighted_score
+
+
 def _bucket_bounds(
     *,
     bucket_index: int,
@@ -801,11 +845,14 @@ def run_oos_event_study(
     bootstrap_iterations: int = 1000,
     monotonicity_iterations: int = 1000,
     negative_control_iterations: int = 500,
+    bucket_dimension: str = "score",
 ) -> OosEventStudyResult:
     if bucket_count < 2:
         raise ValueError("bucket_count must be >= 2")
     if train_window_days <= 0 or test_window_days <= 0:
         raise ValueError("train_window_days and test_window_days must be > 0")
+    if bucket_dimension not in {"score", "conviction"}:
+        raise ValueError("bucket_dimension must be 'score' or 'conviction'")
     selected_horizons = _iter_horizons(horizons)
     if not events:
         return OosEventStudyResult(
@@ -874,12 +921,44 @@ def run_oos_event_study(
             fold_start = test_end + timedelta(days=1)
             continue
 
-        edges = _score_bucket_edges(
-            [event.score for event in train_events],
-            bucket_count=bucket_count,
-        )
+        if bucket_dimension == "conviction":
+            distributions = _conviction_distributions(train_events)
+            train_values = [
+                value
+                for event in train_events
+                if (value := _conviction_score(event, training_distributions=distributions))
+                is not None
+            ]
+            test_values = {
+                event.packet_id: value
+                for event in test_events
+                if (value := _conviction_score(event, training_distributions=distributions))
+                is not None
+            }
+        else:
+            train_values = [event.score for event in train_events]
+            test_values = {event.packet_id: event.score for event in test_events}
+
+        if not train_values:
+            skipped_folds.append(
+                OosFoldSkip(
+                    fold_index=fold_index,
+                    train_start=train_start,
+                    train_end=train_end,
+                    test_start=test_start,
+                    test_end=test_end,
+                    train_event_count=len(train_events),
+                    test_event_count=len(test_events),
+                    reason=f"missing_{bucket_dimension}_training_values",
+                )
+            )
+            fold_start = test_end + timedelta(days=1)
+            continue
+
+        edges = _score_bucket_edges(train_values, bucket_count=bucket_count)
         bucket_by_packet = {
-            event.packet_id: _assign_bucket(event.score, edges=edges) for event in test_events
+            packet_id: _assign_bucket(value, edges=edges)
+            for packet_id, value in test_values.items()
         }
         observations = compute_event_forward_returns(
             test_events,
@@ -904,9 +983,16 @@ def run_oos_event_study(
                 fold_totals[(horizon, bucket)] = 0
 
         for event in test_events:
-            bucket = bucket_by_packet[event.packet_id]
+            assigned_bucket = bucket_by_packet.get(event.packet_id)
+            if assigned_bucket is None:
+                for horizon in selected_horizons:
+                    fold_skip[f"missing_{bucket_dimension}_bucket_value"] += 1
+                    fold_skip_by_horizon[horizon][
+                        f"missing_{bucket_dimension}_bucket_value"
+                    ] += 1
+                continue
             for horizon in selected_horizons:
-                fold_totals[(horizon, bucket)] += 1
+                fold_totals[(horizon, assigned_bucket)] += 1
 
         for obs in observations:
             observation_bucket = bucket_by_packet.get(obs.packet_id)

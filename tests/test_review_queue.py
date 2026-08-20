@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import UTC, datetime
 
 from insider_alerts.review.queue import (
@@ -7,6 +8,7 @@ from insider_alerts.review.queue import (
     enqueue_review_packet,
     list_deadletters,
     list_pending_review_packets,
+    mark_notification_delivered,
     replay_deadletter,
 )
 from insider_alerts.sec.models import FilingRef
@@ -80,6 +82,14 @@ def test_apply_decision_validates_schema(tmp_path) -> None:
     }
     updated = apply_decision(db, good)
     assert updated == 1
+
+    assert mark_notification_delivered(db, good["packet_id"]) == 1
+    with sqlite3.connect(db) as conn:
+        delivered_at = conn.execute(
+            "SELECT notification_sent_at FROM review_packets WHERE packet_id = ?",
+            (good["packet_id"],),
+        ).fetchone()[0]
+    assert delivered_at is not None
 
     try:
         apply_decision(

@@ -95,7 +95,16 @@ def enrich_filings_with_xml_url(settings: Settings, *, limit: int) -> EnrichResu
         if ref.filing_detail_url.lower().endswith(".xml"):
             xml_url = _normalize_form4_xml_url(ref.filing_detail_url)
         else:
-            html = client.get_text(ref.filing_detail_url)
+            try:
+                html = client.get_text(ref.filing_detail_url)
+            except SecHttpError as exc:
+                logger.warning(
+                    "SEC detail enrichment failed for accession=%s url=%s: %s",
+                    ref.accession_number,
+                    ref.filing_detail_url,
+                    exc,
+                )
+                continue
             maybe = locate_form4_xml_url(html)
             if maybe is None:
                 continue

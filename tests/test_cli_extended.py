@@ -2220,6 +2220,8 @@ def test_cli_ops_event_study_outputs_schema_and_promising_label(monkeypatch) -> 
     assert "dedupe_diagnostics" in payload
     assert "aggregate_bucket_metrics" in payload
     assert "negative_control" in payload
+    assert payload["conviction_bucket_analysis"]["available"] is True
+    assert payload["conviction_bucket_analysis"]["aggregate_bucket_metrics"]
     assert payload["dedupe_diagnostics"]["collapsed_duplicate_count"] == 1
 
 
@@ -2359,7 +2361,7 @@ def test_recent_alerted_event_keys_only_returns_recent_approvals(tmp_path) -> No
             CREATE TABLE review_packets (
                 packet_id TEXT, accession_number TEXT, cik TEXT, form_type TEXT,
                 payload_json TEXT, status TEXT, decision_json TEXT,
-                created_at TEXT, updated_at TEXT
+                created_at TEXT, updated_at TEXT, notification_sent_at TEXT
             )
             """
         )
@@ -2375,15 +2377,16 @@ def test_recent_alerted_event_keys_only_returns_recent_approvals(tmp_path) -> No
         ]
         for packet_id, payload, decision, updated in rows:
             conn.execute(
-                "INSERT INTO review_packets (packet_id, payload_json, decision_json, updated_at)"
-                " VALUES (?, ?, ?, ?)",
-                (packet_id, payload, decision, updated),
+                "INSERT INTO review_packets ("
+                "packet_id, payload_json, decision_json, updated_at, notification_sent_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (packet_id, payload, decision, updated, updated),
             )
         conn.commit()
 
     keys = cli._recent_alerted_event_keys(str(db), lookback_days=7)
     assert keys == {cli._economic_event_key(_mkzr_packet("x", "P"))}, (
-        "only recent APPROVED packets seed the suppression set"
+        "only recently delivered APPROVED packets seed the suppression set"
     )
 
 

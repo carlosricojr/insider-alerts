@@ -1116,12 +1116,18 @@ class CanaryRunner:
             timed = (
                 by_id.get(int(row["timed_exit_order_id"])) if row["timed_exit_order_id"] else None
             )
+            current_position_quantity = account.positions.get(str(row["symbol"]), 0.0)
             filled_exit = next(
-                (order for order in (stop, target, timed) if order and order.filled > 0),
+                (
+                    order
+                    for order in (stop, target, timed)
+                    if order
+                    and order.filled > 0
+                    and (order.remaining <= 0 or current_position_quantity == 0)
+                ),
                 None,
             )
             if filled_exit is None:
-                current_position_quantity = account.positions.get(str(row["symbol"]), 0.0)
                 expected_quantity = float(row["live_quantity"] or 0.0)
                 if current_position_quantity == 0 and expected_quantity > 0:
                     self.store.update(

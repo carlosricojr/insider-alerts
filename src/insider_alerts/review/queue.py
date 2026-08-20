@@ -33,6 +33,16 @@ def ensure_review_tables(db_path: str) -> None:
             )
             """
         )
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(review_packets)").fetchall()
+        }
+        if "notification_sent_at" not in columns:
+            try:
+                conn.execute("ALTER TABLE review_packets ADD COLUMN notification_sent_at TEXT")
+            except sqlite3.OperationalError as exc:
+                # A second service can finish this additive migration after our PRAGMA.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS deadletter_events (
@@ -190,6 +200,23 @@ def apply_decision(db_path: str, payload: Mapping[str, object]) -> int:
                 (packet_id, str(payload["reason"]), encoded, now),
             )
 
+        conn.commit()
+    return int(cursor.rowcount)
+
+
+def mark_notification_delivered(db_path: str, packet_id: str) -> int:
+    """Record delivery only after the notification provider returns successfully."""
+    ensure_review_tables(db_path)
+    delivered_at = datetime.now(tz=UTC).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE review_packets
+            SET notification_sent_at = ?
+            WHERE packet_id = ?
+            """,
+            (delivered_at, packet_id),
+        )
         conn.commit()
     return int(cursor.rowcount)
 

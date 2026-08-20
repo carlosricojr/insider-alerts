@@ -233,6 +233,33 @@ def test_overdue_tenth_session_exit_uses_immediate_market_exit(
     assert runner.store.rows()[0]["live_state"] == "closing"
 
 
+def test_partial_exit_remains_managed_and_flattens_residual_position(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    asyncio.run(runner.cycle(now))
+    token = broker_token("crash-test-packet")
+    broker.snapshot = AccountSnapshot("ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 20}, 0)
+    broker.order_values = [
+        BrokerOrder(101, f"IA-E07-{token}-ENTRY", "TEST", "entry", "Filled", 20, 0, 10)
+    ]
+    asyncio.run(runner.cycle(now + timedelta(minutes=12)))
+
+    broker.snapshot = AccountSnapshot("ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 15}, 2)
+    broker.order_values = [
+        BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Submitted", 5, 15, 11),
+        BrokerOrder(202, f"IA-E07-{token}-STOP", "TEST", "stop", "Submitted", 0, 20, 0),
+    ]
+    asyncio.run(runner.cycle(now + timedelta(minutes=13)))
+
+    row = runner.store.rows()[0]
+    assert row["live_state"] == "closing"
+    assert row["live_exit_at"] is None
+    assert broker.market_exits[-1][:2] == ("TEST", 15)
+
+
 def test_incomplete_exchange_schedule_rejects_before_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

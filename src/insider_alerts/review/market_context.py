@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -276,7 +278,15 @@ class DailyMarketDataClient:
             self._enforce_rate_limit()
             try:
                 with urlopen(req, timeout=self.timeout_seconds) as response:
-                    return str(response.read().decode("utf-8", "replace"))
+                    body = bytes(response.read())
+                    headers = getattr(response, "headers", None)
+                    encoding = headers.get("Content-Encoding", "") if headers is not None else ""
+                    normalized_encoding = str(encoding).strip().lower()
+                    if normalized_encoding == "gzip":
+                        body = gzip.decompress(body)
+                    elif normalized_encoding == "deflate":
+                        body = zlib.decompress(body)
+                    return body.decode("utf-8", "replace")
             except HTTPError as exc:
                 last_error = exc
                 if (
@@ -290,7 +300,7 @@ class DailyMarketDataClient:
                 raise MarketContextError(
                     f"market data request failed for {symbol}: HTTP {exc.code} {exc.reason}"
                 ) from exc
-            except (OSError, URLError, HTTPException, ValueError) as exc:
+            except (OSError, URLError, HTTPException, ValueError, zlib.error) as exc:
                 last_error = exc
                 if attempt < self.retry_attempts:
                     delay = self._retry_delay(attempt)
