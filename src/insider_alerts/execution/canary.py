@@ -515,13 +515,13 @@ class CanaryStore:
         *,
         quantity: int,
         entry_bar: DailyBar,
+        stop_price: float,
+        target_price: float,
         exit_bar: DailyBar,
         exit_price: float,
         exit_reason: str,
     ) -> None:
         now = datetime.now(UTC).isoformat()
-        stop = entry_bar.open * 0.90
-        target = entry_bar.open * 1.10
         with self.connect() as conn:
             conn.execute(
                 """
@@ -536,8 +536,8 @@ class CanaryStore:
                     quantity,
                     entry_bar.trade_date.isoformat(),
                     entry_bar.open,
-                    stop,
-                    target,
+                    stop_price,
+                    target_price,
                     exit_bar.trade_date.isoformat(),
                     exit_price,
                     exit_reason,
@@ -771,6 +771,8 @@ class CanaryRunner:
                     row,
                     quantity=int(row["planned_quantity"]),
                     entry_bar=entry_bar,
+                    stop_price=stop,
+                    target_price=target,
                     exit_bar=exit_bar,
                     exit_price=exit_price,
                     exit_reason=reason,

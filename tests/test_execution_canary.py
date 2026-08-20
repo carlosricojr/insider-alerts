@@ -85,6 +85,45 @@ def test_status_report_exposes_current_runtime_revision(tmp_path: Path) -> None:
     assert report["source_revision_current"] is True
 
 
+def test_shadow_trade_records_configured_stop_and_target_levels(tmp_path: Path) -> None:
+    now = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
+    store = CanaryStore(str(tmp_path / "ledger.db"))
+    signal = _signal(now - timedelta(minutes=30))
+    store.insert_candidate(
+        signal,
+        session=date(2026, 1, 5),
+        rank="rank",
+        is_eligible=True,
+        reason="eligible",
+        prior_close=10.0,
+        median_dollar_volume=1_000_000.0,
+        quantity=20,
+        now=now,
+    )
+    row = store.rows()[0]
+    entry = DailyBar("TEST", date(2026, 1, 5), 10.0, 10.2, 9.8, 10.0, 100_000.0)
+    exit_bar = DailyBar("TEST", date(2026, 1, 6), 10.0, 10.7, 9.9, 10.5, 100_000.0)
+
+    store.record_shadow_trade(
+        row,
+        quantity=20,
+        entry_bar=entry,
+        stop_price=9.5,
+        target_price=10.6,
+        exit_bar=exit_bar,
+        exit_price=10.6,
+        exit_reason="target",
+    )
+
+    with store.connect() as conn:
+        trade = conn.execute(
+            "SELECT stop_price,target_price FROM shadow_trades WHERE packet_id=?",
+            (signal.packet_id,),
+        ).fetchone()
+    assert trade is not None
+    assert (trade["stop_price"], trade["target_price"]) == (9.5, 10.6)
+
+
 class FakeBroker:
     def __init__(self, sessions: list[date], bars: list[DailyBar], commission: float) -> None:
         self.session_values = sessions

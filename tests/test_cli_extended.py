@@ -1739,9 +1739,12 @@ def test_cli_ops_backtest_skips_fetch_when_cache_is_fresh(monkeypatch) -> None:
     monkeypatch.setattr(cli, "refresh_price_bars", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "get_price_bars", lambda *args, **kwargs: [bar])
 
+    fetched_symbols: list[str] = []
+
     class _FakePriceClient:
         def fetch_history(self, symbol):  # type: ignore[no-untyped-def]
-            raise AssertionError("fetch_history should not be called when cache is fresh")
+            fetched_symbols.append(symbol)
+            return [bar]
 
     monkeypatch.setattr(cli, "StooqPriceClient", lambda **kwargs: _FakePriceClient())
     monkeypatch.setattr(
@@ -1772,6 +1775,7 @@ def test_cli_ops_backtest_skips_fetch_when_cache_is_fresh(monkeypatch) -> None:
         ],
     )
     assert result.exit_code == 0
+    assert fetched_symbols == []
 
 
 def test_cli_ops_backtest_fetches_only_trade_eligible_symbols(monkeypatch) -> None:

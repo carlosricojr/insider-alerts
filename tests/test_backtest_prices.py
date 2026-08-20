@@ -1,5 +1,6 @@
 import gzip
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
+from email.utils import format_datetime
 from http.client import InvalidURL
 from types import TracebackType
 from urllib.error import HTTPError
@@ -158,7 +159,13 @@ def test_stooq_price_client_retries_retryable_http_error(monkeypatch) -> None:
     def _fake_urlopen(req, timeout):
         calls["count"] += 1
         if calls["count"] == 1:
-            raise HTTPError(req.full_url, 429, "Too Many Requests", hdrs=None, fp=None)
+            raise HTTPError(
+                req.full_url,
+                429,
+                "Too Many Requests",
+                hdrs={"Retry-After": "2"},
+                fp=None,
+            )
         return _FakeResponse()
 
     monkeypatch.setattr(prices_module, "urlopen", _fake_urlopen)
@@ -175,7 +182,20 @@ def test_stooq_price_client_retries_retryable_http_error(monkeypatch) -> None:
     bars = client.fetch_history("MAT")
     assert len(bars) == 1
     assert calls["count"] == 2
-    assert 0.5 in sleeps
+    assert 2.0 in sleeps
+
+
+def test_stooq_price_client_parses_http_date_retry_after() -> None:
+    now = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    error = HTTPError(
+        "https://example.test",
+        429,
+        "Too Many Requests",
+        hdrs={"Retry-After": format_datetime(now + timedelta(seconds=5), usegmt=True)},
+        fp=None,
+    )
+
+    assert StooqPriceClient._retry_after_seconds(error, now=now) == 5.0
 
 
 def test_stooq_price_client_decodes_gzip_payload(monkeypatch) -> None:

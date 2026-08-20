@@ -11,6 +11,7 @@ import time
 import zlib
 from collections.abc import Callable
 from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -116,6 +117,26 @@ class StooqPriceClient:
         return status_code in {403, 429} or status_code >= 500
 
     @staticmethod
+    def _retry_after_seconds(error: HTTPError, *, now: datetime | None = None) -> float:
+        headers = getattr(error, "headers", None)
+        if headers is None:
+            return 0.0
+        value = headers.get("Retry-After")
+        if value is None:
+            return 0.0
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            reference = now or datetime.now(UTC)
+            return max(0.0, (retry_at - reference).total_seconds())
+
+    @staticmethod
     def _decode_response_bytes(raw: bytes, content_encoding: str) -> bytes:
         encodings = [part.strip().lower() for part in content_encoding.split(",") if part.strip()]
         decoded = raw
@@ -167,6 +188,8 @@ class StooqPriceClient:
                     and self._is_retryable_http_status(int(exc.code))
                 ):
                     delay = self._retry_delay(attempt)
+                    if int(exc.code) == 429:
+                        delay = max(delay, self._retry_after_seconds(exc))
                     if delay > 0:
                         self.sleep_fn(delay)
                     continue
