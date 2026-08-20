@@ -260,6 +260,53 @@ def test_partial_exit_remains_managed_and_flattens_residual_position(
     assert broker.market_exits[-1][:2] == ("TEST", 15)
 
 
+def test_cancelled_timed_exit_after_partial_fill_is_replaced_for_residual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    asyncio.run(runner.cycle(now))
+    token = broker_token("crash-test-packet")
+    broker.snapshot = AccountSnapshot(
+        "ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 20}, 0, {"TEST": 10.0}
+    )
+    broker.order_values = [
+        BrokerOrder(101, f"IA-E07-{token}-ENTRY", "TEST", "entry", "Filled", 20, 0, 10)
+    ]
+    asyncio.run(runner.cycle(now + timedelta(minutes=12)))
+    runner.store.update("crash-test-packet", live_exit_session=now.date().isoformat())
+    protective_orders = [
+        BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Submitted", 0, 20, 0),
+        BrokerOrder(202, f"IA-E07-{token}-STOP", "TEST", "stop", "Submitted", 0, 20, 0),
+    ]
+    broker.order_values = protective_orders
+    broker.snapshot = AccountSnapshot(
+        "ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 20}, 2, {"TEST": 10.0}
+    )
+    due = datetime(2026, 1, 5, 20, 31, tzinfo=UTC)
+    asyncio.run(runner.cycle(due))
+    assert broker.moc_calls == 1
+
+    broker.snapshot = AccountSnapshot(
+        "ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 15}, 0, {"TEST": 10.0}
+    )
+    broker.order_values = [
+        BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Cancelled", 5, 15, 11),
+        BrokerOrder(202, f"IA-E07-{token}-STOP", "TEST", "stop", "Cancelled", 0, 20, 0),
+        BrokerOrder(203, f"IA-E07-{token}-TIME", "TEST", "time", "Cancelled", 0, 20, 0),
+    ]
+
+    asyncio.run(runner.cycle(due + timedelta(minutes=1)))
+
+    row = runner.store.rows()[0]
+    assert row["live_state"] == "closing"
+    assert row["live_quantity"] == 15
+    assert row["timed_exit_order_id"] == 204
+    assert broker.moc_calls == 2
+    assert broker.protected[-1][1] == 15
+
+
 def test_incomplete_exchange_schedule_rejects_before_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

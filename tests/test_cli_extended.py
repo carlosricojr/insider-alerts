@@ -1994,7 +1994,7 @@ def test_cli_ops_backtest_refreshes_when_cache_misses_exit_window(monkeypatch) -
     assert "MAT" in fetched_symbols
 
 
-def test_cli_ops_event_study_outputs_schema_and_promising_label(monkeypatch) -> None:
+def test_cli_ops_event_study_outputs_schema_and_promising_label(monkeypatch, tmp_path) -> None:
     runner = CliRunner()
     canonical_events = [
         CanonicalEvent(
@@ -2199,11 +2199,31 @@ def test_cli_ops_event_study_outputs_schema_and_promising_label(monkeypatch) -> 
             raise AssertionError(f"fetch_history should not run for {symbol}")
 
     monkeypatch.setattr(cli, "StooqPriceClient", lambda **kwargs: _NeverFetch())
+    study_db = tmp_path / "insider_alerts_research_2026-08-17.db"
+    study_db.write_bytes(b"frozen research snapshot")
+    confirmatory_report = tmp_path / "signal-study.json"
+    confirmatory_report.write_text(
+        json.dumps(
+            {
+                "schema_version": "signal-study-v1",
+                "family_size": 168,
+                "cohort": "live",
+                "requested_start_date": "2026-02-11",
+                "requested_end_date": "2026-08-17",
+                "database_path": str(study_db.resolve()),
+                "database_sha256": cli._file_sha256(study_db),
+                "surviving_hypotheses": ["E07|F00"],
+            }
+        ),
+        encoding="utf-8",
+    )
     result = runner.invoke(
         cli.app,
         [
             "ops",
             "event-study",
+            "--database-path",
+            str(study_db),
             "--start-date",
             "2025-01-01",
             "--end-date",
@@ -2215,11 +2235,14 @@ def test_cli_ops_event_study_outputs_schema_and_promising_label(monkeypatch) -> 
             "--min-test-events",
             "5",
             "--no-refresh-prices",
+            "--confirmatory-report",
+            str(confirmatory_report),
         ],
     )
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["go_no_go"]["label"] == "promising_edge"
+    assert payload["go_no_go"]["hard_gates"]["locked_confirmatory_result_pass"] is True
     assert "readiness" in payload
     assert "dedupe_diagnostics" in payload
     assert "aggregate_bucket_metrics" in payload
@@ -2295,6 +2318,32 @@ def test_cli_ops_event_study_returns_non_zero_when_not_decision_grade(monkeypatc
     payload = json.loads(result.stdout)
     assert payload["go_no_go"]["label"] == "non_decision_grade"
     assert payload["go_no_go"]["hard_gates"]["readiness_pass"] is False
+
+
+def test_confirmatory_gate_rejects_wrong_family_and_missing_candidate(tmp_path) -> None:
+    study_db = tmp_path / "insider_alerts_research_2026-08-17.db"
+    study_db.write_bytes(b"frozen research snapshot")
+    report_path = tmp_path / "signal-study.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "signal-study-v1",
+                "family_size": 12,
+                "surviving_hypotheses": ["E06|F00"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    gate = cli._load_confirmatory_gate(
+        report_path,
+        candidate_hypothesis="E07|F00",
+        expected_database_path=study_db,
+    )
+
+    assert gate["pass"] is False
+    assert gate["family_size_valid"] is False
+    assert gate["candidate_survived"] is False
 
 
 def _mkzr_packet(packet_id: str, owner: str) -> dict[str, object]:

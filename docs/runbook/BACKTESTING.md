@@ -31,6 +31,8 @@ This runbook explains how to evaluate whether pre-LLM insider signals are econom
 ## Command
 ```powershell
 uv run python -m insider_alerts.cli ops backtest `
+  --start-date 2025-01-01 `
+  --end-date 2026-06-30 `
   --min-score-grid "70,80,90" `
   --hold-days-grid "3,5,10,20" `
   --stop-loss-grid "0.03,0.05" `
@@ -45,7 +47,10 @@ uv run python -m insider_alerts.cli ops backtest `
 ```
 
 Date window behavior:
-- Default (no date flags): runs on the last 365 days ending today.
+- The example uses an explicit 546-day span so a 365-day train window plus a 90-day test
+  window and boundary buffer can produce complete folds.
+- Default (no date flags): runs on the last 365 days ending today and is only a smoke test for
+  this walk-forward configuration because it cannot contain a complete 365+90-day fold.
 - Explicit override: pass both `--start-date` and `--end-date` together.
 - Backtest checks local filing coverage for the requested window.
 - If coverage is missing (or there are no local signals), it runs SEC historical Form 4 backfill from quarterly `master.idx` files for the window, then runs bounded enrich/enqueue bootstrap batches before retrying signal load.
@@ -71,6 +76,7 @@ Before tuning or trusting strategy-level backtest parameters, run event-study va
 
 ```powershell
 uv run python -m insider_alerts.cli ops event-study `
+  --database-path data/insider_alerts_research_2026-08-17.db `
   --horizons "1,3,5,10,20" `
   --bucket-count 5 `
   --train-window-days 365 `
@@ -86,6 +92,8 @@ uv run python -m insider_alerts.cli ops event-study `
   --min-median-dollar-volume-20d 500000 `
   --conviction-feature-coverage-min 0.8 `
   --random-seed 7 `
+  --confirmatory-report reports/signal_study_locked.json `
+  --candidate-hypothesis "E07|F00" `
   --output-json reports/event_study_latest.json `
   --output-csv reports/event_study_latest.csv
 ```
@@ -96,6 +104,9 @@ What this command does:
 - Computes OOS bucketed alpha by horizon using train-only quantile cutoffs.
 - Adds uncertainty outputs (bootstrap CI), monotonicity checks, FDR-adjusted q-values, and
   negative-control baselines.
+- Loads the frozen `ops signal-study` JSON, verifies its cohort, date window, database path and
+  SHA-256 against the selected snapshot, and requires the candidate to survive the locked
+  168-hypothesis Bonferroni/Holm family before any decision-grade result is possible.
 - Emits a `go_no_go` block:
   - `promising_edge`
   - `no_go`
@@ -103,16 +114,21 @@ What this command does:
 
 This command is explicitly exploratory and reports
 `analysis_class=exploratory_oos_diagnostic`. Its adjustable parameters and FDR values cannot
-override the locked 168-hypothesis Bonferroni/Holm result from `ops signal-study`.
+override the locked 168-hypothesis Bonferroni/Holm result from `ops signal-study`; a missing,
+malformed, wrong-family, or non-surviving confirmatory report yields
+`confirmatory_gate_failed` and exit code `3`.
 
 Hard gate behavior:
-- `ops event-study` exits with code `3` when the run is not decision-grade.
+- `ops event-study` exits with code `3` when the run is not decision-grade, including when the
+  locked confirmatory report does not validate the named candidate.
 - This is intentional; do not proceed to strategy tuning when hard gates fail.
 
 ## Interpretation Matrix
 - `promising_edge`: dataset is decision-grade and OOS edge gates passed. Candidate for controlled live pilot design.
 - `no_go`: dataset is decision-grade but edge gates failed. Improve feature set/filters before pilot.
 - `non_decision_grade`: data sufficiency/coverage quality gates failed. Backfill/repair data first.
+- `confirmatory_gate_failed`: the locked family did not validate the candidate; exploratory FDR
+  output cannot promote it.
 
 ## Failure Modes To Treat As Blocking
 - Missing internal months in requested window.

@@ -333,7 +333,7 @@ class DailyMarketDataClient:
                 raise MarketContextError(
                     f"market data request failed for {symbol}: HTTP {exc.code} {exc.reason}"
                 ) from exc
-            except (OSError, URLError, HTTPException, ValueError, zlib.error) as exc:
+            except (OSError, EOFError, URLError, HTTPException, ValueError, zlib.error) as exc:
                 last_error = exc
                 if attempt < self.retry_attempts:
                     delay = self._retry_delay(attempt)

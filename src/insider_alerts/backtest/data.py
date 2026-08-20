@@ -59,7 +59,10 @@ def load_scored_signals(
     init_db(db_path)
     ensure_review_tables(db_path)
 
-    where_parts = ["json_extract(rp.payload_json, '$.issuer_symbol') IS NOT NULL"]
+    where_parts = [
+        "json_valid(rp.payload_json)",
+        "json_extract(rp.payload_json, '$.issuer_symbol') IS NOT NULL",
+    ]
     params: list[str] = []
     if start_date is not None:
         where_parts.append("date(f.filed_at) >= ?")

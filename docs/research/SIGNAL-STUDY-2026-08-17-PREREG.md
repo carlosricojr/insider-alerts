@@ -121,8 +121,11 @@ SPY-relative alpha statistic as the primary test.
 5. beat both controls at one-sided `p < 0.05`: (a) permute entry dates as blocks among eligible
    signal dates while preserving each signal's symbol, and (b) draw one eligible entry date
    uniformly without replacement from the same symbol's covered history for every trade;
-6. exhibit a stable neighborhood: at least two of `E05`, `E06`, and `E08` must have positive
-   post-50-bps mean alpha when `E07` is the candidate, with the same filter and eligibility rules;
+6. exhibit a stable neighborhood for barrier-rule candidates, with the same filter and
+   eligibility rules: `E05` uses neighbors `{E06,E07}`, `E06` uses `{E05,E07,E08}`, `E07` uses
+   `{E05,E06,E08}`, and `E08` uses `{E06,E07}`; at least two named neighbors must have positive
+   post-50-bps mean alpha. For non-barrier candidates `E01`-`E04`, this gate is recorded as not
+   applicable and does not fail the candidate;
 7. pass a chronological 20-slot equal-notional replay with no overlapping same-symbol positions,
    positive realized return, and no calendar month contributing more than 50% of total P&L.
 

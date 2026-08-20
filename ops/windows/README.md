@@ -28,8 +28,9 @@ Install the separate IBKR canary watchdog with:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-live-canary-task.ps1 -Start
 ```
 
-It runs the live canary invisibly at user logon with one-minute watchdog recovery. Passing
-`-Start` stops any existing instance before starting the registered definition, ensuring deployed
-source changes are loaded. The worker also fingerprints its Python source and exits for an
-invisible watchdog restart if the source later changes. The live policy and broker gates are
-documented in `docs/runbook/LIVE_CANARY.md`.
+It registers separate hidden `pythonw.exe` worker and watchdog tasks. The watchdog runs every
+minute, ensures a stopped worker is started, and force-restarts a worker whose durable heartbeat
+is stale for more than two minutes. Passing `-Start` stops any existing instances before starting
+both registered definitions, ensuring deployed source changes are loaded. The worker also
+fingerprints its Python source and exits for an invisible watchdog restart if the source later
+changes. The live policy and broker gates are documented in `docs/runbook/LIVE_CANARY.md`.

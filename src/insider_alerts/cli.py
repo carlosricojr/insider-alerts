@@ -26,7 +26,11 @@ from insider_alerts.backtest.engine import (
     run_walk_forward,
 )
 from insider_alerts.backtest.event_data import load_canonical_events
-from insider_alerts.backtest.event_study import TradabilityConfig, run_oos_event_study
+from insider_alerts.backtest.event_study import (
+    CONVICTION_FEATURE_WEIGHTS,
+    TradabilityConfig,
+    run_oos_event_study,
+)
 from insider_alerts.backtest.fundamentals import (
     load_cached_companyfacts,
     refresh_companyfacts,
@@ -34,6 +38,8 @@ from insider_alerts.backtest.fundamentals import (
 )
 from insider_alerts.backtest.intraday_prices import (
     build_intraday_requests,
+    completed_minute_bar_sessions,
+    filter_completed_minute_bars,
     get_minute_bars,
     refresh_ibkr_minute_bars,
 )
@@ -50,8 +56,8 @@ from insider_alerts.backtest.readiness import (
     audit_event_study_readiness,
 )
 from insider_alerts.backtest.signal_study import (
+    CONFIRMATORY_FAMILY_SIZE,
     DAILY_EXECUTION_RULES,
-    NEW_YORK,
     collect_daily_strategy_observations,
     compute_point_in_time_features,
     evaluate_daily_hypothesis_family,
@@ -71,6 +77,7 @@ from insider_alerts.execution.canary import (
     status_report as live_canary_status_report,
 )
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
+from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.review.queue import (
     DecisionValidationError,
@@ -361,9 +368,9 @@ def _compute_conviction_metrics(
     weighted_sum = 0.0
     weight_total = 0.0
     for metric_pct, weight in (
-        (holding_pct, 0.50),
-        (value_pct, 0.30),
-        (liquidity_pct, 0.20),
+        (holding_pct, CONVICTION_FEATURE_WEIGHTS["holding_change_ratio"]),
+        (value_pct, CONVICTION_FEATURE_WEIGHTS["open_market_gross_value"]),
+        (liquidity_pct, CONVICTION_FEATURE_WEIGHTS["trade_pct_daily_turnover"]),
     ):
         if metric_pct is None:
             continue
@@ -445,6 +452,104 @@ def _json_default(value: object) -> object:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def _load_confirmatory_gate(
+    report_path: Path | None,
+    *,
+    candidate_hypothesis: str,
+    expected_database_path: Path,
+) -> dict[str, object]:
+    if report_path is None:
+        return {
+            "pass": False,
+            "reason": "confirmatory_report_required",
+            "candidate_hypothesis": candidate_hypothesis,
+        }
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "pass": False,
+            "reason": f"confirmatory_report_unreadable:{type(exc).__name__}",
+            "candidate_hypothesis": candidate_hypothesis,
+            "report_path": str(report_path),
+        }
+    if not isinstance(payload, dict):
+        return {
+            "pass": False,
+            "reason": "confirmatory_report_not_object",
+            "candidate_hypothesis": candidate_hypothesis,
+            "report_path": str(report_path),
+        }
+    survivors = payload.get("surviving_hypotheses")
+    family_size = payload.get("family_size")
+    schema_version = payload.get("schema_version")
+    cohort = payload.get("cohort")
+    requested_start_date = payload.get("requested_start_date")
+    requested_end_date = payload.get("requested_end_date")
+    reported_database_path = payload.get("database_path")
+    reported_database_sha256 = payload.get("database_sha256")
+    family_valid = family_size == CONFIRMATORY_FAMILY_SIZE
+    schema_valid = schema_version == "signal-study-v1"
+    cohort_valid = cohort == "live"
+    date_window_valid = (
+        requested_start_date == "2026-02-11" and requested_end_date == "2026-08-17"
+    )
+    expected_database_exists = expected_database_path.is_file()
+    try:
+        database_path_valid = (
+            isinstance(reported_database_path, str)
+            and Path(reported_database_path).resolve() == expected_database_path.resolve()
+        )
+    except OSError:
+        database_path_valid = False
+    expected_database_sha256 = (
+        _file_sha256(expected_database_path) if expected_database_exists else None
+    )
+    database_hash_valid = (
+        isinstance(reported_database_sha256, str)
+        and reported_database_sha256 == expected_database_sha256
+    )
+    candidate_survived = (
+        isinstance(survivors, list)
+        and candidate_hypothesis in {str(item) for item in survivors}
+    )
+    passed = all(
+        (
+            family_valid,
+            schema_valid,
+            cohort_valid,
+            date_window_valid,
+            expected_database_exists,
+            database_path_valid,
+            database_hash_valid,
+            candidate_survived,
+        )
+    )
+    return {
+        "pass": passed,
+        "reason": "passed" if passed else "locked_confirmatory_result_failed",
+        "candidate_hypothesis": candidate_hypothesis,
+        "report_path": str(report_path),
+        "family_size": family_size,
+        "family_size_valid": family_valid,
+        "schema_version": schema_version,
+        "schema_valid": schema_valid,
+        "cohort": cohort,
+        "cohort_valid": cohort_valid,
+        "requested_start_date": requested_start_date,
+        "requested_end_date": requested_end_date,
+        "date_window_valid": date_window_valid,
+        "expected_database_path": str(expected_database_path.resolve()),
+        "expected_database_exists": expected_database_exists,
+        "database_path": reported_database_path,
+        "database_path_valid": database_path_valid,
+        "expected_database_sha256": expected_database_sha256,
+        "database_sha256": reported_database_sha256,
+        "database_hash_valid": database_hash_valid,
+        "candidate_survived": candidate_survived,
+    }
+
+
 def _evaluate_event_study_gates(
     *,
     readiness: object,
@@ -456,6 +561,7 @@ def _evaluate_event_study_gates(
     core_horizons: tuple[int, ...],
     ci_lower_bound_bps: float,
     fdr_q_threshold: float,
+    confirmatory_gate: dict[str, object],
 ) -> dict[str, object]:
     readiness_ready = bool(getattr(readiness, "is_ready", False))
     folds = list(getattr(event_study, "folds", []))
@@ -504,13 +610,15 @@ def _evaluate_event_study_gates(
         if missing_rate > max_missing_price_skip_rate:
             execution_coverage_guard = False
 
-    decision_grade = (
+    diagnostic_ready = (
         readiness_ready
         and fold_count_pass
         and fold_test_min_pass
         and top_bucket_min_events_pass
         and execution_coverage_guard
     )
+    confirmatory_pass = bool(confirmatory_gate.get("pass", False))
+    decision_grade = diagnostic_ready and confirmatory_pass
 
     ci_floor = ci_lower_bound_bps / 10000.0
     positive_core_count = 0
@@ -569,13 +677,17 @@ def _evaluate_event_study_gates(
     )
 
     label = "promising_edge" if edge_pass else "no_go"
-    if not decision_grade:
+    if not diagnostic_ready:
         label = "non_decision_grade"
+    elif not confirmatory_pass:
+        label = "confirmatory_gate_failed"
     return {
         "label": label,
         "decision_grade": decision_grade,
         "edge_pass": edge_pass,
         "hard_gates": {
+            "diagnostic_ready": diagnostic_ready,
+            "locked_confirmatory_result_pass": confirmatory_pass,
             "readiness_pass": readiness_ready,
             "min_fold_count_pass": fold_count_pass,
             "min_test_events_per_fold_pass": fold_test_min_pass,
@@ -2313,6 +2425,11 @@ def ops_backtest(
 
 @ops_app.command("event-study")
 def ops_event_study(
+    database_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--database-path",
+        help="Database snapshot to evaluate and bind to the confirmatory report.",
+    ),
     start_date_text: str = typer.Option(
         "",
         "--start-date",
@@ -2435,6 +2552,16 @@ def ops_event_study(
         min=0.0,
         max=1.0,
     ),
+    confirmatory_report_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--confirmatory-report",
+        help="Locked ops signal-study JSON required for any decision-grade result.",
+    ),
+    candidate_hypothesis: str = typer.Option(
+        "E07|F00",
+        "--candidate-hypothesis",
+        help="Frozen signal-study hypothesis that this diagnostic is intended to support.",
+    ),
     refresh_prices_enabled: bool = typer.Option(
         True,
         "--refresh-prices/--no-refresh-prices",
@@ -2454,6 +2581,7 @@ def ops_event_study(
     Run OOS event-study alpha validation for Form 4 signals.
     """
     settings = get_settings()
+    selected_db = database_path or Path(settings.database_path)
     start_supplied = bool(start_date_text.strip())
     end_supplied = bool(end_date_text.strip())
     if start_supplied != end_supplied:
@@ -2488,12 +2616,12 @@ def ops_event_study(
     horizons = _parse_int_grid(horizons_text, min_value=1)
     benchmark = benchmark_symbol.strip().upper() or "SPY"
     canonical_events = load_canonical_events(
-        settings.database_path,
+        str(selected_db),
         start_date=start_date,
         end_date=end_date,
     )
     raw_signals = load_scored_signals(
-        settings.database_path,
+        str(selected_db),
         start_date=start_date,
         end_date=end_date,
     )
@@ -2526,7 +2654,7 @@ def ops_event_study(
     price_errors: list[str] = []
     for symbol in unique_symbols:
         fetch_error: str | None = None
-        cache_start, cache_end = get_price_bar_bounds(settings.database_path, symbol=symbol)
+        cache_start, cache_end = get_price_bar_bounds(str(selected_db), symbol=symbol)
         needs_refresh = refresh_prices_enabled and (
             cache_start is None
             or cache_end is None
@@ -2536,14 +2664,14 @@ def ops_event_study(
         try:
             if needs_refresh:
                 fetched = price_client.fetch_history(symbol)
-                refresh_price_bars(settings.database_path, symbol=symbol, bars=fetched)
+                refresh_price_bars(str(selected_db), symbol=symbol, bars=fetched)
         except PriceDataError as exc:
             fetch_error = f"{symbol}: {exc}"
         except Exception as exc:  # Defensive: keep one symbol error from aborting.
             fetch_error = f"{symbol}: unexpected price refresh error: {exc}"
 
         bars = get_price_bars(
-            settings.database_path,
+            str(selected_db),
             symbol=symbol,
             start_date=price_start,
             end_date=price_end,
@@ -2561,7 +2689,7 @@ def ops_event_study(
     # Price coverage is part of readiness. Audit only after the optional refresh so a
     # successful first run cannot report the stale pre-refresh state.
     readiness = audit_event_study_readiness(
-        settings.database_path,
+        str(selected_db),
         start_date=start_date,
         end_date=end_date,
         canonical_events=[asdict(event) for event in canonical_events],
@@ -2620,6 +2748,11 @@ def ops_event_study(
         else None
     )
 
+    confirmatory_gate = _load_confirmatory_gate(
+        confirmatory_report_path,
+        candidate_hypothesis=candidate_hypothesis,
+        expected_database_path=selected_db,
+    )
     go_no_go = _evaluate_event_study_gates(
         readiness=readiness,
         event_study=event_study,
@@ -2630,11 +2763,12 @@ def ops_event_study(
         core_horizons=(5, 10),
         ci_lower_bound_bps=ci_lower_bound_bps,
         fdr_q_threshold=fdr_q_threshold,
+        confirmatory_gate=confirmatory_gate,
     )
 
     total_cluster_packets = sum(event.cluster_packet_count for event in canonical_events)
     canonical_count = len(canonical_events)
-    db_path = Path(settings.database_path)
+    db_path = selected_db
     db_hash = _file_sha256(db_path) if db_path.exists() else None
     db_size_bytes = db_path.stat().st_size if db_path.exists() else None
     report: dict[str, object] = {
@@ -2642,7 +2776,7 @@ def ops_event_study(
         "confirmatory_eligible": False,
         "run_timestamp_utc": datetime.now(tz=UTC).isoformat(),
         "database_metadata": {
-            "database_path": settings.database_path,
+            "database_path": str(selected_db.resolve()),
             "database_sha256": db_hash,
             "database_size_bytes": db_size_bytes,
         },
@@ -2709,6 +2843,7 @@ def ops_event_study(
                 else []
             ),
         },
+        "confirmatory_gate": confirmatory_gate,
         "price_errors": price_errors,
         "go_no_go": go_no_go,
     }
@@ -3389,16 +3524,19 @@ def ops_signal_study(
         if normalized_cohort == "live"
         else {}
     )
-    minute_bars_payload = minute_bars_by_symbol if any(minute_bars_by_symbol.values()) else None
-    cached_intraday_pairs: set[tuple[str, date]] = set()
-    for symbol, minute_bars in minute_bars_by_symbol.items():
-        counts_by_date: dict[date, int] = {}
-        for bar in minute_bars:
-            session_date = bar.timestamp.astimezone(NEW_YORK).date()
-            counts_by_date[session_date] = counts_by_date.get(session_date, 0) + 1
-        cached_intraday_pairs.update(
-            (symbol, session_date) for session_date, count in counts_by_date.items() if count >= 300
-        )
+    cached_intraday_pairs = completed_minute_bar_sessions(
+        str(selected_db),
+        requests=intraday_requests,
+    )
+    verified_minute_bars_by_symbol = filter_completed_minute_bars(
+        minute_bars_by_symbol,
+        completed_sessions=cached_intraday_pairs,
+    )
+    minute_bars_payload = (
+        verified_minute_bars_by_symbol
+        if any(verified_minute_bars_by_symbol.values())
+        else None
+    )
     report = evaluate_daily_hypothesis_family(
         signals,
         bars_by_symbol=bars_by_symbol,
@@ -3443,6 +3581,8 @@ def ops_signal_study(
             "run_timestamp_utc": datetime.now(UTC).isoformat(),
             "cohort": normalized_cohort,
             "database_path": str(selected_db.resolve()),
+            "database_sha256": _file_sha256(selected_db) if selected_db.is_file() else None,
+            "database_size_bytes": selected_db.stat().st_size if selected_db.is_file() else None,
             "requested_start_date": start_date.isoformat(),
             "requested_end_date": end_date.isoformat(),
             "symbols_requested": len(symbols),
@@ -3645,6 +3785,26 @@ def ops_live_canary_status(
     """Show canary state without connecting to IBKR or changing broker state."""
 
     typer.echo(json.dumps(live_canary_status_report(str(ledger_path)), indent=2, sort_keys=True))
+
+
+@ops_app.command("live-canary-watchdog")
+def ops_live_canary_watchdog(
+    worker_task_name: str = typer.Option(..., "--worker-task-name"),
+    ledger_path: Path = typer.Option(Path("data/live_canary.db"), "--ledger-path"),  # noqa: B008
+    stale_seconds: int = typer.Option(120, "--stale-seconds", min=30),
+    output_log_path: Path = typer.Option(  # noqa: B008
+        Path("logs/live-canary-watchdog.log"),
+        "--output-log",
+    ),
+) -> None:
+    """Restart the hidden canary worker when its durable heartbeat is stale."""
+
+    result = run_scheduled_task_watchdog(
+        ledger_db=str(ledger_path),
+        worker_task_name=worker_task_name,
+        stale_seconds=stale_seconds,
+    )
+    append_watchdog_log(output_log_path, result)
 
 
 if __name__ == "__main__":

@@ -118,6 +118,41 @@ def test_load_scored_signals_reads_payload_and_filters_dates(tmp_path) -> None:
     assert filtered == []
 
 
+def test_load_scored_signals_skips_malformed_json_before_sqlite_extract(tmp_path) -> None:
+    db_path = str(tmp_path / "db.sqlite3")
+    init_db(db_path)
+    ensure_review_tables(db_path)
+    filed_at = datetime(2026, 2, 12, 20, 39, 47, tzinfo=UTC).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        for suffix, payload in (
+            ("001", "{malformed"),
+            ("002", json.dumps({"issuer_symbol": "MAT", "score": 95.0})),
+        ):
+            accession = f"0001708842-26-{suffix}"
+            conn.execute(
+                """
+                INSERT INTO filings (
+                    source, cik, accession_number, form_type, filed_at,
+                    filing_detail_url, primary_doc_url, raw_rss_entry
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("sec_rss", "0000063276", accession, "4", filed_at, "https://example", None, "{}"),
+            )
+            conn.execute(
+                """
+                INSERT INTO review_packets (
+                    packet_id, accession_number, cik, form_type, payload_json,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (f"packet-{suffix}", accession, "0000063276", "4", payload, filed_at, filed_at),
+            )
+
+    signals = load_scored_signals(db_path)
+
+    assert [signal.symbol for signal in signals] == ["MAT"]
+
+
 def test_load_scored_signals_skips_non_tradable_symbols(tmp_path) -> None:
     db_path = str(tmp_path / "db.sqlite3")
     init_db(db_path)

@@ -23,6 +23,9 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("MARKET_DATA_RETRY_MIN_SECONDS", raising=False)
     monkeypatch.delenv("MARKET_DATA_RETRY_MAX_SECONDS", raising=False)
     monkeypatch.delenv("MARKET_EARNINGS_SHOCK_DROP_THRESHOLD", raising=False)
+    monkeypatch.delenv("IB_GATEWAY_HOST", raising=False)
+    monkeypatch.delenv("IB_GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("INSIDER_IB_CLIENT_ID", raising=False)
     monkeypatch.delenv("DATABASE_PATH", raising=False)
 
     settings = Settings(_env_file=None)
@@ -48,7 +51,10 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.database_path == "data/insider_alerts.db"
 
 
-def test_config_loads_ib_gateway_from_env_file(tmp_path) -> None:
+def test_config_loads_ib_gateway_from_env_file(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("IB_GATEWAY_HOST", raising=False)
+    monkeypatch.delenv("IB_GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("INSIDER_IB_CLIENT_ID", raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text(
         "IB_GATEWAY_HOST=custom-gateway\n"

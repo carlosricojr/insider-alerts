@@ -59,15 +59,18 @@ Read state without connecting to IBKR:
 .\.venv\Scripts\python.exe -m insider_alerts.cli ops live-canary-status
 ```
 
-The status includes a runtime source fingerprint. `source_revision_current: false` means files
-changed after the worker started. New workers detect later source drift themselves, exit cleanly,
-and are relaunched invisibly by the watchdog's next recovery trigger. Running the installer with
-`-Start` performs an immediate controlled restart so the registered worker always loads the
-current source.
+The installer creates two direct-`pythonw.exe` tasks: a long-running worker and an independent
+one-minute watchdog. The status includes a runtime source fingerprint and durable cycle
+heartbeats. `source_revision_current: false` makes the worker exit cleanly. If the worker is not
+running, the watchdog starts it; if the newest start/success heartbeat is more than 120 seconds
+old, the watchdog ends and restarts it. All subprocesses use Windows `CREATE_NO_WINDOW`.
+Running the installer with `-Start` performs an immediate controlled restart so the registered
+worker always loads the current source.
 
-Logs are `logs/live-canary.out.log` and `logs/live-canary.err.log`; the independent durable ledger
-is `data/live_canary.db`. Stop the background canary before manually trading in this same IBKR
-account. If the process detects manual activity anyway, it blocks new entries.
+Logs are `logs/live-canary.out.log`, `logs/live-canary.err.log`, and
+`logs/live-canary-watchdog.log`; the independent durable ledger is `data/live_canary.db`. Stop the
+background canary before manually trading in this same IBKR account. If the process detects
+manual activity anyway, it blocks new entries.
 
 ## Recovery
 

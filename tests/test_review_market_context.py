@@ -191,6 +191,40 @@ def test_daily_market_data_client_decodes_gzip_response(monkeypatch) -> None:
     assert snapshot.source == "yahoo"
 
 
+def test_daily_market_data_client_retries_truncated_gzip(monkeypatch) -> None:
+    calls = 0
+
+    class _FakeResponse:
+        headers = {"Content-Encoding": "gzip"}
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"\x1f\x8b"
+
+    def _fake_urlopen(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _FakeResponse()
+
+    monkeypatch.setattr(market_context_module, "urlopen", _fake_urlopen)
+    client = DailyMarketDataClient(
+        user_agent="test",
+        timeout_seconds=1.0,
+        retry_attempts=2,
+        retry_min_seconds=0.0,
+    )
+
+    with pytest.raises(MarketContextError, match="market data request failed"):
+        client._download_text("https://example.test", symbol="TEST")
+
+    assert calls == 2
+
+
 def test_daily_market_data_client_applies_retry_policy_to_ib(monkeypatch) -> None:
     calls: list[str] = []
     sleeps: list[float] = []

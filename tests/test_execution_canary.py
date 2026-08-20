@@ -290,7 +290,7 @@ def test_live_entry_reserves_entry_and_exit_commissions(
         _bars(date(2026, 1, 2)),
         commission=0.35,
     )
-    broker.snapshot = AccountSnapshot("ACCOUNT", 228.0, 228.0, 228.0, {}, 0)
+    broker.snapshot = AccountSnapshot("ACCOUNT", 261.0, 261.0, 261.0, {}, 0)
     runner = CanaryRunner(config, broker)
     runner.store.activation(now - timedelta(hours=1))
 

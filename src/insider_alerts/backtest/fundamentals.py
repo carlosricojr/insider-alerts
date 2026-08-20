@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Iterable, Mapping
+from contextlib import closing
 from datetime import UTC, date, datetime
 
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
@@ -96,10 +97,12 @@ def refresh_companyfacts(
     fetched = 0
     reused = 0
     errors: list[str] = []
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as read_conn:
         cached_ciks = {
-            str(row[0]) for row in conn.execute("SELECT cik FROM sec_companyfacts_cache").fetchall()
+            str(row[0])
+            for row in read_conn.execute("SELECT cik FROM sec_companyfacts_cache").fetchall()
         }
+    with closing(sqlite3.connect(db_path)) as conn:
         for raw_cik in requested_ciks:
             digits = "".join(char for char in str(raw_cik) if char.isdigit())
             if not digits:

@@ -11,9 +11,9 @@ from datetime import date, timedelta
 from insider_alerts.backtest.event_data import CanonicalEvent
 from insider_alerts.backtest.models import DailyBar
 
-_CONVICTION_FEATURE_WEIGHTS = {
-    "holding_change_ratio": 0.4,
-    "open_market_gross_value": 0.4,
+CONVICTION_FEATURE_WEIGHTS = {
+    "holding_change_ratio": 0.5,
+    "open_market_gross_value": 0.3,
     "trade_pct_daily_turnover": 0.2,
 }
 
@@ -448,7 +448,7 @@ def _finite_rationale_value(event: CanonicalEvent, feature: str) -> float | None
 
 def _conviction_distributions(events: Sequence[CanonicalEvent]) -> dict[str, list[float]]:
     distributions: dict[str, list[float]] = {}
-    for feature in _CONVICTION_FEATURE_WEIGHTS:
+    for feature in CONVICTION_FEATURE_WEIGHTS:
         values = [
             value
             for event in events
@@ -465,7 +465,7 @@ def _conviction_score(
 ) -> float | None:
     """Training-fold percentile composite matching the live conviction weights."""
     weighted_score = 0.0
-    for feature, weight in _CONVICTION_FEATURE_WEIGHTS.items():
+    for feature, weight in CONVICTION_FEATURE_WEIGHTS.items():
         value = _finite_rationale_value(event, feature)
         distribution = training_distributions.get(feature, [])
         if value is None or not distribution:

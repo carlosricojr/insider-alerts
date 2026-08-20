@@ -1189,6 +1189,27 @@ class CanaryRunner:
                 else None
             )
             current_position_quantity = account.positions.get(str(row["symbol"]), 0.0)
+            cancelled_statuses = {"cancelled", "canceled", "apicancelled", "inactive"}
+            if (
+                timed is not None
+                and timed.status.lower() in cancelled_statuses
+                and current_position_quantity > 0
+            ):
+                residual_quantity = int(round(current_position_quantity))
+                self.store.update(
+                    str(row["packet_id"]),
+                    live_state="open",
+                    live_quantity=residual_quantity,
+                    timed_exit_order_id=None,
+                )
+                self.store.event(
+                    "cancelled_timed_exit_reopened",
+                    packet_id=str(row["packet_id"]),
+                    level="critical",
+                    cancelled_order_id=timed.order_id,
+                    residual_quantity=residual_quantity,
+                )
+                timed = None
             filled_exit = next(
                 (
                     order

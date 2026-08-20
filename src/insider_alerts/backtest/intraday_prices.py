@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time as time_module
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
@@ -26,6 +26,18 @@ def ensure_minute_bars_table(db_path: str) -> None:
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (symbol, bar_timestamp)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_bar_minute_sessions (
+                symbol TEXT NOT NULL,
+                session_date TEXT NOT NULL,
+                bar_count INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, session_date)
             )
             """
         )
@@ -136,6 +148,86 @@ def _cached_session_count(db_path: str, *, symbol: str, session_date: date) -> i
     return int(row[0]) if row is not None else 0
 
 
+def _cached_session_complete(db_path: str, *, symbol: str, session_date: date) -> bool:
+    ensure_minute_bars_table(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT bar_count
+            FROM price_bar_minute_sessions
+            WHERE symbol = ? AND session_date = ?
+            """,
+            (symbol.upper(), session_date.isoformat()),
+        ).fetchone()
+    if row is None or int(row[0]) <= 0:
+        return False
+    return _cached_session_count(db_path, symbol=symbol, session_date=session_date) >= int(row[0])
+
+
+def completed_minute_bar_sessions(
+    db_path: str,
+    *,
+    requests: Iterable[tuple[str, date]],
+) -> set[tuple[str, date]]:
+    return {
+        (symbol, session_date)
+        for symbol, session_date in set(requests)
+        if _cached_session_complete(db_path, symbol=symbol, session_date=session_date)
+    }
+
+
+def filter_completed_minute_bars(
+    bars_by_symbol: Mapping[str, Sequence[MinuteBar]],
+    *,
+    completed_sessions: set[tuple[str, date]],
+) -> dict[str, list[MinuteBar]]:
+    normalized_sessions = {
+        (symbol.upper(), session_date) for symbol, session_date in completed_sessions
+    }
+    return {
+        symbol: [
+            bar
+            for bar in bars
+            if (bar.symbol.upper(), bar.timestamp.astimezone(NEW_YORK).date())
+            in normalized_sessions
+        ]
+        for symbol, bars in bars_by_symbol.items()
+    }
+
+
+def _mark_session_complete(
+    db_path: str,
+    *,
+    symbol: str,
+    session_date: date,
+    bar_count: int,
+    source: str = "ibkr_trades_rth",
+) -> None:
+    if bar_count <= 0:
+        raise ValueError("bar_count must be positive")
+    ensure_minute_bars_table(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO price_bar_minute_sessions (
+                symbol, session_date, bar_count, source, completed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, session_date) DO UPDATE SET
+                bar_count=excluded.bar_count,
+                source=excluded.source,
+                completed_at=excluded.completed_at
+            """,
+            (
+                symbol.upper(),
+                session_date.isoformat(),
+                bar_count,
+                source,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
 def refresh_ibkr_minute_bars(
     db_path: str,
     *,
@@ -165,7 +257,7 @@ def refresh_ibkr_minute_bars(
         ib.connect(host, port, clientId=client_id, timeout=10, readonly=True)
         request_count = 0
         for symbol, session_date in requested:
-            if _cached_session_count(db_path, symbol=symbol, session_date=session_date) > 0:
+            if _cached_session_complete(db_path, symbol=symbol, session_date=session_date):
                 reused += 1
                 continue
             contract = contracts.get(symbol)
@@ -215,6 +307,12 @@ def refresh_ibkr_minute_bars(
                 errors.append(f"{symbol}|{session_date}: no minute bars")
                 continue
             upsert_minute_bars(db_path, bars=bars)
+            _mark_session_complete(
+                db_path,
+                symbol=symbol,
+                session_date=session_date,
+                bar_count=len(bars),
+            )
             fetched += 1
     finally:
         if ib.isConnected():
