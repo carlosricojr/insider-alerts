@@ -87,37 +87,49 @@ def run_scheduled_task_watchdog(
     )
     runner = task_runner or _run_schtasks
     end_return_code: int | None = None
+    query_arguments = ["/Query", "/TN", worker_task_name, "/FO", "CSV", "/NH", "/V"]
+    worker_running = _task_is_running(runner(query_arguments))
+    if stale and worker_running:
+        end_result = runner(["/End", "/TN", worker_task_name])
+        end_return_code = end_result.returncode
+        if end_result.returncode != 0:
+            error = (
+                end_result.stderr or end_result.stdout or "unknown schtasks failure"
+            ).strip()
+            raise RuntimeError(f"failed to stop stale scheduled canary worker: {error}")
+        for attempt in range(stop_poll_attempts):
+            if not _task_is_running(runner(query_arguments)):
+                break
+            if attempt + 1 < stop_poll_attempts:
+                sleep_fn(0.25)
+        else:
+            raise RuntimeError("stale scheduled canary worker did not stop")
+    should_start = stale or not worker_running
+    run_return_code: int | None = None
+    if should_start:
+        run_result = runner(["/Run", "/TN", worker_task_name])
+        run_return_code = run_result.returncode
+        if run_result.returncode != 0:
+            error = (run_result.stderr or run_result.stdout or "unknown schtasks failure").strip()
+            raise RuntimeError(f"failed to start scheduled canary worker: {error}")
     if stale:
-        query_arguments = ["/Query", "/TN", worker_task_name, "/FO", "CSV", "/NH", "/V"]
-        if _task_is_running(runner(query_arguments)):
-            end_result = runner(["/End", "/TN", worker_task_name])
-            end_return_code = end_result.returncode
-            if end_result.returncode != 0:
-                error = (
-                    end_result.stderr or end_result.stdout or "unknown schtasks failure"
-                ).strip()
-                raise RuntimeError(f"failed to stop stale scheduled canary worker: {error}")
-            for attempt in range(stop_poll_attempts):
-                if not _task_is_running(runner(query_arguments)):
-                    break
-                if attempt + 1 < stop_poll_attempts:
-                    sleep_fn(0.25)
-            else:
-                raise RuntimeError("stale scheduled canary worker did not stop")
-    run_result = runner(["/Run", "/TN", worker_task_name])
-    if run_result.returncode != 0:
-        error = (run_result.stderr or run_result.stdout or "unknown schtasks failure").strip()
-        raise RuntimeError(f"failed to start scheduled canary worker: {error}")
-    event_type = "watchdog_worker_restarted" if stale else "watchdog_worker_ensured"
+        action = "restart"
+        event_type = "watchdog_worker_restarted"
+    elif should_start:
+        action = "start"
+        event_type = "watchdog_worker_started"
+    else:
+        action = "already_running"
+        event_type = "watchdog_worker_ensured"
     store.event(event_type, level="critical" if stale else "info", reason=reason)
     return {
         "checked_at_utc": checked_at.isoformat(),
         "worker_task_name": worker_task_name,
         "heartbeat_stale": stale,
         "reason": reason,
-        "action": "restart" if stale else "ensure_running",
+        "action": action,
         "end_return_code": end_return_code,
-        "run_return_code": run_result.returncode,
+        "run_return_code": run_return_code,
     }
 
 
