@@ -1,9 +1,9 @@
 # CodeRabbit PR Review Loop (Mandatory)
 
 <!-- markdownlint-disable MD013 -->
-<!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 3.0.0 -->
+<!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 3.1.0 -->
 <!-- CANONICAL_SOURCE: https://github.com/ospina-company/alpha-core/blob/main/docs/agents/coderabbit-pr-review-loop.md -->
-<!-- CANONICAL_BODY_SHA256: eceb059d093af120965a9942d20388fca95ca6c3d2e4c3d48f445fc992046ffb -->
+<!-- CANONICAL_BODY_SHA256: 74a0206bad6dfd41d3319edcf524feb50f025543998b8920120a9775cd576b9b -->
 <!-- markdownlint-enable MD013 -->
 
 This is the canonical workflow for any task that prepares, updates, or merges a
@@ -46,8 +46,8 @@ Exit codes:
 | Code | Meaning | Next action |
 | --- | --- | --- |
 | `0` | Review of record obtained, zero unresolved actionable threads | Proceed to merge gates |
-| `10` | Both channels **verified** unavailable | Perform the rung-2 agent review yourself, now |
-| `20` | Review obtained but not merge-ready: threads open, unaddressed ladder findings, or the App check is not terminal-pass | Address findings, re-run |
+| `10` | Both channels **verified** unavailable — throttled/failed, or both affirmatively refused a diff with no reviewable files | Perform the rung-2 agent review yourself, now |
+| `20` | Not merge-ready: threads open, unaddressed ladder findings, a non-passing App check — or no review of record at all yet (`NO_REVIEW_OF_RECORD_ON_HEAD`, e.g. `--check-only` or an untried channel) | Address findings or run the race, then re-run |
 | `30` | Deadline expired with a channel still active | Re-run or raise `--deadline`; this is **not** rung 2 |
 | `1` | Usage or hard error | Read stderr; do not merge |
 
@@ -55,25 +55,58 @@ Exhausting the time budget is not evidence that CodeRabbit is unavailable, so
 `30` never licenses a rung-2 review. Neither does a channel that was never
 tried — a `--check-only` pass or a disabled leg reports
 `NO_REVIEW_OF_RECORD_ON_HEAD` and exit `20`. Only exit `10` licenses rung 2, and
-it requires the App to have been **requested and refused** *and* the CLI to have
-been **attempted and failed or skipped**, each for a recorded reason.
+it requires the App to have been **attempted and verified down** — throttled, or
+an affirmative no-reviewable-files refusal — *and* the CLI to have been
+**attempted and failed or skipped**, each for a recorded reason.
 
 The classification recorded in the PR always names what actually happened:
 
 | Classification | Meaning |
 | --- | --- |
 | `APP_REVIEW_COMPLETED` | Rung 0: the App reviewed this head |
-| `APP_REVIEW_COMPLETED_CHECK_NOT_TERMINAL` | App review is substantive but its check has not passed |
+| `APP_REVIEW_COMPLETED_CHECK_NOT_TERMINAL` | App review is substantive but its check is still pending or unreadable |
+| `APP_REVIEW_COMPLETED_CHECK_FAILED` | App review is substantive but its check failed |
 | `APP_REVIEW_UNAVAILABLE_ADAPTIVE_LIMIT` | Rung 1: App throttled, CLI review of record |
 | `APP_REVIEW_PENDING_CLI_REVIEW_OF_RECORD` | Rung 1: CLI finished first, App still pending |
 | `APP_REVIEW_NOT_REQUESTED_CLI_REVIEW_OF_RECORD` | Rung 1: the App leg was disabled for this run |
+| `APP_REVIEW_REFUSED_NO_FILES_CLI_REVIEW_OF_RECORD` | Rung 1: the App refused the head (no reviewable files), CLI review of record |
 | `REVIEW_RACE_DEADLINE_EXPIRED` | Budget exhausted, no review of record yet |
 | `NO_REVIEW_OF_RECORD_ON_HEAD` | No review covers this head, and no channel was proven unavailable |
 | `NON_CODERABBIT_AGENT_REVIEW` | Rung 2: both channels **attempted** and verified unavailable |
+| `NO_REVIEWABLE_FILES_NON_CODERABBIT_AGENT_REVIEW` | Rung 2: both channels affirmatively refused the diff — nothing in it is reviewable by CodeRabbit |
 
 It writes `review-of-record.json` and `review-of-record.md` to a temp evidence
 directory (never inside the repository — the CLI would otherwise review its own
 output). Paste the markdown into the PR, or pass `--post-evidence`.
+
+### No reviewable files: binary-only and fully path-filtered diffs
+
+A diff can be unreviewable by CodeRabbit **as a property of the diff itself**:
+every changed file is binary or excluded by path filters (CodeRabbit blocks
+several asset patterns by default, e.g. `!**/*.png`). Both channels then
+refuse deterministically — this is neither a throttle nor an outage:
+
+- the **App** posts `Review skipped — Review was skipped due to path filters`
+  and answers `@coderabbitai full review` with
+  `Action not completed — No files to review.`;
+- the **CLI** fails with `Review failed: No files to review`.
+
+Re-requesting, re-running the race, or raising `--deadline` can never change a
+diff-bound refusal; doing so to "escape" one is a banned pattern. The tool
+detects both refusals (structural auto-generated markers only, so prose that
+merely quotes these phrases never counts), stops the race, suppresses further
+App requests for the refused head, and classifies the outcome
+`NO_REVIEWABLE_FILES_NON_CODERABBIT_AGENT_REVIEW` with exit `10`: rung 2 is
+licensed immediately.
+
+The rung-2 review of an asset-only diff verifies the assets, not code lenses:
+integrity and byte-identity with the source asset, dimensions/naming
+conventions, embedded metadata and provenance (EXIF/text chunks, C2PA
+`caBX` manifests on AI-generated images — anything under a public web root is
+served publicly), size and reference impact. Record it on the PR under that
+classification. When running the ladder by hand, treat these refusal notices
+exactly like a live throttle: record them and move to rung 2 without waiting
+or re-asking.
 
 Verify a repository's copy of this document before relying on it:
 
@@ -281,6 +314,8 @@ These are defects, not styles. Each one converts a throttle into dead time:
   *review* gate — check state is not review evidence, and a throttled review can
   leave a terminal non-pending check;
 - re-posting `@coderabbitai full review` against a live throttle;
+- re-running the race or raising `--deadline` against a no-reviewable-files
+  refusal — the refusal is diff-bound and cannot change on the same head;
 - treating "no CodeRabbit comments yet" as "review in progress, keep waiting";
 - running the ladder sequentially — asking the App, waiting, then trying the CLI
   only after the App fails;
@@ -439,8 +474,9 @@ jq -rs -e -r --arg head "$EVIDENCE_HEAD" '
    select(.submittedAt != null) |
    select(((.body // "") | test("Actionable comments posted|Walkthrough"))
           or ((.body // "") | length) >= 400) |
-   select(((.body // "") | ascii_downcase |
-           test("action not completed|review rate limited|review limit reached|fair usage limits policy|reviews paused|review was skipped")) | not)] |
+   select(((.body // "") | test("Actionable comments posted"))
+          or ((((.body // "") | ascii_downcase) |
+           test("auto-generated comment: rate limited by coderabbit.ai|action not completed</summary>|reviews paused|review was skipped")) | not))] |
   sort_by(.submittedAt) | last as $review |
   if $review == null then
     error("no completed CodeRabbit review found for the captured head")
@@ -449,11 +485,15 @@ jq -rs -e -r --arg head "$EVIDENCE_HEAD" '
      (($review.body // "")|gsub("[\\r\\n]+";" ")|.[0:160])] | @tsv
   end' /tmp/pr-reviews.jsonl
 jq -rs -r '.[].data.repository.pullRequest.comments.nodes[] |
-  select(.author.login|ascii_downcase|contains("coderabbit")) |
+  select((.author.login // "" | ascii_downcase) |
+         IN("coderabbitai","coderabbitai[bot]","coderabbit")) |
   [.createdAt,.updatedAt,.url,(.body|gsub("[\\r\\n]+";" ")|.[0:240])] | @tsv' \
   /tmp/pr-comments.jsonl
+# Outdated threads are excluded to match the tool: a thread the diff has
+# moved past is not an actionable merge blocker.
 jq -rs -r '.[].data.repository.pullRequest.reviewThreads.nodes[] |
-  select(.isResolved|not) | [.id,.isOutdated,.path,.line] | @tsv' \
+  select((.isResolved|not) and (.isOutdated|not)) |
+  [.id,.path,.line] | @tsv' \
   /tmp/pr-threads.jsonl
 jq -rs -r '.[].data.node.comments.nodes[] |
   [.author.login,.createdAt,.url,(.body|gsub("[\\r\\n]+";" ")|.[0:240])] |
@@ -474,14 +514,29 @@ set -euo pipefail
 
 CHECK_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
 test "$CHECK_HEAD" = "$EVIDENCE_HEAD"
-gh pr checks "$PR" --json name,bucket,state,workflow,link \
-  | tee /tmp/pr-checks.json
+# gh pr checks exits non-zero when checks merely fail or are pending; under
+# `set -euo pipefail` that would kill the pass before jq ever evaluates the
+# payload. Capture the payload and the status separately -- a parseable
+# payload is a real answer regardless of the exit code.
+checks_rc=0
+gh pr checks "$PR" --required --json name,bucket,state,workflow,link \
+  > /tmp/pr-checks.json || checks_rc=$?
+cat /tmp/pr-checks.json
 
-# Required CI must pass on every path. `all` over an empty array is vacuously
-# true, so require at least one check before applying the predicate.
-jq -e 'length > 0 and
-       all(.[]; ((.bucket | ascii_downcase) == "pass" or
-                 (.bucket | ascii_downcase) == "skipping"))' /tmp/pr-checks.json
+# The gate is REQUIRED CI, so scope the query with --required: an optional
+# pending or failing check must not block the merge. Caveat: a required check
+# that has not registered with GitHub yet does not appear in this output at
+# all, so the non-empty requirement below fails closed on "nothing registered"
+# and you must confirm the expected required workflows are present in the
+# listing (compare against branch protection when in doubt).
+# CodeRabbit's own check is excluded here: on a ladder classification it is
+# legitimately absent, stale, or non-passing, and the CLASSIFICATION block
+# below is the sole owner of that gate.
+jq -e '(length > 0) and
+       ([ .[] | select((((.name // "") | ascii_downcase) |
+                        contains("coderabbit")) | not) ] |
+        all(.[]; ((.bucket | ascii_downcase) == "pass" or
+                  (.bucket | ascii_downcase) == "skipping")))' /tmp/pr-checks.json
 
 # The CodeRabbit check itself is a gate ONLY when the App is the reviewer of
 # record. On a ladder classification it is legitimately absent or stale, and
@@ -501,9 +556,11 @@ printf 'evidence and checks verified on: %s\n' "$FINAL_HEAD"
 
 Match the review **author** against the exact bot identities above, never a
 substring: a human account named `coderabbit-fan` could otherwise post a
-fabricated Walkthrough and have it accepted as the review of record. Check
-*names*, by contrast, vary freely, so match those with a case-insensitive
-`coderabbit` substring. A terminal `pass` only closes the check-state gate;
+fabricated Walkthrough and have it accepted as the review of record. The same
+exact-identity rule applies to **comment evidence** (throttle and refusal
+notices): a lookalike login must not be able to plant a fake notice that the
+evidence pass then acts on. Check *names*, by contrast, vary freely, so match
+those with a case-insensitive `coderabbit` substring. A terminal `pass` only closes the check-state gate;
 it does not prove the semantic review gate. When the review of record came from
 the ladder, the App check may legitimately be absent or non-passing; the ladder
 evidence carries the semantic gate instead.
@@ -524,7 +581,8 @@ including actionable human threads; do not use a bulk resolve command as a
 substitute for triage.
 
 **Do not substitute a raw review-comment count** for the unresolved-thread
-listing above (`jq … select(.isResolved|not) … /tmp/pr-threads.jsonl`).
+listing above (`jq … select((.isResolved|not) and (.isOutdated|not)) …
+/tmp/pr-threads.jsonl`).
 Resolution state lives on the *thread*, not the comment, so a count such as
 `gh api repos/$OWNER/$NAME/pulls/$PR/comments | jq 'length'` cannot distinguish
 four states that must be merged on differently:
