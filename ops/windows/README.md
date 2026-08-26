@@ -34,3 +34,16 @@ is stale for more than two minutes. Passing `-Start` stops any existing instance
 both registered definitions, ensuring deployed source changes are loaded. The worker also
 fingerprints its Python source and exits for an invisible watchdog restart if the source later
 changes. The live policy and broker gates are documented in `docs/runbook/LIVE_CANARY.md`.
+
+Install the separate prospective evidence worker after deploying its pinned alpha-core runtime:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\ops\windows\install-research-capture-task.ps1 `
+  -AlphaRoot C:\path\to\clean-alpha-core-runtime `
+  -Start
+```
+
+The task runs one bounded capture per minute through `pythonw.exe`. It has no order code, cannot
+block the live canary, ignores overlapping launches, hides all windows, and kills a timed-out
+alpha-core capture process tree. Health is available from `ops research-capture-status`.

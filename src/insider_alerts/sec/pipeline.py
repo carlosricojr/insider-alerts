@@ -268,7 +268,9 @@ def enqueue_review_packets(
             "score": score.score,
             "rationale": score.rationale,
             "issuer_symbol": facts.issuer_symbol,
+            "issuer_cik": facts.issuer_cik,
             "owner": facts.reporting_owner_name,
+            "reporting_owner_cik": facts.reporting_owner_cik,
         }
         packets_to_enqueue.append((ref, packet))
 
