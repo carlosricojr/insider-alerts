@@ -18,6 +18,17 @@ class SecRetryableStatusError(SecHttpError):
     """Retryable status-code failure."""
 
 
+@dataclass(frozen=True, slots=True)
+class SecResource:
+    content: bytes
+    status_code: int
+    final_url: str
+    etag: str | None
+    last_modified: str | None
+    content_type: str | None
+    upstream_digest: str | None = None
+
+
 @dataclass(slots=True)
 class SecHttpClient:
     settings: Settings
@@ -39,7 +50,7 @@ class SecHttpClient:
             "Accept-Encoding": "gzip, deflate",
         }
 
-    def _get_once(self, url: str) -> str:
+    def _get_once(self, url: str) -> SecResource:
         self._enforce_rate_limit()
         with httpx.Client(
             timeout=self.settings.sec_timeout_seconds,
@@ -50,9 +61,21 @@ class SecHttpClient:
             raise SecRetryableStatusError(f"retryable status code: {response.status_code}")
         if response.status_code >= 400:
             raise SecHttpError(f"non-retryable status code: {response.status_code}")
-        return response.text
+        return SecResource(
+            content=response.content,
+            status_code=response.status_code,
+            final_url=str(response.url),
+            etag=response.headers.get("etag"),
+            last_modified=response.headers.get("last-modified"),
+            content_type=response.headers.get("content-type"),
+            upstream_digest=(
+                response.headers.get("content-digest")
+                or response.headers.get("digest")
+                or response.headers.get("content-md5")
+            ),
+        )
 
-    def get_text(self, url: str) -> str:
+    def get_resource(self, url: str) -> SecResource:
         try:
             for attempt in Retrying(
                 stop=stop_after_attempt(self.settings.sec_retry_attempts),
@@ -69,3 +92,7 @@ class SecHttpClient:
             raise SecHttpError(f"SEC request failed for {url}: {exc}") from exc
 
         raise SecHttpError(f"SEC request failed for {url}: unknown retry state")
+
+    def get_text(self, url: str) -> str:
+        resource = self.get_resource(url)
+        return resource.content.decode("utf-8")

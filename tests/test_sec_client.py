@@ -22,6 +22,28 @@ def test_sec_client_sends_required_headers(httpx_mock: HTTPXMock) -> None:
     assert req.headers["Accept-Encoding"] == "gzip, deflate"
 
 
+def test_sec_client_returns_binary_resource_metadata(httpx_mock: HTTPXMock) -> None:
+    settings = Settings(SEC_RATE_LIMIT_PER_SECOND=10)
+    client = SecHttpClient(settings)
+    httpx_mock.add_response(
+        status_code=200,
+        content=b"zip-bytes",
+        headers={
+            "ETag": '"digest"',
+            "Content-Type": "application/zip",
+            "Content-Digest": "sha-256=:abc=:",
+        },
+    )
+
+    response = client.get_resource("https://www.sec.gov/archive.zip")
+
+    assert response.content == b"zip-bytes"
+    assert response.status_code == 200
+    assert response.etag == '"digest"'
+    assert response.content_type == "application/zip"
+    assert response.upstream_digest == "sha-256=:abc=:"
+
+
 def test_sec_client_retries_on_429(httpx_mock: HTTPXMock) -> None:
     settings = Settings(SEC_RETRY_ATTEMPTS=3, SEC_RATE_LIMIT_PER_SECOND=10)
     client = SecHttpClient(settings)

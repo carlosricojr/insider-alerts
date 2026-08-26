@@ -28,7 +28,9 @@ from insider_alerts.sec.store import upsert_filing_refs
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _approved_job(tmp_path: Path) -> tuple[Path, str, datetime]:
+def _approved_job(
+    tmp_path: Path, *, owner_ciks: tuple[str, ...] = ("0000000002",)
+) -> tuple[Path, str, datetime]:
     source_db = tmp_path / "source.db"
     accession = "0000000001-26-000001"
     cik = "0000000001"
@@ -56,7 +58,8 @@ def _approved_job(tmp_path: Path) -> tuple[Path, str, datetime]:
         {
             "issuer_symbol": "TEST",
             "issuer_cik": cik,
-            "reporting_owner_cik": "0000000002",
+            "reporting_owner_cik": owner_ciks[0] if len(owner_ciks) == 1 else None,
+            "reporting_owner_ciks": list(owner_ciks),
             "score": 9.0,
             "rationale": {},
         },
@@ -169,6 +172,40 @@ def test_terminal_option_failure_is_persisted_as_valid_immutable_snapshot(
         assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone()[0] == 1
     assert run_capture_once(config, now=decision_at + timedelta(seconds=3)).status == "idle"
     assert packet_id in result.job_id
+
+
+def test_capture_preserves_multi_owner_ambiguity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(
+        tmp_path, owner_ciks=("0000000002", "0000000003")
+    )
+    config = _config(tmp_path, source_db)
+
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (
+            None,
+            None,
+            None,
+            "OPTION_ARTIFACT_INVALID",
+            "fixture",
+            False,
+        ),
+    )
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+    assert result.status == "completed"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+        assert row is not None
+        record = json.loads(bytes(row[0]))
+    assert record["payload"]["signal"]["reporting_owner_ciks"] == [
+        "0000000002",
+        "0000000003",
+    ]
+    assert record["payload"]["classification"]["owner_cik"] is None
+    assert record["payload"]["classification"]["transaction_owner_mapping"] == "ambiguous"
 
 
 def test_successful_option_capture_is_content_addressed_and_referenced(

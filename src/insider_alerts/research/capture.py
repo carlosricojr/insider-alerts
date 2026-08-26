@@ -614,8 +614,20 @@ def _append_snapshot(
         raise ValueError("persisted signal payloads must be objects")
     filing = _filing_context(config.source_db, job)
     candidate = _candidate_context(config.canary_ledger, job.packet_id)
-    owner_cik = payload.get("reporting_owner_cik")
-    owner_ciks = [str(owner_cik)] if isinstance(owner_cik, str) and owner_cik else []
+    payload_owner_ciks = payload.get("reporting_owner_ciks")
+    if isinstance(payload_owner_ciks, list):
+        owner_ciks = sorted(
+            {
+                str(value)
+                for value in payload_owner_ciks
+                if isinstance(value, str) and value
+            }
+        )
+    else:
+        owner_cik = payload.get("reporting_owner_cik")
+        owner_ciks = [str(owner_cik)] if isinstance(owner_cik, str) and owner_cik else []
+    owner_cik = owner_ciks[0] if len(owner_ciks) == 1 else None
+    owner_mapping = "exact" if owner_cik else "ambiguous" if owner_ciks else "missing"
     issuer_cik = str(payload.get("issuer_cik") or job.issuer_cik).lstrip("0") or "0"
     notification_at = (
         parse_utc(str(filing["notification_sent_at"]))
@@ -746,10 +758,10 @@ def _append_snapshot(
                 },
                 "classification": {
                     "state": "unpartitionable",
-                    "owner_cik": str(owner_cik) if owner_ciks else None,
+                    "owner_cik": owner_cik,
                     "classification_year": job.decision_at.year,
                     "cutoff_at_utc": utc_text(job.decision_at),
-                    "transaction_owner_mapping": "exact" if owner_ciks else "missing",
+                    "transaction_owner_mapping": owner_mapping,
                     "history_coverage_complete": False,
                     "left_censored": True,
                     "history_input_sha256": sha256_bytes(b"owner-history-not-yet-captured"),
