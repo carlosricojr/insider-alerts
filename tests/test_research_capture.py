@@ -102,6 +102,11 @@ def test_approval_atomically_enqueues_only_future_approved_signals(tmp_path: Pat
     assert row[0] == f"{packet_id}|insider-evidence-capture-v1"
     assert row[1] == packet_id
     assert row[10] == "pending"
+    with sqlite3.connect(source_db) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="identity is immutable"):
+            conn.execute("UPDATE research_capture_jobs SET payload_json='{}'")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            conn.execute("DELETE FROM research_capture_jobs")
 
     reject_db = tmp_path / "reject.db"
     ensure_review_tables(str(reject_db))

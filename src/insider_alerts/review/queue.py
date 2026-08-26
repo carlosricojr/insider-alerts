@@ -117,6 +117,16 @@ def ensure_review_tables(db_path: str) -> None:
             BEFORE UPDATE ON research_capture_jobs
             WHEN OLD.status = 'complete'
             BEGIN SELECT RAISE(ABORT, 'completed capture jobs are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS research_capture_job_identity_immutable
+            BEFORE UPDATE OF
+                job_id, packet_id, contract_version, accession_number, issuer_cik, form_type,
+                payload_json, decision_json, source_first_observed_at_utc, decision_at_utc,
+                created_at_utc
+            ON research_capture_jobs
+            BEGIN SELECT RAISE(ABORT, 'capture job identity is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS research_capture_jobs_no_delete
+            BEFORE DELETE ON research_capture_jobs
+            BEGIN SELECT RAISE(ABORT, 'capture jobs cannot be deleted'); END;
             CREATE TRIGGER IF NOT EXISTS enqueue_research_capture_after_approval
             AFTER UPDATE OF status ON review_packets
             WHEN NEW.status = 'approve' AND OLD.status <> 'approve'
