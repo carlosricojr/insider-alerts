@@ -11,7 +11,12 @@ import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker
 
 import insider_alerts.research.capture as capture_module
-from insider_alerts.research.capture import CaptureConfig, run_capture_once, sha256_bytes
+from insider_alerts.research.capture import (
+    CaptureConfig,
+    ProcessResult,
+    run_capture_once,
+    sha256_bytes,
+)
 from insider_alerts.review.queue import (
     apply_decision,
     enqueue_review_packet,
@@ -164,6 +169,63 @@ def test_terminal_option_failure_is_persisted_as_valid_immutable_snapshot(
         assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone()[0] == 1
     assert run_capture_once(config, now=decision_at + timedelta(seconds=3)).status == "idle"
     assert packet_id in result.job_id
+
+
+def test_successful_option_capture_is_content_addressed_and_referenced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, packet_id, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        captured = datetime.now(UTC)
+        artifact = {
+            "schema_version": "insider-evidence-option-surface-v1",
+            "artifact_status": "RESEARCH_ONLY",
+            "source_id": "ib_gateway:US_OPTIONS:SMART:type1",
+            "request_id": request_id,
+            "symbol": "TEST",
+            "client_id": 48,
+            "market_data_type": 1,
+            "requested_at_utc": (captured - timedelta(seconds=1)).isoformat(),
+            "source_max_ts_utc": captured.isoformat(),
+            "captured_at_utc": captured.isoformat(),
+            "min_dte_days": 3,
+            "max_dte_days": 30,
+            "max_expiries": 3,
+            "max_contracts_per_expiry": 120,
+            "surfaces": [
+                {
+                    "expiry": "2026-09-18",
+                    "underlying_price": 10.0,
+                    "underlying_bid": 9.99,
+                    "underlying_ask": 10.01,
+                    "underlying_source_timestamp_utc": captured.isoformat(),
+                    "quotes": [{}],
+                }
+            ],
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(artifact), encoding="utf-8")
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "captured"
+    option_files = list((config.artifact_root / "options").glob("*.json"))
+    assert len(option_files) == 1
+    assert option_files[0].stem == sha256_bytes(option_files[0].read_bytes())
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+        record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "captured"
+    assert observation["artifact_sha256"] == option_files[0].stem
+    assert packet_id in record["payload"]["signal"]["packet_id"]
 
 
 def test_retryable_option_failure_keeps_job_durable_without_snapshot(
