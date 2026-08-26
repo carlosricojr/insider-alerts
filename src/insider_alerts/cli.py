@@ -79,6 +79,7 @@ from insider_alerts.execution.canary import (
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
+from insider_alerts.research.capture import capture_status
 from insider_alerts.review.queue import (
     DecisionValidationError,
     apply_decision,
@@ -3785,6 +3786,20 @@ def ops_live_canary_status(
     """Show canary state without connecting to IBKR or changing broker state."""
 
     typer.echo(json.dumps(live_canary_status_report(str(ledger_path)), indent=2, sort_keys=True))
+
+
+@ops_app.command("research-capture-status")
+def ops_research_capture_status(
+    database_path: Path | None = typer.Option(None, "--database-path"),  # noqa: B008
+    evidence_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/evidence.db"), "--evidence-db"
+    ),
+) -> None:
+    """Show blinded capture health and counts; never expose outcomes."""
+
+    settings = get_settings()
+    selected_db = database_path or Path(settings.database_path)
+    typer.echo(json.dumps(capture_status(selected_db, evidence_db), indent=2, sort_keys=True))
 
 
 @ops_app.command("live-canary-watchdog")

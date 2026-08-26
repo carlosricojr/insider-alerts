@@ -18,6 +18,8 @@ class DecisionValidationError(ValueError):
 
 def ensure_review_tables(db_path: str) -> None:
     with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS review_packets (
@@ -64,6 +66,72 @@ def ensure_review_tables(db_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_review_packets_status_created_at
             ON review_packets (status, created_at DESC)
+            """
+        )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS research_capture_jobs (
+                job_id TEXT PRIMARY KEY,
+                packet_id TEXT NOT NULL,
+                contract_version TEXT NOT NULL,
+                accession_number TEXT NOT NULL,
+                issuer_cik TEXT NOT NULL,
+                form_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                source_first_observed_at_utc TEXT NOT NULL,
+                decision_at_utc TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','leased','retry','complete')),
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                lease_owner TEXT,
+                lease_expires_at_utc TEXT,
+                last_error_kind TEXT,
+                last_error_message TEXT,
+                record_sha256 TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                UNIQUE(packet_id, contract_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_capture_jobs_claim
+                ON research_capture_jobs(status, decision_at_utc, job_id);
+            CREATE TABLE IF NOT EXISTS research_capture_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+                started_at_utc TEXT NOT NULL,
+                finished_at_utc TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('retry','completed')),
+                error_kind TEXT,
+                error_message TEXT,
+                retryable INTEGER NOT NULL CHECK(retryable IN (0,1)),
+                UNIQUE(job_id, attempt_number)
+            );
+            CREATE TRIGGER IF NOT EXISTS research_capture_attempts_no_update
+            BEFORE UPDATE ON research_capture_attempts
+            BEGIN SELECT RAISE(ABORT, 'capture attempts are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS research_capture_attempts_no_delete
+            BEFORE DELETE ON research_capture_attempts
+            BEGIN SELECT RAISE(ABORT, 'capture attempts are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS research_capture_complete_immutable
+            BEFORE UPDATE ON research_capture_jobs
+            WHEN OLD.status = 'complete'
+            BEGIN SELECT RAISE(ABORT, 'completed capture jobs are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS enqueue_research_capture_after_approval
+            AFTER UPDATE OF status ON review_packets
+            WHEN NEW.status = 'approve' AND OLD.status <> 'approve'
+            BEGIN
+                INSERT OR IGNORE INTO research_capture_jobs(
+                    job_id, packet_id, contract_version, accession_number, issuer_cik,
+                    form_type, payload_json, decision_json, source_first_observed_at_utc,
+                    decision_at_utc, created_at_utc, updated_at_utc
+                ) VALUES(
+                    NEW.packet_id || '|insider-evidence-capture-v1',
+                    NEW.packet_id, 'insider-evidence-capture-v1', NEW.accession_number,
+                    NEW.cik, NEW.form_type, NEW.payload_json, NEW.decision_json,
+                    NEW.created_at, NEW.updated_at, NEW.updated_at, NEW.updated_at
+                );
+            END;
             """
         )
         conn.commit()
