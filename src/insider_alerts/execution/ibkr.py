@@ -13,10 +13,12 @@ from insider_alerts.execution.canary import (
     BrokerOrder,
     CommissionPreview,
 )
+from insider_alerts.execution.errors import (
+    IbkrContractQualificationError,
+    IbkrExecutionError,
+)
 
-
-class IbkrExecutionError(RuntimeError):
-    """Raised when IBKR cannot safely complete a requested execution action."""
+__all__ = ["IbkrBroker", "IbkrExecutionError"]
 
 
 class IbkrBroker:
@@ -83,12 +85,27 @@ class IbkrBroker:
         normalized = symbol.upper()
         if normalized in self._contracts:
             return self._contracts[normalized]
-        from ib_async import Stock
+        from ib_async import RequestError, Stock
 
         contract = Stock(normalized, "SMART", "USD")
-        qualified = await self.ib.qualifyContractsAsync(contract)
+        previous_raise_request_errors = bool(self.ib.RaiseRequestErrors)
+        self.ib.RaiseRequestErrors = True
+        try:
+            qualified = await self.ib.qualifyContractsAsync(contract)
+        except RequestError as exc:
+            if exc.code == 200:
+                raise IbkrContractQualificationError(
+                    f"IBKR could not qualify US stock symbol {normalized}"
+                ) from exc
+            raise IbkrExecutionError(
+                f"IBKR contract lookup failed for {normalized}: {exc}"
+            ) from exc
+        finally:
+            self.ib.RaiseRequestErrors = previous_raise_request_errors
         if not qualified or not contract.conId:
-            raise IbkrExecutionError(f"IBKR could not qualify US stock symbol {normalized}")
+            raise IbkrContractQualificationError(
+                f"IBKR could not qualify US stock symbol {normalized}"
+            )
         self._contracts[normalized] = contract
         return contract
 
