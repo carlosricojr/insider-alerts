@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
+from insider_alerts.execution.errors import ContractQualificationError
 
 NEW_YORK = ZoneInfo("America/New_York")
 _FINGERPRINT_CACHE: dict[
@@ -432,12 +433,13 @@ class CanaryStore:
         median_dollar_volume: float | None,
         quantity: int,
         now: datetime,
+        event_detail: dict[str, object] | None = None,
     ) -> None:
         stamp = now.astimezone(UTC).isoformat()
         shadow_state = "queued" if is_eligible and session is not None else "rejected"
         live_state = "queued" if is_eligible and session is not None else "rejected"
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO candidates(
                     packet_id, accession_number, cik, symbol, signal_at, score,
@@ -466,6 +468,18 @@ class CanaryStore:
                     stamp,
                 ),
             )
+            if event_detail is not None and cursor.rowcount > 0:
+                conn.execute(
+                    "INSERT INTO events(occurred_at,level,event_type,packet_id,detail_json) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        stamp,
+                        "info",
+                        "candidate_detected",
+                        signal.packet_id,
+                        json.dumps(event_detail, sort_keys=True, separators=(",", ":")),
+                    ),
+                )
             conn.commit()
 
     def rows(self, where: str = "1=1", params: Sequence[object] = ()) -> list[sqlite3.Row]:
@@ -649,8 +663,19 @@ class CanaryRunner:
             if signal.signal_at < activation or self.store.has_candidate(signal.packet_id):
                 continue
             detected += 1
-            bars = await self.broker.daily_bars(signal.symbol)
-            ok, reason, prior_close, median_dv = eligibility(self.config, signal, bars)
+            qualification_error: str | None = None
+            try:
+                bars = await self.broker.daily_bars(signal.symbol)
+            except ContractQualificationError as exc:
+                ok, reason, prior_close, median_dv = (
+                    False,
+                    "contract_qualification_failed",
+                    None,
+                    None,
+                )
+                qualification_error = str(exc)
+            else:
+                ok, reason, prior_close, median_dv = eligibility(self.config, signal, bars)
             target_session = (
                 entry_session(self.config, signal.signal_at, sessions, now=now) if ok else None
             )
@@ -678,14 +703,13 @@ class CanaryRunner:
                 median_dollar_volume=median_dv,
                 quantity=quantity,
                 now=now,
-            )
-            self.store.event(
-                "candidate_detected",
-                packet_id=signal.packet_id,
-                symbol=signal.symbol,
-                eligible=ok,
-                reason=reason,
-                entry_session=target_session.isoformat() if target_session else None,
+                event_detail={
+                    "symbol": signal.symbol,
+                    "eligible": ok,
+                    "reason": reason,
+                    "entry_session": target_session.isoformat() if target_session else None,
+                    "qualification_error": qualification_error,
+                },
             )
             eligible_count += int(ok)
             rejected += int(not ok)

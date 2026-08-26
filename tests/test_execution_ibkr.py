@@ -7,6 +7,10 @@ import ib_async
 import pytest
 
 import insider_alerts.execution.ibkr as ibkr_module
+from insider_alerts.execution.errors import (
+    ContractQualificationError,
+    IbkrContractQualificationError,
+)
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 
 
@@ -31,6 +35,57 @@ def _mk_broker() -> IbkrBroker:
 
     broker._contract = _contract
     return broker
+
+
+def test_unqualified_contract_uses_terminal_contract_error() -> None:
+    broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
+
+    class _FakeIb:
+        RaiseRequestErrors = False
+
+        async def qualifyContractsAsync(self, contract):  # type: ignore[no-untyped-def]
+            assert self.RaiseRequestErrors is True
+            return []
+
+    fake = _FakeIb()
+    broker.ib = fake
+
+    with pytest.raises(IbkrContractQualificationError) as captured:
+        asyncio.run(broker._contract("bad"))
+
+    assert isinstance(captured.value, ContractQualificationError)
+    assert isinstance(captured.value, IbkrExecutionError)
+    assert "BAD" in str(captured.value)
+    assert fake.RaiseRequestErrors is False
+
+
+def test_contract_maps_only_error_200_to_terminal_qualification_error() -> None:
+    from ib_async import RequestError
+
+    broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
+
+    class _FakeIb:
+        def __init__(self, error: RequestError) -> None:
+            self.error = error
+            self.RaiseRequestErrors = False
+
+        async def qualifyContractsAsync(self, contract):  # type: ignore[no-untyped-def]
+            assert self.RaiseRequestErrors is True
+            raise self.error
+
+    terminal_broker = _FakeIb(RequestError(1, 200, "No security definition"))
+    broker.ib = terminal_broker
+    with pytest.raises(IbkrContractQualificationError):
+        asyncio.run(broker._contract("bad"))
+    assert terminal_broker.RaiseRequestErrors is False
+
+    transient = RequestError(2, 162, "Historical data service error")
+    transient_broker = _FakeIb(transient)
+    broker.ib = transient_broker
+    with pytest.raises(IbkrExecutionError) as captured:
+        asyncio.run(broker._contract("retry"))
+    assert captured.value.__cause__ is transient
+    assert transient_broker.RaiseRequestErrors is False
 
 
 def test_preview_entry_marks_unexpected_payload_invalid() -> None:

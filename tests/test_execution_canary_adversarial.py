@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from insider_alerts.execution.canary import (
     CommissionPreview,
     broker_token,
 )
+from insider_alerts.execution.errors import ContractQualificationError
 
 
 def _signal(now: datetime) -> DeliveredSignal:
@@ -57,6 +60,7 @@ class HostileBroker:
         self.cancelled_orders: list[int] = []
         self.moc_calls = 0
         self.crash_after_moc_accept = False
+        self.daily_bar_errors: dict[str, Exception] = {}
 
     async def connect(self, *, readonly: bool) -> None:
         return None
@@ -68,6 +72,9 @@ class HostileBroker:
         return self.session_values
 
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]:
+        error = self.daily_bar_errors.get(symbol)
+        if error is not None:
+            raise error
         return self.bar_values
 
     async def account_snapshot(self) -> AccountSnapshot:
@@ -167,6 +174,93 @@ def _runner(
     runner = CanaryRunner(config, broker)
     runner.store.activation(now - timedelta(hours=2))
     return runner, broker
+
+
+def test_discovery_quarantines_unqualifiable_contract_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    bad = replace(_signal(now), packet_id="bad-packet", symbol="BAD")
+    good = replace(_signal(now), packet_id="good-packet", symbol="GOOD")
+    monkeypatch.setattr(
+        "insider_alerts.execution.canary.load_delivered_signals",
+        lambda *args, **kwargs: [bad, good],
+    )
+    broker.daily_bar_errors["BAD"] = ContractQualificationError("unknown contract")
+
+    result = asyncio.run(
+        runner._discover(
+            now - timedelta(hours=2),
+            broker.session_values,
+            now,
+        )
+    )
+
+    assert (result.detected, result.eligible, result.rejected) == (2, 1, 1)
+    rows = {str(row["packet_id"]): row for row in runner.store.rows()}
+    assert rows["bad-packet"]["eligibility_reason"] == "contract_qualification_failed"
+    assert rows["bad-packet"]["shadow_state"] == "rejected"
+    assert rows["bad-packet"]["live_state"] == "rejected"
+    assert rows["good-packet"]["eligible"] == 1
+    with runner.store.connect() as conn:
+        event = conn.execute(
+            "select detail_json from events where packet_id='bad-packet'"
+        ).fetchone()
+    assert event is not None
+    assert '"qualification_error":"unknown contract"' in str(event["detail_json"])
+
+
+def test_discovery_retries_transient_daily_bar_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    broker.daily_bar_errors["TEST"] = ConnectionError("temporary disconnect")
+
+    with pytest.raises(ConnectionError, match="temporary disconnect"):
+        asyncio.run(
+            runner._discover(
+                now - timedelta(hours=2),
+                broker.session_values,
+                now,
+            )
+        )
+
+    assert runner.store.rows() == []
+
+
+def test_discovery_rolls_back_candidate_when_evidence_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    broker.daily_bar_errors["TEST"] = ContractQualificationError("unknown contract")
+    with runner.store.connect() as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER fail_candidate_event
+            BEFORE INSERT ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'evidence write failed');
+            END
+            """
+        )
+        conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="evidence write failed"):
+        asyncio.run(
+            runner._discover(
+                now - timedelta(hours=2),
+                broker.session_values,
+                now,
+            )
+        )
+
+    assert runner.store.rows() == []
 
 
 def test_crash_after_entry_acceptance_does_not_duplicate_order(
