@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insider-alerts.local/schemas/hypothesis-registry-v1.json",
+  "title": "Insider Alerts hypothesis registry entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "hypothesis_id",
+    "title",
+    "status",
+    "preregistration",
+    "created_at_utc",
+    "activation",
+    "family",
+    "cohort",
+    "strategy",
+    "classifier",
+    "endpoint",
+    "inference",
+    "terminal_information_time",
+    "economic_gates",
+    "feature_policy",
+    "amendment_policy",
+    "decision_states",
+    "references"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "hypothesis_id": {"type": "string", "pattern": "^[A-Z0-9]+(?:-[A-Z0-9]+)*-V[0-9]+$"},
+    "title": {"type": "string", "minLength": 1},
+    "status": {"enum": ["draft", "active", "retired"]},
+    "preregistration": {"type": "string", "pattern": "^docs/research/.+\\.md$"},
+    "created_at_utc": {"$ref": "#/$defs/datetime"},
+    "activation": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "activated_at_utc",
+            "activation_git_commit",
+            "registry_definition_sha256",
+            "preregistration_sha256",
+            "hypothesis_schema_sha256",
+            "evidence_schema_sha256",
+            "inference_artifact_sha256",
+            "dependency_lock_sha256",
+            "policy_sha256",
+            "classifier_version",
+            "enrollment_start_sequence"
+          ],
+          "properties": {
+            "activated_at_utc": {"$ref": "#/$defs/datetime"},
+            "activation_git_commit": {"$ref": "#/$defs/sha1"},
+            "registry_definition_sha256": {
+              "allOf": [{"$ref": "#/$defs/sha256"}],
+              "description": "RFC 8785 canonical registry digest after removing top-level status and activation."
+            },
+            "preregistration_sha256": {"$ref": "#/$defs/sha256"},
+            "hypothesis_schema_sha256": {"$ref": "#/$defs/sha256"},
+            "evidence_schema_sha256": {"$ref": "#/$defs/sha256"},
+            "inference_artifact_sha256": {"$ref": "#/$defs/sha256"},
+            "dependency_lock_sha256": {"$ref": "#/$defs/sha256"},
+            "policy_sha256": {"$ref": "#/$defs/sha256"},
+            "classifier_version": {"type": "string", "minLength": 1},
+            "enrollment_start_sequence": {"const": 1}
+          }
+        }
+      ]
+    },
+    "family": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family_id", "alpha_budget", "hypothesis_count", "correction", "threshold"],
+      "properties": {
+        "family_id": {"type": "string", "minLength": 1},
+        "alpha_budget": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.05},
+        "hypothesis_count": {"type": "integer", "minimum": 1},
+        "correction": {"const": "bonferroni"},
+        "threshold": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.05}
+      }
+    },
+    "cohort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "decision", "activation_boundary", "pre_activation_excluded", "late_enrollment"],
+      "properties": {
+        "source": {"const": "sec_rss"},
+        "decision": {"const": "approve"},
+        "activation_boundary": {"const": "source_first_observed_at_utc_gte_activation"},
+        "pre_activation_excluded": {"const": true},
+        "late_enrollment": {"const": "prohibited"}
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_policy",
+        "entry",
+        "signal_cutoff_et",
+        "price_min_usd",
+        "price_max_usd",
+        "median_dollar_volume_min_usd",
+        "stop_pct",
+        "target_pct",
+        "maximum_sessions",
+        "same_bar_collision",
+        "overlapping_symbol_positions",
+        "primary_round_trip_bps",
+        "stress_round_trip_bps",
+        "shadow_slot_budget_usd",
+        "max_concurrent_shadow_positions",
+        "capacity_rank",
+        "capacity_order",
+        "capacity_scope",
+        "whole_share_planning",
+        "challenger_mode"
+      ],
+      "properties": {
+        "base_policy": {"const": "E07/F00"},
+        "entry": {"const": "next_regular_session_opening_auction"},
+        "signal_cutoff_et": {"const": "09:20:00"},
+        "price_min_usd": {"const": 2},
+        "price_max_usd": {"const": 200},
+        "median_dollar_volume_min_usd": {"const": 500000},
+        "stop_pct": {"const": 0.1},
+        "target_pct": {"const": 0.1},
+        "maximum_sessions": {"const": 10},
+        "same_bar_collision": {"const": "stop_first"},
+        "overlapping_symbol_positions": {"const": "suppress"},
+        "primary_round_trip_bps": {"const": 20},
+        "stress_round_trip_bps": {"const": 50},
+        "shadow_slot_budget_usd": {"const": 200},
+        "max_concurrent_shadow_positions": {"const": 20},
+        "capacity_rank": {
+          "const": "sha256(policy_salt|entry_session|packet_id|accession_number|symbol)"
+        },
+        "capacity_order": {"const": "ascending"},
+        "capacity_scope": {"const": "challenger_eligible_candidates"},
+        "whole_share_planning": {"const": true},
+        "challenger_mode": {"const": "shadow_only"}
+      }
+    },
+    "classifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "level",
+        "identity_key",
+        "lookback_calendar_years",
+        "qualifying_transaction_codes",
+        "classification_cutoff",
+        "routine_rule",
+        "routine_is_absorbing",
+        "eligible_state",
+        "excluded_states",
+        "multi_owner_policy"
+      ],
+      "properties": {
+        "name": {"const": "cohen_malloy_pomorski_trader_level"},
+        "level": {"const": "reporting_owner"},
+        "identity_key": {"const": "reporting_owner_cik"},
+        "lookback_calendar_years": {"const": 3},
+        "qualifying_transaction_codes": {
+          "type": "array",
+          "minItems": 2,
+          "prefixItems": [{"const": "P"}, {"const": "S"}],
+          "items": false
+        },
+        "classification_cutoff": {"const": "start_of_calendar_year_america_new_york"},
+        "routine_rule": {"const": "same_transaction_month_present_in_each_of_three_prior_years"},
+        "routine_is_absorbing": {"const": true},
+        "eligible_state": {"const": "opportunistic"},
+        "excluded_states": {
+          "type": "array",
+          "minItems": 3,
+          "prefixItems": [
+            {"const": "routine"},
+            {"const": "unpartitionable"},
+            {"const": "ambiguous_multi_owner"}
+          ],
+          "items": false
+        },
+        "multi_owner_policy": {"const": "exclude_from_confirmatory_cohort"}
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "aggregation", "benchmark", "cost_bps", "alternative"],
+      "properties": {
+        "name": {"const": "mean_post_cost_spy_relative_trade_return"},
+        "aggregation": {"const": "equal_notional_arithmetic_mean"},
+        "benchmark": {"const": "SPY_matched_entry_exit"},
+        "cost_bps": {"const": 20},
+        "alternative": {"const": "greater_than_zero"}
+      }
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test", "side", "cluster", "block_length_clusters", "resamples", "seed", "p_value_formula", "interim_looks"],
+      "properties": {
+        "test": {"const": "null_centered_circular_moving_block_bootstrap_trade_weighted_mean"},
+        "side": {"const": "one_sided_greater"},
+        "cluster": {"const": "entry_date"},
+        "block_length_clusters": {"const": 10},
+        "resamples": {"const": 10000},
+        "seed": {"const": 260826},
+        "p_value_formula": {"const": "(1 + exceedances) / (1 + resamples)"},
+        "interim_looks": {"const": 0}
+      }
+    },
+    "terminal_information_time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_enrolled_trades",
+        "minimum_distinct_entry_dates",
+        "freeze_at_complete_entry_date",
+        "include_all_boundary_date_entries",
+        "all_frozen_outcomes_required",
+        "max_enrollment_calendar_months",
+        "look_count",
+        "seal_dataset_before_outcomes"
+      ],
+      "properties": {
+        "target_enrolled_trades": {"const": 100},
+        "minimum_distinct_entry_dates": {"const": 60},
+        "freeze_at_complete_entry_date": {"const": true},
+        "include_all_boundary_date_entries": {"const": true},
+        "all_frozen_outcomes_required": {"const": true},
+        "max_enrollment_calendar_months": {"const": 18},
+        "look_count": {"const": 1},
+        "seal_dataset_before_outcomes": {"const": true}
+      }
+    },
+    "economic_gates": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "feature_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["confirmatory_features", "capture_only_features", "unregistered_subgroups"],
+      "properties": {
+        "confirmatory_features": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [{"const": "owner_classification"}],
+          "items": false
+        },
+        "capture_only_features": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "unregistered_subgroups": {"const": "prohibited"}
+      }
+    },
+    "amendment_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["material_change", "outcome_informed_change", "corrections"],
+      "properties": {
+        "material_change": {"const": "retire_and_require_new_id_and_fresh_sample"},
+        "outcome_informed_change": {"const": "prohibited"},
+        "corrections": {"const": "append_only_with_supersession_reference"}
+      }
+    },
+    "decision_states": {
+      "type": "array",
+      "minItems": 4,
+      "prefixItems": [
+        {"const": "COLLECTING"},
+        {"const": "PROMOTE_RECOMMENDED"},
+        {"const": "KILL"},
+        {"const": "INVALID"}
+      ],
+      "items": false
+    },
+    "references": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uri"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "draft"}}, "required": ["status"]},
+      "then": {"properties": {"activation": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "active"}}, "required": ["status"]},
+      "then": {"properties": {"activation": {"type": "object"}}}
+    }
+  ],
+  "$defs": {
+    "datetime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
