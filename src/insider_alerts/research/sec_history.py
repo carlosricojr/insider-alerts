@@ -591,10 +591,13 @@ class HistoryStore:
             row = conn.execute(
                 """
                 SELECT o.sha256,o.size_bytes,o.path
-                FROM archive_releases a JOIN raw_objects o ON o.sha256=a.archive_sha256
-                WHERE a.source_url=? ORDER BY a.retrieved_at_utc DESC LIMIT 1
+                FROM raw_retrievals r
+                JOIN archive_releases a ON a.archive_sha256=r.raw_sha256
+                JOIN raw_objects o ON o.sha256=a.archive_sha256
+                WHERE r.url=? OR r.final_url=?
+                ORDER BY r.retrieved_at_utc DESC LIMIT 1
                 """,
-                (url,),
+                (url, url),
             ).fetchone()
         if row is None:
             return None

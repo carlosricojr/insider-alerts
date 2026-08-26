@@ -122,6 +122,7 @@ def test_complete_archive_selection_fails_on_gap() -> None:
 
 def test_bulk_sync_is_resumable_and_binds_snapshot_to_manifest(tmp_path: Path) -> None:
     archive_url = "https://www.sec.gov/files/data/2006q1_form345.zip"
+    moved_url = "https://www.sec.gov/files/moved/2006q1_form345.zip"
     manifest = f'<a href="{archive_url}">2006 Q1</a>'.encode()
     resources = {
         "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets": (
@@ -153,6 +154,19 @@ def test_bulk_sync_is_resumable_and_binds_snapshot_to_manifest(tmp_path: Path) -
         through=(2006, 1),
         now_fn=now,
     )
+    resources[
+        "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets"
+    ] = SecResource(
+        f'<a href="{moved_url}">2006 Q1</a>'.encode(),
+        200,
+        "https://www.sec.gov/manifest",
+        None,
+        None,
+        "text/html",
+    )
+    resources[moved_url] = SecResource(
+        _archive_bytes(), 200, moved_url, '"archive"', None, "application/zip"
+    )
     second = sync_bulk_archives(
         client=client,  # type: ignore[arg-type]
         store=store,
@@ -160,13 +174,23 @@ def test_bulk_sync_is_resumable_and_binds_snapshot_to_manifest(tmp_path: Path) -
         through=(2006, 1),
         now_fn=now,
     )
+    third = sync_bulk_archives(
+        client=client,  # type: ignore[arg-type]
+        store=store,
+        raw_store=raw,
+        through=(2006, 1),
+        now_fn=now,
+    )
 
-    assert first.snapshot_sha256 == second.snapshot_sha256
     assert (first.downloaded_count, first.reused_count) == (1, 0)
-    assert (second.downloaded_count, second.reused_count) == (0, 1)
+    assert (second.downloaded_count, second.reused_count) == (1, 0)
+    assert (third.downloaded_count, third.reused_count) == (0, 1)
+    assert second.snapshot_sha256 == third.snapshot_sha256
     assert client.urls == [
         "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets",
         archive_url,
+        "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets",
+        moved_url,
         "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets",
     ]
 
