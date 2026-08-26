@@ -17,6 +17,7 @@ from insider_alerts.review.queue import ensure_review_tables
 from insider_alerts.sec.store import init_db
 
 NEW_YORK = ZoneInfo("America/New_York")
+_SEC_MISSING_TRADING_SYMBOLS = frozenset({"NONE"})
 
 
 @dataclass(slots=True, frozen=True)
@@ -170,7 +171,7 @@ def load_delivered_signals(
         if not isinstance(raw_symbol, str):
             continue
         symbol = normalize_backtest_symbol(raw_symbol)
-        if symbol is None:
+        if symbol is None or symbol in _SEC_MISSING_TRADING_SYMBOLS:
             continue
         key = (str(row["accession_number"]), symbol)
         if key in seen:
@@ -249,7 +250,7 @@ def load_historical_approved_replay(
         raw_symbol = payload.get("issuer_symbol")
         symbol = normalize_backtest_symbol(raw_symbol) if isinstance(raw_symbol, str) else None
         score = _finite_float(payload.get("score"))
-        if symbol is None or score is None:
+        if symbol is None or symbol in _SEC_MISSING_TRADING_SYMBOLS or score is None:
             continue
         key = (str(row["accession_number"]), symbol)
         if key in seen:

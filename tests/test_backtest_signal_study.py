@@ -15,6 +15,7 @@ from insider_alerts.backtest.signal_study import (
     compute_point_in_time_features,
     holm_adjust,
     load_delivered_signals,
+    load_historical_approved_replay,
     moving_block_null_p_value,
     simulate_daily_rule,
     simulate_intraday_rule,
@@ -153,12 +154,57 @@ def test_load_delivered_signals_keeps_only_live_approvals_and_earliest_duplicate
                 filed_at=filed,
                 updated_at=datetime(2026, 5, 1, 14, 10, tzinfo=UTC),
             )
+            _insert(
+                conn,
+                packet_id="acc4|5|4",
+                accession="acc4",
+                symbol="NYSE:NONE",
+                source="sec_rss",
+                status="approve",
+                filed_at=filed,
+                updated_at=datetime(2026, 5, 1, 14, 11, tzinfo=UTC),
+            )
             conn.commit()
 
         events = load_delivered_signals(db_path)
         assert len(events) == 1
         assert events[0].packet_id == "acc1|1|4"
         assert events[0].signal_at == datetime(2026, 5, 1, 14, 7, tzinfo=UTC)
+    finally:
+        rmtree(case_dir, ignore_errors=True)
+
+
+def test_load_historical_approved_replay_rejects_normalized_missing_symbol() -> None:
+    db_path, case_dir = _db_path()
+    try:
+        init_db(db_path)
+        ensure_review_tables(db_path)
+        filed = datetime(2026, 5, 1, 14, 0, tzinfo=UTC)
+        with sqlite3.connect(db_path) as conn:
+            _insert(
+                conn,
+                packet_id="acc1|1|4",
+                accession="acc1",
+                symbol="MAT",
+                source="sec_master_index",
+                status="approve",
+                filed_at=filed,
+                updated_at=datetime(2026, 5, 2, 14, 0, tzinfo=UTC),
+            )
+            _insert(
+                conn,
+                packet_id="acc2|2|4",
+                accession="acc2",
+                symbol="(NONE)",
+                source="sec_master_index",
+                status="approve",
+                filed_at=filed,
+                updated_at=datetime(2026, 5, 2, 14, 1, tzinfo=UTC),
+            )
+            conn.commit()
+
+        events = load_historical_approved_replay(db_path)
+        assert [event.symbol for event in events] == ["MAT"]
     finally:
         rmtree(case_dir, ignore_errors=True)
 
