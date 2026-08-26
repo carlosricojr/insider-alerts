@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "hypothesis_id": "OPP-E07-V1",
+  "title": "Positive E07 alpha among prospectively classified opportunistic insiders",
+  "status": "draft",
+  "preregistration": "docs/research/OPPORTUNISTIC-PROSPECTIVE-TRIAL-2026-08-26-PREREG.md",
+  "created_at_utc": "2026-08-26T20:53:00Z",
+  "activation": null,
+  "family": {
+    "family_id": "OPPORTUNISTIC-INSIDER-2026",
+    "alpha_budget": 0.025,
+    "hypothesis_count": 1,
+    "correction": "bonferroni",
+    "threshold": 0.025
+  },
+  "cohort": {
+    "source": "sec_rss",
+    "decision": "approve",
+    "activation_boundary": "source_first_observed_at_utc_gte_activation",
+    "pre_activation_excluded": true,
+    "late_enrollment": "prohibited"
+  },
+  "strategy": {
+    "base_policy": "E07/F00",
+    "entry": "next_regular_session_opening_auction",
+    "signal_cutoff_et": "09:20:00",
+    "price_min_usd": 2,
+    "price_max_usd": 200,
+    "median_dollar_volume_min_usd": 500000,
+    "stop_pct": 0.1,
+    "target_pct": 0.1,
+    "maximum_sessions": 10,
+    "same_bar_collision": "stop_first",
+    "overlapping_symbol_positions": "suppress",
+    "primary_round_trip_bps": 20,
+    "stress_round_trip_bps": 50,
+    "shadow_slot_budget_usd": 200,
+    "max_concurrent_shadow_positions": 20,
+    "capacity_rank": "sha256(policy_salt|entry_session|packet_id|accession_number|symbol)",
+    "capacity_order": "ascending",
+    "capacity_scope": "challenger_eligible_candidates",
+    "whole_share_planning": true,
+    "challenger_mode": "shadow_only"
+  },
+  "classifier": {
+    "name": "cohen_malloy_pomorski_trader_level",
+    "level": "reporting_owner",
+    "identity_key": "reporting_owner_cik",
+    "lookback_calendar_years": 3,
+    "qualifying_transaction_codes": ["P", "S"],
+    "classification_cutoff": "start_of_calendar_year_america_new_york",
+    "routine_rule": "same_transaction_month_present_in_each_of_three_prior_years",
+    "routine_is_absorbing": true,
+    "eligible_state": "opportunistic",
+    "excluded_states": ["routine", "unpartitionable", "ambiguous_multi_owner"],
+    "multi_owner_policy": "exclude_from_confirmatory_cohort"
+  },
+  "endpoint": {
+    "name": "mean_post_cost_spy_relative_trade_return",
+    "aggregation": "equal_notional_arithmetic_mean",
+    "benchmark": "SPY_matched_entry_exit",
+    "cost_bps": 20,
+    "alternative": "greater_than_zero"
+  },
+  "inference": {
+    "test": "null_centered_circular_moving_block_bootstrap_trade_weighted_mean",
+    "side": "one_sided_greater",
+    "cluster": "entry_date",
+    "block_length_clusters": 10,
+    "resamples": 10000,
+    "seed": 260826,
+    "p_value_formula": "(1 + exceedances) / (1 + resamples)",
+    "interim_looks": 0
+  },
+  "terminal_information_time": {
+    "target_enrolled_trades": 100,
+    "minimum_distinct_entry_dates": 60,
+    "freeze_at_complete_entry_date": true,
+    "include_all_boundary_date_entries": true,
+    "all_frozen_outcomes_required": true,
+    "max_enrollment_calendar_months": 18,
+    "look_count": 1,
+    "seal_dataset_before_outcomes": true
+  },
+  "economic_gates": [
+    "positive_mean_absolute_return_at_20bps",
+    "positive_mean_alpha_at_50bps",
+    "profit_factor_above_one_at_20bps",
+    "positive_mean_50bps_alpha_in_both_chronological_halves",
+    "positive_mean_50bps_alpha_without_best_trade",
+    "positive_mean_50bps_alpha_without_best_calendar_month",
+    "symbol_positive_pnl_contribution_at_most_25pct",
+    "calendar_month_net_pnl_contribution_at_most_50pct",
+    "positive_20_slot_replay_return_at_50bps",
+    "all_integrity_and_reconciliation_checks_pass"
+  ],
+  "feature_policy": {
+    "confirmatory_features": ["owner_classification"],
+    "capture_only_features": [
+      "market_cap",
+      "directional_trend",
+      "realized_volatility",
+      "historical_volatility",
+      "implied_volatility",
+      "option_surface",
+      "role",
+      "purchase_size",
+      "notification_latency"
+    ],
+    "unregistered_subgroups": "prohibited"
+  },
+  "amendment_policy": {
+    "material_change": "retire_and_require_new_id_and_fresh_sample",
+    "outcome_informed_change": "prohibited",
+    "corrections": "append_only_with_supersession_reference"
+  },
+  "decision_states": ["COLLECTING", "PROMOTE_RECOMMENDED", "KILL", "INVALID"],
+  "references": [
+    "https://www.nber.org/papers/w16454",
+    "https://www.nber.org/papers/w20592",
+    "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets"
+  ]
+}
