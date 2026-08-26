@@ -1,9 +1,9 @@
 # CodeRabbit PR Review Loop (Mandatory)
 
 <!-- markdownlint-disable MD013 -->
-<!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 3.1.0 -->
+<!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 3.2.7 -->
 <!-- CANONICAL_SOURCE: https://github.com/ospina-company/alpha-core/blob/main/docs/agents/coderabbit-pr-review-loop.md -->
-<!-- CANONICAL_BODY_SHA256: 74a0206bad6dfd41d3319edcf524feb50f025543998b8920120a9775cd576b9b -->
+<!-- CANONICAL_BODY_SHA256: af7456efaf0962c8c1c63532bdb887d4f1c8807b0a9b33e41ae220142d0cdf45 -->
 <!-- markdownlint-enable MD013 -->
 
 This is the canonical workflow for any task that prepares, updates, or merges a
@@ -41,6 +41,9 @@ Useful flags: `--base <branch>`, `--repo OWNER/NAME`, `--repo-dir <worktree>`,
 `--deadline <seconds>` (default 900), `--check-only` (verify only, request
 nothing), `--post-evidence`, `--json`.
 
+The plan-limited pre-launch verifier requires GitHub CLI 2.50.0 or newer so its
+paginated JSON captures are complete and machine-parseable.
+
 Exit codes:
 
 | Code | Meaning | Next action |
@@ -58,6 +61,9 @@ tried — a `--check-only` pass or a disabled leg reports
 it requires the App to have been **attempted and verified down** — throttled, or
 an affirmative no-reviewable-files refusal — *and* the CLI to have been
 **attempted and failed or skipped**, each for a recorded reason.
+`CLI_REVIEW_SKIPPED_POLICY` is a hard stop and must never license rung 2: do not
+bypass a repository, organization, sandbox, or execution policy by switching
+reviewers.
 
 The classification recorded in the PR always names what actually happened:
 
@@ -74,6 +80,7 @@ The classification recorded in the PR always names what actually happened:
 | `NO_REVIEW_OF_RECORD_ON_HEAD` | No review covers this head, and no channel was proven unavailable |
 | `NON_CODERABBIT_AGENT_REVIEW` | Rung 2: both channels **attempted** and verified unavailable |
 | `NO_REVIEWABLE_FILES_NON_CODERABBIT_AGENT_REVIEW` | Rung 2: both channels affirmatively refused the diff — nothing in it is reviewable by CodeRabbit |
+| `PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK` | Check-gate fallback: a private pre-launch repository cannot configure required checks on its current plan, so a tracked expected-check contract is verified against every current-head check |
 
 It writes `review-of-record.json` and `review-of-record.md` to a temp evidence
 directory (never inside the repository — the CLI would otherwise review its own
@@ -342,14 +349,197 @@ schedule. It is not legitimate as a substitute for the review ladder.
    coderabbit-review-of-record <pr-number>
    ```
 
-   By hand, that means posting one top-level `@coderabbitai full review` comment
-   and starting `cr review --base <integration-branch> --agent` in the same
-   minute.
+   Run every manual shell block below in the same interactive shell session so the `EXIT` trap and shared variables remain active across the race, evidence capture, final gates, and cleanup. Do not paste these blocks into separate shells.
+
+   By hand, bind the App request to the captured exact head, save the request
+   URL and timestamp, and start `cr review --base <integration-branch> --agent`
+   in the same minute:
+
+   ```bash
+   set -euo pipefail
+   umask 077
+   : "${PR:?set PR to the numeric pull request number}"
+   case "$PR" in *[!0-9]*|"") exit 2 ;; esac
+   REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+   INTEGRATION_BRANCH=$(gh pr view "$PR" --repo "$REPO" \
+     --json baseRefName --jq .baseRefName)
+   test -n "$REPO"
+   test -n "$INTEGRATION_BRANCH"
+   CODERABBIT_EVIDENCE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/coderabbit-review.XXXXXX")
+   chmod 700 "$CODERABBIT_EVIDENCE_DIR"
+   cleanup_coderabbit_artifacts() {
+     if [ -n "${CODERABBIT_INPUT_WORKTREE:-}" ]; then
+       git worktree remove --force "$CODERABBIT_INPUT_WORKTREE" \
+         >/dev/null 2>&1 || true
+     fi
+     if [ -n "${CODERABBIT_INPUT_PARENT:-}" ]; then
+       rm -rf -- "$CODERABBIT_INPUT_PARENT"
+     fi
+     if [ -n "${CHECK_EVIDENCE_DIR:-}" ]; then
+       rm -rf -- "$CHECK_EVIDENCE_DIR"
+     fi
+     rm -rf -- "$CODERABBIT_EVIDENCE_DIR"
+   }
+   trap cleanup_coderabbit_artifacts EXIT
+   CODERABBIT_REQUEST_EVIDENCE="$CODERABBIT_EVIDENCE_DIR/app-request.json"
+   CODERABBIT_CLI_STDOUT="$CODERABBIT_EVIDENCE_DIR/cli-stdout.jsonl"
+   CODERABBIT_CLI_STDERR="$CODERABBIT_EVIDENCE_DIR/cli-stderr.log"
+   command -v python3 >/dev/null
+   command -v cr >/dev/null
+   hash_file() {
+     if command -v shasum >/dev/null 2>&1; then
+       shasum -a 256 "$1" | awk '{print $1}'
+     elif command -v sha256sum >/dev/null 2>&1; then
+       sha256sum "$1" | awk '{print $1}'
+     else
+       return 127
+     fi
+   }
+   run_cli_bounded() {
+     python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+   import subprocess
+   import sys
+
+   try:
+       with open(sys.argv[4], "wb") as stdout_file, open(sys.argv[5], "wb") as stderr_file:
+           completed = subprocess.run(
+               ["cr", "review", "--base", sys.argv[2], "--agent", "--type", "committed"],
+               check=False,
+               cwd=sys.argv[3],
+               timeout=int(sys.argv[1]),
+               stdout=stdout_file,
+               stderr=stderr_file,
+           )
+   except subprocess.TimeoutExpired:
+       raise SystemExit(124)
+   raise SystemExit(completed.returncode)
+   PY
+   }
+   RACE_STARTED_EPOCH=$(date +%s)
+   RACE_DEADLINE_SECONDS=900
+   EVIDENCE_HEAD=$(gh pr view "$PR" --repo "$REPO" \
+     --json headRefOid --jq .headRefOid)
+   test "$(git rev-parse HEAD)" = "$EVIDENCE_HEAD"
+   WORKTREE_STATUS=$(git status --porcelain --untracked-files=all)
+   test -z "$WORKTREE_STATUS"
+   CODERABBIT_INPUT_PARENT=$(mktemp -d \
+     "${TMPDIR:-/tmp}/coderabbit-input.XXXXXX")
+   chmod 700 "$CODERABBIT_INPUT_PARENT"
+   CODERABBIT_INPUT_WORKTREE="$CODERABBIT_INPUT_PARENT/worktree"
+   git worktree add --detach --quiet \
+     "$CODERABBIT_INPUT_WORKTREE" "$EVIDENCE_HEAD"
+   test "$(git -C "$CODERABBIT_INPUT_WORKTREE" rev-parse HEAD)" = \
+     "$EVIDENCE_HEAD"
+   INPUT_WORKTREE_STATUS=$(git -C "$CODERABBIT_INPUT_WORKTREE" status \
+     --porcelain --untracked-files=all)
+   test -z "$INPUT_WORKTREE_STATUS"
+   APP_REQUEST_STARTED_EPOCH=$(date +%s)
+   APP_REQUEST_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   APP_REQUEST_BODY=$(printf '@coderabbitai full review\n\nExact head: %s' \
+     "$EVIDENCE_HEAD")
+   APP_REQUEST=$(gh api "repos/$REPO/issues/$PR/comments" \
+     -f body="$APP_REQUEST_BODY")
+   APP_REQUESTED_AT=$(jq -r .created_at <<< "$APP_REQUEST")
+   APP_REQUEST_URL=$(jq -r .html_url <<< "$APP_REQUEST")
+   CLI_REMAINING_SECONDS=$((RACE_DEADLINE_SECONDS - ($(date +%s) - RACE_STARTED_EPOCH)))
+   test "$CLI_REMAINING_SECONDS" -gt 0
+   CLI_STARTED_EPOCH=$(date +%s)
+   CLI_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   CLI_RC=0
+   run_cli_bounded "$CLI_REMAINING_SECONDS" "$INTEGRATION_BRANCH" \
+     "$CODERABBIT_INPUT_WORKTREE" "$CODERABBIT_CLI_STDOUT" \
+     "$CODERABBIT_CLI_STDERR" || CLI_RC=$?
+   CLI_FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   test -f "$CODERABBIT_CLI_STDOUT"
+   test -f "$CODERABBIT_CLI_STDERR"
+   CLI_STDOUT_SHA256=$(hash_file "$CODERABBIT_CLI_STDOUT")
+   CLI_STDERR_SHA256=$(hash_file "$CODERABBIT_CLI_STDERR")
+   test -n "$CLI_STDOUT_SHA256"
+   test -n "$CLI_STDERR_SHA256"
+   test "$(git -C "$CODERABBIT_INPUT_WORKTREE" rev-parse HEAD)" = \
+     "$EVIDENCE_HEAD"
+   POST_CLI_INPUT_STATUS=$(git -C "$CODERABBIT_INPUT_WORKTREE" status \
+     --porcelain --untracked-files=all)
+   test -z "$POST_CLI_INPUT_STATUS"
+   APP_CLI_START_DELTA_SECONDS=$((CLI_STARTED_EPOCH - APP_REQUEST_STARTED_EPOCH))
+   if [ "$APP_CLI_START_DELTA_SECONDS" -lt 0 ] || \
+      [ "$APP_CLI_START_DELTA_SECONDS" -gt 30 ]; then
+     printf 'App/CLI start interval is outside 0..30 seconds: %s\n' \
+       "$APP_CLI_START_DELTA_SECONDS" >&2
+     exit 1
+   fi
+   jq -n --arg head "$EVIDENCE_HEAD" \
+     --arg appRequestStartedAt "$APP_REQUEST_STARTED_AT" \
+     --arg appRequestedAt "$APP_REQUESTED_AT" \
+     --arg appRequestUrl "$APP_REQUEST_URL" \
+     --arg cliStartedAt "$CLI_STARTED_AT" \
+     --arg cliFinishedAt "$CLI_FINISHED_AT" \
+     --arg cliStdoutPath "$CODERABBIT_CLI_STDOUT" \
+     --arg cliStderrPath "$CODERABBIT_CLI_STDERR" \
+     --arg cliStdoutSha256 "$CLI_STDOUT_SHA256" \
+     --arg cliStderrSha256 "$CLI_STDERR_SHA256" \
+     --argjson appRequestStartedEpoch "$APP_REQUEST_STARTED_EPOCH" \
+     --argjson cliStartedEpoch "$CLI_STARTED_EPOCH" \
+     --argjson cliExitCode "$CLI_RC" \
+     --argjson appCliStartDeltaSeconds "$APP_CLI_START_DELTA_SECONDS" \
+     '{head:$head,appRequestStartedAt:$appRequestStartedAt,
+       appRequestedAt:$appRequestedAt,
+       appRequestUrl:$appRequestUrl,cliStartedAt:$cliStartedAt,
+       cliFinishedAt:$cliFinishedAt,
+       cliStdoutPath:$cliStdoutPath,cliStderrPath:$cliStderrPath,
+       cliStdoutSha256:$cliStdoutSha256,
+       cliStderrSha256:$cliStderrSha256,
+       appRequestStartedEpoch:$appRequestStartedEpoch,
+       cliStartedEpoch:$cliStartedEpoch,cliExitCode:$cliExitCode,
+       appCliStartDeltaSeconds:$appCliStartDeltaSeconds}' \
+     > "$CODERABBIT_REQUEST_EVIDENCE"
+   jq -e '
+     def integer: type == "number" and floor == .;
+     (.cliExitCode | integer) and (.cliExitCode == 0) and
+     (.appRequestStartedEpoch | integer) and
+     (.cliStartedEpoch | integer) and
+     (.cliStdoutPath | type == "string" and length > 0) and
+     (.cliStderrPath | type == "string" and length > 0) and
+     (.cliStdoutSha256 | test("^[0-9a-f]{64}$")) and
+     (.cliStderrSha256 | test("^[0-9a-f]{64}$")) and
+     (.appCliStartDeltaSeconds | integer) and
+     (.appCliStartDeltaSeconds ==
+       (.cliStartedEpoch - .appRequestStartedEpoch)) and
+     (.appCliStartDeltaSeconds >= 0) and
+     (.appCliStartDeltaSeconds <= 30)
+   ' "$CODERABBIT_REQUEST_EVIDENCE" >/dev/null || {
+     rm -f "$CODERABBIT_REQUEST_EVIDENCE"
+     exit 1
+   }
+   test "$(hash_file "$CODERABBIT_CLI_STDOUT")" = "$CLI_STDOUT_SHA256"
+   test "$(hash_file "$CODERABBIT_CLI_STDERR")" = "$CLI_STDERR_SHA256"
+   test "$CLI_RC" -eq 0
+   ```
 
    `@coderabbitai review` is incremental and does not replace a required full
    review of a production diff. `@coderabbitai resume` re-enables automatic
    reviews and can cause later pushes to spend additional allowance; prefer a
    deliberate full-review request.
+
+   This by-hand fallback is deliberately stricter than the installed command:
+   it requires the committed-only CLI leg to succeed. The installed command
+   owns first-finisher App classification and bounded cancellation. A timeout
+   or unavailable CLI in the manual path is recorded but cannot be waved
+   through merely because an App review may have appeared concurrently.
+
+   The installed command constructs a private detached worktree at the
+   captured PR head and invokes `cr` only inside that isolated exact-commit
+   input. It validates the isolated worktree immediately before invocation and
+   again before classifying any invoked terminal CLI result, successful or
+   failed, and rechecks abandonment after worktree creation before any review
+   invocation. Movement invalidates the result, including a no-files or
+   rate-limit response; changing and restoring the caller's HEAD cannot alter
+   the bytes supplied to the review. Evidence claims `isolated-worktree` input
+   only after that validation succeeds and records `inputValidated: true` only
+   after the post-invocation check. Deadline abandonment occurs before final
+   GitHub evidence capture and reclaims the registered worktree before
+   publishing a terminal timeout; cleanup failure is itself terminal,
+   fail-closed evidence rather than a successful timeout cleanup claim.
 
 4. Let required CI finish on its own schedule while the review race runs; the
    two are independent and must not be serialized. Fetch fresh evidence, verify
@@ -390,6 +580,159 @@ requested test/docs-only follow-up. **Any production-code change, however small,
 still requires a fresh completed review.** Never spend money to escape an
 adaptive limit.
 
+## Plan-limited pre-launch check fallback
+
+`PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK` is a narrow check-gate classification,
+not a review bypass and not branch protection. It exists only for a private
+repository whose current GitHub plan makes required-check configuration
+unavailable during pre-launch work on a non-production integration branch.
+Manual conventions remain weaker than enforced protection, so the fallback
+must expire before the first production promotion.
+
+The canonical verifier, not caller-supplied booleans or a hand-written evidence
+block, owns this classification:
+
+```bash
+plan-limited-prelaunch-check <pr-number> \
+  --repo OWNER/REPO \
+  --repo-dir "$PWD" \
+  --review-evidence /absolute/path/to/review-of-record.json \
+  --json
+```
+
+Install or refresh that command from a clean checkout of canonical alpha-core
+`main` with `bash scripts/agents/install-plan-limited-prelaunch.sh`. It runs
+outside the target worktree and byte-compares itself with alpha-core `main`
+before evaluating a PR. The verifier first resolves canonical `main` to an
+immutable commit OID and fetches the canonical bytes by that OID, so a moving
+ref cannot split the identity check from the evidence record and PR-authored
+verifier changes cannot authorize themselves.
+
+The review artifact must come from the simultaneous App/CLI
+`coderabbit-review-of-record` race. The verifier keeps the resulting review
+classification separate from `checkGateClassification`; it never relabels a
+CLI or App review as the plan fallback. Before verification, a repository
+`OWNER` or `MEMBER` pins the artifact bytes in a PR comment with the exact line
+`CODERABBIT_REVIEW_OF_RECORD_SHA256: <sha256>`. This authenticates the external
+artifact rather than trusting caller-controlled JSON fields.
+
+Every condition below is mandatory and evaluated fail-closed by the verifier:
+
+1. GitHub reports that the repository is private. Fresh calls to both the
+   branch-protection endpoint for the PR base and the repository-rulesets
+   endpoint must fail with HTTP 403 evidence whose GitHub message explicitly
+   says the feature requires a plan upgrade. A 404, missing permission,
+   transient error, empty ruleset, or any successful response does not qualify.
+   If protection or required-check configuration is available, configure it;
+   the fallback is categorically unavailable.
+2. The PR base equals the configured non-production integration branch. The
+   verifier rejects the default branch, `main`, `master`, every production or
+   release branch, and every production promotion.
+3. The linked remediation issue belongs to the same repository, is freshly
+   `OPEN`, and has repository `OWNER`/`MEMBER` comments containing the exact
+   lines shown below. These structured attestations reject contrary or
+   ambiguous prose, establish that the branch is non-production, and expire the
+   fallback before the first production promotion. The fallback never closes
+   that issue.
+
+   ```text
+   PLAN_LIMITED_PRELAUNCH_REMEDIATION: launch-blocking-before-first-production-promotion
+   PLAN_LIMITED_PRELAUNCH_INTEGRATION_BRANCH: <branch>
+   ```
+4. `.github/prelaunch-check-fallback.json` is a repository-owned, non-empty
+   expected-check contract. The verifier reads the blob from the PR head, never
+   a mutable worktree replacement or moving local ref, by using the captured
+   immutable head SHA. It trusts the config only when its bytes equal the copy
+   at the PR base commit. For a one-time first installation or an explicit
+   later policy change, an
+   `OWNER` or `MEMBER` must put the exact marker
+   `PLAN_LIMITED_PRELAUNCH_CONFIG_SHA256: <sha256>` on the remediation issue.
+   This bootstrap pins the bytes outside the pull request; subsequent changes
+   must first land in the base or receive a new explicit pin.
+5. The verifier captures the PR head, queries check runs and commit status
+   contexts from that exact commit, and matches expected checks by name plus
+   producer identity (`app_slug` for check runs and a non-empty trusted target
+   URL prefix plus exact `creator_login` for status contexts). Each active
+   expected check must be present
+   exactly once and terminal in an explicitly permitted `success` or `skipped`
+   state. Repository-owned `when_changed` rules activate conditional checks;
+   both source and destination paths of renames are evaluated, and a matching
+   path with an absent check fails closed.
+   Status contexts come from the paginated commit-status listing, which retains
+   exact creator identities. Its latest distinct context identities are
+   count-checked against the combined status summary. Historical transitions
+   remain captured but are not mistaken for additional current contexts; a creator-less summary row can never satisfy an expected producer.
+6. The allowlist cannot hide GitHub evidence: every latest current-head check
+   run and status context is inspected, including unexpected ones. Any pending,
+   cancelled, timed-out, or failing result rejects the fallback; an unexpected
+   run is tolerated only when it concluded `success`, `skipped`, or `neutral`.
+   Immutable API IDs select the latest run within each check suite and the
+   latest status context. Distinct suites remain distinct even when an app
+   reuses a check name, so neither an older result nor a duplicate-name sibling
+   can hide a newer pending or failing result. GitHub result caps or
+   incomplete pagination reject the fallback instead of silently truncating the
+   check universe. After a fixed 15-second stability dwell, a second complete
+   same-SHA snapshot must equal the first; any check/status mutation during
+   capture requires a fresh run. The dwell duration is explicit in the output
+   and is never an adaptive-limit cooldown wait.
+7. Exactly one expected entry is the semantic CodeRabbit gate. Its evidence
+   must use the canonical review tool version, cover this repository, PR, base,
+   and exact head, show that the App leg was attempted concurrently, record
+   `waitedOnCooldown: false`, retain the exact bot identity checks enforced by
+   `coderabbit-review-of-record`, contain no unaddressed CLI findings, and show
+   zero unresolved non-outdated review threads. Canonical classification/state
+   pairs, PR-bound terminal notices, strictly parsed and ordered App/CLI
+   timestamps, and a non-empty CLI reviewed-file set drawn from the PR's
+   changed paths are mandatory; impossible hand-written combinations fail. A
+   completed App review also requires its CodeRabbit check to pass.
+8. GitHub must report the PR `MERGEABLE`. The verifier re-fetches the head after
+   collecting checks and review evidence and rejects any head, base-name, or
+   base-OID mismatch. Merge still uses `--match-head-commit` with that captured
+   head, immediately after re-confirming the integration base.
+
+The output records `checkGateClassification`, the independent
+`reviewClassification`, exact head, config hash and trust source, immutable
+`canonicalVerifierOid`, `stabilityDwellSeconds`, plan-limit API evidence,
+expected/observed matrix, remediation issue, and all failures.
+Post the successful JSON plus the substantive review-of-record evidence to the
+PR before merging.
+
+A repository-owned contract uses this exact schema (names, producers, and path
+rules remain local policy, not canonical defaults):
+
+```json
+{
+  "schema_version": 1,
+  "classification": "PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK",
+  "integration_branch": "staging",
+  "expires": "before-first-production-promotion",
+  "remediation_issue": "https://github.com/OWNER/REPO/issues/NUMBER",
+  "expected_checks": [
+    {
+      "name": "Static checks",
+      "kind": "check_run",
+      "app_slug": "github-actions",
+      "allowed": ["success"]
+    },
+    {
+      "name": "Backend coverage",
+      "kind": "check_run",
+      "app_slug": "github-actions",
+      "allowed": ["success"],
+      "when_changed": ["backend/**", "shared/backend/**"]
+    },
+    {
+      "name": "Deployment",
+      "kind": "status_context",
+      "target_url_prefix": "https://deploy.example/OWNER/REPO/",
+      "creator_login": "deployment-bot[bot]",
+      "allowed": ["success"]
+    },
+    {"name": "CodeRabbit semantic review", "kind": "review_evidence"}
+  ]
+}
+```
+
 ## Fresh status, SHA, Walkthrough, and thread verification
 
 `coderabbit-review-of-record` performs this capture and these checks. Run the
@@ -401,11 +744,34 @@ capped GraphQL connection into an evidence file:
 ```bash
 set -euo pipefail
 
-PR=<number>
+: "${PR:?set PR to the numeric pull request number}"
+case "$PR" in *[!0-9]*|"") exit 2 ;; esac
 REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 OWNER=${REPO%/*}
 NAME=${REPO#*/}
 EVIDENCE_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+: "${CODERABBIT_REQUEST_EVIDENCE:?run the manual race in this shell first}"
+test -f "$CODERABBIT_REQUEST_EVIDENCE"
+test "$(jq -r .head "$CODERABBIT_REQUEST_EVIDENCE")" = "$EVIDENCE_HEAD"
+APP_REQUESTED_AT=$(jq -r .appRequestedAt "$CODERABBIT_REQUEST_EVIDENCE")
+APP_REQUEST_URL=$(jq -r .appRequestUrl "$CODERABBIT_REQUEST_EVIDENCE")
+CLI_STARTED_AT=$(jq -r .cliStartedAt "$CODERABBIT_REQUEST_EVIDENCE")
+CLI_FINISHED_AT=$(jq -r .cliFinishedAt "$CODERABBIT_REQUEST_EVIDENCE")
+PR_REVIEWS_JSONL="$CODERABBIT_EVIDENCE_DIR/pr-reviews.jsonl"
+PR_COMMENTS_JSONL="$CODERABBIT_EVIDENCE_DIR/pr-comments.jsonl"
+PR_THREADS_JSONL="$CODERABBIT_EVIDENCE_DIR/pr-threads.jsonl"
+PR_THREAD_COMMENTS_JSONL="$CODERABBIT_EVIDENCE_DIR/pr-thread-comments.jsonl"
+jq -e '
+  def integer: type == "number" and floor == .;
+  (.cliExitCode | integer) and (.cliExitCode == 0) and
+  (.appRequestStartedEpoch | integer) and
+  (.cliStartedEpoch | integer) and
+  (.appCliStartDeltaSeconds | integer) and
+  (.appCliStartDeltaSeconds ==
+    (.cliStartedEpoch - .appRequestStartedEpoch)) and
+  (.appCliStartDeltaSeconds >= 0) and
+  (.appCliStartDeltaSeconds <= 30)
+' "$CODERABBIT_REQUEST_EVIDENCE" >/dev/null
 
 gh api graphql --paginate \
   -F owner="$OWNER" -F name="$NAME" -F number="$PR" \
@@ -416,7 +782,7 @@ gh api graphql --paginate \
         author{login} state body submittedAt url commit{oid}
       }}
     }}
-  }' > /tmp/pr-reviews.jsonl
+  }' > "$PR_REVIEWS_JSONL"
 
 gh api graphql --paginate \
   -F owner="$OWNER" -F name="$NAME" -F number="$PR" \
@@ -427,7 +793,7 @@ gh api graphql --paginate \
         nodes{author{login} body createdAt updatedAt url}
       }
     }}
-  }' > /tmp/pr-comments.jsonl
+  }' > "$PR_COMMENTS_JSONL"
 
 gh api graphql --paginate \
   -F owner="$OWNER" -F name="$NAME" -F number="$PR" \
@@ -439,11 +805,11 @@ gh api graphql --paginate \
         nodes{id isResolved isOutdated path line}
       }
     }}
-  }' > /tmp/pr-threads.jsonl
+  }' > "$PR_THREADS_JSONL"
 
-: > /tmp/pr-thread-comments.jsonl
+: > "$PR_THREAD_COMMENTS_JSONL"
 jq -rs -r '.[].data.repository.pullRequest.reviewThreads.nodes[].id' \
-  /tmp/pr-threads.jsonl |
+  "$PR_THREADS_JSONL" |
 while IFS= read -r thread_id; do
   gh api graphql --paginate -F id="$thread_id" \
     -f query='query($id:ID!,$endCursor:String){node(id:$id){
@@ -453,7 +819,7 @@ while IFS= read -r thread_id; do
           nodes{author{login} body createdAt url commit{oid}}
         }
       }
-    }}' >> /tmp/pr-thread-comments.jsonl
+    }}' >> "$PR_THREAD_COMMENTS_JSONL"
 done
 ```
 
@@ -465,12 +831,14 @@ pass as a completed review:
 ```bash
 jq -s -e --arg head "$EVIDENCE_HEAD" \
   'all(.[]; .data.repository.pullRequest.headRefOid == $head)' \
-  /tmp/pr-reviews.jsonl /tmp/pr-comments.jsonl /tmp/pr-threads.jsonl
-jq -rs -e -r --arg head "$EVIDENCE_HEAD" '
+  "$PR_REVIEWS_JSONL" "$PR_COMMENTS_JSONL" "$PR_THREADS_JSONL"
+jq -rs -e -r --arg head "$EVIDENCE_HEAD" \
+  --arg requested "$APP_REQUESTED_AT" '
   [.[].data.repository.pullRequest.reviews.nodes[] |
    select((.author.login // "" | ascii_downcase) |
-          IN("coderabbitai","coderabbitai[bot]","coderabbit")) |
+          IN("coderabbitai","coderabbitai[bot]")) |
    select(.commit.oid == $head) |
+   select(.submittedAt >= $requested) |
    select(.submittedAt != null) |
    select(((.body // "") | test("Actionable comments posted|Walkthrough"))
           or ((.body // "") | length) >= 400) |
@@ -483,21 +851,23 @@ jq -rs -e -r --arg head "$EVIDENCE_HEAD" '
   else
     [$review.commit.oid,$review.state,$review.submittedAt,$review.url,
      (($review.body // "")|gsub("[\\r\\n]+";" ")|.[0:160])] | @tsv
-  end' /tmp/pr-reviews.jsonl
-jq -rs -r '.[].data.repository.pullRequest.comments.nodes[] |
+  end' "$PR_REVIEWS_JSONL"
+jq -rs -r --arg requested "$APP_REQUESTED_AT" '
+  .[].data.repository.pullRequest.comments.nodes[] |
   select((.author.login // "" | ascii_downcase) |
-         IN("coderabbitai","coderabbitai[bot]","coderabbit")) |
+         IN("coderabbitai","coderabbitai[bot]")) |
+  select(.createdAt >= $requested) |
   [.createdAt,.updatedAt,.url,(.body|gsub("[\\r\\n]+";" ")|.[0:240])] | @tsv' \
-  /tmp/pr-comments.jsonl
+  "$PR_COMMENTS_JSONL"
 # Outdated threads are excluded to match the tool: a thread the diff has
 # moved past is not an actionable merge blocker.
 jq -rs -r '.[].data.repository.pullRequest.reviewThreads.nodes[] |
   select((.isResolved|not) and (.isOutdated|not)) |
   [.id,.path,.line] | @tsv' \
-  /tmp/pr-threads.jsonl
+  "$PR_THREADS_JSONL"
 jq -rs -r '.[].data.node.comments.nodes[] |
   [.author.login,.createdAt,.url,(.body|gsub("[\\r\\n]+";" ")|.[0:240])] |
-  @tsv' /tmp/pr-thread-comments.jsonl
+  @tsv' "$PR_THREAD_COMMENTS_JSONL"
 ```
 
 Search review text and comments case-insensitively for at least `pause`, `skip`,
@@ -505,6 +875,12 @@ Search review text and comments case-insensitively for at least `pause`, `skip`,
 matches in context; keywords are indicators, not a substitute for semantic
 inspection. When a match is an adaptive-limit notice, record it and move to the
 ladder — do not wait for the quoted cooldown.
+
+Only an App review or terminal notice created after `APP_REQUESTED_AT` is
+evidence for this race. Record `APP_REQUEST_URL`, require the App attempt and
+CLI start to be within 30 seconds, and require any completed App review or
+terminal notice to fall before the CLI review finishes. A stale bot comment on
+the same head is not evidence for the current review of record.
 
 Bind the check query and final merge decision to the same captured head. Restart
 the entire evidence pass if any equality test fails:
@@ -514,14 +890,35 @@ set -euo pipefail
 
 CHECK_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
 test "$CHECK_HEAD" = "$EVIDENCE_HEAD"
+umask 077
+CHECK_EVIDENCE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/coderabbit-checks.XXXXXX")
+chmod 700 "$CHECK_EVIDENCE_DIR"
+REQUIRED_CHECKS_JSON="$CHECK_EVIDENCE_DIR/required-checks.json"
+STATUS_PAGES_JSON="$CHECK_EVIDENCE_DIR/status-pages.json"
 # gh pr checks exits non-zero when checks merely fail or are pending; under
 # `set -euo pipefail` that would kill the pass before jq ever evaluates the
 # payload. Capture the payload and the status separately -- a parseable
 # payload is a real answer regardless of the exit code.
 checks_rc=0
 gh pr checks "$PR" --required --json name,bucket,state,workflow,link \
-  > /tmp/pr-checks.json || checks_rc=$?
-cat /tmp/pr-checks.json
+  > "$REQUIRED_CHECKS_JSON" || checks_rc=$?
+cat "$REQUIRED_CHECKS_JSON"
+gh api --paginate --slurp \
+  "repos/$REPO/commits/$CHECK_HEAD/statuses?per_page=100" \
+  > "$STATUS_PAGES_JSON"
+
+# A same-named workflow check must not impersonate the CodeRabbit semantic
+# gate. Verify the newest exact CodeRabbit status context was emitted by an
+# exact bot identity before partitioning its linkless status row from CI.
+CODERABBIT_STATUS_VERIFIED=false
+if jq -e '
+  [ .[][] | select(.context == "CodeRabbit") ][0] as $status |
+  ($status != null) and
+  (($status.creator.login // "" | ascii_downcase) as $login |
+   ($login == "coderabbitai" or $login == "coderabbitai[bot]"))
+' "$STATUS_PAGES_JSON" >/dev/null; then
+  CODERABBIT_STATUS_VERIFIED=true
+fi
 
 # The gate is REQUIRED CI, so scope the query with --required: an optional
 # pending or failing check must not block the merge. Caveat: a required check
@@ -532,22 +929,29 @@ cat /tmp/pr-checks.json
 # CodeRabbit's own check is excluded here: on a ladder classification it is
 # legitimately absent, stale, or non-passing, and the CLASSIFICATION block
 # below is the sole owner of that gate.
-jq -e '(length > 0) and
-       ([ .[] | select((((.name // "") | ascii_downcase) |
-                        contains("coderabbit")) | not) ] |
-        all(.[]; ((.bucket | ascii_downcase) == "pass" or
-                  (.bucket | ascii_downcase) == "skipping")))' /tmp/pr-checks.json
+jq -e --argjson coderabbitStatusVerified "$CODERABBIT_STATUS_VERIFIED" '
+       [ .[] | select((($coderabbitStatusVerified and
+                        (.name // "") == "CodeRabbit" and
+                        (.workflow // "") == "" and
+                        (.link // "") == "") | not)) ] as $required_ci |
+       ($required_ci | length) > 0 and
+       all($required_ci[]; ((.bucket | ascii_downcase) == "pass" or
+                            (.bucket | ascii_downcase) == "skipping"))' \
+  "$REQUIRED_CHECKS_JSON"
 
 # The CodeRabbit check itself is a gate ONLY when the App is the reviewer of
 # record. On a ladder classification it is legitimately absent or stale, and
 # the ladder evidence carries the semantic gate instead.
-CLASSIFICATION=<recorded-classification>
+: "${CLASSIFICATION:?set the recorded review classification}"
 if [ "$CLASSIFICATION" = "APP_REVIEW_COMPLETED" ]; then
+  test "$CODERABBIT_STATUS_VERIFIED" = true
   jq -e '
-    [ .[] | select((.name // "") | ascii_downcase |
-      contains("coderabbit")) ] as $coderabbit |
+    [ .[] | select((.name // "") == "CodeRabbit" and
+                    (.workflow // "") == "" and
+                    (.link // "") == "") ] as $coderabbit |
     ($coderabbit | length) > 0 and
-    all($coderabbit[]; (.bucket | ascii_downcase) == "pass")' /tmp/pr-checks.json
+    all($coderabbit[]; (.bucket | ascii_downcase) == "pass")' \
+    "$REQUIRED_CHECKS_JSON"
 fi
 FINAL_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
 test "$FINAL_HEAD" = "$EVIDENCE_HEAD"
@@ -559,8 +963,10 @@ substring: a human account named `coderabbit-fan` could otherwise post a
 fabricated Walkthrough and have it accepted as the review of record. The same
 exact-identity rule applies to **comment evidence** (throttle and refusal
 notices): a lookalike login must not be able to plant a fake notice that the
-evidence pass then acts on. Check *names*, by contrast, vary freely, so match
-those with a case-insensitive `coderabbit` substring. A terminal `pass` only closes the check-state gate;
+evidence pass then acts on. The App's semantic status is the exact `CodeRabbit`
+context from `coderabbitai` or `coderabbitai[bot]`; similarly named workflow
+checks remain ordinary CI and cannot impersonate or be excluded as that gate.
+A terminal `pass` only closes the check-state gate;
 it does not prove the semantic review gate. When the review of record came from
 the ladder, the App check may legitimately be absent or non-passing; the ladder
 evidence carries the semantic gate instead.
@@ -569,7 +975,7 @@ Resolve a thread only after addressing the finding or replying with evidence
 that it is not actionable:
 
 ```bash
-THREAD_ID=<graphql-review-thread-id>
+: "${THREAD_ID:?set the GraphQL review thread id}"
 gh api graphql -F id="$THREAD_ID" \
   -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){
     thread{id isResolved}
@@ -582,7 +988,7 @@ substitute for triage.
 
 **Do not substitute a raw review-comment count** for the unresolved-thread
 listing above (`jq … select((.isResolved|not) and (.isOutdated|not)) …
-/tmp/pr-threads.jsonl`).
+"$PR_THREADS_JSONL"`).
 Resolution state lives on the *thread*, not the comment, so a count such as
 `gh api repos/$OWNER/$NAME/pulls/$PR/comments | jq 'length'` cannot distinguish
 four states that must be merged on differently:
@@ -602,7 +1008,9 @@ with the completed-review evidence required above.
 
 Merge only when all applicable gates hold:
 
-- required CI is successful on the current head;
+- required CI is successful on the current head, or the complete
+  `PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK` evidence contract above passes for a
+  qualifying pre-launch integration branch;
 - a completed CodeRabbit review covers the current production diff, proven by
   SHA plus substantive review/Walkthrough text — from the GitHub App, or, when
   the App is adaptively rate-limited, a documented **escape ladder** review
