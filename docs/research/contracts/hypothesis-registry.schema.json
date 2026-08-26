@@ -167,6 +167,7 @@
         "lookback_calendar_years": {"const": 3},
         "qualifying_transaction_codes": {
           "type": "array",
+          "minItems": 2,
           "prefixItems": [{"const": "P"}, {"const": "S"}],
           "items": false
         },
@@ -176,6 +177,7 @@
         "eligible_state": {"const": "opportunistic"},
         "excluded_states": {
           "type": "array",
+          "minItems": 3,
           "prefixItems": [
             {"const": "routine"},
             {"const": "unpartitionable"},
@@ -250,6 +252,7 @@
       "properties": {
         "confirmatory_features": {
           "type": "array",
+          "minItems": 1,
           "prefixItems": [{"const": "owner_classification"}],
           "items": false
         },
@@ -274,6 +277,7 @@
     },
     "decision_states": {
       "type": "array",
+      "minItems": 4,
       "prefixItems": [
         {"const": "COLLECTING"},
         {"const": "PROMOTE_RECOMMENDED"},

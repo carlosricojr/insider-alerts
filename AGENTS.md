@@ -1,8 +1,9 @@
 # Repository working agreements
 
-This repository operates a live IBKR canary. The root checkout at
-`C:\Users\carlo\Repositories\insider-alerts` is the deployment checkout and must remain on a
-clean, synced `main` branch.
+This repository operates a live IBKR canary. The deployment checkout configured by the scheduled
+task named `Insider Alerts Live Canary Worker` must remain on a clean, synced `main` branch. Before
+deployment, inspect that task's executable arguments, resolve the checkout, and verify its branch
+and `origin/main` equality.
 
 ## Safety and scope
 

@@ -74,6 +74,21 @@ def test_draft_registry_matches_frozen_contract() -> None:
         "seal_dataset_before_outcomes": True,
     }
 
+    fixed_arrays = (
+        ("classifier", "qualifying_transaction_codes"),
+        ("classifier", "excluded_states"),
+        ("feature_policy", "confirmatory_features"),
+    )
+    for parent, field in fixed_arrays:
+        truncated = json.loads(json.dumps(registry))
+        truncated[parent][field] = truncated[parent][field][:-1]
+        with pytest.raises(ValidationError):
+            Draft202012Validator(schema).validate(truncated)
+    truncated = json.loads(json.dumps(registry))
+    truncated["decision_states"] = truncated["decision_states"][:-1]
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(truncated)
+
 
 def test_evidence_contract_requires_point_in_time_and_failure_evidence() -> None:
     schema = _load(CONTRACTS / "evidence-snapshot.schema.json")
@@ -237,6 +252,21 @@ def test_evidence_contract_accepts_explicit_missingness_and_rejects_omission() -
     with pytest.raises(ValidationError):
         validator.validate(snapshot)
     snapshot["payload"]["observations"]["owner_history"] = captured
+
+    snapshot["payload"]["signal"]["reporting_owner_ciks"] = ["2", "3"]
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["signal"]["reporting_owner_ciks"] = ["2"]
+
+    snapshot["payload"]["classification"]["left_censored"] = True
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["left_censored"] = False
+
+    snapshot["payload"]["classification"]["history_coverage_complete"] = False
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["history_coverage_complete"] = True
 
     snapshot["recorded_at_utc"] = "2026-08-26T16:00:02-04:00"
     with pytest.raises(ValidationError):
