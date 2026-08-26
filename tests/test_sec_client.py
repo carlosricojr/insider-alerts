@@ -44,6 +44,19 @@ def test_sec_client_returns_binary_resource_metadata(httpx_mock: HTTPXMock) -> N
     assert response.upstream_digest == "sha-256=:abc=:"
 
 
+def test_sec_client_honors_declared_text_charset_with_replacement(
+    httpx_mock: HTTPXMock,
+) -> None:
+    client = SecHttpClient(Settings(SEC_RATE_LIMIT_PER_SECOND=10))
+    httpx_mock.add_response(
+        status_code=200,
+        content=b"caf\xe9",
+        headers={"Content-Type": "text/plain; charset=iso-8859-1"},
+    )
+
+    assert client.get_text("https://www.sec.gov/text") == "café"
+
+
 def test_sec_client_retries_on_429(httpx_mock: HTTPXMock) -> None:
     settings = Settings(SEC_RETRY_ATTEMPTS=3, SEC_RATE_LIMIT_PER_SECOND=10)
     client = SecHttpClient(settings)

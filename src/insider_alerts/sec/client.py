@@ -27,6 +27,10 @@ class SecResource:
     last_modified: str | None
     content_type: str | None
     upstream_digest: str | None = None
+    encoding: str = "utf-8"
+
+    def text(self) -> str:
+        return self.content.decode(self.encoding, errors="replace")
 
 
 @dataclass(slots=True)
@@ -73,6 +77,7 @@ class SecHttpClient:
                 or response.headers.get("digest")
                 or response.headers.get("content-md5")
             ),
+            encoding=response.encoding or "utf-8",
         )
 
     def get_resource(self, url: str) -> SecResource:
@@ -95,4 +100,4 @@ class SecHttpClient:
 
     def get_text(self, url: str) -> str:
         resource = self.get_resource(url)
-        return resource.content.decode("utf-8")
+        return resource.text()

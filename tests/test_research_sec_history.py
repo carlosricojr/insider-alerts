@@ -203,6 +203,11 @@ def test_raw_objects_and_normalized_rows_are_immutable(tmp_path: Path) -> None:
         raw_object=published,
         retrieved_at=retrieved_at,
     )
+    store.ingest_archive(
+        ArchiveRef(2006, 1, "https://www.sec.gov/moved/2006q1_form345.zip"),
+        raw_object=published,
+        retrieved_at=retrieved_at,
+    )
     snapshot_sha = store.create_snapshot(
         manifest_sha256=manifest.sha256,
         members=[(2006, 1, published.sha256)],

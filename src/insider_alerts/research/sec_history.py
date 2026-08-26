@@ -441,7 +441,7 @@ class HistoryStore:
                 int(existing["quarter"]),
                 str(existing["source_url"]),
             )
-            if existing_identity != (ref.year, ref.quarter, ref.url):
+            if existing_identity[:2] != (ref.year, ref.quarter):
                 raise ValueError("archive digest is bound to different release metadata")
             return
         if hashlib.sha256(raw_object.path.read_bytes()).hexdigest() != raw_object.sha256:
@@ -922,7 +922,7 @@ def sync_bulk_archives(
         suffix=".html",
     )
     refs = select_complete_archives(
-        parse_archive_manifest(manifest_resource.content.decode("utf-8")), through=through
+        parse_archive_manifest(manifest_resource.text()), through=through
     )
     members: list[tuple[int, int, str]] = []
     downloaded = 0

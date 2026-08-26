@@ -626,8 +626,20 @@ def _append_snapshot(
     else:
         owner_cik = payload.get("reporting_owner_cik")
         owner_ciks = [str(owner_cik)] if isinstance(owner_cik, str) and owner_cik else []
-    owner_cik = owner_ciks[0] if len(owner_ciks) == 1 else None
-    owner_mapping = "exact" if owner_cik else "ambiguous" if owner_ciks else "missing"
+    payload_owner_count = payload.get("reporting_owner_count")
+    owner_count = (
+        payload_owner_count
+        if isinstance(payload_owner_count, int) and payload_owner_count >= 0
+        else len(owner_ciks)
+    )
+    owner_cik = owner_ciks[0] if owner_count == 1 and len(owner_ciks) == 1 else None
+    owner_mapping = (
+        "exact"
+        if owner_cik
+        else "ambiguous"
+        if owner_count > 1 or len(owner_ciks) > 1
+        else "missing"
+    )
     classification_state = (
         "ambiguous_multi_owner" if owner_mapping == "ambiguous" else "unpartitionable"
     )
