@@ -205,6 +205,7 @@ def test_capture_preserves_multi_owner_ambiguity(
         "0000000003",
     ]
     assert record["payload"]["classification"]["owner_cik"] is None
+    assert record["payload"]["classification"]["state"] == "ambiguous_multi_owner"
     assert record["payload"]["classification"]["transaction_owner_mapping"] == "ambiguous"
 
 

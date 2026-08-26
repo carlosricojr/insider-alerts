@@ -628,6 +628,9 @@ def _append_snapshot(
         owner_ciks = [str(owner_cik)] if isinstance(owner_cik, str) and owner_cik else []
     owner_cik = owner_ciks[0] if len(owner_ciks) == 1 else None
     owner_mapping = "exact" if owner_cik else "ambiguous" if owner_ciks else "missing"
+    classification_state = (
+        "ambiguous_multi_owner" if owner_mapping == "ambiguous" else "unpartitionable"
+    )
     issuer_cik = str(payload.get("issuer_cik") or job.issuer_cik).lstrip("0") or "0"
     notification_at = (
         parse_utc(str(filing["notification_sent_at"]))
@@ -757,7 +760,7 @@ def _append_snapshot(
                     "configuration_sha256": _configuration_sha(config),
                 },
                 "classification": {
-                    "state": "unpartitionable",
+                    "state": classification_state,
                     "owner_cik": owner_cik,
                     "classification_year": job.decision_at.year,
                     "cutoff_at_utc": utc_text(job.decision_at),
