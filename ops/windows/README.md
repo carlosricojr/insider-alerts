@@ -38,7 +38,10 @@ changes. The live policy and broker gates are documented in `docs/runbook/LIVE_C
 Install the separate prospective evidence worker after deploying its pinned alpha-core runtime:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-research-capture-task.ps1 -Start
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\ops\windows\install-research-capture-task.ps1 `
+  -AlphaRoot C:\path\to\clean-alpha-core-runtime `
+  -Start
 ```
 
 The task runs one bounded capture per minute through `pythonw.exe`. It has no order code, cannot

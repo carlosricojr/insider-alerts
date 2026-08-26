@@ -14,7 +14,7 @@ from time import monotonic
 from typing import Any, Literal
 
 import rfc8785
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
 CAPTURE_CONTRACT_VERSION = "insider-evidence-capture-v1"
 HYPOTHESIS_ID = "OPP-E07-V1"
@@ -78,7 +78,7 @@ class CaptureJob:
 
 @dataclass(slots=True, frozen=True)
 class CaptureResult:
-    status: Literal["idle", "retry_scheduled", "completed"]
+    status: Literal["idle", "retry_scheduled", "completed", "failed"]
     job_id: str | None = None
     snapshot_sha256: str | None = None
     option_status: str | None = None
@@ -163,15 +163,28 @@ def ensure_evidence_store(path: Path) -> None:
 def _claim_job(config: CaptureConfig, *, worker_id: str, now: datetime) -> CaptureJob | None:
     with _connect(config.source_db, write=True) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE research_capture_jobs
+            SET status='failed', lease_owner=NULL, lease_expires_at_utc=NULL,
+                last_error_kind='CAPTURE_ATTEMPTS_EXHAUSTED',
+                last_error_message='capture attempts exhausted before finalization',
+                updated_at_utc=?
+            WHERE attempt_count >= ? AND (
+                status IN ('pending','retry')
+            )
+            """,
+            (utc_text(now), config.max_attempts),
+        )
         rows = conn.execute(
             """
             SELECT * FROM research_capture_jobs
-            WHERE status IN ('pending', 'retry')
-               OR (status = 'leased' AND lease_expires_at_utc <= ?)
+            WHERE (status IN ('pending', 'retry') AND attempt_count < ?)
+               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?)
             ORDER BY decision_at_utc, job_id
             LIMIT 100
             """,
-            (utc_text(now),),
+            (config.max_attempts, config.max_attempts, utc_text(now)),
         ).fetchall()
         selected: sqlite3.Row | None = None
         for row in rows:
@@ -182,7 +195,12 @@ def _claim_job(config: CaptureConfig, *, worker_id: str, now: datetime) -> Captu
         if selected is None:
             conn.commit()
             return None
-        attempt_count = int(selected["attempt_count"]) + 1
+        previous_attempt_count = int(selected["attempt_count"])
+        attempt_count = (
+            previous_attempt_count
+            if str(selected["status"]) == "leased"
+            else previous_attempt_count + 1
+        )
         cursor = conn.execute(
             """
             UPDATE research_capture_jobs
@@ -234,7 +252,7 @@ def _record_attempt(
     with _connect(config.source_db, write=True) as conn:
         conn.execute(
             """
-            INSERT INTO research_capture_attempts(
+            INSERT OR IGNORE INTO research_capture_attempts(
                 job_id, attempt_number, started_at_utc, finished_at_utc, status,
                 error_kind, error_message, retryable
             ) VALUES(?,?,?,?,?,?,?,?)
@@ -808,19 +826,7 @@ def _heartbeat(config: CaptureConfig, *, now: datetime, result: str, job_id: str
         )
 
 
-def run_capture_once(
-    config: CaptureConfig,
-    *,
-    now: datetime | None = None,
-    worker_id: str | None = None,
-) -> CaptureResult:
-    now = (now or datetime.now(UTC)).astimezone(UTC)
-    worker_id = worker_id or f"{platform.node()}:{os.getpid()}"
-    ensure_evidence_store(config.evidence_db)
-    job = _claim_job(config, worker_id=worker_id, now=now)
-    if job is None:
-        _heartbeat(config, now=now, result="idle", job_id=None)
-        return CaptureResult(status="idle")
+def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResult:
     started = datetime.now(UTC)
     timer = monotonic()
     existing_sha = _existing_snapshot_sha(config.evidence_db, job.job_id)
@@ -936,6 +942,59 @@ def run_capture_once(
         snapshot_sha256=record_sha,
         option_status="captured" if option_artifact else error_kind,
     )
+
+
+def run_capture_once(
+    config: CaptureConfig,
+    *,
+    now: datetime | None = None,
+    worker_id: str | None = None,
+) -> CaptureResult:
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    worker_id = worker_id or f"{platform.node()}:{os.getpid()}"
+    ensure_evidence_store(config.evidence_db)
+    job = _claim_job(config, worker_id=worker_id, now=now)
+    if job is None:
+        _heartbeat(config, now=now, result="idle", job_id=None)
+        return CaptureResult(status="idle")
+    try:
+        return _process_claimed_job(config, job)
+    except Exception as exc:
+        finished = datetime.now(UTC)
+        message = f"{type(exc).__name__}: {exc}"
+        permanent = isinstance(exc, (KeyError, TypeError, ValueError, ValidationError)) or (
+            "content-address collision" in str(exc)
+        )
+        deadline = job.decision_at + timedelta(seconds=config.capture_deadline_seconds)
+        retryable = (
+            not permanent and job.attempt_count < config.max_attempts and finished < deadline
+        )
+        state = "retry" if retryable else "failed"
+        error_kind = "CAPTURE_INTERNAL_RETRYABLE" if retryable else "CAPTURE_INTERNAL_TERMINAL"
+        _record_attempt(
+            config,
+            job,
+            started_at=finished,
+            finished_at=finished,
+            status=state,
+            error_kind=error_kind,
+            error_message=message,
+            retryable=retryable,
+        )
+        _set_job_state(
+            config,
+            job,
+            state=state,
+            now=finished,
+            error_kind=error_kind,
+            error_message=message,
+        )
+        _heartbeat(config, now=finished, result=state, job_id=job.job_id)
+        return CaptureResult(
+            status="retry_scheduled" if retryable else "failed",
+            job_id=job.job_id,
+            option_status=error_kind,
+        )
 
 
 def capture_status(source_db: Path, evidence_db: Path) -> dict[str, Any]:

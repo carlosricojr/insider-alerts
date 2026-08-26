@@ -43,8 +43,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
         option_timeout_seconds=args.option_timeout,
     )
-    print(json.dumps(asdict(run_capture_once(config)), sort_keys=True))
-    return 0
+    result = run_capture_once(config)
+    print(json.dumps(asdict(result), sort_keys=True))
+    return 2 if result.status == "failed" else 0
 
 
 if __name__ == "__main__":

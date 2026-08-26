@@ -1,6 +1,7 @@
 param(
   [string]$TaskName = "Insider Alerts Research Evidence Capture",
-  [string]$AlphaRoot = "C:\Users\carlo\Repositories\alpha-core-worktrees\insider-evidence-surface-runtime",
+  [Parameter(Mandatory = $true)]
+  [string]$AlphaRoot,
   [int]$IntervalMinutes = 1,
   [switch]$Start
 )

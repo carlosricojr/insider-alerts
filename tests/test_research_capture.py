@@ -231,6 +231,51 @@ def test_restart_after_snapshot_append_recovers_without_recapture(
         assert conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone()[0] == 1
 
 
+def test_permanent_internal_failure_is_terminal_and_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "invalid", False),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_append_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("invalid envelope")),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "failed"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,lease_owner,lease_expires_at_utc,last_error_kind "
+            "FROM research_capture_jobs"
+        ).fetchone() == ("failed", None, None, "CAPTURE_INTERNAL_TERMINAL")
+        assert conn.execute(
+            "SELECT status,retryable FROM research_capture_attempts"
+        ).fetchone() == ("failed", 0)
+
+
+def test_exhausted_unleased_job_is_failed_instead_of_reclaimed(tmp_path: Path) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "UPDATE research_capture_jobs SET status='retry', attempt_count=?",
+            (config.max_attempts,),
+        )
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "idle"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("failed", "CAPTURE_ATTEMPTS_EXHAUSTED")
+
+
 def test_worker_entrypoint_is_structurally_order_incapable() -> None:
     worker = (ROOT / "src/insider_alerts/research/worker.py").read_text(encoding="utf-8")
     capture = (ROOT / "src/insider_alerts/research/capture.py").read_text(encoding="utf-8")

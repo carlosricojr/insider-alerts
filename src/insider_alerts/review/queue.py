@@ -82,7 +82,7 @@ def ensure_review_tables(db_path: str) -> None:
                 source_first_observed_at_utc TEXT NOT NULL,
                 decision_at_utc TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','leased','retry','complete')),
+                    CHECK(status IN ('pending','leased','retry','complete','failed')),
                 attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
                 lease_owner TEXT,
                 lease_expires_at_utc TEXT,
@@ -101,7 +101,7 @@ def ensure_review_tables(db_path: str) -> None:
                 attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
                 started_at_utc TEXT NOT NULL,
                 finished_at_utc TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('retry','completed')),
+                status TEXT NOT NULL CHECK(status IN ('retry','completed','failed')),
                 error_kind TEXT,
                 error_message TEXT,
                 retryable INTEGER NOT NULL CHECK(retryable IN (0,1)),
@@ -115,8 +115,8 @@ def ensure_review_tables(db_path: str) -> None:
             BEGIN SELECT RAISE(ABORT, 'capture attempts are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS research_capture_complete_immutable
             BEFORE UPDATE ON research_capture_jobs
-            WHEN OLD.status = 'complete'
-            BEGIN SELECT RAISE(ABORT, 'completed capture jobs are immutable'); END;
+            WHEN OLD.status IN ('complete','failed')
+            BEGIN SELECT RAISE(ABORT, 'final capture jobs are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS research_capture_job_identity_immutable
             BEFORE UPDATE OF
                 job_id, packet_id, contract_version, accession_number, issuer_cik, form_type,
