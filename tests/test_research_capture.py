@@ -966,6 +966,54 @@ def test_retryable_option_failure_keeps_job_durable_without_snapshot(
         assert conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone()[0] == 0
 
 
+def test_closed_venue_option_failure_is_typed_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = replace(_config(tmp_path, source_db), max_attempts=2)
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: ProcessResult(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "IB Gateway request failed: bid/ask packet is not actionable because "
+                "the venue session is not open"
+            ),
+            timed_out=False,
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "retry_scheduled"
+    assert result.option_status == "OPTION_CAPTURE_VENUE_CLOSED"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,attempt_count,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("retry", 1, "OPTION_CAPTURE_VENUE_CLOSED")
+        assert conn.execute(
+            "SELECT status,retryable,error_kind FROM research_capture_attempts"
+        ).fetchone() == ("retry", 1, "OPTION_CAPTURE_VENUE_CLOSED")
+    with sqlite3.connect(config.evidence_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone()[0] == 0
+
+    terminal = run_capture_once(config, now=decision_at + timedelta(seconds=3))
+
+    assert terminal.status == "completed"
+    assert terminal.option_status == "OPTION_CAPTURE_VENUE_CLOSED"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    assert row is not None
+    record = json.loads(bytes(row[0]))
+    assert record["payload"]["observations"]["options_surface"]["status"] == "error"
+    assert any(
+        error["kind"] == "OPTION_CAPTURE_VENUE_CLOSED"
+        for error in record["payload"]["errors"]
+    )
+
+
 def test_restart_after_snapshot_append_recovers_without_recapture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
