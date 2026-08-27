@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ast
 import asyncio
 import json
@@ -12,6 +13,8 @@ from zoneinfo import ZoneInfo
 import pytest
 from typer.testing import CliRunner
 
+import insider_alerts.research.bar_worker as bar_worker
+import insider_alerts.research.session_feed as session_feed_module
 from insider_alerts import cli
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import (
@@ -120,6 +123,142 @@ def test_feed_is_append_only_idempotent_and_preserves_revisions(tmp_path: Path) 
             conn.execute("UPDATE bar_observations SET symbol='X'")
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             conn.execute("DELETE FROM bar_feed_requests")
+
+
+def test_current_date_requires_explicit_official_close_proof(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 27, 20, 1, tzinfo=UTC)
+    today = now.astimezone(NEW_YORK).date()
+    store = BarFeedStore(tmp_path / "feed.db")
+    current = _bar(today)
+
+    assert store.append_completed([current], observed_at_utc=now) == (0, 0, 0)
+    assert store.append_completed(
+        [current],
+        observed_at_utc=now,
+        completed_through_date=today,
+    ) == (1, 0, 0)
+    with pytest.raises(ValueError, match="future"):
+        store.append_completed(
+            [current],
+            observed_at_utc=now,
+            completed_through_date=today + timedelta(days=1),
+        )
+
+
+def test_preclose_poll_is_due_again_once_current_session_is_proven_complete(
+    tmp_path: Path,
+) -> None:
+    preclose = datetime(2026, 8, 27, 19, 0, tzinfo=UTC)
+    postclose = datetime(2026, 8, 27, 20, 1, tzinfo=UTC)
+    today = preclose.astimezone(NEW_YORK).date()
+    store = BarFeedStore(tmp_path / "feed.db")
+    store.request(_request(preclose, through=today + timedelta(days=10)))
+    current = _bar(today)
+
+    first_source = FakeSource([current])
+    second_source = FakeSource([current])
+    third_source = FakeSource([current])
+    first = asyncio.run(
+        collect_once(
+            store,
+            first_source,
+            now=preclose,
+            minimum_interval_seconds=0,
+        )
+    )
+    second = asyncio.run(
+        collect_once(
+            store,
+            second_source,
+            now=postclose,
+            minimum_interval_seconds=0,
+            completed_through_date=today,
+        )
+    )
+    third = asyncio.run(
+        collect_once(
+            store,
+            third_source,
+            now=postclose + timedelta(minutes=1),
+            minimum_interval_seconds=0,
+            completed_through_date=today,
+        )
+    )
+
+    assert first.observations_added == 0
+    assert second.observations_added == 1
+    assert second_source.symbols == ["TEST"]
+    assert third.symbols == 0
+    assert third_source.symbols == []
+    assert store.first_observed_bars("TEST", start_date=today) == [current]
+
+
+def test_worker_keeps_historical_feed_available_when_session_store_is_missing(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing-sessions.db"
+    args = argparse.Namespace(
+        feed_db=tmp_path / "feed.db",
+        session_feed_db=missing,
+        host="127.0.0.1",
+        port=4001,
+        client_id=176,
+        error_log=tmp_path / "error.log",
+    )
+
+    assert asyncio.run(bar_worker._run(args))["requests"] == 0
+    assert not missing.exists()
+
+
+def test_worker_degrades_corrupt_session_proof_without_stopping_historical_feed(
+    tmp_path: Path,
+) -> None:
+    corrupt = tmp_path / "corrupt-sessions.db"
+    corrupt.write_bytes(b"not sqlite")
+    args = argparse.Namespace(
+        feed_db=tmp_path / "feed.db",
+        session_feed_db=corrupt,
+        host="127.0.0.1",
+        port=4001,
+        client_id=176,
+        error_log=tmp_path / "error.log",
+    )
+
+    assert asyncio.run(bar_worker._run(args))["requests"] == 0
+    status = BarFeedStore(args.feed_db).status()
+    assert status["failure_count"] == 1
+    assert "file is not a database" in args.error_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("error_type", [TypeError, IndexError, KeyError, ValueError])
+def test_structurally_corrupt_session_proof_uses_non_tradable_failure_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    corrupt = tmp_path / "corrupt-sessions.db"
+    corrupt.touch()
+
+    def fail_validation(_store: object) -> None:
+        raise error_type("corrupt cell structure")
+
+    monkeypatch.setattr(
+        session_feed_module.SessionFeedStore,
+        "validate_integrity",
+        fail_validation,
+    )
+    args = argparse.Namespace(
+        feed_db=tmp_path / "feed.db",
+        session_feed_db=corrupt,
+        host="127.0.0.1",
+        port=4001,
+        client_id=176,
+        error_log=tmp_path / "error.log",
+    )
+
+    assert asyncio.run(bar_worker._run(args))["requests"] == 0
+    with sqlite3.connect(args.feed_db) as conn:
+        assert conn.execute("SELECT symbol FROM bar_feed_failures").fetchone()[0] == "SESSION-FEED"
 
 
 def test_worker_stays_offline_when_idle_and_collects_only_requested_range(tmp_path: Path) -> None:

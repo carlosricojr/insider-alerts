@@ -112,6 +112,34 @@ def test_worker_records_rejections_and_failure_health(tmp_path: Path) -> None:
     assert failed_store.status()["health"]["last_result"] == "failed"
 
 
+def test_completed_through_date_uses_schedule_as_known_at_that_instant(tmp_path: Path) -> None:
+    store = SessionFeedStore(tmp_path / "sessions.db")
+    observed = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    session = _session(date(2026, 8, 27), close_hour_local=13)
+    store.append([session], observed_at_utc=observed)
+
+    assert store.completed_through_date(session.closes_at_utc) is None
+    assert (
+        store.completed_through_date(session.closes_at_utc + timedelta(minutes=1))
+        == session.session_date
+    )
+
+
+def test_completed_through_ignores_schedule_revision_observed_after_boundary(
+    tmp_path: Path,
+) -> None:
+    store = SessionFeedStore(tmp_path / "sessions.db")
+    day = date(2026, 8, 27)
+    regular = _session(day)
+    early = _session(day, close_hour_local=13)
+    store.append([regular], observed_at_utc=datetime(2026, 8, 20, 12, 0, tzinfo=UTC))
+    correction_at = datetime(2026, 8, 27, 18, 2, tzinfo=UTC)
+    store.append([early], observed_at_utc=correction_at)
+
+    assert store.completed_through_date(correction_at - timedelta(minutes=1)) is None
+    assert store.completed_through_date(correction_at + timedelta(minutes=1)) == day
+
+
 def test_status_does_not_create_missing_database(tmp_path: Path) -> None:
     missing = tmp_path / "wrong.db"
     assert session_feed_status(missing)["integrity_status"] == "missing"
@@ -131,6 +159,10 @@ def test_windows_session_task_is_direct_hidden_pythonw() -> None:
     assert "powershell" not in action.lower()
     assert "cmd.exe" not in action.lower()
     assert "-Hidden" in installer
+    bar_installer = (
+        Path(__file__).parents[1] / "ops" / "windows" / "install-research-bar-feed-task.ps1"
+    ).read_text(encoding="utf-8")
+    assert "--session-feed-db" in bar_installer
 
 
 def test_endpoint_convention_is_frozen_in_registry_and_preregistration() -> None:

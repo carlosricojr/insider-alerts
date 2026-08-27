@@ -29,6 +29,7 @@ $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments = @(
   "-m insider_alerts.research.bar_worker",
   "--feed-db `"$repoRoot\data\research\bar_feed.db`"",
+  "--session-feed-db `"$repoRoot\data\research\session_feed.db`"",
   "--port $Port",
   "--client-id $ClientId",
   "--error-log `"$repoRoot\logs\research-bar-feed.err.log`""

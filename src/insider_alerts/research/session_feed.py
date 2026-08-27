@@ -9,7 +9,7 @@ import sqlite3
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -18,6 +18,7 @@ import rfc8785
 
 SESSION_FEED_VERSION = "ibkr-spy-rth-schedule-v1"
 NEW_YORK = ZoneInfo("America/New_York")
+SESSION_COMPLETION_MINIMUM_AGE = timedelta(minutes=1)
 
 
 def _utc_text(value: datetime) -> str:
@@ -337,6 +338,23 @@ class SessionFeedStore:
             session = self._verify_row(row)
             latest[session.session_date] = (int(row["sequence"]), session)
         return [latest[day][1] for day in sorted(latest)]
+
+    def completed_through_date(
+        self,
+        as_of_utc: datetime,
+        *,
+        minimum_age: timedelta = SESSION_COMPLETION_MINIMUM_AGE,
+    ) -> date | None:
+        if as_of_utc.tzinfo is None:
+            raise ValueError("session completion boundary cannot be naive")
+        if minimum_age < timedelta(0):
+            raise ValueError("session completion minimum age cannot be negative")
+        completed = [
+            session.session_date
+            for session in self.schedule_as_known_at(as_of_utc)
+            if session.closes_at_utc + minimum_age <= as_of_utc
+        ]
+        return max(completed, default=None)
 
     def validate_integrity(self) -> None:
         rows = self._rows()
