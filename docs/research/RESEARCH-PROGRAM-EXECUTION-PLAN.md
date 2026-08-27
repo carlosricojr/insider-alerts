@@ -133,7 +133,7 @@ snapshot, or stop the existing canary from managing positions.
 Exit gate: hand-worked fixtures, boundary dates, amendments, same-month intersections, incomplete
 years, left-censor cases, multi-owner filings, duplicate accessions, and replay-as-of tests all pass.
 
-### M4 — Frozen inference executable (current)
+### M4 — Frozen inference executable (complete)
 
 - Implement the exact endpoint, PRNG, circular block sampler, ordering and tie rules, sample freeze,
   18-month deadline, economic gates, decision states, and machine-readable report while the registry
@@ -144,7 +144,13 @@ years, left-censor cases, multi-owner filings, duplicate accessions, and replay-
 Exit gate: frozen fixtures deterministically promote or kill; the exact implementation is reviewed,
 merged, deployed, and hashable before any confirmatory enrollment.
 
-### M5 — Activate challenger, collect, and decide
+### M5 — Activate challenger, collect, and decide (current)
+
+The order-incapable challenger runtime, point-in-time session/bar feeds, outcome materializer, and
+prospective control-diagnostic capture are deployed. Deployment of the diagnostic outcome
+materializer and terminal dataset/seal tooling remains an activation prerequisite; the terminal
+dataset itself can exist only after the prospective sample freezes. The registry is still draft,
+so no confirmatory enrollment has begun.
 
 - Activate `OPP-E07-V1` only after M2, M3, and M4 are deployed from known merged commits and every
   required artifact digest is sealed.

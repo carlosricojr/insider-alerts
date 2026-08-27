@@ -11,12 +11,15 @@ import pytest
 import rfc8785
 from typer.testing import CliRunner
 
+import insider_alerts.research.diagnostic_outcomes as diagnostic_outcomes
 import insider_alerts.research.diagnostics as diagnostics
 from insider_alerts import cli
+from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal
 from insider_alerts.execution.canary import CanaryStore
 from insider_alerts.research.bar_feed import BarFeedStore
 from insider_alerts.research.capture import ensure_evidence_store
+from insider_alerts.research.diagnostic_outcomes import finalize_diagnostic_outcomes
 from insider_alerts.research.diagnostics import (
     DiagnosticConfig,
     DiagnosticRunResult,
@@ -453,6 +456,13 @@ def test_diagnostics_status_cli_is_blinded(tmp_path: Path) -> None:
     path = tmp_path / "diagnostics.db"
     store = DiagnosticStore(path)
     store.write_health(now=datetime.now(UTC), result=DiagnosticRunResult("idle_registry_draft"))
+    store.write_outcome_health(
+        now=datetime.now(UTC),
+        status="idle_registry_draft",
+        error=None,
+        candidates_seen=0,
+        outcomes_waiting=0,
+    )
 
     result = CliRunner().invoke(
         cli.app, ["ops", "research-diagnostics-status", "--diagnostics-db", str(path)]
@@ -463,6 +473,360 @@ def test_diagnostics_status_cli_is_blinded(tmp_path: Path) -> None:
     assert payload["integrity_status"] == "valid"
     assert payload["operational_status"] == "healthy"
     assert "return" not in result.stdout.lower()
+
+
+def _install_terminal_control_bars(
+    config: DiagnosticConfig,
+    *,
+    days: list[date],
+    omit_stock_date: date | None = None,
+) -> datetime:
+    sessions = SessionFeedStore(config.session_feed_db, initialize=False).latest_schedule()
+    by_date = {session.session_date: session for session in sessions}
+    final_close = by_date[days[9]].closes_at_utc
+    observed_at = final_close + timedelta(minutes=1)
+    stock = [
+        DailyBar(
+            "TEST",
+            day,
+            10.0,
+            11.0 if index == 0 else 10.5,
+            9.5,
+            10.25,
+            100_000.0,
+        )
+        for index, day in enumerate(days[:10])
+        if day != omit_stock_date
+    ]
+    spy = [DailyBar("SPY", day, 100.0, 102.0, 99.0, 101.0, 1_000_000.0) for day in days[:10]]
+    store = BarFeedStore(config.bar_feed_db, initialize=False)
+    store.append_completed(
+        [*stock, *spy],
+        observed_at_utc=observed_at,
+        completed_through_date=days[9],
+    )
+    for symbol, count in (("TEST", len(stock)), ("SPY", len(spy))):
+        store.record_successful_poll(
+            symbol,
+            local_date=observed_at.astimezone(NEW_YORK).date(),
+            earliest_start_date=days[0] - timedelta(days=120),
+            requested_through_date=days[9],
+            completed_through_date=days[9],
+            now=observed_at + timedelta(minutes=1),
+            returned_bar_count=count,
+            in_range_bar_count=count,
+            source_rejection_count=0,
+            validation_rejection_count=0,
+        )
+    return observed_at + timedelta(minutes=2)
+
+
+def test_diagnostic_outcome_uses_research_authority_and_records_canary_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    signal_at = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    activated_at = signal_at - timedelta(hours=1)
+    days = _weekdays(date(2026, 8, 28), 12)
+    _install_schedule(config.session_feed_db, days, signal_at - timedelta(minutes=1))
+    packet_id = _install_canary(
+        config.canary_ledger_db,
+        activated_at=activated_at,
+        signal_at=signal_at,
+        entry_session=days[0],
+    )
+    job_id = _install_source_job(
+        config.source_db,
+        packet_id=packet_id,
+        source_at=signal_at - timedelta(minutes=1),
+        decision_at=signal_at,
+    )
+    _install_routine_evidence(
+        config.evidence_db,
+        job_id=job_id,
+        packet_id=packet_id,
+        source_at=signal_at - timedelta(minutes=1),
+        decision_at=signal_at,
+        recorded_at=signal_at + timedelta(minutes=1),
+    )
+    canary = CanaryStore(str(config.canary_ledger_db))
+    row = canary.rows()[0]
+    entry_bar = DailyBar("TEST", days[0], 10.0, 11.0, 9.5, 10.5, 100_000.0)
+    canary.record_shadow_trade(
+        row,
+        quantity=20,
+        entry_bar=entry_bar,
+        stop_price=8.9,
+        target_price=11.0,
+        exit_bar=entry_bar,
+        exit_price=11.0,
+        exit_reason="target",
+    )
+    window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
+    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    run_diagnostics_once(config, now=signal_at + timedelta(minutes=2))
+    terminal_at = _install_terminal_control_bars(config, days=days)
+
+    append_outcome_receipt = DiagnosticStore.append_outcome_receipt
+    monkeypatch.setattr(
+        DiagnosticStore,
+        "append_outcome_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("post-reconciliation crash")),
+    )
+    with pytest.raises(RuntimeError, match="post-reconciliation crash"):
+        finalize_diagnostic_outcomes(config, now=terminal_at)
+    with sqlite3.connect(config.diagnostics_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM diagnostic_reconciliations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM diagnostic_outcomes").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM diagnostic_outcome_receipts").fetchone()[0] == 0
+    monkeypatch.setattr(DiagnosticStore, "append_outcome_receipt", append_outcome_receipt)
+
+    result = finalize_diagnostic_outcomes(config, now=terminal_at)
+    replay = finalize_diagnostic_outcomes(config, now=terminal_at + timedelta(minutes=1))
+
+    assert result.outcomes_added == result.receipts_added == 1
+    assert result.reconciliations_added == 0
+    assert replay.outcomes_added == replay.receipts_added == 0
+    assert DiagnosticStore(config.diagnostics_db).outcome_disposition_counts() == {"unavailable": 1}
+    with sqlite3.connect(config.diagnostics_db) as conn:
+        outcome = json.loads(
+            conn.execute("SELECT record_json FROM diagnostic_outcomes").fetchone()[0]
+        )
+        receipt = conn.execute(
+            "SELECT disposition,reason,outcome_record_sha256 FROM diagnostic_outcome_receipts"
+        ).fetchone()
+        categories = {
+            row[0] for row in conn.execute("SELECT category FROM diagnostic_reconciliations")
+        }
+    assert outcome["exit_price"] == 11.0
+    assert outcome["canary_agreement"]["status"] == "mismatch"
+    assert outcome["canary_agreement"]["mismatched_fields"] == ["stop_price"]
+    assert receipt is not None
+    assert receipt[0:2] == ("unavailable", "canary_research_outcome_mismatch")
+    assert receipt[2] is not None
+    assert "canary_research_outcome_mismatch" in categories
+    with sqlite3.connect(config.diagnostics_db) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="diagnostic outcomes are immutable"):
+            conn.execute("DELETE FROM diagnostic_outcomes")
+        with pytest.raises(
+            sqlite3.IntegrityError, match="diagnostic outcome receipts are immutable"
+        ):
+            conn.execute("DELETE FROM diagnostic_outcome_receipts")
+    assert "gross_return" not in json.dumps(
+        DiagnosticStore(config.diagnostics_db).status(now=terminal_at), sort_keys=True
+    )
+
+
+def test_diagnostic_nontrade_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    signal_at = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    activated_at = signal_at - timedelta(hours=1)
+    days = _weekdays(date(2026, 8, 28), 12)
+    _install_schedule(config.session_feed_db, days, signal_at - timedelta(minutes=1))
+    packet_id = _install_canary(
+        config.canary_ledger_db,
+        activated_at=activated_at,
+        signal_at=signal_at,
+        entry_session=days[0],
+    )
+    _install_source_job(
+        config.source_db,
+        packet_id=packet_id,
+        source_at=signal_at - timedelta(minutes=1),
+        decision_at=signal_at,
+    )
+    window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
+    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    run_diagnostics_once(config, now=signal_at + timedelta(minutes=1))
+
+    not_traded = finalize_diagnostic_outcomes(config, now=signal_at + timedelta(minutes=2))
+
+    assert not_traded.receipts_added == 1
+    assert not_traded.outcomes_added == 0
+    assert DiagnosticStore(config.diagnostics_db).outcome_disposition_counts() == {"not_traded": 1}
+
+
+def test_unavailable_control_does_not_block_later_ready_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    signal_at = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    activated_at = signal_at - timedelta(hours=1)
+    days = _weekdays(date(2026, 8, 28), 12)
+    _install_schedule(config.session_feed_db, days, signal_at - timedelta(minutes=1))
+    first_packet = _install_canary(
+        config.canary_ledger_db,
+        activated_at=activated_at,
+        signal_at=signal_at,
+        entry_session=days[0],
+    )
+    canary = CanaryStore(str(config.canary_ledger_db))
+    canary.insert_candidate(
+        DeliveredSignal(
+            packet_id="packet-2",
+            accession_number="0000000001-26-000002",
+            cik="0000000001",
+            symbol="READY",
+            filed_at=signal_at - timedelta(minutes=5),
+            signal_at=signal_at + timedelta(seconds=1),
+            score=0.9,
+            rationale={},
+        ),
+        session=days[0],
+        rank="b" * 64,
+        is_eligible=True,
+        reason="eligible",
+        prior_close=10.0,
+        median_dollar_volume=1_000_000.0,
+        quantity=20,
+        now=signal_at + timedelta(seconds=2),
+    )
+    for row in canary.rows():
+        entry_bar = DailyBar(str(row["symbol"]), days[0], 10.0, 11.0, 9.5, 10.5, 100_000.0)
+        canary.record_shadow_trade(
+            row,
+            quantity=20,
+            entry_bar=entry_bar,
+            stop_price=9.0,
+            target_price=11.0,
+            exit_bar=entry_bar,
+            exit_price=11.0,
+            exit_reason="target",
+        )
+    _install_source_job(
+        config.source_db,
+        packet_id=first_packet,
+        source_at=signal_at - timedelta(minutes=1),
+        decision_at=signal_at,
+    )
+    _install_source_job(
+        config.source_db,
+        packet_id="packet-2",
+        source_at=signal_at - timedelta(seconds=30),
+        decision_at=signal_at + timedelta(seconds=1),
+    )
+    window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
+    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    run_diagnostics_once(config, now=signal_at + timedelta(minutes=1))
+    terminal_at = _install_terminal_control_bars(config, days=days, omit_stock_date=days[0])
+    ready_bars = [
+        DailyBar(
+            "READY",
+            day,
+            10.0,
+            11.0 if index == 0 else 10.5,
+            9.5,
+            10.25,
+            100_000.0,
+        )
+        for index, day in enumerate(days[:10])
+    ]
+    bars = BarFeedStore(config.bar_feed_db, initialize=False)
+    bars.append_completed(
+        ready_bars,
+        observed_at_utc=terminal_at - timedelta(seconds=30),
+        completed_through_date=days[9],
+    )
+    bars.record_successful_poll(
+        "READY",
+        local_date=terminal_at.astimezone(NEW_YORK).date(),
+        earliest_start_date=days[0] - timedelta(days=120),
+        requested_through_date=days[9],
+        completed_through_date=days[9],
+        now=terminal_at,
+        returned_bar_count=10,
+        in_range_bar_count=10,
+        source_rejection_count=0,
+        validation_rejection_count=0,
+    )
+
+    result = finalize_diagnostic_outcomes(config, now=terminal_at + timedelta(minutes=1))
+
+    assert result.status == "degraded"
+    assert result.outcomes_added == 1
+    assert result.receipts_added == 2
+    assert result.unavailable_total == 1
+    assert DiagnosticStore(config.diagnostics_db).outcome_disposition_counts() == {
+        "available": 1,
+        "unavailable": 1,
+    }
+
+
+def test_diagnostic_integrity_rejects_orphans_and_health_cannot_move_backward(
+    tmp_path: Path,
+) -> None:
+    store = DiagnosticStore(tmp_path / "diagnostics.db")
+    later = datetime(2026, 8, 28, 12, 1, tzinfo=UTC)
+    earlier = later - timedelta(minutes=1)
+    store.write_health(now=later, result=DiagnosticRunResult("collecting", candidates_seen=2))
+    store.write_health(now=earlier, result=DiagnosticRunResult("degraded", candidates_seen=1))
+    store.write_outcome_health(
+        now=later,
+        status="collecting",
+        error=None,
+        candidates_seen=2,
+        outcomes_waiting=1,
+    )
+    store.write_outcome_health(
+        now=earlier,
+        status="degraded",
+        error="stale",
+        candidates_seen=1,
+        outcomes_waiting=1,
+    )
+
+    status = store.status(now=later)
+
+    assert status["health"]["last_result"] == "collecting"
+    assert status["outcome_health"]["last_result"] == "collecting"
+    orphan = {
+        "contract_version": diagnostics.DIAGNOSTIC_CONTRACT_VERSION,
+        "hypothesis_id": "OPP-E07-V1",
+        "packet_id": "orphan",
+        "evidence_record_sha256": "a" * 64,
+        "routine_eligible": False,
+        "routine_reason": "missing",
+        "recorded_at_utc": _utc_text(later),
+    }
+    assert store.add_evidence_binding(orphan)
+    with pytest.raises(ValueError, match="no owning diagnostic candidate"):
+        store.validate_integrity()
+
+
+def test_diagnostic_store_migrates_pre_outcome_schema_non_destructively(tmp_path: Path) -> None:
+    path = tmp_path / "diagnostics.db"
+    DiagnosticStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE diagnostic_outcome_receipts")
+        conn.execute("DROP TABLE diagnostic_outcomes")
+        conn.execute("DROP TABLE diagnostic_outcome_health")
+        conn.execute(
+            "INSERT INTO diagnostic_health VALUES(1,?,?,?,?,?)",
+            (_utc_text(datetime(2026, 8, 28, tzinfo=UTC)), "collecting", None, 0, 0),
+        )
+
+    migrated = DiagnosticStore(path)
+
+    with sqlite3.connect(path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'diagnostic_%'"
+            )
+        }
+        health = conn.execute(
+            "SELECT last_result FROM diagnostic_health WHERE singleton=1"
+        ).fetchone()
+    assert {
+        "diagnostic_outcomes",
+        "diagnostic_outcome_receipts",
+        "diagnostic_outcome_health",
+    }.issubset(tables)
+    assert health == ("collecting",)
+    migrated.validate_integrity()
 
 
 def test_diagnostics_status_fails_closed_for_missing_stale_and_corrupt_store(

@@ -4,9 +4,11 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import rfc8785
@@ -19,6 +21,7 @@ import insider_alerts.research.trial_worker as trial_worker
 from insider_alerts import cli
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import BarFeedStore
+from insider_alerts.research.outcome_proof import FrozenScheduleBinding, bound_horizon
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
 from insider_alerts.research.trial_runtime import (
     EntryCompletionInputs,
@@ -1165,12 +1168,108 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["diagnostics"]["status"] == "idle_registry_draft"
+    assert payload["diagnostic_outcomes"]["status"] == "idle_registry_draft"
     assert payload["candidate_runtime"]["status"] == "idle"
     assert payload["entry_finalizer"]["status"] == "idle_registry_draft"
     assert payload["outcome_finalizer"]["status"] == "idle_registry_draft"
     assert not error_log.exists()
     assert not (tmp_path / "bars.db").exists()
     assert not (tmp_path / "sessions.db").exists()
+
+
+def test_trial_worker_runs_time_sensitive_confirmatory_phases_before_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order: list[str] = []
+
+    def ordered(name: str, function: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            order.append(name)
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        trial_worker,
+        "run_trial_once",
+        ordered("candidate_runtime", trial_worker.run_trial_once),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        ordered("entry_finalizer", trial_worker.finalize_pending_entry_dates),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_trial_outcomes",
+        ordered("outcome_finalizer", trial_worker.finalize_trial_outcomes),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "run_diagnostics_once",
+        ordered("diagnostic_capture", trial_worker.run_diagnostics_once),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_diagnostic_outcomes",
+        ordered("diagnostic_outcomes", trial_worker.finalize_diagnostic_outcomes),
+    )
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(tmp_path / "trial.db"),
+            "--diagnostics-db",
+            str(tmp_path / "diagnostics.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert order == [
+        "candidate_runtime",
+        "entry_finalizer",
+        "outcome_finalizer",
+        "diagnostic_capture",
+        "diagnostic_outcomes",
+    ]
+    capsys.readouterr()
+
+
+def test_diagnostic_logger_failure_cannot_block_confirmatory_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "run_diagnostics_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("diagnostic corrupt")),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "_append_error",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("log locked")),
+    )
+    trial_db = tmp_path / "trial.db"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--diagnostics-db",
+            str(tmp_path / "diagnostics.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"]["status"] == "degraded"
+    assert TrialStore(trial_db).status()["health"]["last_result"] == "idle_registry_draft"
 
 
 def test_trial_worker_isolates_diagnostic_failure_from_confirmatory_phase(
@@ -1215,6 +1314,51 @@ def test_trial_worker_isolates_diagnostic_failure_from_confirmatory_phase(
         "degraded"
     )
     assert "diagnostic phase isolated" in error_log.read_text(encoding="utf-8")
+
+
+def test_trial_worker_isolates_diagnostic_outcome_failure_from_confirmatory_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_diagnostic_outcomes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("outcome corrupt")),
+    )
+    diagnostics_db = tmp_path / "diagnostics.db"
+    trial_db = tmp_path / "trial.db"
+    error_log = tmp_path / "worker.err.log"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--diagnostics-db",
+            str(diagnostics_db),
+            "--evidence-db",
+            str(tmp_path / "evidence.db"),
+            "--bar-feed-db",
+            str(tmp_path / "bars.db"),
+            "--session-feed-db",
+            str(tmp_path / "sessions.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["diagnostic_outcomes"]["status"] == "degraded"
+    assert payload["candidate_runtime"]["status"] == "idle"
+    assert TrialStore(trial_db).status()["health"]["last_result"] == "idle_registry_draft"
+    assert (
+        trial_worker.DiagnosticStore(diagnostics_db).status()["outcome_health"]["last_result"]
+        == "degraded"
+    )
+    assert "diagnostic outcome phase isolated" in error_log.read_text(encoding="utf-8")
 
 
 def test_trial_worker_records_finalizer_failure_in_durable_health(
@@ -1383,6 +1527,16 @@ def test_windows_trial_task_is_direct_hidden_pythonw() -> None:
     assert "-Hidden" in installer
     assert "New-TimeSpan -Minutes $IntervalMinutes" in installer
     assert "-MultipleInstances IgnoreNew" in installer
+    for required in (
+        "--diagnostics-db",
+        "--canary-ledger-db",
+        "--source-db",
+        "--evidence-db",
+        "--bar-feed-db",
+        "--session-feed-db",
+        "--registry-path",
+    ):
+        assert required in installer
 
 
 def _install_finalizer_inputs(
@@ -1393,16 +1547,18 @@ def _install_finalizer_inputs(
     sessions = _sessions(first=date(2026, 7, 1), count=60)
     if final_session_close is not None:
         sessions = [
-            replace(
-                session,
-                closes_at_utc=datetime.combine(
-                    session.session_date,
-                    final_session_close,
-                    tzinfo=UTC,
-                ),
+            (
+                replace(
+                    session,
+                    closes_at_utc=datetime.combine(
+                        session.session_date,
+                        final_session_close,
+                        tzinfo=UTC,
+                    ),
+                )
+                if session.session_date == date(2026, 9, 9)
+                else session
             )
-            if session.session_date == date(2026, 9, 9)
-            else session
             for session in sessions
         ]
     SessionFeedStore(config.session_feed_db).append(
@@ -1574,7 +1730,7 @@ def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
     completion = store.entry_completion_records()[0]
     assert completion["decision_clock_at_utc"] == _utc_text(decision_at)
     assert completion["schedule_observation_watermark"] > 0
-    assert len(completion["schedule_record_sha256s"]) >= 10
+    assert len(completion["schedule_record_sha256s"]) > 10
     assert completion["bar_observation_watermark"] == 20
     assert completion["bar_poll_receipt_watermark"] == 1
     assert len(completion["bar_record_sha256s"]) == 20
@@ -1800,6 +1956,55 @@ def test_outcome_finalizer_rejects_corrupt_frozen_schedule_binding(
     store = TrialStore(config.trial_db)
     completion = store.entry_completion_records()[0]
     completion["schedule_record_sha256s"] = ["0" * 64]
+
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
+        outcome_finalizer._bound_horizon(
+            SessionFeedStore(config.session_feed_db, initialize=False),
+            completion,
+            candidate,
+        )
+
+
+def test_exact_horizon_binding_rejects_an_extra_schedule_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    completion = TrialStore(config.trial_db).entry_completion_records()[0]
+    session_store = SessionFeedStore(config.session_feed_db, initialize=False)
+    horizon = outcome_finalizer._bound_horizon(session_store, completion, candidate)
+    binding = FrozenScheduleBinding(
+        entry_date=candidate.planned_entry_date,
+        final_session_date=candidate.final_session_date,
+        as_of_utc=runtime._parse_utc(str(completion["decision_clock_at_utc"])),
+        observation_watermark=int(completion["schedule_observation_watermark"]),
+        record_sha256s=tuple(record.record_sha256 for record in horizon) + ("0" * 64,),
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
+        bound_horizon(session_store, binding)
+
+
+def test_entry_completion_binding_rejects_an_unknown_schedule_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    completion = TrialStore(config.trial_db).entry_completion_records()[0]
+    completion["schedule_record_sha256s"] = [
+        *completion["schedule_record_sha256s"],
+        "0" * 64,
+    ]
 
     with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
         outcome_finalizer._bound_horizon(
