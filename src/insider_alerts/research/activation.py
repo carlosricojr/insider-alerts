@@ -313,22 +313,25 @@ class ActivationStore:
             raise ActivationInvalid("activation_armed_attestation_not_pre_boundary")
         registry_digest = _sha256(deployed_registry_bytes)
         armed_text = _utc_text(armed_at)
-        with contextlib.closing(self._connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM activation_armed_attestation WHERE singleton=1"
-            ).fetchone()
-            if row is not None:
-                if row["active_registry_sha256"] != registry_digest:
-                    raise ActivationInvalid("alternate_armed_attestation_prohibited")
-                existing_armed_at = _parse_utc(row["armed_at_utc"], "armed_at")
-                if existing_armed_at >= activated_at:
-                    raise ActivationInvalid("activation_armed_attestation_not_pre_boundary")
-                return
-            conn.execute(
-                "INSERT INTO activation_armed_attestation VALUES(1,?,?)",
-                (registry_digest, armed_text),
-            )
+        try:
+            with contextlib.closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM activation_armed_attestation WHERE singleton=1"
+                ).fetchone()
+                if row is not None:
+                    if row["active_registry_sha256"] != registry_digest:
+                        raise ActivationInvalid("alternate_armed_attestation_prohibited")
+                    existing_armed_at = _parse_utc(row["armed_at_utc"], "armed_at")
+                    if existing_armed_at >= activated_at:
+                        raise ActivationInvalid("activation_armed_attestation_not_pre_boundary")
+                    return
+                conn.execute(
+                    "INSERT INTO activation_armed_attestation VALUES(1,?,?)",
+                    (registry_digest, armed_text),
+                )
+        except sqlite3.Error as exc:
+            raise ActivationInvalid("activation_store_invalid") from exc
 
     def verify_armed(
         self, deployed_registry_bytes: bytes, *, activated_at: datetime

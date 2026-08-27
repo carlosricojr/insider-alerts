@@ -384,6 +384,52 @@ def test_active_registry_requires_append_only_receipt(
         conn.execute("DELETE FROM activation_armed_attestation")
 
 
+def test_armed_attestation_translates_sqlite_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingConnection:
+        def __enter__(self) -> FailingConnection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def execute(self, _statement: str) -> None:
+            raise sqlite3.OperationalError("unavailable")
+
+    store = activation.ActivationStore(tmp_path / "activation.db")
+    monkeypatch.setattr(store, "_connect", FailingConnection)
+
+    with pytest.raises(activation.ActivationInvalid, match="activation_store_invalid"):
+        store.attest_armed(
+            b"registry",
+            armed_at=PREPARED_AT,
+            activated_at=ACTIVATED_AT,
+        )
+
+
+def test_armed_attestation_preserves_domain_failures(tmp_path: Path) -> None:
+    store = activation.ActivationStore(tmp_path / "activation.db")
+    store.attest_armed(
+        b"first-registry",
+        armed_at=PREPARED_AT,
+        activated_at=ACTIVATED_AT,
+    )
+
+    with pytest.raises(
+        activation.ActivationInvalid,
+        match="alternate_armed_attestation_prohibited",
+    ):
+        store.attest_armed(
+            b"alternate-registry",
+            armed_at=PREPARED_AT + timedelta(minutes=1),
+            activated_at=ACTIVATED_AT,
+        )
+
+
 def test_activation_module_has_no_broker_or_order_capability() -> None:
     source = (ROOT / "src/insider_alerts/research/activation.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
