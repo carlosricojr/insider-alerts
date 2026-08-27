@@ -331,7 +331,9 @@ def list_pending_review_packets(db_path: str, *, limit: int) -> list[dict[str, o
                    created_at, updated_at
             FROM review_packets
             WHERE status = 'pending'
-            ORDER BY created_at DESC
+            -- Oldest first prevents retryable judge outages from stranding earlier signals once
+            -- the pending queue grows beyond the caller's bounded decision limit.
+            ORDER BY created_at ASC, packet_id ASC
             LIMIT ?
             """,
             (limit,),

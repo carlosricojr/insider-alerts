@@ -169,3 +169,25 @@ def test_list_pending_review_packets_returns_pending_only(tmp_path) -> None:
     assert len(rows) == 1
     assert rows[0]["packet_id"] == "0000320193-24-000124|0000320193|4"
     assert rows[0]["payload"]["score"] == 12
+
+
+def test_list_pending_review_packets_prioritizes_oldest_retry(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(accession_number="0000320193-24-000123"), {"score": 10})
+    enqueue_review_packet(db, _sample_ref(accession_number="0000320193-24-000124"), {"score": 12})
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE review_packets SET created_at=? WHERE accession_number=?",
+            ("2026-08-27T21:01:00+00:00", "0000320193-24-000123"),
+        )
+        conn.execute(
+            "UPDATE review_packets SET created_at=? WHERE accession_number=?",
+            ("2026-08-27T21:02:00+00:00", "0000320193-24-000124"),
+        )
+
+    rows = list_pending_review_packets(db, limit=1)
+
+    assert [row["packet_id"] for row in rows] == [
+        "0000320193-24-000123|0000320193|4"
+    ]
