@@ -28,7 +28,8 @@ All lists must already be in the registered deterministic order. False integrity
 confirmatory decision.
 Diagnostic membership or receipt catch-up never delays the primary seal. At challenger terminal
 readiness, incomplete diagnostic material becomes an empty, explicitly unavailable group; status
-labels this condition as non-blocking so an operator cannot optionally time the primary look around
+never predeclares diagnostics clean and instead states that they are assessed non-blockingly under
+the seal's multi-store locks, so an operator cannot optionally time the primary look around
 diagnostic completion.
 
 The SQLite seal store uses full synchronization and append-only triggers. Terminal sealing is a

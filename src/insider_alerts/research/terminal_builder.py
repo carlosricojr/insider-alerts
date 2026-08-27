@@ -749,11 +749,7 @@ def terminal_status(config: TerminalBuildConfig) -> TerminalBuildResult:
         reason=(
             "challenger_outcomes_pending"
             if challenger_waiting
-            else (
-                "ready_to_seal_diagnostics_nonblocking_unavailable"
-                if control_count != control_receipts
-                else "ready_to_seal"
-            )
+            else "ready_to_seal_diagnostics_assessed_nonblocking_at_seal"
         ),
     )
 

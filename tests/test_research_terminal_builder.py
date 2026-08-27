@@ -402,6 +402,7 @@ def test_public_seal_status_and_single_decision_are_crash_idempotent(
         artifact_root=tmp_path / "artifacts",
     )
     now = datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
+    ready_status = builder.terminal_status(config)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
@@ -417,6 +418,7 @@ def test_public_seal_status_and_single_decision_are_crash_idempotent(
     decision = builder.decide_terminal_dataset(config, now=now + timedelta(minutes=2))
     decision_replay = builder.decide_terminal_dataset(config, now=now + timedelta(minutes=3))
 
+    assert ready_status.reason == "ready_to_seal_diagnostics_assessed_nonblocking_at_seal"
     assert first.status == replay.status == sealed_status.status == "sealed"
     assert first.terminal_dataset_sha256 == replay.terminal_dataset_sha256
     assert first.terminal_seal_receipt_sha256 == replay.terminal_seal_receipt_sha256
