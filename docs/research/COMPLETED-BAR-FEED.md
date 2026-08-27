@@ -24,6 +24,13 @@ bounded to 50 fairly rotated symbols, and each source call has a 40-second appli
 Empty IBKR responses are failures and remain retryable. Failures are isolated and appended, which
 prevents one bad symbol from blocking later symbols or creating pointless pacing pressure.
 
+Every successful symbol response also appends an immutable poll receipt in the same transaction
+that advances mutable poll state. The receipt binds the poll instant, requested range,
+officially-completed-through date, returned/in-range bar counts, and source/validation rejection
+counts. This makes a healthy short history distinguishable from a failed or unattempted fetch. The
+store also exposes a maximum observation-sequence watermark and first-observed bar records bounded
+by that watermark, so a later backfill or revision cannot change an already sealed trial input.
+
 The feed is intentionally separate from the live canary process. A broker outage or locked feed
 database can delay research resolution, but cannot delay reconciliation or protective-order
 management in the live account. No requests exist before a prospective candidate asks for them, so

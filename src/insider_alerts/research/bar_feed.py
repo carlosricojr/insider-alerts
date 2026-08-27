@@ -23,6 +23,7 @@ from insider_alerts.backtest.models import DailyBar
 NEW_YORK = ZoneInfo("America/New_York")
 _SOURCE_TIMEOUT_SECONDS = 40.0
 BAR_FEED_VERSION = "ibkr-completed-rth-daily-v1"
+BAR_FEED_SCHEMA_VERSION = 2
 
 
 def _utc_text(value: datetime) -> str:
@@ -85,6 +86,29 @@ class SourceBarBatch:
     rejections: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class BarObservationRecord:
+    sequence: int
+    bar: DailyBar
+    observed_at_utc: datetime
+    record_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BarPollReceipt:
+    sequence: int
+    symbol: str
+    polled_at_utc: datetime
+    requested_start_date: date
+    requested_through_date: date
+    completed_through_date: date | None
+    returned_bar_count: int
+    in_range_bar_count: int
+    source_rejection_count: int
+    validation_rejection_count: int
+    record_sha256: str
+
+
 class HistoricalBarSource(Protocol):
     async def connect(self) -> None: ...
 
@@ -115,9 +139,25 @@ class BarFeedStore:
 
     def _initialize(self) -> None:
         with contextlib.closing(self._connect()) as conn, conn:
+            schema_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bar_feed_schema'"
+            ).fetchone()
+            if schema_table_exists is not None:
+                existing = conn.execute(
+                    "SELECT schema_version FROM bar_feed_schema WHERE singleton=1"
+                ).fetchone()
+                if (
+                    existing is not None
+                    and int(existing["schema_version"]) > BAR_FEED_SCHEMA_VERSION
+                ):
+                    raise ValueError("bar feed schema is newer than this runtime supports")
             conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS bar_feed_schema (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    schema_version INTEGER NOT NULL CHECK(schema_version>=1)
+                );
                 CREATE TABLE IF NOT EXISTS bar_feed_requests (
                     sequence INTEGER NOT NULL UNIQUE,
                     request_id TEXT PRIMARY KEY,
@@ -189,6 +229,39 @@ class BarFeedStore:
                     completed_through_date TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS bar_poll_receipts (
+                    sequence INTEGER NOT NULL UNIQUE,
+                    receipt_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    polled_at_utc TEXT NOT NULL,
+                    requested_start_date TEXT NOT NULL,
+                    requested_through_date TEXT NOT NULL,
+                    completed_through_date TEXT,
+                    returned_bar_count INTEGER NOT NULL CHECK(returned_bar_count>=0),
+                    in_range_bar_count INTEGER NOT NULL CHECK(in_range_bar_count>=0),
+                    source_rejection_count INTEGER NOT NULL CHECK(source_rejection_count>=0),
+                    validation_rejection_count INTEGER NOT NULL
+                      CHECK(validation_rejection_count>=0),
+                    record_sha256 TEXT NOT NULL UNIQUE,
+                    record_json BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS bar_poll_receipts_symbol_time
+                ON bar_poll_receipts(symbol, polled_at_utc, sequence);
+                CREATE TRIGGER IF NOT EXISTS bar_poll_receipts_sequence
+                BEFORE INSERT ON bar_poll_receipts
+                WHEN NEW.sequence<>(SELECT COALESCE(MAX(sequence),0)+1 FROM bar_poll_receipts)
+                BEGIN SELECT RAISE(ABORT, 'bar poll receipt sequence must be gap-free'); END;
+                CREATE TRIGGER IF NOT EXISTS bar_poll_receipts_time_monotonic
+                BEFORE INSERT ON bar_poll_receipts
+                WHEN EXISTS(SELECT 1 FROM bar_poll_receipts WHERE polled_at_utc>NEW.polled_at_utc)
+                BEGIN SELECT RAISE(ABORT, 'bar poll receipt time cannot move backwards'); END;
+                CREATE TRIGGER IF NOT EXISTS bar_poll_receipts_no_update
+                BEFORE UPDATE ON bar_poll_receipts
+                BEGIN SELECT RAISE(ABORT, 'bar poll receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS bar_poll_receipts_no_delete
+                BEFORE DELETE ON bar_poll_receipts
+                BEGIN SELECT RAISE(ABORT, 'bar poll receipts are immutable'); END;
+
                 CREATE TABLE IF NOT EXISTS bar_feed_failures (
                     sequence INTEGER NOT NULL UNIQUE,
                     failure_id TEXT PRIMARY KEY,
@@ -209,6 +282,14 @@ class BarFeedStore:
                 BEFORE DELETE ON bar_feed_failures
                 BEGIN SELECT RAISE(ABORT, 'bar feed failures are immutable'); END;
                 """
+            )
+            conn.execute(
+                """
+                INSERT INTO bar_feed_schema(singleton,schema_version) VALUES(1,?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                  schema_version=MAX(bar_feed_schema.schema_version,excluded.schema_version)
+                """,
+                (BAR_FEED_SCHEMA_VERSION,),
             )
             poll_columns = {
                 str(row["name"]) for row in conn.execute("PRAGMA table_info(bar_poll_state)")
@@ -353,17 +434,87 @@ class BarFeedStore:
             requester=expected["requester"],
         )
 
-    def mark_polled(
+    def record_successful_poll(
         self,
         symbol: str,
         *,
         local_date: date,
         earliest_start_date: date,
+        requested_through_date: date,
         completed_through_date: date | None,
         now: datetime,
-    ) -> None:
+        returned_bar_count: int,
+        in_range_bar_count: int,
+        source_rejection_count: int,
+        validation_rejection_count: int,
+    ) -> str:
         normalized = _normalized_symbol(symbol)
+        counts = (
+            returned_bar_count,
+            in_range_bar_count,
+            source_rejection_count,
+            validation_rejection_count,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in counts
+        ):
+            raise ValueError("bar poll receipt counts must be non-negative integers")
+        if in_range_bar_count > returned_bar_count:
+            raise ValueError("in-range bar count cannot exceed returned bar count")
+        if earliest_start_date > requested_through_date:
+            raise ValueError("bar poll receipt start date cannot follow through date")
+        if local_date != now.astimezone(NEW_YORK).date():
+            raise ValueError("bar poll receipt local date does not match poll timestamp")
+        if completed_through_date is not None and completed_through_date > local_date:
+            raise ValueError("bar poll receipt completed-through date cannot be in the future")
+        record: dict[str, object] = {
+            "contract_version": BAR_FEED_VERSION,
+            "symbol": normalized,
+            "polled_at_utc": _utc_text(now),
+            "requested_start_date": earliest_start_date.isoformat(),
+            "requested_through_date": requested_through_date.isoformat(),
+            "completed_through_date": (
+                completed_through_date.isoformat() if completed_through_date else None
+            ),
+            "returned_bar_count": returned_bar_count,
+            "in_range_bar_count": in_range_bar_count,
+            "source_rejection_count": source_rejection_count,
+            "validation_rejection_count": validation_rejection_count,
+        }
+        encoded = _canonical(record)
+        digest = _sha256(encoded)
         with contextlib.closing(self._connect()) as conn, conn:
+            sequence = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM bar_poll_receipts"
+                ).fetchone()[0]
+            )
+            conn.execute(
+                """
+                INSERT INTO bar_poll_receipts(
+                    sequence,receipt_id,symbol,polled_at_utc,requested_start_date,
+                    requested_through_date,completed_through_date,returned_bar_count,
+                    in_range_bar_count,source_rejection_count,validation_rejection_count,
+                    record_sha256,record_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    sequence,
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, digest)),
+                    normalized,
+                    _utc_text(now),
+                    earliest_start_date.isoformat(),
+                    requested_through_date.isoformat(),
+                    completed_through_date.isoformat() if completed_through_date else None,
+                    returned_bar_count,
+                    in_range_bar_count,
+                    source_rejection_count,
+                    validation_rejection_count,
+                    digest,
+                    encoded,
+                ),
+            )
             conn.execute(
                 """
                 INSERT INTO bar_poll_state(
@@ -394,6 +545,7 @@ class BarFeedStore:
                     completed_through_date.isoformat() if completed_through_date else None,
                 ),
             )
+        return digest
 
     def fair_symbol_order(self, symbols: Sequence[str]) -> list[str]:
         """Prioritize never-attempted and least-recently-attempted symbols."""
@@ -582,7 +734,32 @@ class BarFeedStore:
         *,
         start_date: date | None = None,
         through_date: date | None = None,
+        max_sequence: int | None = None,
     ) -> list[DailyBar]:
+        return [
+            record.bar
+            for record in self.first_observed_bar_records(
+                symbol,
+                start_date=start_date,
+                through_date=through_date,
+                max_sequence=max_sequence,
+            )
+        ]
+
+    def observation_watermark(self) -> int:
+        with contextlib.closing(self._connect()) as conn:
+            return int(
+                conn.execute("SELECT COALESCE(MAX(sequence),0) FROM bar_observations").fetchone()[0]
+            )
+
+    def first_observed_bar_records(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        through_date: date | None = None,
+        max_sequence: int | None = None,
+    ) -> list[BarObservationRecord]:
         normalized = _normalized_symbol(symbol)
         clauses = ["symbol=?"]
         parameters: list[object] = [normalized]
@@ -592,6 +769,15 @@ class BarFeedStore:
         if through_date is not None:
             clauses.append("trade_date<=?")
             parameters.append(through_date.isoformat())
+        if max_sequence is not None:
+            if (
+                isinstance(max_sequence, bool)
+                or not isinstance(max_sequence, int)
+                or max_sequence < 0
+            ):
+                raise ValueError("bar observation watermark must be a non-negative integer")
+            clauses.append("sequence<=?")
+            parameters.append(max_sequence)
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
@@ -601,15 +787,116 @@ class BarFeedStore:
                     SELECT MIN(first_seen.sequence) FROM bar_observations first_seen
                     WHERE first_seen.symbol=bar_observations.symbol
                       AND first_seen.trade_date=bar_observations.trade_date
+                      {"AND first_seen.sequence<=?" if max_sequence is not None else ""}
                   )
                 ORDER BY trade_date
                 """,
+                [*parameters, *([max_sequence] if max_sequence is not None else [])],
+            ).fetchall()
+        output: list[BarObservationRecord] = []
+        for row in rows:
+            output.append(
+                BarObservationRecord(
+                    sequence=int(row["sequence"]),
+                    bar=self._verify_observation_row(row),
+                    observed_at_utc=datetime.fromisoformat(
+                        str(row["observed_at_utc"]).replace("Z", "+00:00")
+                    ).astimezone(UTC),
+                    record_sha256=str(row["record_sha256"]),
+                )
+            )
+        return output
+
+    @staticmethod
+    def _verify_poll_receipt_row(row: sqlite3.Row) -> BarPollReceipt:
+        raw = bytes(row["record_json"])
+        digest = str(row["record_sha256"])
+        if _sha256(raw) != digest:
+            raise ValueError("bar poll receipt stored bytes failed integrity check")
+        record = json.loads(raw)
+        if not isinstance(record, dict) or _canonical(record) != raw:
+            raise ValueError("bar poll receipt is not canonical JSON")
+        expected = {
+            "contract_version": BAR_FEED_VERSION,
+            "symbol": str(row["symbol"]),
+            "polled_at_utc": str(row["polled_at_utc"]),
+            "requested_start_date": str(row["requested_start_date"]),
+            "requested_through_date": str(row["requested_through_date"]),
+            "completed_through_date": row["completed_through_date"],
+            "returned_bar_count": int(row["returned_bar_count"]),
+            "in_range_bar_count": int(row["in_range_bar_count"]),
+            "source_rejection_count": int(row["source_rejection_count"]),
+            "validation_rejection_count": int(row["validation_rejection_count"]),
+        }
+        if (
+            record != expected
+            or str(uuid.uuid5(uuid.NAMESPACE_URL, digest)) != str(row["receipt_id"])
+        ):
+            raise ValueError("bar poll receipt columns do not match immutable record")
+        count_keys = (
+            "returned_bar_count",
+            "in_range_bar_count",
+            "source_rejection_count",
+            "validation_rejection_count",
+        )
+        if any(
+            isinstance(record.get(key), bool) or not isinstance(record.get(key), int)
+            for key in count_keys
+        ):
+            raise ValueError("bar poll receipt count types are invalid")
+        polled_at = datetime.fromisoformat(expected["polled_at_utc"].replace("Z", "+00:00"))
+        if polled_at.tzinfo is None:
+            raise ValueError("bar poll receipt timestamp is naive")
+        start = date.fromisoformat(expected["requested_start_date"])
+        through = date.fromisoformat(expected["requested_through_date"])
+        if start > through:
+            raise ValueError("bar poll receipt date range is invalid")
+        completed_through = (
+            date.fromisoformat(str(expected["completed_through_date"]))
+            if expected["completed_through_date"] is not None
+            else None
+        )
+        if (
+            completed_through is not None
+            and completed_through > polled_at.astimezone(NEW_YORK).date()
+        ):
+            raise ValueError("bar poll receipt completed-through date is in the future")
+        counts = (
+            expected["returned_bar_count"],
+            expected["in_range_bar_count"],
+            expected["source_rejection_count"],
+            expected["validation_rejection_count"],
+        )
+        if any(value < 0 for value in counts) or expected["in_range_bar_count"] > expected[
+            "returned_bar_count"
+        ]:
+            raise ValueError("bar poll receipt counts are invalid")
+        return BarPollReceipt(
+            sequence=int(row["sequence"]),
+            symbol=expected["symbol"],
+            polled_at_utc=polled_at.astimezone(UTC),
+            requested_start_date=start,
+            requested_through_date=through,
+            completed_through_date=completed_through,
+            returned_bar_count=expected["returned_bar_count"],
+            in_range_bar_count=expected["in_range_bar_count"],
+            source_rejection_count=expected["source_rejection_count"],
+            validation_rejection_count=expected["validation_rejection_count"],
+            record_sha256=digest,
+        )
+
+    def poll_receipts(self, symbol: str | None = None) -> list[BarPollReceipt]:
+        parameters: tuple[object, ...] = ()
+        where = ""
+        if symbol is not None:
+            where = "WHERE symbol=?"
+            parameters = (_normalized_symbol(symbol),)
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT * FROM bar_poll_receipts {where} ORDER BY sequence",
                 parameters,
             ).fetchall()
-        output: list[DailyBar] = []
-        for row in rows:
-            output.append(self._verify_observation_row(row))
-        return output
+        return [self._verify_poll_receipt_row(row) for row in rows]
 
     @staticmethod
     def _verify_observation_row(row: sqlite3.Row) -> DailyBar:
@@ -671,6 +958,35 @@ class BarFeedStore:
         ):
             raise ValueError("bar-feed failure columns do not match immutable record")
 
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            is not None
+        )
+
+    @classmethod
+    def _poll_receipt_rows(cls, conn: sqlite3.Connection) -> list[sqlite3.Row]:
+        receipts_exist = cls._table_exists(conn, "bar_poll_receipts")
+        schema_version: int | None = None
+        if cls._table_exists(conn, "bar_feed_schema"):
+            row = conn.execute(
+                "SELECT schema_version FROM bar_feed_schema WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                raise ValueError("bar feed schema marker is missing")
+            schema_version = int(row["schema_version"])
+            if schema_version < 1 or schema_version > BAR_FEED_SCHEMA_VERSION:
+                raise ValueError("bar feed schema version is unsupported")
+        if not receipts_exist:
+            if schema_version is not None and schema_version >= 2:
+                raise ValueError("bar poll receipt table is missing after schema migration")
+            return []
+        return conn.execute("SELECT * FROM bar_poll_receipts ORDER BY sequence").fetchall()
+
     def validate_integrity(self) -> None:
         with contextlib.closing(self._connect()) as conn:
             request_rows = conn.execute(
@@ -682,6 +998,7 @@ class BarFeedStore:
             failure_rows = conn.execute(
                 "SELECT * FROM bar_feed_failures ORDER BY sequence"
             ).fetchall()
+            poll_receipt_rows = self._poll_receipt_rows(conn)
         if [int(row["sequence"]) for row in request_rows] != list(range(1, len(request_rows) + 1)):
             raise ValueError("bar-feed request sequence is not gap-free")
         if [int(row["sequence"]) for row in observation_rows] != list(
@@ -690,6 +1007,10 @@ class BarFeedStore:
             raise ValueError("bar observation sequence is not gap-free")
         if [int(row["sequence"]) for row in failure_rows] != list(range(1, len(failure_rows) + 1)):
             raise ValueError("bar-feed failure sequence is not gap-free")
+        if [int(row["sequence"]) for row in poll_receipt_rows] != list(
+            range(1, len(poll_receipt_rows) + 1)
+        ):
+            raise ValueError("bar poll receipt sequence is not gap-free")
         for row in request_rows:
             self._verify_request_row(row)
         for row in observation_rows:
@@ -699,6 +1020,11 @@ class BarFeedStore:
             raise ValueError("bar observation timestamps move backwards")
         for row in failure_rows:
             self._verify_failure_row(row)
+        poll_times: list[datetime] = []
+        for row in poll_receipt_rows:
+            poll_times.append(self._verify_poll_receipt_row(row).polled_at_utc)
+        if poll_times != sorted(poll_times):
+            raise ValueError("bar poll receipt timestamps move backwards")
 
     def write_health(
         self,
@@ -768,6 +1094,11 @@ class BarFeedStore:
             failure_count = int(
                 conn.execute("SELECT COUNT(*) FROM bar_feed_failures").fetchone()[0]
             )
+            poll_receipt_count = (
+                int(conn.execute("SELECT COUNT(*) FROM bar_poll_receipts").fetchone()[0])
+                if self._table_exists(conn, "bar_poll_receipts")
+                else 0
+            )
             unresolved_count = int(
                 conn.execute(
                     """
@@ -805,6 +1136,7 @@ class BarFeedStore:
             "observation_count": observation_count,
             "revision_count": revision_count,
             "failure_count": failure_count,
+            "poll_receipt_count": poll_receipt_count,
             "unresolved_request_count": unresolved_count,
             "overdue_request_count": overdue_count,
             "integrity_status": integrity_status,
@@ -903,12 +1235,17 @@ async def collect_once(
                     observed_at_utc=now,
                     completed_through_date=completed_through_date,
                 )
-                store.mark_polled(
+                store.record_successful_poll(
                     symbol,
                     local_date=now.astimezone(NEW_YORK).date(),
                     earliest_start_date=start,
+                    requested_through_date=through,
                     completed_through_date=completed_through_date,
                     now=now,
+                    returned_bar_count=len(batch.bars),
+                    in_range_bar_count=len(bars),
+                    source_rejection_count=len(batch.rejections),
+                    validation_rejection_count=symbol_rejected,
                 )
                 added += symbol_added
                 revisions += symbol_revisions

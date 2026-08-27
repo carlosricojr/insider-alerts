@@ -280,6 +280,12 @@ def test_worker_stays_offline_when_idle_and_collects_only_requested_range(tmp_pa
     assert source.symbols == ["TEST"]
     assert source.connected == source.disconnected == 1
     assert store.first_observed_bars("TEST") == [wanted]
+    receipts = store.poll_receipts("TEST")
+    assert len(receipts) == 1
+    assert receipts[0].returned_bar_count == 2
+    assert receipts[0].in_range_bar_count == 2
+    assert receipts[0].source_rejection_count == 0
+    assert receipts[0].validation_rejection_count == 0
     assert store.status()["health"]["last_result"] == "completed"
     second_source = FakeSource([wanted])
     second = asyncio.run(collect_once(store, second_source, now=now + timedelta(minutes=1)))
@@ -298,6 +304,74 @@ def test_worker_failure_is_durable_and_disconnects(tmp_path: Path) -> None:
     health = store.status()["health"]
     assert health["last_result"] == "failed"
     assert "gateway unavailable" in health["last_error"]
+    assert store.poll_receipts() == []
+
+
+def test_successful_poll_receipt_is_append_only_and_binds_rejections(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
+    store = BarFeedStore(tmp_path / "feed.db")
+    request = _request(now)
+    store.request(request)
+    valid = _bar(request.start_date)
+    invalid = _bar(request.start_date + timedelta(days=1), close=20.0)
+    source = FakeSource([valid, invalid], rejections=("source rejected one row",))
+
+    result = asyncio.run(collect_once(store, source, now=now, minimum_interval_seconds=0))
+
+    assert result.rejected_bars == 2
+    receipt = store.poll_receipts("test")[0]
+    assert receipt.symbol == "TEST"
+    assert receipt.polled_at_utc == now
+    assert receipt.requested_start_date == request.start_date
+    assert receipt.requested_through_date == request.through_date
+    assert receipt.completed_through_date is None
+    assert receipt.returned_bar_count == 2
+    assert receipt.in_range_bar_count == 2
+    assert receipt.source_rejection_count == 1
+    assert receipt.validation_rejection_count == 1
+    assert len(receipt.record_sha256) == 64
+    assert store.status()["poll_receipt_count"] == 1
+    store.validate_integrity()
+    with sqlite3.connect(store.path) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE bar_poll_receipts SET symbol='OTHER'")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("DELETE FROM bar_poll_receipts")
+
+
+def test_bar_observation_watermark_freezes_first_observed_snapshot(tmp_path: Path) -> None:
+    observed = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
+    store = BarFeedStore(tmp_path / "feed.db")
+    first_day = date(2026, 8, 25)
+    second_day = date(2026, 8, 26)
+    first = _bar(first_day)
+    assert store.append_completed([first], observed_at_utc=observed) == (1, 0, 0)
+    watermark = store.observation_watermark()
+    assert watermark == 1
+    assert store.append_completed(
+        [_bar(first_day, close=10.25), _bar(second_day)],
+        observed_at_utc=observed + timedelta(minutes=1),
+    ) == (2, 1, 0)
+
+    frozen = store.first_observed_bar_records("TEST", max_sequence=watermark)
+    assert [(item.sequence, item.bar) for item in frozen] == [(1, first)]
+    assert frozen[0].observed_at_utc == observed
+    assert len(frozen[0].record_sha256) == 64
+    assert store.first_observed_bars("TEST") == [first, _bar(second_day)]
+    with pytest.raises(ValueError, match="watermark"):
+        store.first_observed_bar_records("TEST", max_sequence=True)  # type: ignore[arg-type]
+
+
+def test_integrity_detects_poll_receipt_byte_tampering(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
+    store = BarFeedStore(tmp_path / "feed.db")
+    store.request(_request(now))
+    asyncio.run(collect_once(store, FakeSource([_bar(now.date() - timedelta(days=1))]), now=now))
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("DROP TRIGGER bar_poll_receipts_no_update")
+        conn.execute("UPDATE bar_poll_receipts SET record_json=?", (b"{}",))
+
+    assert store.status()["integrity_status"] == "invalid"
 
 
 def test_final_horizon_remains_collectible_on_following_day(tmp_path: Path) -> None:
@@ -490,6 +564,45 @@ def test_status_does_not_create_a_missing_database(tmp_path: Path) -> None:
     corrupt = tmp_path / "corrupt.db"
     corrupt.write_bytes(b"not sqlite")
     assert bar_feed_status(corrupt)["integrity_status"] == "invalid"
+
+
+def test_status_accepts_legacy_schema_until_non_mutating_migration(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    BarFeedStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE bar_poll_receipts")
+        conn.execute("DROP TABLE bar_feed_schema")
+
+    assert bar_feed_status(path)["integrity_status"] == "valid"
+    runner = CliRunner()
+    legacy = runner.invoke(
+        cli.app,
+        ["ops", "research-bar-feed-status", "--feed-db", str(path)],
+    )
+    assert legacy.exit_code == 0
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bar_poll_receipts'"
+        ).fetchone() is None
+
+    BarFeedStore(path)
+    assert bar_feed_status(path)["integrity_status"] == "valid"
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE bar_poll_receipts")
+    assert bar_feed_status(path)["integrity_status"] == "invalid"
+
+
+def test_initializer_refuses_to_downgrade_newer_schema_marker(tmp_path: Path) -> None:
+    path = tmp_path / "future.db"
+    BarFeedStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE bar_feed_schema SET schema_version=3 WHERE singleton=1")
+
+    with pytest.raises(ValueError, match="newer than this runtime"):
+        BarFeedStore(path)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT schema_version FROM bar_feed_schema").fetchone()[0] == 3
+    assert bar_feed_status(path)["integrity_status"] == "invalid"
 
 
 def test_status_rejects_naive_time_and_cli_uses_integrity_exit_code(tmp_path: Path) -> None:
