@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from insider_alerts.research.trial_finalizer import finalize_pending_entry_dates
-from insider_alerts.research.trial_runtime import TrialRuntimeConfig, TrialStore, run_trial_once
+from insider_alerts.research.trial_runtime import (
+    TrialRuntimeConfig,
+    TrialRuntimeRetryable,
+    TrialStore,
+    run_trial_once,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -59,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         finalized = finalize_pending_entry_dates(config)
-    except (sqlite3.OperationalError, OSError) as exc:
+    except (TrialRuntimeRetryable, sqlite3.OperationalError, OSError) as exc:
         now = datetime.now(UTC)
         detail = f"{type(exc).__name__}: {exc}"[:2000]
         _append_error(args.error_log, exc)

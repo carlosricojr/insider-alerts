@@ -41,6 +41,10 @@ class TrialRuntimeInvalid(RuntimeError):
     """A fail-closed violation that can invalidate prospective trial operation."""
 
 
+class TrialRuntimeRetryable(RuntimeError):
+    """A transient runtime condition that must not poison prospective state."""
+
+
 class EvidenceExcluded(RuntimeError):
     """An expected evidence row that is outside this registry's candidate universe."""
 
@@ -1150,7 +1154,7 @@ class TrialStore:
                 if date.fromisoformat(str(latest["entry_date"])) >= inputs.entry_date:
                     raise TrialRuntimeInvalid("entry_dates_not_strictly_ordered")
                 if inputs.completed_at_utc < _parse_utc(str(latest["sealed_at_utc"])):
-                    raise TrialRuntimeInvalid("entry_seal_time_moved_backwards")
+                    raise TrialRuntimeRetryable("entry_seal_time_moved_backwards")
             earlier_pending = conn.execute(
                 """
                 SELECT 1 FROM trial_candidates candidate
@@ -1239,7 +1243,9 @@ class TrialStore:
             if decision_clock_at.tzinfo is None:
                 raise TrialRuntimeInvalid("entry_completion_decision_clock_naive")
             decision_clock_at = decision_clock_at.astimezone(UTC)
-            if not inputs.completed_at_utc <= decision_clock_at < entry_open:
+            if decision_clock_at < inputs.completed_at_utc:
+                raise TrialRuntimeRetryable("entry_completion_clock_moved_backwards")
+            if decision_clock_at >= entry_open:
                 raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
             record: dict[str, Any] = {
                 "contract_version": TRIAL_CONTRACT_VERSION,
@@ -1421,7 +1427,7 @@ class TrialStore:
                 if date.fromisoformat(str(latest["entry_date"])) >= inputs.entry_date:
                     raise TrialRuntimeInvalid("entry_dates_not_strictly_ordered")
                 if inputs.lapsed_at_utc < _parse_utc(str(latest["sealed_at_utc"])):
-                    raise TrialRuntimeInvalid("entry_seal_time_moved_backwards")
+                    raise TrialRuntimeRetryable("entry_seal_time_moved_backwards")
             earlier_pending = conn.execute(
                 """
                 SELECT 1 FROM trial_candidates candidate

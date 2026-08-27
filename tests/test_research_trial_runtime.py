@@ -29,6 +29,7 @@ from insider_alerts.research.trial_runtime import (
     TrialResolution,
     TrialRuntimeConfig,
     TrialRuntimeInvalid,
+    TrialRuntimeRetryable,
     TrialStore,
     TrialWindow,
     planned_entry_session,
@@ -1004,7 +1005,7 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
         resolved_at_utc=next_inputs.completed_at_utc,
     )
 
-    with pytest.raises(TrialRuntimeInvalid, match="seal_time_moved_backwards"):
+    with pytest.raises(TrialRuntimeRetryable, match="seal_time_moved_backwards"):
         store.append_entry_completion(next_inputs, [next_resolution])
 
 
@@ -1112,6 +1113,36 @@ def test_trial_worker_retryable_finalizer_failure_is_degraded_not_poisoned(
     assert status["faults"] == 0
     assert status["health"]["last_result"] == "degraded"
     assert "database is locked" in error_log.read_text(encoding="utf-8")
+
+
+def test_trial_worker_clock_regression_is_degraded_not_poisoned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        lambda _config: (_ for _ in ()).throw(
+            TrialRuntimeRetryable("entry_completion_clock_moved_backwards")
+        ),
+    )
+    trial_db = tmp_path / "trial.db"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(tmp_path / "worker.err.log"),
+        ]
+    )
+
+    assert exit_code == 2
+    status = TrialStore(trial_db).status()
+    assert status["faults"] == 0
+    assert status["health"]["last_result"] == "degraded"
 
 
 def test_trial_worker_logs_when_trial_database_cannot_be_opened(tmp_path: Path) -> None:
@@ -1335,6 +1366,24 @@ def test_finalizer_rolls_boundary_race_into_lapse_without_permanent_fault(
     assert store.resolutions()[0].reason == (
         "entry_date_completion_lapsed:decision_clock_reached_official_open_before_seal"
     )
+
+
+def test_finalizer_clock_regression_is_retryable_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    decision_at = datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    moments = iter((decision_at, decision_at - timedelta(seconds=1)))
+
+    with pytest.raises(TrialRuntimeRetryable, match="clock_moved_backwards"):
+        finalizer.finalize_pending_entry_dates(config, clock=lambda: next(moments))
+
+    store = TrialStore(config.trial_db)
+    assert store.resolutions() == []
+    assert store.status()["entry_date_completions"] == 0
 
 
 def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(
