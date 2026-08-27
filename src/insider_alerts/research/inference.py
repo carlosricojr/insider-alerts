@@ -27,11 +27,13 @@ from insider_alerts.research.sec_history import CLASSIFIER_VERSION
 HYPOTHESIS_ID = "OPP-E07-V1"
 REPORT_SCHEMA_VERSION = 1
 TRIAL_INPUT_SCHEMA_VERSION = 1
-TERMINAL_DATASET_SCHEMA_VERSION = 1
+TERMINAL_DATASET_SCHEMA_VERSION = 2
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 260_826
 BLOCK_LENGTH = 10
 ALPHA_THRESHOLD = 0.025
+TARGET_ENROLLED_TRADES = 100
+MINIMUM_DISTINCT_ENTRY_DATES = 60
 PRIMARY_COST = 0.002
 STRESS_COST = 0.005
 PRNG_NAME = "sha256_counter_u64_rejection_v1"
@@ -398,22 +400,34 @@ def _entry_date_completions(raw: Any, evaluated_at: datetime) -> dict[date, date
     return result
 
 
-def _freeze_boundary(
-    candidates: Sequence[Candidate], completions: Mapping[date, datetime]
+def cohort_freeze_boundary(
+    enrolled_entry_dates: Sequence[date],
+    completions: Mapping[date, datetime],
 ) -> tuple[date, datetime] | None:
+    """Return the first immutable complete-date boundary meeting the frozen sample floor."""
+
     counts: Counter[date] = Counter(
-        candidate.entry_date
-        for candidate in candidates
-        if candidate.enrollment_state == "enrolled"
-        and candidate.entry_date is not None
-        and candidate.entry_date in completions
+        entry_date for entry_date in enrolled_entry_dates if entry_date in completions
     )
     cumulative = 0
     for distinct_dates, entry_day in enumerate(sorted(counts), start=1):
         cumulative += counts[entry_day]
-        if cumulative >= 100 and distinct_dates >= 60:
+        if cumulative >= TARGET_ENROLLED_TRADES and distinct_dates >= MINIMUM_DISTINCT_ENTRY_DATES:
             return entry_day, completions[entry_day]
     return None
+
+
+def _freeze_boundary(
+    candidates: Sequence[Candidate], completions: Mapping[date, datetime]
+) -> tuple[date, datetime] | None:
+    return cohort_freeze_boundary(
+        [
+            candidate.entry_date
+            for candidate in candidates
+            if candidate.enrollment_state == "enrolled" and candidate.entry_date is not None
+        ],
+        completions,
+    )
 
 
 def _candidate_projection_sha256(candidates: Sequence[Candidate]) -> str:
@@ -848,6 +862,7 @@ def _validate_registry(registry: Mapping[str, Any], *, allow_draft: bool) -> Non
         "hypothesis_schema_sha256": Path("docs/research/contracts/hypothesis-registry.schema.json"),
         "evidence_schema_sha256": Path("docs/research/contracts/evidence-snapshot.schema.json"),
         "inference_artifact_sha256": Path("src/insider_alerts/research/inference.py"),
+        "terminal_builder_artifact_sha256": Path("src/insider_alerts/research/terminal_builder.py"),
         "dependency_lock_sha256": Path("uv.lock"),
         "policy_sha256": Path(str(registry["strategy"]["policy_artifact"])),
     }
@@ -917,6 +932,53 @@ def _integrity(raw: Any, *, terminal: bool) -> dict[str, bool | None]:
     return result
 
 
+def _diagnostic_group_status(raw: Any) -> dict[str, dict[str, Any]]:
+    value = _mapping(raw, "diagnostic_group_status")
+    _exact_keys(value, {"control", "routine"}, "diagnostic_group_status")
+    result: dict[str, dict[str, Any]] = {}
+    for group in ("control", "routine"):
+        record = _mapping(value[group], f"{group}_group_status")
+        _exact_keys(
+            record,
+            {
+                "status",
+                "error_code",
+                "membership_count",
+                "available_trade_count",
+                "not_traded_count",
+                "unavailable_count",
+            },
+            f"{group}_group_status",
+        )
+        status = _text(record["status"], f"{group}_group_state")
+        if status not in {"available", "unavailable"}:
+            raise TrialInvalid(f"{group}_group_state_invalid")
+        counts: dict[str, int] = {}
+        for name in (
+            "membership_count",
+            "available_trade_count",
+            "not_traded_count",
+            "unavailable_count",
+        ):
+            count = record[name]
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise TrialInvalid(f"{group}_group_{name}_invalid")
+            counts[name] = count
+        if counts["membership_count"] != sum(
+            counts[name]
+            for name in ("available_trade_count", "not_traded_count", "unavailable_count")
+        ):
+            raise TrialInvalid(f"{group}_group_accounting_mismatch")
+        error_code = record["error_code"]
+        if status == "available":
+            if error_code is not None or counts["unavailable_count"] != 0:
+                raise TrialInvalid(f"{group}_available_group_metadata_invalid")
+        elif not isinstance(error_code, str) or not error_code:
+            raise TrialInvalid(f"{group}_unavailable_group_error_missing")
+        result[group] = {"status": status, "error_code": error_code, **counts}
+    return result
+
+
 def _parse_terminal(
     raw: Any,
     *,
@@ -929,7 +991,7 @@ def _parse_terminal(
     list[Trade],
     list[Trade],
     list[Trade],
-    dict[str, str],
+    dict[str, dict[str, Any]],
     datetime,
 ]:
     value = _mapping(raw, "terminal_dataset")
@@ -944,6 +1006,7 @@ def _parse_terminal(
             "challenger_trades",
             "control_trades",
             "routine_trades",
+            "diagnostic_group_status",
             "dataset_sha256",
         },
         "terminal_dataset",
@@ -968,29 +1031,38 @@ def _parse_terminal(
     if sealed_at > evaluated_at:
         raise TrialInvalid("terminal_dataset_sealed_in_future")
     groups: dict[str, list[Trade]] = {}
-    diagnostic_errors: dict[str, str] = {}
-    for key, group in (
-        ("challenger_trades", "challenger"),
-        ("control_trades", "control"),
-        ("routine_trades", "routine"),
-    ):
-        try:
-            trades = [
-                _parse_trade(item, index, group)
-                for index, item in enumerate(_list(value[key], key))
-            ]
-            if trades != sorted(trades, key=_trade_order):
-                raise TrialInvalid(f"{group}_trade_order_invalid")
-            if len({trade.trade_id for trade in trades}) != len(trades):
-                raise TrialInvalid(f"{group}_trade_id_duplicate")
-            if any(trade.exit_at > sealed_at for trade in trades):
-                raise TrialInvalid(f"{group}_trade_exit_after_seal")
-            groups[group] = trades
-        except TrialInvalid as exc:
-            if group == "challenger":
-                raise
+    for key, group in (("challenger_trades", "challenger"),):
+        trades = [
+            _parse_trade(item, index, group) for index, item in enumerate(_list(value[key], key))
+        ]
+        if trades != sorted(trades, key=_trade_order):
+            raise TrialInvalid(f"{group}_trade_order_invalid")
+        if len({trade.trade_id for trade in trades}) != len(trades):
+            raise TrialInvalid(f"{group}_trade_id_duplicate")
+        if any(trade.exit_at > sealed_at for trade in trades):
+            raise TrialInvalid(f"{group}_trade_exit_after_seal")
+        groups[group] = trades
+    diagnostic_status = _diagnostic_group_status(value["diagnostic_group_status"])
+    for key, group in (("control_trades", "control"), ("routine_trades", "routine")):
+        raw_trades = _list(value[key], key)
+        metadata = diagnostic_status[group]
+        if metadata["status"] == "unavailable":
+            if raw_trades:
+                raise TrialInvalid(f"{group}_unavailable_group_has_trades")
             groups[group] = []
-            diagnostic_errors[group] = exc.code
+            continue
+        trades = [_parse_trade(item, index, group) for index, item in enumerate(raw_trades)]
+        if trades != sorted(trades, key=_trade_order):
+            raise TrialInvalid(f"{group}_trade_order_invalid")
+        if len({trade.trade_id for trade in trades}) != len(trades):
+            raise TrialInvalid(f"{group}_trade_id_duplicate")
+        if any(trade.exit_at > sealed_at for trade in trades):
+            raise TrialInvalid(f"{group}_trade_exit_after_seal")
+        if any(trade.entry_date > freeze_boundary for trade in trades):
+            raise TrialInvalid(f"{group}_trade_after_freeze")
+        if len(trades) != metadata["available_trade_count"]:
+            raise TrialInvalid(f"{group}_available_trade_count_mismatch")
+        groups[group] = trades
     expected = {candidate.candidate_id: candidate for candidate in frozen_candidates}
     challenger = groups["challenger"]
     if {trade.trade_id for trade in challenger} != set(expected):
@@ -1011,7 +1083,7 @@ def _parse_terminal(
         challenger,
         groups["control"],
         groups["routine"],
-        diagnostic_errors,
+        diagnostic_status,
         sealed_at,
     )
 
@@ -1097,18 +1169,36 @@ class TrialSealStore:
                   report_json BLOB NOT NULL,
                   report_sha256 TEXT NOT NULL UNIQUE
                 );
+                CREATE TABLE IF NOT EXISTS terminal_pending(
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  terminal_json BLOB NOT NULL,
+                  terminal_dataset_sha256 TEXT NOT NULL UNIQUE,
+                  candidate_projection_sha256 TEXT NOT NULL,
+                  candidate_universe_sha256 TEXT NOT NULL,
+                  enrollment_deadline_utc TEXT NOT NULL
+                );
                 CREATE TRIGGER IF NOT EXISTS trial_receipts_no_update
                 BEFORE UPDATE ON trial_receipts
                 BEGIN SELECT RAISE(ABORT,'trial receipts are append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS trial_receipts_no_delete
                 BEFORE DELETE ON trial_receipts
                 BEGIN SELECT RAISE(ABORT,'trial receipts are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS trial_receipts_mutually_exclusive
+                BEFORE INSERT ON trial_receipts
+                WHEN EXISTS(SELECT 1 FROM trial_receipts WHERE kind<>NEW.kind)
+                BEGIN SELECT RAISE(ABORT,'terminal receipt kinds are mutually exclusive'); END;
                 CREATE TRIGGER IF NOT EXISTS decision_report_no_update
                 BEFORE UPDATE ON decision_report
                 BEGIN SELECT RAISE(ABORT,'decision report is append-only'); END;
                 CREATE TRIGGER IF NOT EXISTS decision_report_no_delete
                 BEFORE DELETE ON decision_report
                 BEGIN SELECT RAISE(ABORT,'decision report is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS terminal_pending_no_update
+                BEFORE UPDATE ON terminal_pending
+                BEGIN SELECT RAISE(ABORT,'pending terminal dataset is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS terminal_pending_no_delete
+                BEFORE DELETE ON terminal_pending
+                BEGIN SELECT RAISE(ABORT,'pending terminal dataset is append-only'); END;
                 """
             )
 
@@ -1126,14 +1216,36 @@ class TrialSealStore:
         encoded = rfc8785.dumps(dict(receipt))
         with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            if kind == "deadline_miss" and conn.execute(
+                "SELECT 1 FROM terminal_pending WHERE singleton=1"
+            ).fetchone() is not None:
+                raise TrialInvalid("terminal_receipt_kind_conflict")
             row = conn.execute(
                 "SELECT receipt_json FROM trial_receipts WHERE kind=?", (kind,)
             ).fetchone()
             if row is not None:
                 existing = json.loads(bytes(row["receipt_json"]))
                 if existing != dict(receipt):
+                    if kind == "terminal_seal" and all(
+                        existing.get(name) == receipt.get(name)
+                        for name in (
+                            "schema_version",
+                            "hypothesis_id",
+                            "kind",
+                            "enrollment_deadline_utc",
+                            "terminal_dataset_sha256",
+                            "candidate_projection_sha256",
+                            "candidate_universe_sha256",
+                        )
+                    ):
+                        return dict(existing)
                     raise TrialInvalid(f"alternate_{kind}_receipt_prohibited")
                 return dict(existing)
+            if (
+                conn.execute("SELECT 1 FROM trial_receipts WHERE kind<>?", (kind,)).fetchone()
+                is not None
+            ):
+                raise TrialInvalid("terminal_receipt_kind_conflict")
             conn.execute(
                 "INSERT INTO trial_receipts(kind,receipt_json,receipt_sha256) VALUES(?,?,?)",
                 (kind, encoded, digest),
@@ -1156,6 +1268,8 @@ class TrialSealStore:
     def seal_deadline_miss(
         self, payload: Mapping[str, Any], *, recorded_at: datetime
     ) -> dict[str, Any]:
+        if self.pending_terminal() is not None:
+            raise TrialInvalid("terminal_receipt_kind_conflict")
         activated_at = _utc(payload.get("activated_at_utc"), "activated_at")
         candidates = [
             _parse_candidate(item, index)
@@ -1171,10 +1285,51 @@ class TrialSealStore:
         )
         return self._put_receipt(receipt)
 
-    def seal_terminal(
-        self, payload: Mapping[str, Any], *, recorded_at: datetime | None = None
+    def pending_terminal(self) -> dict[str, Any] | None:
+        """Return and verify the first durably staged terminal dataset, if any."""
+
+        with contextlib.closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM terminal_pending WHERE singleton=1").fetchone()
+        if row is None:
+            return None
+        raw = bytes(row["terminal_json"])
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or rfc8785.dumps(parsed) != raw:
+            raise TrialInvalid("pending_terminal_dataset_not_canonical")
+        dataset_digest = _sha256(parsed.get("dataset_sha256"), "terminal_dataset_sha")
+        unsigned = dict(parsed)
+        unsigned.pop("dataset_sha256", None)
+        if (
+            _canonical_sha256(unsigned) != dataset_digest
+            or row["terminal_dataset_sha256"] != dataset_digest
+            or row["candidate_projection_sha256"]
+            != parsed.get("candidate_projection_sha256")
+        ):
+            raise TrialInvalid("pending_terminal_dataset_invalid")
+        _sha256(row["candidate_universe_sha256"], "pending_candidate_universe_sha")
+        _utc(row["enrollment_deadline_utc"], "pending_enrollment_deadline")
+        return parsed
+
+    def stage_terminal(
+        self,
+        registry: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        allow_draft: bool = False,
     ) -> dict[str, Any]:
-        terminal = _mapping(payload.get("terminal_dataset"), "terminal_dataset")
+        """Durably bind the first valid terminal bytes before artifact publication."""
+
+        validation = evaluate_trial(
+            registry,
+            payload,
+            allow_draft=allow_draft,
+            terminal_validation_only=True,
+        )
+        if validation.get("reason_codes") != ["terminal_payload_validated_not_evaluated"]:
+            reasons = validation.get("reason_codes")
+            reason = reasons[0] if isinstance(reasons, list) and reasons else "terminal_invalid"
+            raise TrialInvalid(f"terminal_preseal_validation_failed:{reason}")
+        terminal = dict(_mapping(payload.get("terminal_dataset"), "terminal_dataset"))
         dataset_digest = _sha256(terminal.get("dataset_sha256"), "terminal_dataset_sha")
         unsigned = dict(terminal)
         unsigned.pop("dataset_sha256", None)
@@ -1187,14 +1342,94 @@ class TrialSealStore:
         projection_digest = _candidate_projection_sha256(candidates)
         if terminal.get("candidate_projection_sha256") != projection_digest:
             raise TrialInvalid("terminal_candidate_projection_digest_mismatch")
+        universe_digest = _candidate_universe_sha256(candidates)
+        deadline = enrollment_deadline(_utc(payload.get("activated_at_utc"), "activated_at"))
+        encoded = rfc8785.dumps(terminal)
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conflicting = conn.execute(
+                "SELECT kind FROM trial_receipts WHERE kind='deadline_miss'"
+            ).fetchone()
+            if conflicting is not None:
+                raise TrialInvalid("terminal_receipt_kind_conflict")
+            row = conn.execute("SELECT * FROM terminal_pending WHERE singleton=1").fetchone()
+            if row is not None:
+                if (
+                    bytes(row["terminal_json"]) != encoded
+                    or row["terminal_dataset_sha256"] != dataset_digest
+                    or row["candidate_projection_sha256"] != projection_digest
+                    or row["candidate_universe_sha256"] != universe_digest
+                    or _utc(row["enrollment_deadline_utc"], "pending_enrollment_deadline")
+                    != deadline
+                ):
+                    raise TrialInvalid("alternate_terminal_dataset_prohibited")
+                return terminal
+            existing_receipt = conn.execute(
+                "SELECT receipt_json FROM trial_receipts WHERE kind='terminal_seal'"
+            ).fetchone()
+            if existing_receipt is not None:
+                existing = json.loads(bytes(existing_receipt["receipt_json"]))
+                if (
+                    existing.get("terminal_dataset_sha256") != dataset_digest
+                    or existing.get("candidate_projection_sha256") != projection_digest
+                    or existing.get("candidate_universe_sha256") != universe_digest
+                ):
+                    raise TrialInvalid("alternate_terminal_seal_receipt_prohibited")
+            conn.execute(
+                "INSERT INTO terminal_pending VALUES(1,?,?,?,?,?)",
+                (
+                    encoded,
+                    dataset_digest,
+                    projection_digest,
+                    universe_digest,
+                    _utc_text(deadline),
+                ),
+            )
+        return terminal
+
+    def seal_terminal(
+        self,
+        registry: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        recorded_at: datetime | None = None,
+        allow_draft: bool = False,
+    ) -> dict[str, Any]:
+        terminal = self.stage_terminal(registry, payload, allow_draft=allow_draft)
+        dataset_digest = _sha256(terminal.get("dataset_sha256"), "terminal_dataset_sha")
+        candidates = [
+            _parse_candidate(item, index)
+            for index, item in enumerate(_list(payload.get("candidates"), "candidates"))
+        ]
+        projection_digest = _candidate_projection_sha256(candidates)
         activated_at = _utc(payload.get("activated_at_utc"), "activated_at")
+        candidate_universe_digest = _candidate_universe_sha256(candidates)
+        existing = self.receipt("terminal_seal")
+        if existing is not None:
+            if (
+                existing["terminal_dataset_sha256"] != dataset_digest
+                or existing["candidate_projection_sha256"] != projection_digest
+                or existing["candidate_universe_sha256"] != candidate_universe_digest
+                or _utc(existing["enrollment_deadline_utc"], "terminal_receipt_deadline")
+                != enrollment_deadline(activated_at)
+            ):
+                raise TrialInvalid("alternate_terminal_seal_receipt_prohibited")
+            return existing
+        receipt_recorded_at = recorded_at or datetime.now(UTC)
+        if receipt_recorded_at.tzinfo is None:
+            raise TrialInvalid("terminal_seal_recorded_at_naive")
+        receipt_recorded_at = receipt_recorded_at.astimezone(UTC)
+        terminal_sealed_at = _utc(terminal.get("sealed_at_utc"), "terminal_sealed_at")
+        evaluated_at = _utc(payload.get("evaluated_at_utc"), "evaluated_at")
+        if not terminal_sealed_at <= receipt_recorded_at <= evaluated_at:
+            raise TrialInvalid("terminal_seal_recorded_at_invalid")
         receipt = _build_receipt(
             kind="terminal_seal",
-            recorded_at=recorded_at or datetime.now(UTC),
+            recorded_at=receipt_recorded_at,
             deadline=enrollment_deadline(activated_at),
             terminal_dataset_sha256=dataset_digest,
             candidate_projection_sha256=projection_digest,
-            candidate_universe_sha256=_candidate_universe_sha256(candidates),
+            candidate_universe_sha256=candidate_universe_digest,
         )
         return self._put_receipt(receipt)
 
@@ -1245,6 +1480,7 @@ def evaluate_trial(
     allow_draft: bool = False,
     terminal_receipt: Mapping[str, Any] | None = None,
     deadline_miss_receipt: Mapping[str, Any] | None = None,
+    terminal_validation_only: bool = False,
 ) -> dict[str, Any]:
     """Evaluate one blinded monitoring or sealed terminal input deterministically."""
 
@@ -1424,7 +1660,7 @@ def evaluate_trial(
                     freeze_boundary=freeze_boundary,
                 )
             )
-        digest, challenger, control, routine, diagnostic_errors, terminal_sealed_at = (
+        digest, challenger, control, routine, diagnostic_status, terminal_sealed_at = (
             _parse_terminal(
                 payload["terminal_dataset"],
                 freeze_boundary=freeze_boundary,
@@ -1433,6 +1669,19 @@ def evaluate_trial(
                 evaluated_at=evaluated_at,
             )
         )
+        if terminal_validation_only:
+            report = _base_report(
+                evaluated_at=evaluated_at,
+                activated_at=activated_at,
+                deadline=deadline,
+                state="COLLECTING",
+                reasons=["terminal_payload_validated_not_evaluated"],
+                counts=state_counts,
+                freeze_boundary=freeze_boundary,
+            )
+            report["terminal_dataset_sha256"] = digest
+            report["candidate_projection_sha256"] = candidate_projection_sha
+            return _sealed_report(report)
         if terminal_receipt is None:
             raise TrialInvalid("terminal_seal_receipt_required")
         terminal_receipt_sha = _receipt_sha256(terminal_receipt, "terminal_seal")
@@ -1464,15 +1713,18 @@ def evaluate_trial(
         )
         falsification: dict[str, Any] = {}
         for name, trades in (("control", control), ("routine", routine)):
-            if name in diagnostic_errors:
+            metadata = diagnostic_status[name]
+            if metadata["status"] == "unavailable":
                 falsification[name] = {
                     "status": "unavailable",
-                    "error_code": diagnostic_errors[name],
+                    "error_code": metadata["error_code"],
+                    "accounting": metadata,
                 }
             else:
                 falsification[name] = {
                     "status": "available",
                     "error_code": None,
+                    "accounting": metadata,
                     **_bootstrap(
                         trades,
                         value_name="alpha_20",
@@ -1602,7 +1854,7 @@ def main(argv: list[str] | None = None) -> int:
         store = TrialSealStore(args.seal_db)
         if args.seal_terminal:
             _validate_registry(registry, allow_draft=False)
-            receipt = store.seal_terminal(payload)
+            receipt = store.seal_terminal(registry, payload)
             print(rfc8785.dumps(receipt).decode("utf-8"))
             return 0
         report = evaluate_with_store(registry, payload, store)

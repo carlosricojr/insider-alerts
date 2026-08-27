@@ -335,6 +335,9 @@ def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
             ROOT / "docs/research/contracts/evidence-snapshot.schema.json"
         ),
         "inference_artifact_sha256": inference_module.inference_artifact_sha256(),
+        "terminal_builder_artifact_sha256": file_sha(
+            ROOT / "src/insider_alerts/research/terminal_builder.py"
+        ),
         "dependency_lock_sha256": file_sha(ROOT / "uv.lock"),
         "policy_sha256": file_sha(ROOT / registry["strategy"]["policy_artifact"]),
         "classifier_version": inference_module.CLASSIFIER_VERSION,

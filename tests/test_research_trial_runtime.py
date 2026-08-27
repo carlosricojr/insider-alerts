@@ -537,6 +537,27 @@ def test_entry_completion_atomically_binds_candidates_resolutions_and_inputs(
     store.validate_integrity()
 
 
+def test_candidate_admission_stops_permanently_after_cohort_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    candidate = _trial_candidate(
+        "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
+    )
+    store = TrialStore(tmp_path / "trial.db")
+    frozen = (date(2026, 8, 27), datetime(2026, 8, 27, 13, 20, tzinfo=UTC))
+    monkeypatch.setattr(
+        TrialStore,
+        "_cohort_freeze_in_connection",
+        lambda _self, _conn: frozen,
+    )
+
+    with pytest.raises(runtime.EvidenceExcluded, match="cohort_already_frozen"):
+        store.append_candidate(candidate)
+
+    assert store.candidates() == []
+
+
 def test_entry_completion_candidate_mismatch_rolls_back_everything(tmp_path: Path) -> None:
     ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
     candidate = _trial_candidate(
@@ -1537,6 +1558,30 @@ def test_windows_trial_task_is_direct_hidden_pythonw() -> None:
         "--registry-path",
     ):
         assert required in installer
+
+
+def test_entry_finalizer_is_a_permanent_noop_after_cohort_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    TrialStore(config.trial_db)
+    SessionFeedStore(config.session_feed_db)
+    BarFeedStore(config.bar_feed_db)
+    boundary = date(2026, 8, 27)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        TrialStore,
+        "cohort_freeze",
+        lambda _store: (boundary, datetime(2026, 8, 27, 13, 20, tzinfo=UTC)),
+    )
+
+    result = finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 28, 13, 20, tzinfo=UTC)
+    )
+
+    assert result == finalizer.FinalizationResult(
+        "cohort_frozen", reason="freeze_boundary_entry_date=2026-08-27"
+    )
 
 
 def _install_finalizer_inputs(

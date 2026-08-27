@@ -25,6 +25,7 @@ from insider_alerts.research.trial_runtime import (
     MAX_SESSIONS,
     TrialRuntimeConfig,
     TrialRuntimeInvalid,
+    TrialStore,
     _validated_trial_window,
 )
 
@@ -67,6 +68,7 @@ def _diagnostic_trade_id(packet_id: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticConfig:
+    trial_db: Path
     diagnostics_db: Path
     canary_ledger_db: Path
     source_db: Path
@@ -1271,7 +1273,7 @@ def run_diagnostics_once(
     now = (now or datetime.now(UTC)).astimezone(UTC)
     store = DiagnosticStore(config.diagnostics_db)
     trial_config = TrialRuntimeConfig(
-        trial_db=Path("unused-diagnostic-trial.db"),
+        trial_db=config.trial_db,
         evidence_db=config.evidence_db,
         bar_feed_db=config.bar_feed_db,
         session_feed_db=config.session_feed_db,
@@ -1289,8 +1291,27 @@ def run_diagnostics_once(
     session_store.validate_integrity()
     bar_store = BarFeedStore(config.bar_feed_db)
     bar_store.validate_integrity()
-    bound_packet_ids = store.candidate_packet_ids()
+    trial_store = TrialStore(config.trial_db, initialize=False)
+    trial_store.validate_integrity(include_outcomes=False)
+    frozen = trial_store.cohort_freeze()
+    freeze_boundary = frozen[0] if frozen is not None else None
+    bound_packet_ids = {
+        str(row["packet_id"])
+        for row in store.candidates()
+        if freeze_boundary is None
+        or (
+            row["entry_session"] is not None
+            and date.fromisoformat(str(row["entry_session"])) <= freeze_boundary
+        )
+    }
     rows, metadata, trades = _read_canary(config.canary_ledger_db, window.activated_at_utc)
+    if freeze_boundary is not None:
+        rows = [
+            row
+            for row in rows
+            if row["entry_session"] is not None
+            and date.fromisoformat(str(row["entry_session"])) <= freeze_boundary
+        ]
     observed_packet_ids = {str(row["packet_id"]) for row in rows}
     canary_activation = metadata.get("activation_utc")
     if canary_activation is None:
