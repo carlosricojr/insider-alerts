@@ -771,11 +771,11 @@ def bar_feed_status(path: Path | str) -> dict[str, object]:
             "path": str(selected),
             "integrity_status": "missing",
         }
-    return {
-        "exists": True,
-        "path": str(selected),
-        **BarFeedStore(selected, initialize=False).status(),
-    }
+    try:
+        status = BarFeedStore(selected, initialize=False).status()
+    except sqlite3.DatabaseError:
+        status = {"integrity_status": "invalid"}
+    return {"exists": True, "path": str(selected), **status}
 
 
 async def collect_once(

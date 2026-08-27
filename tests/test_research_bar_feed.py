@@ -240,3 +240,6 @@ def test_status_does_not_create_a_missing_database(tmp_path: Path) -> None:
     missing = tmp_path / "wrong.db"
     assert bar_feed_status(missing)["integrity_status"] == "missing"
     assert not missing.exists()
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not sqlite")
+    assert bar_feed_status(corrupt)["integrity_status"] == "invalid"
