@@ -49,6 +49,7 @@ def _bound_horizon(
             observation_watermark=int(completion["schedule_observation_watermark"]),
             record_sha256s=tuple(str(value) for value in completion["schedule_record_sha256s"]),
             expected_entry_opens_at_utc=_parse_utc(str(completion["entry_opens_at_utc"])),
+            digest_scope="known_schedule_superset",
         ),
     )
 
@@ -72,6 +73,7 @@ def _materialize_one(
             observation_watermark=int(completion["schedule_observation_watermark"]),
             record_sha256s=tuple(str(value) for value in completion["schedule_record_sha256s"]),
             expected_entry_opens_at_utc=_parse_utc(str(completion["entry_opens_at_utc"])),
+            digest_scope="known_schedule_superset",
         ),
         session_store=session_store,
         bar_store=bar_store,

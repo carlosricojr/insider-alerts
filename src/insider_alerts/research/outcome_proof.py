@@ -22,6 +22,7 @@ class FrozenScheduleBinding:
     observation_watermark: int
     record_sha256s: tuple[str, ...]
     expected_entry_opens_at_utc: datetime | None = None
+    digest_scope: Literal["exact_horizon", "known_schedule_superset"] = "exact_horizon"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +67,16 @@ def bound_horizon(
         for record in records
         if binding.entry_date <= record.session.session_date <= binding.final_session_date
     )
+    horizon_digests = {record.record_sha256 for record in horizon}
+    known_digests = {record.record_sha256 for record in records}
+    digest_scope_valid = (
+        bound_digests == horizon_digests
+        if binding.digest_scope == "exact_horizon"
+        else horizon_digests <= bound_digests <= known_digests
+    )
     if (
-        len(horizon) != MAX_SESSIONS
+        binding.digest_scope not in {"exact_horizon", "known_schedule_superset"}
+        or len(horizon) != MAX_SESSIONS
         or horizon[0].session.session_date != binding.entry_date
         or horizon[-1].session.session_date != binding.final_session_date
         or (
@@ -75,7 +84,7 @@ def bound_horizon(
             and horizon[0].session.opens_at_utc != binding.expected_entry_opens_at_utc
         )
         or len(bound_digests) != len(binding.record_sha256s)
-        or any(record.record_sha256 not in bound_digests for record in horizon)
+        or not digest_scope_valid
     ):
         raise TrialRuntimeInvalid("outcome_frozen_schedule_binding_invalid")
     return horizon

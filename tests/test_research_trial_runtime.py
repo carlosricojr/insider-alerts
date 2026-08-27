@@ -21,6 +21,7 @@ import insider_alerts.research.trial_worker as trial_worker
 from insider_alerts import cli
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import BarFeedStore
+from insider_alerts.research.outcome_proof import FrozenScheduleBinding, bound_horizon
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
 from insider_alerts.research.trial_runtime import (
     EntryCompletionInputs,
@@ -1729,7 +1730,7 @@ def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
     completion = store.entry_completion_records()[0]
     assert completion["decision_clock_at_utc"] == _utc_text(decision_at)
     assert completion["schedule_observation_watermark"] > 0
-    assert len(completion["schedule_record_sha256s"]) >= 10
+    assert len(completion["schedule_record_sha256s"]) > 10
     assert completion["bar_observation_watermark"] == 20
     assert completion["bar_poll_receipt_watermark"] == 1
     assert len(completion["bar_record_sha256s"]) == 20
@@ -1955,6 +1956,55 @@ def test_outcome_finalizer_rejects_corrupt_frozen_schedule_binding(
     store = TrialStore(config.trial_db)
     completion = store.entry_completion_records()[0]
     completion["schedule_record_sha256s"] = ["0" * 64]
+
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
+        outcome_finalizer._bound_horizon(
+            SessionFeedStore(config.session_feed_db, initialize=False),
+            completion,
+            candidate,
+        )
+
+
+def test_exact_horizon_binding_rejects_an_extra_schedule_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    completion = TrialStore(config.trial_db).entry_completion_records()[0]
+    session_store = SessionFeedStore(config.session_feed_db, initialize=False)
+    horizon = outcome_finalizer._bound_horizon(session_store, completion, candidate)
+    binding = FrozenScheduleBinding(
+        entry_date=candidate.planned_entry_date,
+        final_session_date=candidate.final_session_date,
+        as_of_utc=runtime._parse_utc(str(completion["decision_clock_at_utc"])),
+        observation_watermark=int(completion["schedule_observation_watermark"]),
+        record_sha256s=tuple(record.record_sha256 for record in horizon) + ("0" * 64,),
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
+        bound_horizon(session_store, binding)
+
+
+def test_entry_completion_binding_rejects_an_unknown_schedule_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    completion = TrialStore(config.trial_db).entry_completion_records()[0]
+    completion["schedule_record_sha256s"] = [
+        *completion["schedule_record_sha256s"],
+        "0" * 64,
+    ]
 
     with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
         outcome_finalizer._bound_horizon(

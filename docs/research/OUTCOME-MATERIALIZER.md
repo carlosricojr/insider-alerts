@@ -17,6 +17,10 @@ contiguous first-observed path through the registered exit, and SPY must contain
 benchmark bars. Bars strictly after an established stock exit are not required. The materializer
 uses the exact schedule watermark and horizon records bound by the pre-open entry completion. A
 later schedule revision or bar backfill cannot rewrite an existing outcome.
+Diagnostic bindings must equal the ten horizon digests exactly. Challenger entry completions also
+bind earlier schedule records used by the pre-open eligibility decision, so that broader set must
+contain the horizon and may contain only records known at the same frozen watermark and decision
+clock.
 
 The pure shared E07 kernel applies the registered stop-first same-day collision rule, gap-aware stop
 and target prices, and session-ten close. Gross stock return is exit price divided by entry-auction
