@@ -5,13 +5,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import sqlite3
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 import rfc8785
@@ -201,6 +202,33 @@ class EntryLapseInputs:
     entry_opens_at_utc: datetime
     schedule_observation_watermark: int
     schedule_record_sha256s: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TrialOutcomeInputs:
+    candidate_id: str
+    confirmatory_enrollment_sequence: int
+    evidence_record_sha256: str
+    entry_rank_sha256: str
+    symbol: str
+    entry_date: date
+    entry_at_utc: datetime
+    exit_date: date
+    exit_at_utc: datetime
+    entry_price: float
+    exit_price: float
+    exit_reason: Literal["stop", "target", "time", "stop_and_target_same_day_stop_assumed"]
+    gross_return: float
+    spy_entry_price: float
+    spy_exit_price: float
+    spy_return: float
+    recorded_at_utc: datetime
+    schedule_observation_watermark: int
+    schedule_record_sha256s: tuple[str, ...]
+    bar_observation_watermark: int
+    bar_poll_receipt_watermark: int
+    bar_record_sha256s: tuple[str, ...]
+    bar_poll_receipt_sha256s: tuple[str, ...]
 
 
 def _validated_trial_window(config: TrialRuntimeConfig) -> TrialWindow:
@@ -904,6 +932,236 @@ class TrialStore:
                 "SELECT * FROM trial_entry_date_completions ORDER BY sequence"
             ).fetchall()
         return [self._verify_completion_row(row) for row in rows]
+
+    @staticmethod
+    def _outcome_record(outcome: TrialOutcomeInputs) -> dict[str, Any]:
+        if not outcome.candidate_id.strip():
+            raise TrialRuntimeInvalid("trial_outcome_candidate_id_empty")
+        if (
+            isinstance(outcome.confirmatory_enrollment_sequence, bool)
+            or not isinstance(outcome.confirmatory_enrollment_sequence, int)
+            or outcome.confirmatory_enrollment_sequence < 1
+        ):
+            raise TrialRuntimeInvalid("trial_outcome_enrollment_sequence_invalid")
+        symbol = _normalized_symbol(outcome.symbol)
+        _require_sha256(outcome.evidence_record_sha256, "trial_outcome_evidence_record")
+        _require_sha256(outcome.entry_rank_sha256, "trial_outcome_entry_rank")
+        timestamps = (outcome.entry_at_utc, outcome.exit_at_utc, outcome.recorded_at_utc)
+        if any(value.tzinfo is None for value in timestamps):
+            raise TrialRuntimeInvalid("trial_outcome_timestamp_naive")
+        entry_at, exit_at, recorded_at = (value.astimezone(UTC) for value in timestamps)
+        if (
+            entry_at.astimezone(NEW_YORK).date() != outcome.entry_date
+            or exit_at.astimezone(NEW_YORK).date() != outcome.exit_date
+            or exit_at <= entry_at
+            or recorded_at < exit_at
+        ):
+            raise TrialRuntimeInvalid("trial_outcome_timestamp_order_invalid")
+        if outcome.exit_date < outcome.entry_date:
+            raise TrialRuntimeInvalid("trial_outcome_date_order_invalid")
+        if outcome.exit_reason not in {
+            "stop",
+            "target",
+            "time",
+            "stop_and_target_same_day_stop_assumed",
+        }:
+            raise TrialRuntimeInvalid("trial_outcome_exit_reason_invalid")
+        prices = (
+            outcome.entry_price,
+            outcome.exit_price,
+            outcome.spy_entry_price,
+            outcome.spy_exit_price,
+        )
+        returns = (outcome.gross_return, outcome.spy_return)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            for value in prices
+        ) or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < -1
+            for value in returns
+        ):
+            raise TrialRuntimeInvalid("trial_outcome_price_or_return_invalid")
+        gross = float(outcome.exit_price) / float(outcome.entry_price) - 1.0
+        spy = float(outcome.spy_exit_price) / float(outcome.spy_entry_price) - 1.0
+        if not math.isclose(float(outcome.gross_return), gross, rel_tol=0.0, abs_tol=1e-15) or not (
+            math.isclose(float(outcome.spy_return), spy, rel_tol=0.0, abs_tol=1e-15)
+        ):
+            raise TrialRuntimeInvalid("trial_outcome_return_price_mismatch")
+        for name, watermark in (
+            ("schedule", outcome.schedule_observation_watermark),
+            ("bar", outcome.bar_observation_watermark),
+            ("bar_poll_receipt", outcome.bar_poll_receipt_watermark),
+        ):
+            if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 1:
+                raise TrialRuntimeInvalid(f"trial_outcome_{name}_watermark_invalid")
+        digest_groups = (
+            ("schedule", outcome.schedule_record_sha256s),
+            ("bar", outcome.bar_record_sha256s),
+            ("bar_poll_receipt", outcome.bar_poll_receipt_sha256s),
+        )
+        canonical_digests: dict[str, tuple[str, ...]] = {}
+        for name, supplied in digest_groups:
+            canonical = tuple(sorted(set(supplied)))
+            if not canonical or len(canonical) != len(supplied):
+                raise TrialRuntimeInvalid(f"trial_outcome_{name}_digests_invalid")
+            for digest in canonical:
+                _require_sha256(digest, f"trial_outcome_{name}_record")
+            canonical_digests[name] = canonical
+        return {
+            "contract_version": TRIAL_CONTRACT_VERSION,
+            "candidate_id": outcome.candidate_id,
+            "confirmatory_enrollment_sequence": outcome.confirmatory_enrollment_sequence,
+            "evidence_record_sha256": outcome.evidence_record_sha256,
+            "entry_rank_sha256": outcome.entry_rank_sha256,
+            "symbol": symbol,
+            "entry_date": outcome.entry_date.isoformat(),
+            "entry_at_utc": _utc_text(entry_at),
+            "exit_date": outcome.exit_date.isoformat(),
+            "exit_at_utc": _utc_text(exit_at),
+            "entry_price": float(outcome.entry_price),
+            "exit_price": float(outcome.exit_price),
+            "exit_reason": outcome.exit_reason,
+            "gross_return": float(outcome.gross_return),
+            "spy_entry_price": float(outcome.spy_entry_price),
+            "spy_exit_price": float(outcome.spy_exit_price),
+            "spy_return": float(outcome.spy_return),
+            "recorded_at_utc": _utc_text(recorded_at),
+            "schedule_observation_watermark": outcome.schedule_observation_watermark,
+            "schedule_record_sha256s": list(canonical_digests["schedule"]),
+            "bar_observation_watermark": outcome.bar_observation_watermark,
+            "bar_poll_receipt_watermark": outcome.bar_poll_receipt_watermark,
+            "bar_record_sha256s": list(canonical_digests["bar"]),
+            "bar_poll_receipt_sha256s": list(canonical_digests["bar_poll_receipt"]),
+        }
+
+    @classmethod
+    def _verify_outcome_row(cls, row: sqlite3.Row) -> TrialOutcomeInputs:
+        raw = bytes(row["record_json"])
+        digest = str(row["record_sha256"])
+        if _sha256(raw) != digest:
+            raise TrialRuntimeInvalid("trial_outcome_digest_mismatch")
+        record = json.loads(raw)
+        if not isinstance(record, dict) or _canonical(record) != raw:
+            raise TrialRuntimeInvalid("trial_outcome_not_canonical")
+        outcome = TrialOutcomeInputs(
+            candidate_id=str(record.get("candidate_id", "")),
+            confirmatory_enrollment_sequence=cast(
+                int, record.get("confirmatory_enrollment_sequence")
+            ),
+            evidence_record_sha256=str(record.get("evidence_record_sha256", "")),
+            entry_rank_sha256=str(record.get("entry_rank_sha256", "")),
+            symbol=str(record.get("symbol", "")),
+            entry_date=date.fromisoformat(str(record.get("entry_date", ""))),
+            entry_at_utc=_parse_utc(str(record.get("entry_at_utc", ""))),
+            exit_date=date.fromisoformat(str(record.get("exit_date", ""))),
+            exit_at_utc=_parse_utc(str(record.get("exit_at_utc", ""))),
+            entry_price=cast(float, record.get("entry_price")),
+            exit_price=cast(float, record.get("exit_price")),
+            exit_reason=cast(
+                Literal["stop", "target", "time", "stop_and_target_same_day_stop_assumed"],
+                record.get("exit_reason"),
+            ),
+            gross_return=cast(float, record.get("gross_return")),
+            spy_entry_price=cast(float, record.get("spy_entry_price")),
+            spy_exit_price=cast(float, record.get("spy_exit_price")),
+            spy_return=cast(float, record.get("spy_return")),
+            recorded_at_utc=_parse_utc(str(record.get("recorded_at_utc", ""))),
+            schedule_observation_watermark=cast(int, record.get("schedule_observation_watermark")),
+            schedule_record_sha256s=tuple(record.get("schedule_record_sha256s", ())),
+            bar_observation_watermark=cast(int, record.get("bar_observation_watermark")),
+            bar_poll_receipt_watermark=cast(int, record.get("bar_poll_receipt_watermark")),
+            bar_record_sha256s=tuple(record.get("bar_record_sha256s", ())),
+            bar_poll_receipt_sha256s=tuple(record.get("bar_poll_receipt_sha256s", ())),
+        )
+        if (
+            record != cls._outcome_record(outcome)
+            or str(row["candidate_id"]) != outcome.candidate_id
+            or str(row["recorded_at_utc"]) != _utc_text(outcome.recorded_at_utc)
+            or str(uuid.uuid5(uuid.NAMESPACE_URL, f"{HYPOTHESIS_ID}|outcome|{digest}"))
+            != str(row["outcome_id"])
+        ):
+            raise TrialRuntimeInvalid("trial_outcome_columns_mismatch")
+        return outcome
+
+    def append_outcome(self, outcome: TrialOutcomeInputs) -> str:
+        record = self._outcome_record(outcome)
+        encoded = _canonical(record)
+        digest = _sha256(encoded)
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM trial_outcomes WHERE candidate_id=?", (outcome.candidate_id,)
+            ).fetchone()
+            if existing is not None:
+                if self._outcome_record(self._verify_outcome_row(existing)) == record:
+                    return str(existing["record_sha256"])
+                raise TrialRuntimeInvalid("trial_outcome_conflicting_replay")
+            candidate_row = conn.execute(
+                "SELECT * FROM trial_candidates WHERE candidate_id=?", (outcome.candidate_id,)
+            ).fetchone()
+            resolution_row = conn.execute(
+                "SELECT * FROM trial_resolutions WHERE candidate_id=?", (outcome.candidate_id,)
+            ).fetchone()
+            if candidate_row is None or resolution_row is None:
+                raise TrialRuntimeInvalid("trial_outcome_candidate_or_resolution_missing")
+            candidate = self._verify_candidate_row(candidate_row)
+            resolution = self._verify_resolution_row(resolution_row)
+            completion_row = conn.execute(
+                "SELECT * FROM trial_entry_date_completions WHERE entry_date=?",
+                (candidate.planned_entry_date.isoformat(),),
+            ).fetchone()
+            if completion_row is None:
+                raise TrialRuntimeInvalid("trial_outcome_entry_completion_missing")
+            completion = self._verify_completion_row(completion_row)
+            if (
+                resolution.enrollment_state != "enrolled"
+                or resolution.confirmatory_enrollment_sequence
+                != outcome.confirmatory_enrollment_sequence
+                or candidate.evidence_record_sha256 != outcome.evidence_record_sha256
+                or candidate.entry_rank_sha256 != outcome.entry_rank_sha256
+                or candidate.symbol != outcome.symbol
+                or candidate.planned_entry_date != outcome.entry_date
+                or outcome.entry_at_utc.astimezone(UTC)
+                != _parse_utc(str(completion["entry_opens_at_utc"]))
+                or outcome.exit_date > candidate.final_session_date
+                or outcome.schedule_observation_watermark
+                != int(completion["schedule_observation_watermark"])
+                or not set(outcome.schedule_record_sha256s).issubset(
+                    set(completion["schedule_record_sha256s"])
+                )
+            ):
+                raise TrialRuntimeInvalid("trial_outcome_candidate_binding_mismatch")
+            sequence = int(
+                conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM trial_outcomes").fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO trial_outcomes VALUES(?,?,?,?,?,?)",
+                (
+                    sequence,
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, f"{HYPOTHESIS_ID}|outcome|{digest}")),
+                    outcome.candidate_id,
+                    _utc_text(outcome.recorded_at_utc),
+                    digest,
+                    encoded,
+                ),
+            )
+        return digest
+
+    def outcome_candidate_ids(self) -> frozenset[str]:
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute("SELECT candidate_id FROM trial_outcomes").fetchall()
+        return frozenset(str(row["candidate_id"]) for row in rows)
+
+    def outcomes(self) -> list[TrialOutcomeInputs]:
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute("SELECT * FROM trial_outcomes ORDER BY sequence").fetchall()
+        return [self._verify_outcome_row(row) for row in rows]
 
     @staticmethod
     def _prior_book_record(position: PriorBookPosition) -> dict[str, Any]:
@@ -1979,6 +2237,49 @@ class TrialStore:
                 ).fetchone()
                 if unresolved_behind_cursor is not None:
                     raise TrialRuntimeInvalid("candidate_unresolved_behind_entry_date_cursor")
+            if include_outcomes:
+                outcomes = [
+                    self._verify_outcome_row(row)
+                    for row in conn.execute(
+                        "SELECT * FROM trial_outcomes ORDER BY sequence"
+                    ).fetchall()
+                ]
+                resolutions_by_candidate = {
+                    resolution.candidate_id: resolution for resolution in resolutions
+                }
+                completions_by_date = {
+                    date.fromisoformat(str(row["entry_date"])): self._verify_completion_row(row)
+                    for row in completion_rows
+                }
+                for outcome in outcomes:
+                    candidate_row = candidates_by_id.get(outcome.candidate_id)
+                    outcome_resolution = resolutions_by_candidate.get(outcome.candidate_id)
+                    outcome_completion = completions_by_date.get(outcome.entry_date)
+                    if (
+                        candidate_row is None
+                        or outcome_resolution is None
+                        or outcome_completion is None
+                    ):
+                        raise TrialRuntimeInvalid("trial_outcome_binding_missing")
+                    candidate = self._verify_candidate_row(candidate_row)
+                    if (
+                        outcome_resolution.enrollment_state != "enrolled"
+                        or outcome_resolution.confirmatory_enrollment_sequence
+                        != outcome.confirmatory_enrollment_sequence
+                        or candidate.evidence_record_sha256 != outcome.evidence_record_sha256
+                        or candidate.entry_rank_sha256 != outcome.entry_rank_sha256
+                        or candidate.symbol != outcome.symbol
+                        or candidate.planned_entry_date != outcome.entry_date
+                        or outcome.entry_at_utc
+                        != _parse_utc(str(outcome_completion["entry_opens_at_utc"]))
+                        or outcome.exit_date > candidate.final_session_date
+                        or outcome.schedule_observation_watermark
+                        != int(outcome_completion["schedule_observation_watermark"])
+                        or not set(outcome.schedule_record_sha256s).issubset(
+                            set(outcome_completion["schedule_record_sha256s"])
+                        )
+                    ):
+                        raise TrialRuntimeInvalid("trial_outcome_binding_mismatch")
             fault_rows = conn.execute("SELECT * FROM trial_faults ORDER BY sequence").fetchall()
             for row in fault_rows:
                 self._verify_fault_row(row)

@@ -289,6 +289,11 @@
         "schedule_input_binding",
         "eligibility_history",
         "healthy_bar_poll_proof",
+        "outcome_materialization",
+        "outcome_bar_binding",
+        "outcome_schedule_binding",
+        "outcome_missingness",
+        "outcome_visibility",
         "prior_book_binding",
         "seal_clock_rule",
         "missing_prior_position_policy",
@@ -326,6 +331,21 @@
         },
         "healthy_bar_poll_proof": {
           "const": "successful_zero_rejection_receipt_after_prior_required_session_close"
+        },
+        "outcome_materialization": {
+          "const": "after_frozen_tenth_session_healthy_stock_and_spy_polls_v1"
+        },
+        "outcome_bar_binding": {
+          "const": "first_observed_watermark_and_record_digests"
+        },
+        "outcome_schedule_binding": {
+          "const": "entry_completion_frozen_ten_session_records"
+        },
+        "outcome_missingness": {
+          "const": "terminal_healthy_poll_missing_required_pre_exit_or_benchmark_bar_invalid"
+        },
+        "outcome_visibility": {
+          "const": "individual_immutable_records_no_aggregate_before_terminal_seal"
         },
         "prior_book_binding": {
           "const": "watermark_bounded_first_observed_records_and_occupancy_digest"

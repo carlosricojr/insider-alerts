@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from insider_alerts.research.trial_finalizer import finalize_pending_entry_dates
+from insider_alerts.research.trial_outcome_finalizer import finalize_trial_outcomes
 from insider_alerts.research.trial_runtime import (
     TrialRuntimeConfig,
     TrialRuntimeRetryable,
@@ -64,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         finalized = finalize_pending_entry_dates(config)
+        outcomes = finalize_trial_outcomes(config)
     except (TrialRuntimeRetryable, sqlite3.OperationalError, OSError) as exc:
         now = datetime.now(UTC)
         detail = f"{type(exc).__name__}: {exc}"[:2000]
@@ -94,7 +96,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(
         json.dumps(
-            {"candidate_runtime": asdict(imported), "entry_finalizer": asdict(finalized)},
+            {
+                "candidate_runtime": asdict(imported),
+                "entry_finalizer": asdict(finalized),
+                "outcome_finalizer": asdict(outcomes),
+            },
             sort_keys=True,
             default=str,
         )

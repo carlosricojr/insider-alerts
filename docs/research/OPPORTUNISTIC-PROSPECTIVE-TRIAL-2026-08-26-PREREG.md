@@ -14,6 +14,9 @@ Draft correction: 2026-08-27, before activation and with zero challenger snapsho
 schedule revisions, healthy-poll receipts, pre-signal eligibility history, the final in-transaction
 decision clock,
 and outcome-independent prior-book occupancy to each entry-date seal<br>
+Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to bind the
+terminal outcome materialization time, exact stock/SPY bar and schedule provenance, and terminal
+missing-session behavior<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -109,10 +112,11 @@ The fixed resolution precedence is `missed`, `ineligible`, `overlap_suppressed`,
 `capacity_suppressed`, then `enrolled`. A healthy completed source poll has an immutable success
 receipt after the last session close needed by that candidate, covers the requested history through
 that session, and reports zero source or validation rejections. Under that proof, fewer than 20
-eligible pre-signal bars is the registered E07 `ineligible` result. Invalid feed integrity, no such
-No qualifying receipt or missing data needed to decide a current candidate's E07 eligibility is systemic
-missingness: finalization waits only until the official open. Missing bars for a prior enrolled
-position instead use a conservative book rule: the position occupies its symbol and one slot
+eligible pre-signal bars is the registered E07 `ineligible` result. Invalid feed integrity remains
+`INVALID`. No qualifying receipt or missing data needed to decide a current candidate's E07
+eligibility is systemic missingness: finalization waits only until the official open. Missing bars
+for a prior enrolled position instead use a conservative book rule: the position occupies its
+symbol and one slot
 through its frozen final session, then expires unconditionally after that session; no outcome field
 is consulted. The final in-transaction decision clock is sampled after resolution rows are staged
 and immediately before the immutable completion seal is staged. If that clock is not strictly
@@ -137,6 +141,19 @@ frozen stop-first barrier price. Matched SPY return is the SPY entry-session RTH
 exit-session RTH close, exactly matching the earlier daily E07 study convention. Persisted trade
 entry/exit timestamps are the official exchange RTH open/close boundaries from the point-in-time
 IBKR SPY schedule; early closes therefore use their actual close, not 16:00 ET.
+
+An individual outcome is materialized only after the candidate's already-frozen tenth session has
+closed and successful zero-rejection stock and SPY polls both cover that session. Their observation
+watermarks must contain the contiguous stock path through the registered exit and SPY bars at the
+entry and exit endpoints. This delay applies even when a stop or target occurred earlier, so
+materialization timing cannot reveal early exits to operations.
+The immutable record binds the entry-completion schedule watermark and all ten frozen session
+digests, the outcome-time bar and receipt watermarks, both receipt digests, and every stock and SPY
+bar digest used to reproduce the barrier and benchmark results. If terminal healthy polls exist but
+a stock bar needed to establish the exit or either SPY endpoint remains absent, the trial is
+`INVALID`; the position is never silently discarded. Bars strictly after an established stock exit
+are irrelevant. Routine status exposes only counts and health, never individual returns or an
+aggregate.
 
 ## Point-in-time owner classification
 
