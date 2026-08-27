@@ -6,7 +6,7 @@ It continuously:
 1. Polls SEC Form 4 feed.
 2. Enriches filings with raw Form 4 XML URLs.
 3. Parses/scorers insider transactions.
-4. Asks Quant (OpenClaw agent) to decide `approve|reject|escalate`.
+4. Asks an isolated local Quant CLI to decide `approve|reject|escalate`.
 5. Sends NTFY notifications for approved trade signals.
 
 ## 1) What this does
@@ -29,7 +29,9 @@ Pipeline per cycle:
 
 Core safety behavior:
 
-- Quant runs through an isolated agent (`quant-insider`), not `main`.
+- Quant uses native Codex first and native Claude as failover, with no tools or write access.
+- A judge infrastructure failure leaves the immutable packet pending for retry; it is not treated
+  as a market judgment.
 - `main` agent is blocked by default in quant mode.
 - Approval guardrails require strong score + positive net insider buy.
 - Duplicate packets (same accession/form) are deadlettered to reduce noise.
@@ -69,11 +71,16 @@ Notes:
 - `NTFY_TOPIC` is what you subscribe to in the NTFY app.
 - Keep `SEC_USER_AGENT` explicit/contactable for SEC compliance.
 
-### C. Create isolated Quant agent (one-time)
+### C. Verify a local Quant CLI (one-time)
 
 ```powershell
-& "$env:APPDATA\npm\openclaw.cmd" agents add quant-insider --workspace "$PWD\ops\quant-insider-workspace" --non-interactive
+codex --version
+claude --version
 ```
+
+Only one backend is required. On Windows the runtime resolves native executables so scheduled
+`pythonw.exe` jobs never open a console. Set `INSIDER_QUANT_CODEX_MODEL` or
+`INSIDER_QUANT_CLAUDE_MODEL` only when an explicit provider model override is required.
 
 ### D. Smoke test notification
 
@@ -112,7 +119,7 @@ owner=Hanson Bryan Craig
 score=100.00
 net_buy_shares=4754.00
 gross_value=13268128.95
-source=quant:quant-insider
+source=quant:quant-insider:codex:gpt-5.6-sol:low
 why=Quant thesis: unusual-size insider accumulation with strong buy skew.
 ```
 
@@ -135,10 +142,12 @@ uv run python -m insider_alerts.cli ops backtest --start-date 2025-02-13 --end-d
 
 - `ModuleNotFoundError: insider_alerts`:
   - run commands from repo root (`cd ...\insider-alerts`).
-- frequent `quant-fallback` escalations:
-  - ensure autopilot uses `--quant-agent-id quant-insider --quant-batch-size 8`.
-  - verify OpenClaw agent works:
-    - `openclaw agent --agent quant-insider --message "Reply exactly OK" --json`
+- nonzero `quant_deferred` counts:
+  - verify at least one of `codex --version` or `claude --version` succeeds for the scheduled-task
+    user;
+  - inspect the labeled backend error in `logs/autopilot.err.log`;
+  - packets remain pending and are retried oldest-first, so do not manually convert an
+    infrastructure error into `escalate`.
 
 ## Further docs
 

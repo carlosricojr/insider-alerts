@@ -535,7 +535,7 @@ class _Completed:
 
 
 def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
-    monkeypatch.setattr(cli, "_resolve_quant_cmd", lambda: ("claude.cmd", "claude"))
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("claude.exe", "claude")])
     calls: list[int] = []
 
     def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
@@ -595,7 +595,7 @@ def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
 
 
 def test_decide_packets_with_quant_rejects_invalid_schema(monkeypatch) -> None:
-    monkeypatch.setattr(cli, "_resolve_quant_cmd", lambda: ("claude.cmd", "claude"))
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("claude.exe", "claude")])
 
     def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
         message = str(args[args.index("-p") + 1])
@@ -633,6 +633,233 @@ def test_decide_packets_with_quant_rejects_invalid_schema(monkeypatch) -> None:
     assert mapped == {}
     assert error is not None
     assert "invalid decision schema" in error
+
+
+def test_decide_packets_with_quant_fails_over_per_missing_packet_and_surfaces_stdout_error(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_resolve_quant_cmds",
+        lambda: [("claude.exe", "claude"), ("codex.exe", "codex")],
+    )
+    calls: list[str] = []
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(args[0]))
+        assert "creationflags" in kwargs
+        if args[0] == "claude.exe":
+            outer = json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "api_error_status": 429,
+                    "result": "You've reached your model limit",
+                }
+            )
+            return _Completed(returncode=1, stdout=outer, stderr="")
+        message = str(args[-1])
+        request = json.loads(message.split("Input: ", 1)[1])
+        decisions = [
+            {
+                "packet_id": packet["packet_id"],
+                "decision": "approve",
+                "why": "fallback classified immutable payload",
+                "edge_hypothesis": "discretionary conviction buy",
+                "risk_flags": [],
+                "evidence": {
+                    "role_tier": "executive",
+                    "open_market_buy_shares": 1000,
+                    "trade_pct_daily_turnover": 0.4,
+                    "novelty_penalty": 0,
+                    "regime_earnings_shock_flag": False,
+                },
+                "confidence": 0.95,
+            }
+            for packet in request["packets"]
+        ]
+        return _Completed(
+            returncode=0,
+            stdout=json.dumps({"decisions": decisions}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    packet_id = "0000000000-00-000001|0000000001|4"
+    mapped, error = cli._decide_packets_with_quant(
+        [
+            {
+                "packet_id": packet_id,
+                "payload": {"score": 99.0, "rationale": {"net_buy_shares": 1000.0}},
+            }
+        ],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=30,
+        quant_thinking="low",
+        quant_batch_size=10,
+    )
+
+    assert calls == ["claude.exe", "codex.exe"]
+    assert mapped[packet_id].decision == "approve"
+    assert mapped[packet_id].source == "quant:quant-insider:codex:gpt-5.6-sol:low"
+    assert error is not None
+    assert "You've reached your model limit" in error
+
+
+def test_decide_packets_with_quant_keeps_valid_primary_decision_and_falls_back_only_missing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_resolve_quant_cmds",
+        lambda: [("primary.exe", "codex"), ("secondary.exe", "codex")],
+    )
+    requested_aliases: list[list[str]] = []
+
+    def decision(alias: str) -> dict[str, object]:
+        return {
+            "packet_id": alias,
+            "decision": "reject",
+            "why": "classified immutable payload",
+            "edge_hypothesis": "no durable edge",
+            "risk_flags": [],
+            "evidence": {
+                "role_tier": "director",
+                "open_market_buy_shares": 10,
+                "trade_pct_daily_turnover": 0.001,
+                "novelty_penalty": 50,
+                "regime_earnings_shock_flag": False,
+            },
+            "confidence": 0.9,
+        }
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        request = json.loads(str(args[-1]).split("Input: ", 1)[1])
+        aliases = [str(packet["packet_id"]) for packet in request["packets"]]
+        requested_aliases.append(aliases)
+        selected = aliases[:1] if args[0] == "primary.exe" else aliases
+        return _Completed(
+            returncode=0,
+            stdout=json.dumps({"decisions": [decision(alias) for alias in selected]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    packet_ids = [
+        "0000000000-00-000001|0000000001|4",
+        "0000000000-00-000002|0000000002|4",
+    ]
+    mapped, error = cli._decide_packets_with_quant(
+        [
+            {
+                "packet_id": packet_id,
+                "payload": {"score": 50.0, "rationale": {"net_buy_shares": 10.0}},
+            }
+            for packet_id in packet_ids
+        ],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=30,
+        quant_thinking="low",
+        quant_batch_size=10,
+    )
+
+    assert requested_aliases == [["P00000", "P00001"], ["P00001"]]
+    assert set(mapped) == set(packet_ids)
+    assert error is not None
+    assert "missing decisions for 1 packet" in error
+
+
+def test_decide_packets_with_quant_handles_nontext_error_streams(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("claude.exe", "claude")])
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: _Completed(  # type: ignore[arg-type]
+            returncode=1,
+            stdout=None,
+            stderr=None,
+        ),
+    )
+
+    mapped, error = cli._decide_packets_with_quant(
+        [
+            {
+                "packet_id": "0000000000-00-000001|0000000001|4",
+                "payload": {"score": 50.0, "rationale": {"net_buy_shares": 10.0}},
+            }
+        ],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=30,
+        quant_thinking="low",
+        quant_batch_size=10,
+    )
+
+    assert mapped == {}
+    assert error is not None
+    assert "invalid JSON envelope" in error
+
+
+def test_cli_ops_autopilot_defers_quant_infrastructure_failure(monkeypatch) -> None:
+    runner = CliRunner()
+    monkeypatch.setattr(
+        cli,
+        "_load_conviction_history",
+        lambda *args, **kwargs: cli._empty_conviction_history(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_poll_once",
+        lambda settings, *, max_items, dry_run: PollResult(0, 0, 0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit: EnrichResult(scanned=0, updated=0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enqueue_review_packets",
+        lambda settings, *, limit: QueueResult(processed=0, enqueued=0),
+    )
+    packet_id = "0000000000-00-000001|0000000001|4"
+    monkeypatch.setattr(
+        cli,
+        "list_pending_review_packets",
+        lambda db_path, limit: [
+            {
+                "packet_id": packet_id,
+                "payload": {
+                    "score": 99.0,
+                    "rationale": {
+                        "net_buy_shares": 1000.0,
+                        "open_market_buy_shares": 1000.0,
+                    },
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_decide_packets_with_quant",
+        lambda *args, **kwargs: ({}, "claude 429; codex unavailable"),
+    )
+    applied: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "apply_decision",
+        lambda db_path, payload: applied.append(dict(payload)) or 1,
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["ops", "autopilot", "--once", "--decision-engine", "quant"],
+    )
+
+    assert result.exit_code == 0
+    assert applied == []
+    assert "decided=0" in result.stdout
+    assert "quant_deferred=1" in result.stdout
+    assert "quant decision engine degraded (0/1 decided)" in result.stderr
 
 
 def test_cli_ops_autopilot_blocks_main_quant_agent_in_isolated_mode() -> None:

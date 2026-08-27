@@ -8,8 +8,8 @@
 5. Apply analyst decisions with `review decide` or `review apply`.
 
 ## Background autopilot
-- Create dedicated Quant agent once:
-  - `& "$env:APPDATA\npm\openclaw.cmd" agents add quant-insider --workspace "$PWD\ops\quant-insider-workspace" --non-interactive`
+- Install and authenticate at least one local Quant CLI (`codex` or `claude`). On Windows the
+  worker resolves native executables and launches them without a console window.
 - Start continuous background loop:
   - `uv run python -m insider_alerts.cli ops autopilot --loop --interval 300 --decision-engine quant --quant-agent-id quant-insider --quant-batch-size 8`
 - Default auto decision rules:
@@ -19,6 +19,11 @@
 - Quant safety mode:
   - blocks `--quant-agent-id main` by default (`--quant-require-isolated-agent`)
   - use a dedicated isolated agent id for Quant decisions
+  - tries native Codex first, then native Claude only for unresolved packets
+  - records the successful backend in `decision_source`
+  - leaves infrastructure-undecided packets pending for oldest-first retry instead of writing a
+    terminal market classification
+  - reports each such packet in the cycle's `quant_deferred` count
 - Notifications:
   - default is enabled and approve-only (`--notify --notify-approve-only`)
   - use `--notify-all-decisions` only if desired

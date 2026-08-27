@@ -149,6 +149,7 @@ class AutoPilotCycleResult:
     rejected_low_edge: int
     escalated_missing_context: int
     escalated_schema_invalid: int
+    quant_deferred: int
     notify_suppressed_duplicate: int = 0
 
 
@@ -1214,34 +1215,94 @@ QUANT_SYSTEM_PROMPT = (
     "verbatim."
 )
 
+
 # Local decision CLIs, in preference order. OpenClaw is no longer supported.
-_QUANT_CLI_CANDIDATES: tuple[tuple[str, str], ...] = (
-    ("claude.cmd", "claude"),
-    ("claude", "claude"),
-    ("codex.cmd", "codex"),
-    ("codex", "codex"),
-)
+def _native_codex_from_shim(shim: Path) -> Path | None:
+    """Resolve the native Windows Codex binary behind an npm shim, if installed."""
+
+    if os.name != "nt":
+        return None
+    package_root = (
+        shim.resolve().parent
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+    )
+    matches = sorted(package_root.glob("codex-win32-*/vendor/*/bin/codex.exe"))
+    return matches[0] if matches else None
 
 
-def _resolve_quant_cmd() -> tuple[str, str] | None:
-    """Return ``(executable, flavor)`` for the local quant decision CLI.
+def _resolve_quant_cmds() -> list[tuple[str, str]]:
+    """Return ordered, real-path-deduplicated local decision backends.
 
-    ``flavor`` is ``claude`` or ``codex`` and selects argument construction plus
-    response-envelope handling. Returns ``None`` when no supported CLI is installed.
+    Native executables are required on Windows. Passing a multiline prompt through an npm
+    ``.cmd`` shim can truncate it, and launching a shim from ``pythonw`` can create a console.
+    Codex is preferred because the local Claude default can be independently rate-limited; Claude
+    remains a failover backend.
     """
-    for name, flavor in _QUANT_CLI_CANDIDATES:
+
+    candidates: list[tuple[Path, str]] = []
+    codex_names = ("codex.exe", "codex.cmd", "codex")
+    for name in codex_names:
+        found = shutil.which(name)
+        if not found:
+            continue
+        path = Path(found)
+        if os.name == "nt" and path.suffix.lower() != ".exe":
+            native = _native_codex_from_shim(path)
+            if native is not None:
+                candidates.append((native, "codex"))
+        else:
+            candidates.append((path, "codex"))
+    for name in ("claude.exe", "claude", "claude.cmd"):
         found = shutil.which(name)
         if found:
-            return found, flavor
+            path = Path(found)
+            if os.name != "nt" or path.suffix.lower() == ".exe":
+                candidates.append((path, "claude"))
     for candidate, flavor in (
-        (Path.home() / ".local" / "bin" / "claude.cmd", "claude"),
+        (Path.home() / ".local" / "bin" / "claude.exe", "claude"),
         (Path.home() / ".local" / "bin" / "claude", "claude"),
-        (Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd", "claude"),
         (Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd", "codex"),
     ):
-        if candidate.exists():
-            return str(candidate), flavor
-    return None
+        if not candidate.exists():
+            continue
+        if flavor == "codex" and os.name == "nt":
+            native = _native_codex_from_shim(candidate)
+            if native is not None:
+                candidates.append((native, flavor))
+        elif os.name != "nt" or candidate.suffix.lower() == ".exe":
+            candidates.append((candidate, flavor))
+
+    resolved: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for candidate, flavor in candidates:
+        key = os.path.normcase(os.path.realpath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append((str(candidate), flavor))
+    return resolved
+
+
+_DEFAULT_QUANT_MODELS = {
+    "codex": "gpt-5.6-sol",
+    "claude": "claude-sonnet-5",
+}
+
+
+def _quant_model(flavor: str) -> str:
+    return (
+        os.environ.get(f"INSIDER_QUANT_{flavor.upper()}_MODEL", "").strip()
+        or os.environ.get("INSIDER_QUANT_MODEL", "").strip()
+        or _DEFAULT_QUANT_MODELS[flavor]
+    )
+
+
+def _quant_effort(quant_thinking: str) -> str:
+    return "low" if quant_thinking in {"off", "minimal"} else quant_thinking
 
 
 def _build_quant_args(
@@ -1249,10 +1310,11 @@ def _build_quant_args(
     flavor: str,
     prompt: str,
     *,
-    quant_timeout_seconds: int,
+    quant_thinking: str,
 ) -> list[str]:
     """Build the argv for a single-shot, tool-free classification call."""
-    model = os.environ.get("INSIDER_QUANT_MODEL", "").strip()
+    model = _quant_model(flavor)
+    effort = _quant_effort(quant_thinking)
     if flavor == "claude":
         args = [
             cmd,
@@ -1267,14 +1329,30 @@ def _build_quant_args(
             "",
             "--max-turns",
             "1",
+            "--effort",
+            effort,
         ]
-        if model:
-            args += ["--model", model]
-        return args
-    # codex: exec runs a single non-interactive turn and prints the reply on stdout.
-    args = [cmd, "exec", "--skip-git-repo-check", f"{QUANT_SYSTEM_PROMPT}\n\n{prompt}"]
-    if model:
         args += ["--model", model]
+        return args
+    # codex: exec runs a single non-interactive turn and prints the reply on stdout. The native
+    # executable receives the prompt directly, avoiding npm-shim multiline truncation on Windows.
+    args = [
+        cmd,
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+        "-c",
+        f'model_reasoning_effort="{effort}"',
+        "--model",
+        model,
+    ]
+    args.append(f"{QUANT_SYSTEM_PROMPT}\n\n{prompt}")
     return args
 
 
@@ -1315,10 +1393,9 @@ def _decide_packets_with_quant(
     quant_thinking: str,
     quant_batch_size: int,
 ) -> tuple[dict[str, AutoDecisionRuleResult], str | None]:
-    resolved = _resolve_quant_cmd()
-    if resolved is None:
+    backends = _resolve_quant_cmds()
+    if not backends:
         return {}, "no local quant CLI found (looked for claude, codex)"
-    quant_cmd, quant_flavor = resolved
     mapped: dict[str, AutoDecisionRuleResult] = {}
     errors: list[str] = []
     batch_size = max(1, quant_batch_size)
@@ -1339,124 +1416,176 @@ def _decide_packets_with_quant(
         if not compact_packets:
             continue
 
-        request = {"packets": compact_packets}
-        prompt = (
-            "Classify each Form 4 packet below.\n"
-            "Return ONLY this JSON shape:\n"
-            # NB: no shell metacharacters (| < > & % ^) anywhere in argv --
-            # claude.cmd/codex.cmd are batch shims and Windows routes .cmd through
-            # cmd.exe, so those characters are injection-prone.
-            '{"decisions":[{"packet_id":"...","decision":"approve, reject, or escalate",'
-            '"why":"max 240 chars","edge_hypothesis":"...","risk_flags":["..."],'
-            '"evidence":{"role_tier":"...","open_market_buy_shares":0,'
-            '"trade_pct_daily_turnover":0,"novelty_penalty":0,'
-            '"regime_earnings_shock_flag":false},"confidence":0.0}]}\n'
-            f"Input: {json.dumps(request, separators=(',', ':'))}"
-        )
-
-        args = _build_quant_args(
-            quant_cmd,
-            quant_flavor,
-            prompt,
-            quant_timeout_seconds=quant_timeout_seconds,
-        )
-
-        try:
-            completed = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=quant_timeout_seconds + 10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(f"chunk[{start}:{start + len(chunk)}] failed: {exc}")
-            continue
-
-        if completed.returncode != 0:
-            stderr = completed.stderr.strip() if completed.stderr else "unknown error"
-            errors.append(f"chunk[{start}:{start + len(chunk)}] non-zero: {stderr}")
-            continue
-
-        text_obj, envelope_error = _extract_quant_response_text(quant_flavor, completed.stdout)
-        if text_obj is None:
-            errors.append(f"chunk[{start}:{start + len(chunk)}] {envelope_error}")
-            continue
-
-        inner = _extract_json_object(text_obj)
-        if inner is None:
-            errors.append(f"chunk[{start}:{start + len(chunk)}] invalid decision JSON")
-            continue
-
-        decisions_obj = inner.get("decisions")
-        if not isinstance(decisions_obj, list):
-            errors.append(f"chunk[{start}:{start + len(chunk)}] decisions missing")
-            continue
-
-        valid_decisions_in_chunk = 0
-        for entry in decisions_obj:
-            if not isinstance(entry, dict):
-                continue
-            packet_id_obj = entry.get("packet_id")
-            decision_obj = entry.get("decision")
-            why_obj = entry.get("why")
-            edge_hypothesis_obj = entry.get("edge_hypothesis")
-            risk_flags_obj = entry.get("risk_flags")
-            evidence_obj = entry.get("evidence")
-            if not isinstance(packet_id_obj, str) or not packet_id_obj.strip():
-                continue
-            original_packet_id = alias_to_packet_id.get(packet_id_obj)
-            if original_packet_id is None:
-                continue
-            if not isinstance(decision_obj, str) or decision_obj not in {
-                "approve",
-                "reject",
-                "escalate",
-            }:
-                continue
-            if not isinstance(why_obj, str) or not why_obj.strip():
-                continue
-            if not isinstance(edge_hypothesis_obj, str) or not edge_hypothesis_obj.strip():
-                continue
-            if not isinstance(risk_flags_obj, list) or any(
-                not isinstance(flag, str) for flag in risk_flags_obj
-            ):
-                continue
-            if not isinstance(evidence_obj, dict):
-                continue
-            required_evidence_keys = {
-                "role_tier",
-                "open_market_buy_shares",
-                "trade_pct_daily_turnover",
-                "novelty_penalty",
-                "regime_earnings_shock_flag",
+        compact_by_alias = {str(packet["packet_id"]): packet for packet in compact_packets}
+        unresolved = set(alias_to_packet_id)
+        for quant_cmd, quant_flavor in backends:
+            if not unresolved:
+                break
+            request = {
+                "packets": [
+                    compact_by_alias[alias]
+                    for alias in alias_to_packet_id
+                    if alias in unresolved
+                ]
             }
-            if not required_evidence_keys.issubset(evidence_obj.keys()):
+            prompt = (
+                "Classify each Form 4 packet below.\n"
+                "Return ONLY this JSON shape:\n"
+                '{"decisions":[{"packet_id":"...","decision":"approve, reject, or escalate",'
+                '"why":"max 240 chars","edge_hypothesis":"...","risk_flags":["..."],'
+                '"evidence":{"role_tier":"...","open_market_buy_shares":0,'
+                '"trade_pct_daily_turnover":0,"novelty_penalty":0,'
+                '"regime_earnings_shock_flag":false},"confidence":0.0}]}\n'
+                f"Input: {json.dumps(request, separators=(',', ':'))}"
+            )
+            args = _build_quant_args(
+                quant_cmd,
+                quant_flavor,
+                prompt,
+                quant_thinking=quant_thinking,
+            )
+            backend_label = f"{quant_flavor}:{Path(quant_cmd).name}"
+            try:
+                completed = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    timeout=quant_timeout_seconds + 10,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} failed: {exc}"
+                )
                 continue
 
-            confidence = _to_float(entry.get("confidence"))
-            if confidence is not None:
-                confidence = max(0.0, min(1.0, confidence))
+            stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+            stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+            if completed.returncode != 0:
+                _ignored, envelope_error = _extract_quant_response_text(
+                    quant_flavor, stdout
+                )
+                detail = (
+                    envelope_error
+                    or stderr.strip()
+                    or stdout.strip()[:160]
+                    or "unknown error"
+                )
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} non-zero: {detail}"
+                )
+                continue
 
-            reason_code = "quant_decision"
-            if decision_obj == "approve" and (confidence is not None and confidence >= 0.85):
-                reason_code = "quant_high_edge"
-            elif decision_obj == "reject":
-                reason_code = "reject_low_edge"
-            elif decision_obj == "escalate":
-                reason_code = "quant_escalate"
-
-            mapped[original_packet_id] = AutoDecisionRuleResult(
-                decision=decision_obj,
-                reason=f"{why_obj.strip()} Edge: {edge_hypothesis_obj.strip()}"[:240],
-                source=f"quant:{quant_agent_id}",
-                confidence=confidence,
-                reason_code=reason_code,
+            text_obj, envelope_error = _extract_quant_response_text(
+                quant_flavor, stdout
             )
-            valid_decisions_in_chunk += 1
+            if text_obj is None:
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} {envelope_error}"
+                )
+                continue
 
-        if valid_decisions_in_chunk == 0:
-            errors.append(f"chunk[{start}:{start + len(chunk)}] invalid decision schema")
+            inner = _extract_json_object(text_obj)
+            if inner is None:
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} "
+                    "invalid decision JSON"
+                )
+                continue
+
+            decisions_obj = inner.get("decisions")
+            if not isinstance(decisions_obj, list):
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} decisions missing"
+                )
+                continue
+
+            resolved_here = 0
+            for entry in decisions_obj:
+                if not isinstance(entry, dict):
+                    continue
+                packet_id_obj = entry.get("packet_id")
+                decision_obj = entry.get("decision")
+                why_obj = entry.get("why")
+                edge_hypothesis_obj = entry.get("edge_hypothesis")
+                risk_flags_obj = entry.get("risk_flags")
+                evidence_obj = entry.get("evidence")
+                if (
+                    not isinstance(packet_id_obj, str)
+                    or packet_id_obj not in unresolved
+                ):
+                    continue
+                original_packet_id = alias_to_packet_id.get(packet_id_obj)
+                if original_packet_id is None:
+                    continue
+                if not isinstance(decision_obj, str) or decision_obj not in {
+                    "approve",
+                    "reject",
+                    "escalate",
+                }:
+                    continue
+                if not isinstance(why_obj, str) or not why_obj.strip():
+                    continue
+                if (
+                    not isinstance(edge_hypothesis_obj, str)
+                    or not edge_hypothesis_obj.strip()
+                ):
+                    continue
+                if not isinstance(risk_flags_obj, list) or any(
+                    not isinstance(flag, str) for flag in risk_flags_obj
+                ):
+                    continue
+                if not isinstance(evidence_obj, dict):
+                    continue
+                required_evidence_keys = {
+                    "role_tier",
+                    "open_market_buy_shares",
+                    "trade_pct_daily_turnover",
+                    "novelty_penalty",
+                    "regime_earnings_shock_flag",
+                }
+                if not required_evidence_keys.issubset(evidence_obj.keys()):
+                    continue
+
+                confidence = _to_float(entry.get("confidence"))
+                if confidence is not None:
+                    confidence = max(0.0, min(1.0, confidence))
+
+                reason_code = "quant_decision"
+                if decision_obj == "approve" and (
+                    confidence is not None and confidence >= 0.85
+                ):
+                    reason_code = "quant_high_edge"
+                elif decision_obj == "reject":
+                    reason_code = "reject_low_edge"
+                elif decision_obj == "escalate":
+                    reason_code = "quant_escalate"
+
+                mapped[original_packet_id] = AutoDecisionRuleResult(
+                    decision=decision_obj,
+                    reason=f"{why_obj.strip()} Edge: {edge_hypothesis_obj.strip()}"[:240],
+                    source=(
+                        f"quant:{quant_agent_id}:{quant_flavor}:"
+                        f"{_quant_model(quant_flavor)}:{_quant_effort(quant_thinking)}"
+                    ),
+                    confidence=confidence,
+                    reason_code=reason_code,
+                )
+                unresolved.remove(packet_id_obj)
+                resolved_here += 1
+
+            if unresolved:
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} "
+                    f"invalid decision schema or missing decisions for {len(unresolved)} "
+                    "packet(s)"
+                )
+            elif resolved_here == 0:
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} "
+                    "invalid decision schema"
+                )
 
     if not errors:
         return mapped, None
@@ -3134,6 +3263,7 @@ def ops_autopilot(
         rejected_low_edge = 0
         escalated_missing_context = 0
         escalated_schema_invalid = 0
+        quant_deferred = 0
         seen_decision_keys: set[str] = set()
 
         for packet in pending:
@@ -3185,24 +3315,11 @@ def ops_autopilot(
                                 reject_score_max=reject_score_max,
                             )
                         else:
-                            reason = (
-                                f"quant unavailable for packet={packet_id_obj}: {quant_error}"
-                                if quant_error
-                                else f"quant missing decision for packet={packet_id_obj}"
-                            )
-                            rule = AutoDecisionRuleResult(
-                                decision="escalate",
-                                reason=reason,
-                                source="quant-fallback",
-                                confidence=None,
-                                reason_code=(
-                                    "quant_schema_invalid"
-                                    if quant_error and "schema" in quant_error.lower()
-                                    else "quant_unavailable"
-                                    if quant_error
-                                    else "quant_missing_decision"
-                                ),
-                            )
+                            # Infrastructure failure is not a scientific classification. Keep the
+                            # packet pending so a later cycle can retry the identical immutable
+                            # payload; applying ``escalate`` here used to suppress signals forever.
+                            quant_deferred += 1
+                            continue
                 else:
                     rule = baseline_rules.get(packet_id_obj) or _auto_decide_packet(
                         packet,
@@ -3345,6 +3462,7 @@ def ops_autopilot(
             rejected_low_edge=rejected_low_edge,
             escalated_missing_context=escalated_missing_context,
             escalated_schema_invalid=escalated_schema_invalid,
+            quant_deferred=quant_deferred,
             notify_suppressed_duplicate=notify_suppressed_duplicate,
         )
         cycle_message = (
@@ -3361,6 +3479,7 @@ def ops_autopilot(
             f"rejected_low_edge={cycle.rejected_low_edge}, "
             f"escalated_missing_context={cycle.escalated_missing_context}, "
             f"escalated_schema_invalid={cycle.escalated_schema_invalid}, "
+            f"quant_deferred={cycle.quant_deferred}, "
             f"notify_suppressed_duplicate={cycle.notify_suppressed_duplicate})"
         )
         typer.echo(cycle_message)
