@@ -24,10 +24,6 @@ from insider_alerts.strategy.e07 import (
 )
 
 NEW_YORK = ZoneInfo("America/New_York")
-_FINGERPRINT_CACHE: dict[
-    Path,
-    tuple[tuple[tuple[str, int, int], ...], str],
-] = {}
 ARM_PHRASE = "I_ACCEPT_LIVE_CANARY_RISK"
 
 
@@ -208,17 +204,6 @@ def runtime_source_fingerprint(package_root: Path | None = None) -> str:
 
     root = package_root or Path(__file__).resolve().parents[1]
     paths = sorted(root.rglob("*.py"), key=lambda item: item.as_posix())
-    signature = tuple(
-        (
-            path.relative_to(root).as_posix(),
-            path.stat().st_size,
-            path.stat().st_mtime_ns,
-        )
-        for path in paths
-    )
-    cached = _FINGERPRINT_CACHE.get(root)
-    if cached is not None and cached[0] == signature:
-        return cached[1]
     digest = hashlib.sha256()
     for path in paths:
         relative = path.relative_to(root).as_posix().encode("utf-8")
@@ -227,9 +212,7 @@ def runtime_source_fingerprint(package_root: Path | None = None) -> str:
         content = path.read_bytes()
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-    fingerprint = digest.hexdigest()
-    _FINGERPRINT_CACHE[root] = (signature, fingerprint)
-    return fingerprint
+    return digest.hexdigest()
 
 
 class CanaryStore:

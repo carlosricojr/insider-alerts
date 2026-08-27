@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -58,8 +59,10 @@ def test_runtime_source_fingerprint_detects_source_changes(tmp_path: Path) -> No
     source = tmp_path / "module.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
     before = runtime_source_fingerprint(tmp_path)
+    original_stat = source.stat()
 
     source.write_text("VALUE = 2\n", encoding="utf-8")
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     assert runtime_source_fingerprint(tmp_path) != before
 
