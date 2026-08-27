@@ -68,10 +68,12 @@ def test_schedule_is_append_only_idempotent_and_point_in_time(tmp_path: Path) ->
     assert store.append([regular], observed_at_utc=observed) == (1, 0)
     assert store.append([regular], observed_at_utc=observed + timedelta(hours=1)) == (0, 0)
     assert store.append([early], observed_at_utc=observed + timedelta(days=1)) == (1, 1)
+    assert store.append([regular], observed_at_utc=observed + timedelta(days=2)) == (1, 1)
     assert store.schedule_as_known_at(observed) == [regular]
-    assert store.schedule_as_known_at(observed + timedelta(days=2)) == [early]
-    assert store.latest_schedule() == [early]
-    assert store.status()["revision_count"] == 1
+    assert store.schedule_as_known_at(observed + timedelta(days=1)) == [early]
+    assert store.schedule_as_known_at(observed + timedelta(days=2)) == [regular]
+    assert store.latest_schedule() == [regular]
+    assert store.status()["revision_count"] == 2
     assert store.status()["integrity_status"] == "valid"
 
     with sqlite3.connect(store.path) as conn:
@@ -114,6 +116,9 @@ def test_status_does_not_create_missing_database(tmp_path: Path) -> None:
     missing = tmp_path / "wrong.db"
     assert session_feed_status(missing)["integrity_status"] == "missing"
     assert not missing.exists()
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not sqlite")
+    assert session_feed_status(corrupt)["integrity_status"] == "invalid"
 
 
 def test_windows_session_task_is_direct_hidden_pythonw() -> None:

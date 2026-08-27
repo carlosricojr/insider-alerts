@@ -108,7 +108,7 @@ class SessionFeedStore:
                     opens_at_utc TEXT NOT NULL,
                     closes_at_utc TEXT NOT NULL,
                     observed_at_utc TEXT NOT NULL,
-                    value_sha256 TEXT NOT NULL UNIQUE,
+                    value_sha256 TEXT NOT NULL,
                     record_sha256 TEXT NOT NULL UNIQUE,
                     record_json BLOB NOT NULL
                 );
@@ -181,9 +181,14 @@ class SessionFeedStore:
                     "closes_at_utc": _utc_text(session.closes_at_utc),
                 }
                 value_sha = _sha256(_canonical(value))
-                if conn.execute(
-                    "SELECT 1 FROM session_observations WHERE value_sha256=?", (value_sha,)
-                ).fetchone():
+                latest = conn.execute(
+                    """
+                    SELECT value_sha256 FROM session_observations
+                    WHERE session_date=? ORDER BY sequence DESC LIMIT 1
+                    """,
+                    (session.session_date.isoformat(),),
+                ).fetchone()
+                if latest is not None and str(latest["value_sha256"]) == value_sha:
                     continue
                 prior = conn.execute(
                     "SELECT 1 FROM session_observations WHERE session_date=? LIMIT 1",
@@ -424,11 +429,11 @@ def session_feed_status(path: Path | str) -> dict[str, object]:
     selected = Path(path)
     if not selected.is_file():
         return {"exists": False, "path": str(selected), "integrity_status": "missing"}
-    return {
-        "exists": True,
-        "path": str(selected),
-        **SessionFeedStore(selected, initialize=False).status(),
-    }
+    try:
+        status = SessionFeedStore(selected, initialize=False).status()
+    except sqlite3.DatabaseError:
+        status = {"integrity_status": "invalid"}
+    return {"exists": True, "path": str(selected), **status}
 
 
 async def collect_sessions_once(
@@ -440,8 +445,8 @@ async def collect_sessions_once(
 ) -> SessionFeedResult:
     if now.tzinfo is None:
         raise ValueError("session-feed collection time cannot be naive")
-    if calendar_days < 30 or calendar_days > 365:
-        raise ValueError("session-feed calendar_days must be in [30, 365]")
+    if calendar_days < 90 or calendar_days > 365:
+        raise ValueError("session-feed calendar_days must be in [90, 365]")
     store.write_health(
         now=now,
         result="started",
