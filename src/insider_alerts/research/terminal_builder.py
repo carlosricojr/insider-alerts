@@ -6,7 +6,9 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
 import sqlite3
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
@@ -575,13 +577,22 @@ def _publish_dataset(root: Path, terminal: Mapping[str, Any]) -> Path:
     directory = root / "terminal-datasets"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{digest}.json"
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=directory, prefix=f".{digest}.", suffix=".staging"
+    )
+    temporary_path = Path(temporary_name)
     try:
-        with path.open("xb") as stream:
+        with os.fdopen(descriptor, "wb") as stream:
             stream.write(encoded)
             stream.flush()
-    except FileExistsError:
-        if path.read_bytes() != encoded:
-            raise TerminalBuildInvalid("terminal_artifact_path_collision") from None
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            if path.read_bytes() != encoded:
+                raise TerminalBuildInvalid("terminal_artifact_path_collision") from None
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return path
 
 
@@ -735,7 +746,15 @@ def terminal_status(config: TerminalBuildConfig) -> TerminalBuildResult:
         control_membership_count=control_count,
         control_outcomes_waiting=max(0, control_count - control_receipts),
         routine_membership_count=routine_count,
-        reason=("challenger_outcomes_pending" if challenger_waiting else "ready_to_seal"),
+        reason=(
+            "challenger_outcomes_pending"
+            if challenger_waiting
+            else (
+                "ready_to_seal_diagnostics_nonblocking_unavailable"
+                if control_count != control_receipts
+                else "ready_to_seal"
+            )
+        ),
     )
 
 
@@ -763,6 +782,8 @@ def decide_terminal_dataset(
         raise TerminalBuildNotReady("terminal_seal_receipt_missing")
     dataset_digest = str(receipt["terminal_dataset_sha256"])
     artifact = config.artifact_root / "terminal-datasets" / f"{dataset_digest}.json"
+    if not artifact.is_file():
+        raise TerminalBuildInvalid("sealed_terminal_artifact_missing")
     raw = artifact.read_bytes()
     terminal = json.loads(raw)
     if not isinstance(terminal, dict) or _canonical(terminal) != raw:

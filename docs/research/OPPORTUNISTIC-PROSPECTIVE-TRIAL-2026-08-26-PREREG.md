@@ -22,8 +22,12 @@ candidates, to freeze prospective full-control and routine diagnostic membership
 outcome authority, failure isolation, and reconciliation semantics<br>
 Draft correction: 2026-08-27, before activation and with zero evidence snapshots or challenger
 candidates, to bind the terminal-dataset producer, permanent cohort-freeze behavior, explicit
-diagnostic completeness accounting, stable multi-store sealing snapshot, and non-aggregating
-pre-seal validation<br>
+  diagnostic completeness accounting, stable multi-store sealing snapshot, and non-aggregating
+  pre-seal validation<br>
+Draft correction: 2026-08-27, before activation and with zero evidence snapshots or challenger
+candidates, to make explicit that diagnostic receipt or membership catch-up is non-blocking at
+challenger terminal readiness and is sealed as typed group-level `unavailable`, preventing an
+optional diagnostic wait from delaying or conditioning the single primary look<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -290,7 +294,10 @@ falsification context, not additional confirmatory tests.
   receipt commits. It independently reconciles diagnostic membership to the authoritative canary
   and source stores. Each diagnostic group carries exact available/not-traded/unavailable
   accounting; group failure produces an empty, explicitly unavailable diagnostic and cannot alter
-  the challenger. The receipt binds the dataset, complete candidate projection, and immutable
+  the challenger. Missing diagnostic receipts or unresolved diagnostic membership at challenger
+  terminal readiness are terminal group-level unavailability, not a reason to wait; operators may
+  not time the primary seal around diagnostic catch-up. The receipt binds the dataset, complete
+  candidate projection, and immutable
   candidate-universe digests. The dataset is published content-addressed before receipt creation,
   so a crash is safely retryable without creating an alternate scientific dataset.
 - Enrollment deadline: convert `activated_at_utc` to `America/New_York`, add exactly 18 calendar

@@ -4,14 +4,20 @@ import hashlib
 import json
 import sqlite3
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import rfc8785
 
 import insider_alerts.research.inference as inference
 import insider_alerts.research.terminal_builder as builder
-from insider_alerts.research.diagnostics import DiagnosticStore
+from insider_alerts.research.diagnostics import (
+    DIAGNOSTIC_CONTRACT_VERSION,
+    DiagnosticStore,
+    _selection_projection,
+)
 from insider_alerts.research.trial_runtime import (
     EntryCompletionInputs,
     TrialCandidate,
@@ -148,14 +154,85 @@ def _empty_external_stores(tmp_path: Path) -> tuple[Path, Path, Path]:
     DiagnosticStore(diagnostics).validate_integrity()
     canary = tmp_path / "canary.db"
     with sqlite3.connect(canary) as conn:
-        conn.execute("CREATE TABLE candidates(packet_id TEXT,signal_at TEXT,entry_session TEXT)")
+        conn.execute(
+            "CREATE TABLE candidates(packet_id TEXT,accession_number TEXT,cik TEXT,symbol TEXT,"
+            "signal_at TEXT,score REAL,entry_session TEXT,lottery_rank TEXT,eligible INTEGER,"
+            "eligibility_reason TEXT,prior_close REAL,median_dollar_volume_20d REAL,"
+            "planned_quantity INTEGER,created_at TEXT)"
+        )
     source = tmp_path / "source.db"
     with sqlite3.connect(source) as conn:
         conn.execute(
-            "CREATE TABLE research_capture_jobs(packet_id TEXT,"
+            "CREATE TABLE research_capture_jobs(job_id TEXT,packet_id TEXT,"
             "source_first_observed_at_utc TEXT,decision_at_utc TEXT)"
         )
     return diagnostics, canary, source
+
+
+def _install_pending_diagnostic(
+    diagnostics: Path, canary: Path, source: Path, *, entry_date: date
+) -> None:
+    packet_id = "control-packet"
+    signal_at = datetime(2026, 2, 1, 15, 0, tzinfo=UTC)
+    created_at = signal_at - timedelta(seconds=1)
+    with sqlite3.connect(canary) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                packet_id,
+                "control-accession",
+                "1234567890",
+                "CTRL",
+                signal_at.isoformat(),
+                1.0,
+                entry_date.isoformat(),
+                "d" * 64,
+                1,
+                "eligible_E07_F00",
+                10.0,
+                1_000_000.0,
+                20,
+                created_at.isoformat(),
+            ),
+        )
+        row = conn.execute("SELECT * FROM candidates").fetchone()
+        assert row is not None
+        selection = _selection_projection(row)
+    with sqlite3.connect(source) as conn:
+        conn.execute(
+            "INSERT INTO research_capture_jobs VALUES(?,?,?,?)",
+            (
+                "control-job",
+                packet_id,
+                (signal_at - timedelta(seconds=5)).isoformat(),
+                signal_at.isoformat(),
+            ),
+        )
+    selection_sha = hashlib.sha256(rfc8785.dumps(selection)).hexdigest()
+    DiagnosticStore(diagnostics).add_candidate(
+        {
+            "contract_version": DIAGNOSTIC_CONTRACT_VERSION,
+            "hypothesis_id": inference.HYPOTHESIS_ID,
+            "packet_id": packet_id,
+            "registry_sha256": "a" * 64,
+            "canary_activation_utc": builder._utc_text(ACTIVATED_AT),
+            "canary_runtime_source_fingerprint": "b" * 64,
+            "canary_selection": selection,
+            "canary_selection_sha256": selection_sha,
+            "source": {
+                "job_id": "control-job",
+                "source_first_observed_at_utc": builder._utc_text(signal_at - timedelta(seconds=5)),
+                "decision_at_utc": builder._utc_text(signal_at),
+            },
+            "schedule_binding": {
+                "observation_watermark": 1,
+                "record_sha256s": ["c" * 64],
+                "final_session": (entry_date + timedelta(days=14)).isoformat(),
+            },
+            "recorded_at_utc": builder._utc_text(signal_at + timedelta(seconds=1)),
+        }
+    )
 
 
 def _active_registry_path(tmp_path: Path) -> Path:
@@ -270,6 +347,43 @@ def test_builder_waits_for_every_frozen_challenger_outcome(
             conn.close()
 
 
+def test_incomplete_diagnostics_are_unavailable_and_never_delay_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inference, "TARGET_ENROLLED_TRADES", 2)
+    monkeypatch.setattr(inference, "MINIMUM_DISTINCT_ENTRY_DATES", 2)
+    trial = tmp_path / "trial.db"
+    _install_trial(trial)
+    diagnostics, canary, source = _empty_external_stores(tmp_path)
+    _install_pending_diagnostic(diagnostics, canary, source, entry_date=date(2026, 2, 3))
+    connections = []
+    try:
+        for path in (trial, diagnostics, canary, source):
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            connections.append(conn)
+        _snapshot, terminal, counts = builder._build_dataset_locked(
+            *connections, activated_at=ACTIVATED_AT
+        )
+    finally:
+        for conn in reversed(connections):
+            conn.rollback()
+            conn.close()
+
+    assert counts["frozen"] == 3
+    assert terminal["control_trades"] == []
+    assert terminal["routine_trades"] == []
+    assert terminal["diagnostic_group_status"]["control"] == {
+        "status": "unavailable",
+        "error_code": "control_terminal_receipts_incomplete",
+        "membership_count": 1,
+        "available_trade_count": 0,
+        "not_traded_count": 0,
+        "unavailable_count": 1,
+    }
+
+
 def test_public_seal_status_and_single_decision_are_crash_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -289,8 +403,16 @@ def test_public_seal_status_and_single_decision_are_crash_idempotent(
     )
     now = datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
 
-    first = builder.seal_terminal_dataset(config, now=now)
-    replay = builder.seal_terminal_dataset(config, now=now + timedelta(minutes=1))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(builder.seal_terminal_dataset, config, now=now),
+            executor.submit(
+                builder.seal_terminal_dataset,
+                config,
+                now=now + timedelta(minutes=1),
+            ),
+        ]
+        first, replay = (future.result(timeout=30) for future in futures)
     sealed_status = builder.terminal_status(config)
     decision = builder.decide_terminal_dataset(config, now=now + timedelta(minutes=2))
     decision_replay = builder.decide_terminal_dataset(config, now=now + timedelta(minutes=3))
@@ -301,3 +423,32 @@ def test_public_seal_status_and_single_decision_are_crash_idempotent(
     assert decision.status == decision_replay.status == "decided"
     assert decision.decision_report_sha256 == decision_replay.decision_report_sha256
     assert builder.terminal_status(config).decision_report_sha256 == decision.decision_report_sha256
+
+
+def test_decision_fails_closed_with_typed_missing_artifact(tmp_path: Path) -> None:
+    config = builder.TerminalBuildConfig(
+        trial_db=tmp_path / "trial.db",
+        diagnostics_db=tmp_path / "diagnostics.db",
+        canary_ledger_db=tmp_path / "canary.db",
+        source_db=tmp_path / "source.db",
+        registry_path=tmp_path / "registry.json",
+        seal_db=tmp_path / "seals.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store = inference.TrialSealStore(config.seal_db)
+    receipt = inference._build_receipt(
+        kind="terminal_seal",
+        recorded_at=datetime(2026, 2, 10, tzinfo=UTC),
+        deadline=datetime(2027, 7, 31, tzinfo=UTC),
+        terminal_dataset_sha256="a" * 64,
+        candidate_projection_sha256="b" * 64,
+        candidate_universe_sha256="c" * 64,
+    )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "INSERT INTO trial_receipts(kind,receipt_json,receipt_sha256) VALUES(?,?,?)",
+            ("terminal_seal", rfc8785.dumps(receipt), receipt["receipt_sha256"]),
+        )
+
+    with pytest.raises(builder.TerminalBuildInvalid, match="sealed_terminal_artifact_missing"):
+        builder.decide_terminal_dataset(config)

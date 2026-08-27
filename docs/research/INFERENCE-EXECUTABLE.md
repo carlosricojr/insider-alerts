@@ -26,6 +26,10 @@ challenger IDs, evidence digests, ranks, dates, and sequences must exactly equal
 All lists must already be in the registered deterministic order. False integrity checks produce
 `INVALID`, never `KILL`. A malformed diagnostic is typed `unavailable` and cannot affect the
 confirmatory decision.
+Diagnostic membership or receipt catch-up never delays the primary seal. At challenger terminal
+readiness, incomplete diagnostic material becomes an empty, explicitly unavailable group; status
+labels this condition as non-blocking so an operator cannot optionally time the primary look around
+diagnostic completion.
 
 The SQLite seal store uses full synchronization and append-only triggers. Terminal sealing is a
 separate command that does no aggregation. It binds the terminal dataset, complete candidate
