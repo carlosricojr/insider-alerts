@@ -76,11 +76,12 @@ class DiagnosticConfig:
     bar_feed_db: Path
     session_feed_db: Path
     registry_path: Path
+    activation_db: Path
 
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticRunResult:
-    status: Literal["idle_registry_draft", "collecting", "degraded"]
+    status: Literal["idle_registry_draft", "idle_registry_armed", "collecting", "degraded"]
     candidates_seen: int = 0
     candidates_added: int = 0
     evidence_bindings_added: int = 0
@@ -1023,6 +1024,7 @@ class DiagnosticStore:
                 return "stale"
             if value.get("last_result") not in {
                 "idle_registry_draft",
+                "idle_registry_armed",
                 "collecting",
                 "degraded",
             }:
@@ -1278,10 +1280,15 @@ def run_diagnostics_once(
         bar_feed_db=config.bar_feed_db,
         session_feed_db=config.session_feed_db,
         registry_path=config.registry_path,
+        activation_db=config.activation_db,
     )
-    window = _validated_trial_window(trial_config)
-    if window.status == "draft":
-        result = DiagnosticRunResult("idle_registry_draft")
+    window = _validated_trial_window(trial_config, now=now)
+    if window.status != "active":
+        result = (
+            DiagnosticRunResult("idle_registry_draft")
+            if window.status == "draft"
+            else DiagnosticRunResult("idle_registry_armed")
+        )
         store.write_health(now=now, result=result)
         return result
     if window.activated_at_utc is None:

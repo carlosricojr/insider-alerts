@@ -228,9 +228,9 @@ def finalize_pending_entry_dates(
     if now.tzinfo is None:
         raise ValueError("trial finalizer clock cannot be naive")
     now = now.astimezone(UTC)
-    window = _validated_trial_window(config)
-    if window.status == "draft":
-        return FinalizationResult("idle_registry_draft")
+    window = _validated_trial_window(config, now=now)
+    if window.status != "active":
+        return FinalizationResult(f"idle_registry_{window.status}")
     trial_store = TrialStore(config.trial_db, clock=clock)
     session_store = SessionFeedStore(config.session_feed_db, initialize=False)
     bar_store = BarFeedStore(config.bar_feed_db, initialize=False)

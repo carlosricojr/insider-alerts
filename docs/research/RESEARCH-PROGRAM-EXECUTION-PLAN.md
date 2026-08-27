@@ -154,6 +154,9 @@ so no confirmatory enrollment has begun.
 
 - Activate `OPP-E07-V1` only after M2, M3, and M4 are deployed from known merged commits and every
   required artifact digest is sealed.
+- Prepare activation from clean synced production `main` under locks proving every scientific
+  store empty. Seal one boundary at least two hours ahead, then review/deploy the exact stored
+  registry bytes in a separate PR before that boundary; never activate late or choose a new time.
 - Preserve the complete E07/F00 candidate ledger and 20-slot control shadow book.
 - Add a separately ranked, 20-slot opportunistic-only shadow book with identical entry,
   eligibility, costs, duplicate, capacity, barrier, and exit semantics.

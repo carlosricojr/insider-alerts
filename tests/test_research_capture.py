@@ -13,6 +13,7 @@ import pytest
 import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker
 
+import insider_alerts.research.activation as activation_module
 import insider_alerts.research.capture as capture_module
 import insider_alerts.research.inference as inference_module
 import insider_alerts.research.worker as worker_module
@@ -48,7 +49,7 @@ def _active_capture_window(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(
+        lambda config, **_kwargs: CaptureWindow(
             status="active",
             policy_sha256=_policy_sha(config),
             activated_at=datetime(2000, 1, 1, tzinfo=UTC),
@@ -134,6 +135,7 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
         insider_git_commit="a" * 40,
         policy_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
         evidence_schema_path=ROOT / "docs/research/contracts/evidence-snapshot.schema.json",
+        activation_db=tmp_path / "activation.db",
         capture_delay_seconds=1,
     )
 
@@ -147,7 +149,7 @@ def test_draft_registry_heartbeats_without_claiming_or_writing_evidence(
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(status="draft", policy_sha256=_policy_sha(config)),
+        lambda config, **_kwargs: CaptureWindow(status="draft", policy_sha256=_policy_sha(config)),
     )
 
     result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
@@ -169,7 +171,7 @@ def test_active_window_excludes_pre_activation_job_without_snapshot(
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(
+        lambda config, **_kwargs: CaptureWindow(
             status="active",
             policy_sha256=_policy_sha(config),
             activated_at=activation,
@@ -208,7 +210,7 @@ def test_active_window_excludes_exact_deadline_with_mixed_timestamp_encoding(
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(
+        lambda config, **_kwargs: CaptureWindow(
             status="active",
             policy_sha256=_policy_sha(config),
             activated_at=observed_at - timedelta(days=1),
@@ -230,7 +232,7 @@ def test_active_window_includes_exact_activation_with_mixed_timestamp_encoding(
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(
+        lambda config, **_kwargs: CaptureWindow(
             status="active",
             policy_sha256=_policy_sha(config),
             activated_at=observed_at,
@@ -256,7 +258,7 @@ def test_active_window_leaves_terminal_out_of_window_job_immutable(
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(
+        lambda config, **_kwargs: CaptureWindow(
             status="active",
             policy_sha256=_policy_sha(config),
             activated_at=decision_at + timedelta(seconds=1),
@@ -288,7 +290,7 @@ def test_active_window_quarantines_expired_out_of_window_lease(
     monkeypatch.setattr(
         capture_module,
         "_validated_capture_window",
-        lambda config: CaptureWindow(
+        lambda config, **_kwargs: CaptureWindow(
             status="active",
             policy_sha256=_policy_sha(config),
             activated_at=decision_at + timedelta(seconds=1),
@@ -324,6 +326,7 @@ def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
     ).stdout.strip()
     file_sha = inference_module._file_sha256
     registry["activation"] = {
+        "activation_prepared_at_utc": capture_module.utc_text(activated_at - timedelta(hours=2)),
         "activated_at_utc": capture_module.utc_text(activated_at),
         "activation_git_commit": commit,
         "registry_definition_sha256": inference_module.registry_definition_sha256(registry),
@@ -338,16 +341,25 @@ def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
         "terminal_builder_artifact_sha256": file_sha(
             ROOT / "src/insider_alerts/research/terminal_builder.py"
         ),
+        "activation_artifact_sha256": file_sha(ROOT / "src/insider_alerts/research/activation.py"),
         "dependency_lock_sha256": file_sha(ROOT / "uv.lock"),
         "policy_sha256": file_sha(ROOT / registry["strategy"]["policy_artifact"]),
         "classifier_version": inference_module.CLASSIFIER_VERSION,
         "enrollment_start_sequence": 1,
+        "activation_receipt_sha256": "",
     }
+    registry["activation"]["activation_receipt_sha256"] = activation_module.activation_receipt(
+        registry
+    )["receipt_sha256"]
+    activation_module.ActivationStore(tmp_path / "activation.db").put(registry)
     policy_path = tmp_path / "active-registry.json"
-    policy_path.write_text(json.dumps(registry), encoding="utf-8")
+    policy_path.write_bytes(rfc8785.dumps(registry))
     config = replace(_config(tmp_path, tmp_path / "source.db"), policy_path=policy_path)
 
-    assert VALIDATE_CAPTURE_WINDOW(config) == CaptureWindow(
+    assert VALIDATE_CAPTURE_WINDOW(
+        config, now=activated_at - timedelta(microseconds=1)
+    ).status == "armed"
+    assert VALIDATE_CAPTURE_WINDOW(config, now=activated_at) == CaptureWindow(
         status="active",
         policy_sha256=_policy_sha(config),
         activated_at=activated_at,

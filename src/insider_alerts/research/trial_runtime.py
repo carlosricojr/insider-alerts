@@ -17,6 +17,10 @@ from zoneinfo import ZoneInfo
 
 import rfc8785
 
+from insider_alerts.research.activation import (
+    ActivationInvalid,
+    validate_deployed_registry_state,
+)
 from insider_alerts.research.bar_feed import BarFeedStore, BarRequest
 from insider_alerts.research.inference import (
     CAPACITY_RANK_SALT,
@@ -108,7 +112,7 @@ def _require_sha256(value: str, context: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class TrialWindow:
-    status: Literal["draft", "active"]
+    status: Literal["draft", "armed", "active"]
     registry_sha256: str
     activated_at_utc: datetime | None = None
     enrollment_deadline_utc: datetime | None = None
@@ -141,6 +145,7 @@ class TrialRuntimeConfig:
     bar_feed_db: Path
     session_feed_db: Path
     registry_path: Path
+    activation_db: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +237,9 @@ class TrialOutcomeInputs:
     bar_poll_receipt_sha256s: tuple[str, ...]
 
 
-def _validated_trial_window(config: TrialRuntimeConfig) -> TrialWindow:
+def _validated_trial_window(
+    config: TrialRuntimeConfig, *, now: datetime | None = None
+) -> TrialWindow:
     try:
         registry_bytes = config.registry_path.read_bytes()
         registry = json.loads(registry_bytes)
@@ -244,18 +251,30 @@ def _validated_trial_window(config: TrialRuntimeConfig) -> TrialWindow:
     try:
         if status == "draft":
             _validate_registry(registry, allow_draft=True)
+            validate_deployed_registry_state(
+                registry,
+                config.activation_db,
+                registry_bytes=registry_bytes,
+                now=now,
+            )
             return TrialWindow("draft", _sha256(registry_bytes))
         if status != "active":
             raise TrialRuntimeInvalid("prospective_registry_not_draft_or_active")
         _validate_registry(registry, allow_draft=False)
-    except ValueError as exc:
+        phase = validate_deployed_registry_state(
+            registry,
+            config.activation_db,
+            registry_bytes=registry_bytes,
+            now=now,
+        )
+    except (ValueError, ActivationInvalid) as exc:
         raise TrialRuntimeInvalid(f"prospective_registry_invalid:{exc}") from exc
     activation = registry.get("activation")
     if not isinstance(activation, dict):
         raise TrialRuntimeInvalid("active_registry_missing_activation")
     activated_at = _parse_utc(str(activation.get("activated_at_utc", "")))
     return TrialWindow(
-        "active",
+        phase,
         _sha256(registry_bytes),
         activated_at,
         enrollment_deadline(activated_at),
@@ -2521,11 +2540,11 @@ def run_trial_once(
     now = (now or datetime.now(UTC)).astimezone(UTC)
     store = TrialStore(config.trial_db)
     try:
-        window = _validated_trial_window(config)
-        if window.status == "draft":
+        window = _validated_trial_window(config, now=now)
+        if window.status != "active":
             store.write_health(
                 now=now,
-                result="idle_registry_draft",
+                result=f"idle_registry_{window.status}",
                 error=None,
                 evidence_seen=0,
                 unresolved_evidence=0,

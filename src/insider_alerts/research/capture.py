@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
+from insider_alerts.research.activation import validate_deployed_registry_state
 from insider_alerts.research.inference import (
     _validate_registry,
     enrollment_deadline,
@@ -46,6 +47,7 @@ class CaptureConfig:
     insider_git_commit: str
     policy_path: Path
     evidence_schema_path: Path
+    activation_db: Path
     capture_delay_seconds: int = 20
     capture_deadline_seconds: int = 600
     option_timeout_seconds: int = 90
@@ -112,7 +114,7 @@ class ProcessResult:
 
 @dataclass(slots=True, frozen=True)
 class CaptureWindow:
-    status: Literal["draft", "active"]
+    status: Literal["draft", "armed", "active"]
     policy_sha256: str
     activated_at: datetime | None = None
     deadline: datetime | None = None
@@ -868,6 +870,7 @@ def _configuration_sha(config: CaptureConfig) -> str:
         "history_db",
         "policy_path",
         "evidence_schema_path",
+        "activation_db",
     ):
         safe[name] = str(getattr(config, name))
     return sha256_bytes(rfc8785.dumps(safe))
@@ -1160,7 +1163,9 @@ def _heartbeat(config: CaptureConfig, *, now: datetime, result: str, job_id: str
     _write_health(config.evidence_db, now=now, result=result, job_id=job_id)
 
 
-def _validated_capture_window(config: CaptureConfig) -> CaptureWindow:
+def _validated_capture_window(
+    config: CaptureConfig, *, now: datetime | None = None
+) -> CaptureWindow:
     try:
         policy_bytes = config.policy_path.read_bytes()
         registry = json.loads(policy_bytes)
@@ -1171,16 +1176,28 @@ def _validated_capture_window(config: CaptureConfig) -> CaptureWindow:
     status = registry.get("status")
     if status == "draft":
         _validate_registry(registry, allow_draft=True)
+        validate_deployed_registry_state(
+            registry,
+            config.activation_db,
+            registry_bytes=policy_bytes,
+            now=now,
+        )
         return CaptureWindow(status="draft", policy_sha256=sha256_bytes(policy_bytes))
     if status != "active":
         raise ValueError("prospective registry is neither draft nor active")
     _validate_registry(registry, allow_draft=False)
+    phase = validate_deployed_registry_state(
+        registry,
+        config.activation_db,
+        registry_bytes=policy_bytes,
+        now=now,
+    )
     activation = registry.get("activation")
     if not isinstance(activation, dict):
         raise ValueError("active registry has no activation record")
     activated_at = parse_utc(str(activation.get("activated_at_utc", "")))
     return CaptureWindow(
-        status="active",
+        status=phase,
         policy_sha256=sha256_bytes(policy_bytes),
         activated_at=activated_at,
         deadline=enrollment_deadline(activated_at),
@@ -1319,9 +1336,9 @@ def run_capture_once(
     now = (now or datetime.now(UTC)).astimezone(UTC)
     worker_id = worker_id or f"{platform.node()}:{os.getpid()}"
     ensure_evidence_store(config.evidence_db)
-    window = _validated_capture_window(config)
-    if window.status == "draft":
-        _heartbeat(config, now=now, result="idle_registry_draft", job_id=None)
+    window = _validated_capture_window(config, now=now)
+    if window.status != "active":
+        _heartbeat(config, now=now, result=f"idle_registry_{window.status}", job_id=None)
         return CaptureResult(status="idle")
     job = _claim_job(config, worker_id=worker_id, now=now, window=window)
     if job is None:

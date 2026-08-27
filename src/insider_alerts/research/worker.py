@@ -22,6 +22,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database-path", type=Path, default=Path("data/insider_alerts.db"))
     parser.add_argument("--evidence-db", type=Path, default=Path("data/research/evidence.db"))
     parser.add_argument(
+        "--activation-db", type=Path, default=Path("data/research/activation.db")
+    )
+    parser.add_argument(
         "--artifact-root", type=Path, default=Path("data/research/artifacts")
     )
     parser.add_argument("--canary-ledger", type=Path, default=Path("data/live_canary.db"))
@@ -63,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_schema_path=(
                 repo_root / "docs" / "research" / "contracts" / "evidence-snapshot.schema.json"
             ),
+            activation_db=args.activation_db,
             option_timeout_seconds=args.option_timeout,
         )
         result = run_capture_once(config)

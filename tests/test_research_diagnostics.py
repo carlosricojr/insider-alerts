@@ -50,6 +50,7 @@ def _config(tmp_path: Path) -> DiagnosticConfig:
         bar_feed_db=tmp_path / "bars.db",
         session_feed_db=tmp_path / "sessions.db",
         registry_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
+        activation_db=tmp_path / "activation.db",
     )
 
 
@@ -268,7 +269,7 @@ def test_active_diagnostics_bind_control_routine_state_and_bar_requests(
     monkeypatch.setattr(
         diagnostics,
         "_validated_trial_window",
-        lambda _config: TrialWindow(
+        lambda _config, **_kwargs: TrialWindow(
             "active", "a" * 64, activated_at, activated_at + timedelta(days=30)
         ),
     )
@@ -352,7 +353,7 @@ def test_changed_canary_selection_is_append_only_reconciliation(
     monkeypatch.setattr(
         diagnostics,
         "_validated_trial_window",
-        lambda _config: TrialWindow(
+        lambda _config, **_kwargs: TrialWindow(
             "active", "a" * 64, activated_at, activated_at + timedelta(days=30)
         ),
     )
@@ -440,7 +441,7 @@ def test_evidence_provenance_mismatch_remains_degraded_on_later_cycles(
     monkeypatch.setattr(
         diagnostics,
         "_validated_trial_window",
-        lambda _config: TrialWindow(
+        lambda _config, **_kwargs: TrialWindow(
             "active", "a" * 64, activated_at, activated_at + timedelta(days=30)
         ),
     )
@@ -565,8 +566,10 @@ def test_diagnostic_outcome_uses_research_authority_and_records_canary_disagreem
         exit_reason="target",
     )
     window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
-    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config: window)
-    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config, **_kwargs: window)
+    monkeypatch.setattr(
+        diagnostic_outcomes, "_validated_trial_window", lambda _config, **_kwargs: window
+    )
     run_diagnostics_once(config, now=signal_at + timedelta(minutes=2))
     terminal_at = _install_terminal_control_bars(config, days=days)
 
@@ -639,8 +642,10 @@ def test_diagnostic_nontrade_is_explicit(tmp_path: Path, monkeypatch: pytest.Mon
         decision_at=signal_at,
     )
     window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
-    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config: window)
-    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config, **_kwargs: window)
+    monkeypatch.setattr(
+        diagnostic_outcomes, "_validated_trial_window", lambda _config, **_kwargs: window
+    )
     run_diagnostics_once(config, now=signal_at + timedelta(minutes=1))
 
     not_traded = finalize_diagnostic_outcomes(config, now=signal_at + timedelta(minutes=2))
@@ -710,8 +715,10 @@ def test_unavailable_control_does_not_block_later_ready_outcome(
         decision_at=signal_at + timedelta(seconds=1),
     )
     window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
-    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config: window)
-    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(diagnostics, "_validated_trial_window", lambda _config, **_kwargs: window)
+    monkeypatch.setattr(
+        diagnostic_outcomes, "_validated_trial_window", lambda _config, **_kwargs: window
+    )
     run_diagnostics_once(config, now=signal_at + timedelta(minutes=1))
     terminal_at = _install_terminal_control_bars(config, days=days, omit_stock_date=days[0])
     ready_bars = [
@@ -766,7 +773,9 @@ def test_post_freeze_unavailable_receipt_does_not_degrade_outcome_health(
     activated_at = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
     freeze_boundary = date(2026, 8, 28)
     window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
-    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(
+        diagnostic_outcomes, "_validated_trial_window", lambda _config, **_kwargs: window
+    )
     monkeypatch.setattr(
         TrialStore,
         "cohort_freeze",
