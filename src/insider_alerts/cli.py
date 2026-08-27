@@ -79,6 +79,7 @@ from insider_alerts.execution.canary import (
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
+from insider_alerts.research.bar_feed import bar_feed_status
 from insider_alerts.research.capture import capture_status
 from insider_alerts.review.queue import (
     DecisionValidationError,
@@ -3800,6 +3801,17 @@ def ops_research_capture_status(
     settings = get_settings()
     selected_db = database_path or Path(settings.database_path)
     typer.echo(json.dumps(capture_status(selected_db, evidence_db), indent=2, sort_keys=True))
+
+
+@ops_app.command("research-bar-feed-status")
+def ops_research_bar_feed_status(
+    feed_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/bar_feed.db"), "--feed-db"
+    ),
+) -> None:
+    """Show completed-bar feed health and counts without connecting to IBKR."""
+
+    typer.echo(json.dumps(bar_feed_status(feed_db), indent=2, sort_keys=True))
 
 
 @ops_app.command("live-canary-watchdog")

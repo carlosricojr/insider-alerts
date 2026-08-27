@@ -53,3 +53,10 @@ it. A 15-minute task limit recovers a hung cycle. Full pin validation also happe
 replacement. The default history database is
 `data/research/sec_history.db`; override it with `-HistoryDatabase` when needed. Health is
 available from `ops research-capture-status`.
+
+## Prospective completed-bar feed
+
+`install-research-bar-feed-task.ps1` registers a separate direct-`pythonw.exe` task that collects
+only requested, completed IBKR daily bars through a narrow client ID. It does not run in the live
+canary process and does not expose account or order operations. Inspect it with
+`ops research-bar-feed-status`.
