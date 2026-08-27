@@ -3811,7 +3811,10 @@ def ops_research_bar_feed_status(
 ) -> None:
     """Show completed-bar feed health and counts without connecting to IBKR."""
 
-    typer.echo(json.dumps(bar_feed_status(feed_db), indent=2, sort_keys=True))
+    report = bar_feed_status(feed_db)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if report.get("integrity_status") != "valid":
+        raise typer.Exit(code=3)
 
 
 @ops_app.command("live-canary-watchdog")

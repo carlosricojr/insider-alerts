@@ -56,7 +56,15 @@ available from `ops research-capture-status`.
 
 ## Prospective completed-bar feed
 
+Install or refresh the task with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\ops\windows\install-research-bar-feed-task.ps1 -Start
+```
+
 `install-research-bar-feed-task.ps1` registers a separate direct-`pythonw.exe` task that collects
 only requested, completed IBKR daily bars through a narrow client ID. It does not run in the live
 canary process and does not expose account or order operations. Inspect it with
-`ops research-bar-feed-status`.
+`ops research-bar-feed-status`. See [the completed-bar feed contract](../../docs/research/COMPLETED-BAR-FEED.md)
+for request, pacing, and integrity semantics.

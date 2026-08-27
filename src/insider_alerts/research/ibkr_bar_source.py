@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import math
 from datetime import UTC, date, datetime
@@ -12,6 +13,8 @@ from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import SourceBarBatch
 
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_QUALIFY_TIMEOUT_SECONDS = 8.0
+_HISTORICAL_TIMEOUT_SECONDS = 30.0
 NEW_YORK = ZoneInfo("America/New_York")
 
 
@@ -67,7 +70,10 @@ class IbkrHistoricalBarSource:
         previous = bool(self.__ib.RaiseRequestErrors)
         self.__ib.RaiseRequestErrors = True
         try:
-            qualified = await self.__ib.qualifyContractsAsync(contract)
+            qualified = await asyncio.wait_for(
+                self.__ib.qualifyContractsAsync(contract),
+                timeout=_QUALIFY_TIMEOUT_SECONDS,
+            )
         except RequestError as exc:
             raise LookupError(f"IBKR could not qualify US stock symbol {normalized}") from exc
         finally:
@@ -94,8 +100,13 @@ class IbkrHistoricalBarSource:
             "TRADES",
             True,
             2,
-            timeout=30,
+            timeout=_HISTORICAL_TIMEOUT_SECONDS,
         )
+        if not bars:
+            raise RuntimeError(
+                f"IBKR historical bars unavailable for {symbol.upper()} "
+                "(timeout, no data, permissions, or pacing)"
+            )
         output: list[DailyBar] = []
         rejections: list[str] = []
         for bar in bars:

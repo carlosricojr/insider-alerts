@@ -10,7 +10,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from typer.testing import CliRunner
 
+from insider_alerts import cli
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import (
     BarFeedStore,
@@ -19,6 +21,7 @@ from insider_alerts.research.bar_feed import (
     bar_feed_status,
     collect_once,
 )
+from insider_alerts.research.ibkr_bar_source import IbkrHistoricalBarSource
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -163,7 +166,7 @@ def test_final_horizon_remains_collectible_on_following_day(tmp_path: Path) -> N
     store.request(_request(now, through=date(2026, 8, 26)))
     assert len(store.pending_requests(as_of=date(2026, 8, 27))) == 1
     assert len(store.pending_requests(as_of=date(2026, 9, 26))) == 1
-    assert store.status()["overdue_request_count"] == 0
+    assert store.status(now=now)["overdue_request_count"] == 0
     store.append_completed([_bar(date(2026, 8, 26))], observed_at_utc=now)
     assert store.pending_requests(as_of=date(2026, 9, 26)) == []
 
@@ -184,6 +187,38 @@ def test_bad_symbol_does_not_block_later_symbols(tmp_path: Path) -> None:
     assert store.status()["health"]["last_result"] == "partial"
 
 
+def test_source_timeout_is_durable_and_does_not_suppress_retry(tmp_path: Path) -> None:
+    class TimeoutSource(FakeSource):
+        async def daily_bars(self, symbol: str, *, start_date: date) -> SourceBarBatch:
+            self.symbols.append(symbol)
+            raise TimeoutError("simulated application timeout")
+
+    now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
+    store = BarFeedStore(tmp_path / "feed.db")
+    store.request(_request(now))
+    source = TimeoutSource([])
+
+    result = asyncio.run(collect_once(store, source, now=now))
+
+    assert result.failed_symbols == 1
+    assert source.connected == source.disconnected == 1
+    assert len(store.pending_requests(as_of=now.astimezone(NEW_YORK).date())) == 1
+    assert store.status(now=now)["health"]["last_result"] == "partial"
+
+
+def test_ibkr_empty_response_fails_closed() -> None:
+    class EmptyIb:
+        async def reqHistoricalDataAsync(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+    source = IbkrHistoricalBarSource(host="127.0.0.1", port=4001, client_id=176)
+    source._IbkrHistoricalBarSource__ib = EmptyIb()  # type: ignore[attr-defined]
+    source._IbkrHistoricalBarSource__contracts["TEST"] = object()  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="historical bars unavailable"):
+        asyncio.run(source.daily_bars("TEST", start_date=date(2026, 8, 1)))
+
+
 def test_ibkr_source_has_no_account_execution_or_order_api() -> None:
     import insider_alerts.research.ibkr_bar_source as source_module
 
@@ -201,12 +236,25 @@ def test_ibkr_source_has_no_account_execution_or_order_api() -> None:
         "accountSummary",
     }
     assert attributes.isdisjoint(forbidden)
-    imported = {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
     assert not any(module.startswith("insider_alerts.execution") for module in imported)
-    assert '"6 M"' not in source
+    string_literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert "6 M" not in string_literals
 
 
 def test_windows_task_uses_direct_hidden_pythonw() -> None:
+    import insider_alerts.research.bar_feed as bar_feed_module
+    import insider_alerts.research.ibkr_bar_source as source_module
+
     installer = (
         Path(__file__).parents[1] / "ops" / "windows" / "install-research-bar-feed-task.ps1"
     ).read_text(encoding="utf-8")
@@ -216,6 +264,18 @@ def test_windows_task_uses_direct_hidden_pythonw() -> None:
     assert "powershell" not in action.lower()
     assert "cmd.exe" not in action.lower()
     assert "-Hidden" in installer
+    assert "New-TimeSpan -Minutes 60" in installer
+    assert (
+        source_module._QUALIFY_TIMEOUT_SECONDS  # type: ignore[attr-defined]
+        + source_module._HISTORICAL_TIMEOUT_SECONDS  # type: ignore[attr-defined]
+        < bar_feed_module._SOURCE_TIMEOUT_SECONDS  # type: ignore[attr-defined]
+    )
+    worst_case_seconds = (
+        50 * bar_feed_module._SOURCE_TIMEOUT_SECONDS  # type: ignore[attr-defined]
+        + 49 * 11
+        + 10
+    )
+    assert worst_case_seconds < 60 * 60
 
 
 def test_status_record_json_is_canonical_and_self_hashing(tmp_path: Path) -> None:
@@ -243,3 +303,21 @@ def test_status_does_not_create_a_missing_database(tmp_path: Path) -> None:
     corrupt = tmp_path / "corrupt.db"
     corrupt.write_bytes(b"not sqlite")
     assert bar_feed_status(corrupt)["integrity_status"] == "invalid"
+
+
+def test_status_rejects_naive_time_and_cli_uses_integrity_exit_code(tmp_path: Path) -> None:
+    store = BarFeedStore(tmp_path / "feed.db")
+    with pytest.raises(ValueError, match="cannot be naive"):
+        store.status(now=datetime(2026, 8, 27, 12, 0))
+
+    runner = CliRunner()
+    valid = runner.invoke(
+        cli.app,
+        ["ops", "research-bar-feed-status", "--feed-db", str(store.path)],
+    )
+    assert valid.exit_code == 0
+    missing = runner.invoke(
+        cli.app,
+        ["ops", "research-bar-feed-status", "--feed-db", str(tmp_path / "missing.db")],
+    )
+    assert missing.exit_code == 3

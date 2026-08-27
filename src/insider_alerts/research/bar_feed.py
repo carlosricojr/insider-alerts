@@ -21,6 +21,7 @@ import rfc8785
 from insider_alerts.backtest.models import DailyBar
 
 NEW_YORK = ZoneInfo("America/New_York")
+_SOURCE_TIMEOUT_SECONDS = 40.0
 BAR_FEED_VERSION = "ibkr-completed-rth-daily-v1"
 
 
@@ -694,8 +695,10 @@ class BarFeedStore:
                 ),
             )
 
-    def status(self) -> dict[str, object]:
-        today = datetime.now(UTC).astimezone(NEW_YORK).date()
+    def status(self, *, now: datetime | None = None) -> dict[str, object]:
+        if now is not None and now.tzinfo is None:
+            raise ValueError("bar-feed status time cannot be naive")
+        today = (now or datetime.now(UTC)).astimezone(NEW_YORK).date()
         overdue_before = today - timedelta(days=30)
         with contextlib.closing(self._connect()) as conn:
             request_count = int(
@@ -831,7 +834,10 @@ async def collect_once(
             start = min(request.start_date for request in symbol_requests)
             through = max(request.through_date for request in symbol_requests)
             try:
-                batch = await source.daily_bars(symbol, start_date=start)
+                batch = await asyncio.wait_for(
+                    source.daily_bars(symbol, start_date=start),
+                    timeout=_SOURCE_TIMEOUT_SECONDS,
+                )
                 for rejection in batch.rejections:
                     store.record_failure(
                         now=now,
