@@ -74,6 +74,14 @@ class SessionFeedResult:
     rejected_sessions: int
 
 
+@dataclass(frozen=True, slots=True)
+class SessionObservationRecord:
+    sequence: int
+    session: ExchangeSession
+    observed_at_utc: datetime
+    record_sha256: str
+
+
 class ExchangeSessionSource(Protocol):
     async def connect(self) -> None: ...
 
@@ -324,20 +332,63 @@ class SessionFeedStore:
             raise ValueError("session failure columns do not match immutable record")
 
     def schedule_as_known_at(self, as_of_utc: datetime) -> list[ExchangeSession]:
-        rows = self._rows(through_observed_at=as_of_utc)
-        latest: dict[date, tuple[int, ExchangeSession]] = {}
-        for row in rows:
-            session = self._verify_row(row)
-            latest[session.session_date] = (int(row["sequence"]), session)
-        return [latest[day][1] for day in sorted(latest)]
+        return [
+            record.session
+            for record in self.schedule_records_as_known_at(as_of_utc)
+        ]
 
     def latest_schedule(self) -> list[ExchangeSession]:
-        rows = self._rows()
-        latest: dict[date, tuple[int, ExchangeSession]] = {}
+        return [record.session for record in self.latest_schedule_records()]
+
+    def observation_watermark(self) -> int:
+        with contextlib.closing(self._connect()) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM session_observations"
+                ).fetchone()[0]
+            )
+
+    def schedule_records_as_known_at(
+        self,
+        as_of_utc: datetime,
+        *,
+        max_sequence: int | None = None,
+    ) -> list[SessionObservationRecord]:
+        if as_of_utc.tzinfo is None:
+            raise ValueError("schedule as-known boundary cannot be naive")
+        if max_sequence is not None and (
+            isinstance(max_sequence, bool)
+            or not isinstance(max_sequence, int)
+            or max_sequence < 0
+        ):
+            raise ValueError("session observation watermark must be a non-negative integer")
+        rows = self._rows(through_observed_at=as_of_utc)
+        latest: dict[date, tuple[int, SessionObservationRecord]] = {}
         for row in rows:
+            sequence = int(row["sequence"])
+            if max_sequence is not None and sequence > max_sequence:
+                continue
             session = self._verify_row(row)
-            latest[session.session_date] = (int(row["sequence"]), session)
+            latest[session.session_date] = (
+                sequence,
+                SessionObservationRecord(
+                    sequence=sequence,
+                    session=session,
+                    observed_at_utc=_parse_utc(str(row["observed_at_utc"])),
+                    record_sha256=str(row["record_sha256"]),
+                ),
+            )
         return [latest[day][1] for day in sorted(latest)]
+
+    def latest_schedule_records(
+        self,
+        *,
+        max_sequence: int | None = None,
+    ) -> list[SessionObservationRecord]:
+        return self.schedule_records_as_known_at(
+            datetime.max.replace(tzinfo=UTC),
+            max_sequence=max_sequence,
+        )
 
     def completed_through_date(
         self,

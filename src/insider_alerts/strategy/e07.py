@@ -118,7 +118,15 @@ def eligibility(
     signal: E07Signal,
     bars: Sequence[DailyBar],
 ) -> tuple[bool, str, float | None, float | None]:
-    completed = completed_bars(bars, signal.signal_at)
+    return eligibility_from_completed_bars(config, completed_bars(bars, signal.signal_at))
+
+
+def eligibility_from_completed_bars(
+    config: E07Config,
+    completed: Sequence[DailyBar],
+) -> tuple[bool, str, float | None, float | None]:
+    """Evaluate E07 eligibility from an already point-in-time-completed history."""
+
     if len(completed) < 20:
         return False, "fewer_than_20_completed_daily_bars", None, None
     prior_close = completed[-1].close

@@ -7,6 +7,13 @@ Draft correction: 2026-08-26, before activation and with zero challenger snapsho
 published finite-observation state machine rather than require unknowable lifetime history<br>
 Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to freeze the
 inference byte stream, ordering, percentile, tie, and economic-gate arithmetic<br>
+Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to freeze
+pre-open entry-date completion, executable evidence readiness, input watermarks, and lapse
+missingness semantics<br>
+Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to bind
+schedule revisions, healthy-poll receipts, pre-signal eligibility history, the final in-transaction
+decision clock,
+and outcome-independent prior-book occupancy to each entry-date seal<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -59,6 +66,13 @@ a new immutable snapshot supersedes it with `enrolled`,
 gap-free confirmatory sequence, assigned transactionally in ascending rank; every other state has a
 null sequence. The original point-in-time snapshot is never rewritten.
 
+The source first-observed timestamp fixes the intended entry session under the 09:20 ET cutoff.
+Enrollment on that intended date additionally requires both the immutable evidence-recorded time
+and trial import time to be strictly before that date's official submission cutoff. A snapshot or
+import arriving at or after the cutoff does not re-plan the stale signal: it resolves `missed` and
+cannot enter a later cohort. Non-decisional option and feature capture never delays or reopens this
+decision.
+
 ## Base signal and execution policy
 
 The control and challenger use the exact live-canary E07/F00 policy in
@@ -74,6 +88,43 @@ The control and challenger use the exact live-canary E07/F00 policy in
   policy salt, entry session, packet, accession, and symbol; $200 planning notional and whole-share
   eligibility are retained, while primary return aggregation remains equal-notional; and
 - 20 bps round trip primary cost, 50 bps stress cost.
+
+For an official session date `D`, its candidate set is completed in one transaction at or after the
+registered 09:20 ET cutoff and strictly before the official open, using the point-in-time schedule
+known at that transaction. Eligibility uses the exact shared E07 history: watermark-bounded
+first-observed records whose session close is strictly before each signal's
+source-first-observed timestamp. A qualifying session may be collected after the signal because its
+market information was already complete before the signal; no session closing at or after the
+signal is eligible merely because its date precedes `D`. The transaction first snapshots both the
+bar-observation, bar-poll-receipt, and schedule-feed observation watermarks, then binds all
+point-in-time schedule records needed
+for the entry and frozen horizon, exact watermark-bounded bar-record digests, qualifying
+poll-receipt digests, each receipt's transactionally captured bar-observation watermark,
+candidate-set digest, and canonical prior-book material plus digest. Capacity and overlap at
+`D`'s open are recomputed from those bound inputs and the pure E07 kernel; outcome-materialization
+timing is never an enrollment input. Same-date candidates are processed in ascending rank, and
+lower-ranked enrollments immediately consume symbol and slot capacity.
+
+The fixed resolution precedence is `missed`, `ineligible`, `overlap_suppressed`,
+`capacity_suppressed`, then `enrolled`. A healthy completed source poll has an immutable success
+receipt after the last session close needed by that candidate, covers the requested history through
+that session, and reports zero source or validation rejections. Under that proof, fewer than 20
+eligible pre-signal bars is the registered E07 `ineligible` result. Invalid feed integrity, no such
+No qualifying receipt or missing data needed to decide a current candidate's E07 eligibility is systemic
+missingness: finalization waits only until the official open. Missing bars for a prior enrolled
+position instead use a conservative book rule: the position occupies its symbol and one slot
+through its frozen final session, then expires unconditionally after that session; no outcome field
+is consulted. The final in-transaction decision clock is sampled after resolution rows are staged
+and immediately before the immutable completion seal is staged. If that clock is not strictly
+before the official open, the transaction rolls back and an
+append-only lapse resolves every candidate for `D` as `missed`, including later arrivals whose
+intended date was `D`. The schedule watermark and all schedule-record digests used for the official
+open and ten-session horizon are sealed; valid revisions between candidate imports do not prevent a
+completion or lapse and therefore do not halt later dates. A lapse never backdates a completion.
+Digest, ordering, or feed-integrity violations remain `INVALID` and halt completion visibly. A
+completion transaction may return from its durable SQLite commit after the open due to bounded
+system latency, but it cannot incorporate any input or decision sampled after the sealed pre-open
+decision clock.
 
 The control ledger records every otherwise eligible E07/F00 signal and its opened, overlap-, or
 capacity-suppressed outcome; at most 20 control positions are open. The challenger independently
@@ -167,8 +218,12 @@ falsification context, not additional confirmatory tests.
   cumulative enrollment contains at least 100 challenger positions and at least 60 distinct entry
   dates. Include every enrolled position on that boundary date, even when this exceeds 100. The
   trigger uses only entry/enrollment state, never exit timing or returns. Entry-date completeness
-  is an ordered append-only pair of entry date and completion UTC; its New York local date must
-  equal the entry date, and it cannot skip a pending candidate planned for that date.
+  is an ordered append-only record containing entry date, completion UTC, the official schedule
+  proof, bound input watermarks/digests, and resolution-set digest. Completion UTC must map to the
+  entry date in New York, must be at or after the registered 09:20 ET cutoff and strictly before
+  its official open, and cannot skip a candidate imported before the cutoff for
+  that date. A separately ordered lapse record is the only permitted way to advance an intended
+  entry date after its open; every candidate for a lapsed date is permanently `missed`.
 - Terminal information time: after cohort freeze, wait until every frozen position has a final E07
   outcome and all integrity checks pass. A separate no-aggregation command then writes a terminal
   dataset receipt to the append-only seal store before the decision command can calculate any

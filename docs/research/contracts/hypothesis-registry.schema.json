@@ -282,6 +282,16 @@
         "look_count",
         "seal_dataset_before_outcomes",
         "entry_date_completion_proof",
+        "decision_readiness",
+        "entry_date_lapse_policy",
+        "bar_input_binding",
+        "bar_poll_receipt_binding",
+        "schedule_input_binding",
+        "eligibility_history",
+        "healthy_bar_poll_proof",
+        "prior_book_binding",
+        "seal_clock_rule",
+        "missing_prior_position_policy",
         "candidate_universe_binding",
         "seal_store",
         "terminal_seal_command_separate"
@@ -295,7 +305,37 @@
         "max_enrollment_calendar_months": {"const": 18},
         "look_count": {"const": 1},
         "seal_dataset_before_outcomes": {"const": true},
-        "entry_date_completion_proof": {"const": "append_only_completed_at_utc"},
+        "entry_date_completion_proof": {
+          "const": "append_only_pre_open_cutoff_completion_v1"
+        },
+        "decision_readiness": {
+          "const": "evidence_recorded_and_trial_imported_strictly_before_cutoff"
+        },
+        "entry_date_lapse_policy": {"const": "append_only_mass_missed_no_backdating"},
+        "bar_input_binding": {
+          "const": "observation_sequence_watermark_and_record_digests"
+        },
+        "bar_poll_receipt_binding": {
+          "const": "receipt_sequence_watermark_digests_and_observation_watermarks"
+        },
+        "schedule_input_binding": {
+          "const": "observation_sequence_watermark_and_point_in_time_record_digests"
+        },
+        "eligibility_history": {
+          "const": "exact_shared_e07_completed_pre_signal_sessions"
+        },
+        "healthy_bar_poll_proof": {
+          "const": "successful_zero_rejection_receipt_after_prior_required_session_close"
+        },
+        "prior_book_binding": {
+          "const": "watermark_bounded_first_observed_records_and_occupancy_digest"
+        },
+        "seal_clock_rule": {
+          "const": "last_in_transaction_decision_clock_strictly_before_open"
+        },
+        "missing_prior_position_policy": {
+          "const": "occupy_through_frozen_final_session_then_expire_unconditionally"
+        },
         "candidate_universe_binding": {"const": "immutable_identity_provenance_digest"},
         "seal_store": {"const": "append_only_sqlite_singleton_receipts"},
         "terminal_seal_command_separate": {"const": true}

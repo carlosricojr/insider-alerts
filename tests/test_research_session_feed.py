@@ -75,6 +75,14 @@ def test_schedule_is_append_only_idempotent_and_point_in_time(tmp_path: Path) ->
     assert store.schedule_as_known_at(observed + timedelta(days=1)) == [early]
     assert store.schedule_as_known_at(observed + timedelta(days=2)) == [regular]
     assert store.latest_schedule() == [regular]
+    assert store.observation_watermark() == 3
+    first_record = store.schedule_records_as_known_at(
+        observed + timedelta(days=2), max_sequence=1
+    )[0]
+    assert first_record.sequence == 1
+    assert first_record.session == regular
+    assert len(first_record.record_sha256) == 64
+    assert store.latest_schedule_records(max_sequence=2)[0].session == early
     assert store.status()["revision_count"] == 2
     assert store.status()["integrity_status"] == "valid"
 
@@ -89,6 +97,18 @@ def test_schedule_is_append_only_idempotent_and_point_in_time(tmp_path: Path) ->
                 )
                 """
             )
+
+
+def test_schedule_record_boundary_and_watermark_validation(tmp_path: Path) -> None:
+    store = SessionFeedStore(tmp_path / "sessions.db")
+    observed = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    store.append([_session(date(2026, 8, 27))], observed_at_utc=observed)
+
+    with pytest.raises(ValueError, match="naive"):
+        store.schedule_records_as_known_at(datetime(2026, 8, 20, 12, 0))
+    for invalid in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="watermark"):
+            store.schedule_records_as_known_at(observed, max_sequence=invalid)  # type: ignore[arg-type]
 
 
 def test_worker_records_rejections_and_failure_health(tmp_path: Path) -> None:

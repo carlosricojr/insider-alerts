@@ -82,6 +82,7 @@ from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.research.bar_feed import bar_feed_status
 from insider_alerts.research.capture import capture_status
 from insider_alerts.research.session_feed import session_feed_status
+from insider_alerts.research.trial_runtime import trial_runtime_status
 from insider_alerts.review.queue import (
     DecisionValidationError,
     apply_decision,
@@ -3827,6 +3828,20 @@ def ops_research_session_feed_status(
     """Show exchange-session feed health without connecting to IBKR."""
 
     report = session_feed_status(feed_db)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if report.get("integrity_status") != "valid":
+        raise typer.Exit(code=3)
+
+
+@ops_app.command("research-trial-status")
+def ops_research_trial_status(
+    trial_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/trial.db"), "--trial-db"
+    ),
+) -> None:
+    """Show blinded prospective-trial state without reading outcome values."""
+
+    report = trial_runtime_status(trial_db)
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
     if report.get("integrity_status") != "valid":
         raise typer.Exit(code=3)
