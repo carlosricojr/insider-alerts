@@ -268,8 +268,10 @@ def test_connect_disconnects_partially_connected_client(monkeypatch: pytest.Monk
             self.errorEvent = _Event()
             self.connected = False
             self.disconnected = False
+            self.connect_kwargs: dict[str, object] = {}
 
         async def connectAsync(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            self.connect_kwargs = kwargs
             self.connected = True
             raise ConnectionError("handshake failed")
 
@@ -283,11 +285,133 @@ def test_connect_disconnects_partially_connected_client(monkeypatch: pytest.Monk
     monkeypatch.setattr(ib_async, "IB", lambda: fake)
     broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
 
-    with pytest.raises(IbkrExecutionError, match="Gateway unavailable"):
+    with pytest.raises(IbkrExecutionError, match="IBKR_GATEWAY_STARTUP_SYNC_FAILED"):
         asyncio.run(broker.connect(readonly=False))
 
     assert fake.disconnected is True
+    assert fake.connect_kwargs["raiseSyncErrors"] is True
     assert broker.ib is None
+
+
+def test_connect_classifies_empty_handshake_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Event:
+        def __iadd__(self, callback):  # type: ignore[no-untyped-def]
+            return self
+
+        def __isub__(self, callback):  # type: ignore[no-untyped-def]
+            return self
+
+    class _TimedOutIB:
+        def __init__(self) -> None:
+            self.errorEvent = _Event()
+
+        async def connectAsync(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise TimeoutError()
+
+        def isConnected(self) -> bool:
+            return False
+
+        def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(ib_async, "IB", _TimedOutIB)
+    broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
+
+    with pytest.raises(IbkrExecutionError) as captured:
+        asyncio.run(broker.connect(readonly=False))
+
+    assert str(captured.value) == (
+        "IBKR_GATEWAY_HANDSHAKE_TIMEOUT: IB Gateway unavailable at "
+        "127.0.0.1:4001: TimeoutError"
+    )
+
+
+def test_readonly_connect_skips_unneeded_order_startup_fetches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Event:
+        def __iadd__(self, callback):  # type: ignore[no-untyped-def]
+            return self
+
+        def emit(self) -> None:
+            pass
+
+    class _ReadonlyIB:
+        def __init__(self) -> None:
+            self.errorEvent = _Event()
+            self.wrapper = _State(clientId=-1)
+            self.connectedEvent = _Event()
+            self.client = _ReadonlyClient()
+
+        async def connectAsync(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise AssertionError("readonly connection must not start account synchronization")
+
+        def reqMarketDataType(self, market_data_type: int) -> None:
+            assert market_data_type == 1
+
+        def isConnected(self) -> bool:
+            return True
+
+    class _ReadonlyClient:
+        def __init__(self) -> None:
+            self.connect_args: tuple[object, ...] = ()
+
+        async def connectAsync(self, *args) -> None:  # type: ignore[no-untyped-def]
+            self.connect_args = args
+
+        def isReady(self) -> bool:
+            return True
+
+    fake = _ReadonlyIB()
+    monkeypatch.setattr(ib_async, "IB", lambda: fake)
+    broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
+
+    asyncio.run(broker.connect(readonly=True))
+
+    assert fake.wrapper.clientId == 1
+    assert fake.client.connect_args == ("127.0.0.1", 4001, 1, 10.0)
+
+
+def test_account_snapshot_times_out_unknown_order_state_and_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Event:
+        def __isub__(self, callback):  # type: ignore[no-untyped-def]
+            return self
+
+    class _StalledIB:
+        def __init__(self) -> None:
+            self.errorEvent = _Event()
+            self.disconnected = False
+
+        def managedAccounts(self) -> list[str]:
+            return ["ACCT"]
+
+        async def reqAllOpenOrdersAsync(self) -> list[object]:
+            return []
+
+        def isConnected(self) -> bool:
+            return not self.disconnected
+
+        def disconnect(self) -> None:
+            self.disconnected = True
+
+    async def _instant_timeout(awaitable, timeout):  # noqa: ARG001
+        await awaitable
+        raise TimeoutError()
+
+    fake = _StalledIB()
+    broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
+    broker.ib = fake
+    monkeypatch.setattr(ibkr_module.asyncio, "wait_for", _instant_timeout)
+
+    with pytest.raises(IbkrExecutionError, match="IBKR_ALL_OPEN_ORDERS_TIMEOUT"):
+        asyncio.run(broker.account_snapshot())
+
+    assert fake.disconnected is True
+    assert broker.ib is None
+    assert broker._all_open_trades == []
+    assert broker._all_orders_checked_at == 0.0
 
 
 def test_submit_market_on_open_allows_partial_fills() -> None:

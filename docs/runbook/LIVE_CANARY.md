@@ -27,8 +27,14 @@ New buys are disabled if any of these is true:
 - the Gateway exposes multiple accounts without an explicit account selection;
 - cash is insufficient or unsettled;
 - a position or order exists that the canary ledger cannot reconcile;
+- IBKR does not acknowledge completion of startup synchronization or the all-open-orders request
+  within its hard deadline (a timeout is unknown broker state, never an empty order list);
 - the conservative commission preview exceeds $0.75 one-way or 50 bps;
 - IBKR returns any warning/rejection during the preflight.
+
+A shadow-only connection performs just the API handshake and starts no account, position, order,
+or execution synchronization. A live-armed connection keeps IBKR's full startup synchronization;
+every required callback must complete before broker state can be treated as known.
 
 The portal pricing setting is not trusted by itself. The per-order what-if response is the runtime
 authority. A finite exact commission is used when IBKR supplies one. Under Tiered pricing IBKR may
@@ -78,3 +84,12 @@ After a restart, the same API client ID must be used so IBKR can bind and reconc
 The daemon re-reads the live account, canary-tagged orders, and its ledger each cycle. If broker
 state is ambiguous it records a critical event and does not initiate another position. Never
 delete or replace `data/live_canary.db` while canary orders or positions exist.
+
+If status repeatedly reports `IBKR_GATEWAY_HANDSHAKE_TIMEOUT`,
+`IBKR_GATEWAY_STARTUP_SYNC_FAILED`, or `IBKR_ALL_OPEN_ORDERS_TIMEOUT`, inspect IB Gateway itself
+before restarting the worker. A listening socket is insufficient proof of health. Confirm that its
+API server and data farms are green and that the Java process is not reporting
+`OutOfMemoryError`. Keep the Gateway logging level at `Error`; enable the live `Show log` /
+`Show API messages` views or detailed API logging only for a bounded diagnostic session, then turn
+them off. The worker discards a socket after an order-reconciliation failure so a delayed callback
+cannot contaminate a later cycle.
