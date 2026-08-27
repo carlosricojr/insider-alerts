@@ -166,6 +166,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _git_blob(repo_root: Path, commit: str, relative_path: Path) -> bytes:
+    commit = _git_commit_sha(commit)
     try:
         completed = subprocess.run(
             ["git", "show", f"{commit}:{relative_path.as_posix()}"],
@@ -209,6 +210,13 @@ def _sha256(value: Any, context: str) -> str:
     text = _text(value, context)
     if len(text) != 64 or any(char not in SHA256_CHARS for char in text):
         raise TrialInvalid(f"{context}_not_sha256")
+    return text
+
+
+def _git_commit_sha(value: Any) -> str:
+    text = _text(value, "activation_git_commit")
+    if len(text) != 40 or any(char not in SHA256_CHARS for char in text):
+        raise TrialInvalid("activation_git_commit_invalid")
     return text
 
 
@@ -775,8 +783,26 @@ def _invalid_report(payload: Mapping[str, Any], code: str) -> dict[str, Any]:
     )
 
 
+def _reviewed_repo_root() -> Path:
+    required = (
+        Path(".git"),
+        Path("uv.lock"),
+        Path("docs/research/contracts/hypothesis-registry.schema.json"),
+    )
+    seen: set[Path] = set()
+    starts = (Path.cwd().resolve(), Path(__file__).resolve().parent)
+    for start in starts:
+        for candidate in (start, *start.parents):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if all((candidate / relative).exists() for relative in required):
+                return candidate
+    raise TrialInvalid("reviewed_repository_checkout_required")
+
+
 def _validate_registry(registry: Mapping[str, Any], *, allow_draft: bool) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = _reviewed_repo_root()
     schema_path = repo_root / "docs/research/contracts/hypothesis-registry.schema.json"
     try:
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -825,7 +851,7 @@ def _validate_registry(registry: Mapping[str, Any], *, allow_draft: bool) -> Non
         "dependency_lock_sha256": Path("uv.lock"),
         "policy_sha256": Path(str(registry["strategy"]["policy_artifact"])),
     }
-    activation_commit = str(activation.get("activation_git_commit"))
+    activation_commit = _git_commit_sha(activation.get("activation_git_commit"))
     for field, relative_path in artifact_expectations.items():
         expected_digest = activation.get(field)
         if expected_digest != _file_sha256(repo_root / relative_path):
@@ -859,7 +885,7 @@ def _validate_registry(registry: Mapping[str, Any], *, allow_draft: bool) -> Non
                 "git",
                 "merge-base",
                 "--is-ancestor",
-                str(activation.get("activation_git_commit")),
+                activation_commit,
                 "HEAD",
             ],
             cwd=repo_root,
@@ -1058,7 +1084,7 @@ class TrialSealStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS trial_receipts(
@@ -1098,7 +1124,7 @@ class TrialSealStore:
         kind = _text(receipt.get("kind"), "receipt_kind")
         digest = _receipt_sha256(receipt, kind)
         encoded = rfc8785.dumps(dict(receipt))
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT receipt_json FROM trial_receipts WHERE kind=?", (kind,)
@@ -1115,7 +1141,7 @@ class TrialSealStore:
         return dict(receipt)
 
     def receipt(self, kind: Literal["deadline_miss", "terminal_seal"]) -> dict[str, Any] | None:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             row = conn.execute(
                 "SELECT receipt_json FROM trial_receipts WHERE kind=?", (kind,)
             ).fetchone()
@@ -1173,7 +1199,7 @@ class TrialSealStore:
         return self._put_receipt(receipt)
 
     def existing_report(self) -> dict[str, Any] | None:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             row = conn.execute(
                 "SELECT report_json,report_sha256 FROM decision_report WHERE singleton=1"
             ).fetchone()
@@ -1195,7 +1221,7 @@ class TrialSealStore:
         if _canonical_sha256(unsigned) != digest:
             raise TrialInvalid("decision_report_digest_mismatch")
         encoded = rfc8785.dumps(dict(report))
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT report_json FROM decision_report WHERE singleton=1"

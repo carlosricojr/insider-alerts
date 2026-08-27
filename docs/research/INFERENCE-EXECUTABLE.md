@@ -2,7 +2,8 @@
 
 `python -m insider_alerts.research.inference` is the single decision executable for the prospective
 trial. It has no broker imports or order capability. Production execution requires an active
-registry whose definition digest and `inference.py` byte digest match the activation record.
+registry whose definition digest and canonical-content `inference.py` digest match the activation
+record.
 
 The strict input object contains the activation/evaluation instants, ordered append-only entry-date
 completion receipts, the complete candidate enrollment projection, fixed integrity checks, and
@@ -52,5 +53,7 @@ artifacts. Later deployment commits are allowed only when that commit remains an
 bound text artifact still matches after platform-stable CRLF-to-LF canonicalization. After the seal
 command, refresh the outer trial input's `evaluated_at_utc` and integrity state without changing the
 sealed terminal dataset or candidate projection; the decision time must be at or after the terminal
-receipt time. Production CLI input
-cannot claim an activation or evaluation time in the future.
+receipt time. Production CLI input rejects an activation time later than current UTC and allows at
+most one minute of positive clock skew for the evaluation time. Activation validation requires the
+reviewed Git repository checkout (including its registry, schemas, policy, and lockfile); a wheel
+without that checkout is intentionally not an authoritative decision environment.
