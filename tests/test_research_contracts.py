@@ -90,6 +90,13 @@ def test_draft_registry_matches_frozen_contract() -> None:
         "healthy_bar_poll_proof": (
             "successful_zero_rejection_receipt_after_prior_required_session_close"
         ),
+        "outcome_materialization": "after_frozen_tenth_session_healthy_stock_and_spy_polls_v1",
+        "outcome_bar_binding": "first_observed_watermark_and_record_digests",
+        "outcome_schedule_binding": "entry_completion_frozen_ten_session_records",
+        "outcome_missingness": (
+            "terminal_healthy_poll_missing_required_pre_exit_or_benchmark_bar_invalid"
+        ),
+        "outcome_visibility": "individual_immutable_records_no_aggregate_before_terminal_seal",
         "prior_book_binding": "watermark_bounded_first_observed_records_and_occupancy_digest",
         "seal_clock_rule": "last_in_transaction_decision_clock_strictly_before_open",
         "missing_prior_position_policy": (

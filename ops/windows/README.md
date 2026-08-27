@@ -85,6 +85,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 ```
 
 The task runs once per minute as direct hidden `pythonw.exe`, imports newly captured immutable
-candidates, and then seals or lapses eligible entry dates in the same sequential cycle. While the
-registry remains `draft`, it only records an idle heartbeat and cannot enroll candidates. Inspect
-it without connecting to IBKR via `ops research-trial-status`.
+candidates, seals or lapses eligible entry dates, and then materializes mature individual outcomes
+in the same sequential cycle. While the registry remains `draft`, it only records an idle heartbeat
+and cannot enroll candidates. Inspect blinded counts and integrity without connecting to IBKR via
+`ops research-trial-status`; that command never exposes return values.

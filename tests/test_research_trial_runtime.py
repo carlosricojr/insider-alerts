@@ -13,6 +13,7 @@ import rfc8785
 from typer.testing import CliRunner
 
 import insider_alerts.research.trial_finalizer as finalizer
+import insider_alerts.research.trial_outcome_finalizer as outcome_finalizer
 import insider_alerts.research.trial_runtime as runtime
 import insider_alerts.research.trial_worker as trial_worker
 from insider_alerts import cli
@@ -25,6 +26,7 @@ from insider_alerts.research.trial_runtime import (
     EntryLapseInputs,
     PriorBookPosition,
     TrialCandidate,
+    TrialOutcomeInputs,
     TrialResolution,
     TrialRuntimeConfig,
     TrialRuntimeInvalid,
@@ -1164,6 +1166,7 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
     payload = json.loads(capsys.readouterr().out)
     assert payload["candidate_runtime"]["status"] == "idle"
     assert payload["entry_finalizer"]["status"] == "idle_registry_draft"
+    assert payload["outcome_finalizer"]["status"] == "idle_registry_draft"
     assert not error_log.exists()
     assert not (tmp_path / "bars.db").exists()
     assert not (tmp_path / "sessions.db").exists()
@@ -1337,8 +1340,26 @@ def test_windows_trial_task_is_direct_hidden_pythonw() -> None:
     assert "-MultipleInstances IgnoreNew" in installer
 
 
-def _install_finalizer_inputs(config: TrialRuntimeConfig) -> TrialCandidate:
+def _install_finalizer_inputs(
+    config: TrialRuntimeConfig,
+    *,
+    final_session_close: time | None = None,
+) -> TrialCandidate:
     sessions = _sessions(first=date(2026, 7, 1), count=60)
+    if final_session_close is not None:
+        sessions = [
+            replace(
+                session,
+                closes_at_utc=datetime.combine(
+                    session.session_date,
+                    final_session_close,
+                    tzinfo=UTC,
+                ),
+            )
+            if session.session_date == date(2026, 9, 9)
+            else session
+            for session in sessions
+        ]
     SessionFeedStore(config.session_feed_db).append(
         sessions,
         observed_at_utc=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
@@ -1375,6 +1396,113 @@ def _install_finalizer_inputs(config: TrialRuntimeConfig) -> TrialCandidate:
     return candidate
 
 
+def _trial_outcome(candidate: TrialCandidate, completion: dict[str, object]) -> TrialOutcomeInputs:
+    entry_price = 10.0
+    exit_price = 11.0
+    spy_entry = 100.0
+    spy_exit = 101.0
+    schedule_digests = completion["schedule_record_sha256s"]
+    assert isinstance(schedule_digests, list) and schedule_digests
+    return TrialOutcomeInputs(
+        candidate_id=candidate.candidate_id,
+        confirmatory_enrollment_sequence=1,
+        evidence_record_sha256=candidate.evidence_record_sha256,
+        entry_rank_sha256=candidate.entry_rank_sha256,
+        symbol=candidate.symbol,
+        entry_date=candidate.planned_entry_date,
+        entry_at_utc=ENTRY_OPEN,
+        exit_date=candidate.planned_entry_date,
+        exit_at_utc=datetime(2026, 8, 27, 20, 0, tzinfo=UTC),
+        entry_price=entry_price,
+        exit_price=exit_price,
+        exit_reason="target",
+        gross_return=exit_price / entry_price - 1.0,
+        spy_entry_price=spy_entry,
+        spy_exit_price=spy_exit,
+        spy_return=spy_exit / spy_entry - 1.0,
+        recorded_at_utc=datetime(2026, 8, 27, 20, 1, tzinfo=UTC),
+        schedule_observation_watermark=int(completion["schedule_observation_watermark"]),
+        schedule_record_sha256s=(str(schedule_digests[0]),),
+        bar_observation_watermark=20,
+        bar_poll_receipt_watermark=2,
+        bar_record_sha256s=("b" * 64,),
+        bar_poll_receipt_sha256s=("c" * 64,),
+    )
+
+
+def _install_terminal_outcome_bars(
+    config: TrialRuntimeConfig,
+    candidate: TrialCandidate,
+    *,
+    omit_stock_date: date | None = None,
+    omit_spy_date: date | None = None,
+    receipt_before_bars: bool = False,
+    exit_style: str = "target",
+) -> datetime:
+    assert exit_style in {"target", "time", "gap_stop"}
+    sessions = [
+        session
+        for session in SessionFeedStore(config.session_feed_db, initialize=False).latest_schedule()
+        if candidate.planned_entry_date <= session.session_date <= candidate.final_session_date
+    ]
+    assert len(sessions) == 10
+    observed_at = sessions[-1].closes_at_utc + timedelta(minutes=30)
+    store = BarFeedStore(config.bar_feed_db)
+
+    def record_receipts(now: datetime) -> None:
+        for symbol in (candidate.symbol, "SPY"):
+            omitted = omit_stock_date if symbol == candidate.symbol else omit_spy_date
+            returned = 9 if omitted is not None else 10
+            store.record_successful_poll(
+                symbol,
+                local_date=now.astimezone(runtime.NEW_YORK).date(),
+                earliest_start_date=candidate.planned_entry_date - timedelta(days=120),
+                requested_through_date=candidate.final_session_date,
+                completed_through_date=candidate.final_session_date,
+                now=now,
+                returned_bar_count=returned,
+                in_range_bar_count=returned,
+                source_rejection_count=0,
+                validation_rejection_count=0,
+            )
+
+    if receipt_before_bars:
+        record_receipts(observed_at - timedelta(minutes=1))
+    stock_bars: list[DailyBar] = []
+    for index, session in enumerate(sessions):
+        if session.session_date == omit_stock_date:
+            continue
+        open_price, high, low, close = 10.0, 10.5, 9.5, 10.25
+        if exit_style == "target":
+            high = 11.0
+        elif exit_style == "gap_stop" and index == 1:
+            open_price, high, low, close = 8.5, 9.0, 8.0, 8.7
+        stock_bars.append(
+            DailyBar(
+                candidate.symbol,
+                session.session_date,
+                open_price,
+                high,
+                low,
+                close,
+                100_000.0,
+            )
+        )
+    spy_bars = [
+        DailyBar("SPY", session.session_date, 100.0, 102.0, 99.0, 101.0, 1_000_000.0)
+        for session in sessions
+        if session.session_date != omit_spy_date
+    ]
+    store.append_completed(
+        [*stock_bars, *spy_bars],
+        observed_at_utc=observed_at,
+        completed_through_date=candidate.final_session_date,
+    )
+    if not receipt_before_bars:
+        record_receipts(observed_at + timedelta(minutes=1))
+    return observed_at + timedelta(minutes=2)
+
+
 def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1407,6 +1535,301 @@ def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
     assert len(completion["bar_record_sha256s"]) == 20
     assert len(completion["bar_poll_receipt_sha256s"]) == 1
     assert completion["prior_book_positions"] == []
+
+
+def test_trial_outcome_is_append_only_bound_and_status_blinded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    store = TrialStore(config.trial_db)
+    completion = store.entry_completion_records()[0]
+    outcome = _trial_outcome(candidate, completion)
+
+    with pytest.raises(TrialRuntimeInvalid, match="return_price_mismatch"):
+        store.append_outcome(replace(outcome, gross_return=0.5))
+    assert store.outcome_candidate_ids() == frozenset()
+
+    digest = store.append_outcome(outcome)
+
+    assert store.append_outcome(outcome) == digest
+    conflicting = replace(outcome, exit_price=12.0, gross_return=0.2)
+    with pytest.raises(TrialRuntimeInvalid, match="trial_outcome_conflicting_replay"):
+        store.append_outcome(conflicting)
+    assert store.outcome_candidate_ids() == frozenset({candidate.candidate_id})
+    assert store.outcomes() == [outcome]
+    store.validate_integrity()
+    status = store.status()
+    assert status["outcomes"] == 1
+    assert "gross_return" not in json.dumps(status, sort_keys=True)
+
+    with sqlite3.connect(store.path) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE trial_outcomes SET recorded_at_utc='2026-01-01T00:00:00Z'")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("DELETE FROM trial_outcomes")
+
+
+def test_outcome_finalizer_waits_for_terminal_proof_then_materializes_without_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+
+    before_terminal = outcome_finalizer.finalize_trial_outcomes(
+        config, clock=lambda: datetime(2026, 8, 28, 20, 30, tzinfo=UTC)
+    )
+    assert before_terminal.status == "waiting"
+    assert TrialStore(config.trial_db).outcome_candidate_ids() == frozenset()
+
+    horizon = [
+        session
+        for session in SessionFeedStore(config.session_feed_db, initialize=False).latest_schedule()
+        if candidate.planned_entry_date <= session.session_date <= candidate.final_session_date
+    ]
+    materialized_at = _install_terminal_outcome_bars(
+        config,
+        candidate,
+        omit_stock_date=horizon[4].session_date,
+    )
+    result = outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: materialized_at)
+
+    assert result == outcome_finalizer.OutcomeFinalizationResult("complete", outcomes_added=1)
+    outcome = TrialStore(config.trial_db).outcomes()[0]
+    assert outcome.candidate_id == candidate.candidate_id
+    assert outcome.exit_reason == "target"
+    assert outcome.exit_date == candidate.planned_entry_date
+    assert len(outcome.schedule_record_sha256s) == 10
+    assert len(outcome.bar_record_sha256s) == 2
+    assert len(outcome.bar_poll_receipt_sha256s) == 2
+
+
+def test_outcome_finalizer_waits_for_receipt_that_observed_terminal_bars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    now = _install_terminal_outcome_bars(config, candidate, receipt_before_bars=True)
+
+    result = outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: now)
+
+    assert result.status == "waiting"
+    assert result.reason == "terminal_bar_or_receipt_proof_unavailable"
+    assert TrialStore(config.trial_db).outcome_candidate_ids() == frozenset()
+
+
+def test_outcome_finalizer_rejects_terminal_healthy_poll_with_missing_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    sessions = [
+        session
+        for session in SessionFeedStore(config.session_feed_db, initialize=False).latest_schedule()
+        if candidate.planned_entry_date <= session.session_date <= candidate.final_session_date
+    ]
+    now = _install_terminal_outcome_bars(
+        config,
+        candidate,
+        omit_stock_date=sessions[4].session_date,
+        exit_style="time",
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="terminal_stock_path_incomplete"):
+        outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: now)
+
+    assert TrialStore(config.trial_db).outcome_candidate_ids() == frozenset()
+
+
+def test_outcome_finalizer_rejects_terminal_healthy_poll_with_missing_spy_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    now = _install_terminal_outcome_bars(
+        config,
+        candidate,
+        omit_spy_date=candidate.planned_entry_date,
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_terminal_spy_benchmark_incomplete"):
+        outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: now)
+
+
+def test_outcome_finalizer_materializes_time_exit_at_frozen_early_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config, final_session_close=time(17, 0))
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    now = _install_terminal_outcome_bars(config, candidate, exit_style="time")
+
+    result = outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: now)
+
+    assert result == outcome_finalizer.OutcomeFinalizationResult("complete", outcomes_added=1)
+    outcome = TrialStore(config.trial_db).outcomes()[0]
+    assert outcome.exit_reason == "time"
+    assert outcome.exit_date == candidate.final_session_date
+    assert outcome.exit_at_utc == datetime(2026, 9, 9, 17, 0, tzinfo=UTC)
+    assert outcome.exit_price == 10.25
+
+
+def test_outcome_finalizer_materializes_gap_down_stop_price(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    now = _install_terminal_outcome_bars(config, candidate, exit_style="gap_stop")
+
+    result = outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: now)
+
+    assert result == outcome_finalizer.OutcomeFinalizationResult("complete", outcomes_added=1)
+    outcome = TrialStore(config.trial_db).outcomes()[0]
+    assert outcome.exit_reason == "stop"
+    assert outcome.exit_price == 8.5
+    assert outcome.gross_return == pytest.approx(-0.15)
+
+
+def test_outcome_finalizer_rejects_corrupt_frozen_schedule_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    store = TrialStore(config.trial_db)
+    completion = store.entry_completion_records()[0]
+    completion["schedule_record_sha256s"] = ["0" * 64]
+
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_frozen_schedule_binding_invalid"):
+        outcome_finalizer._bound_horizon(
+            SessionFeedStore(config.session_feed_db, initialize=False),
+            completion,
+            candidate,
+        )
+
+
+def test_waiting_candidate_does_not_block_later_ready_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    first = _install_finalizer_inputs(config)
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    second = _trial_candidate(
+        "d",
+        symbol="READY",
+        rank="2",
+        evidence_recorded_at=ready,
+        imported_at=ready,
+    )
+    trial_store = TrialStore(config.trial_db)
+    assert trial_store.append_candidate(second)
+    sessions = SessionFeedStore(config.session_feed_db, initialize=False).latest_schedule()
+    completed = [
+        session
+        for session in sessions
+        if session.closes_at_utc < second.source_first_observed_at_utc
+    ][-20:]
+    bar_store = BarFeedStore(config.bar_feed_db, initialize=False)
+    assert bar_store.append_completed(
+        [
+            DailyBar("READY", session.session_date, 10.0, 11.0, 9.0, 10.0, 100_000.0)
+            for session in completed
+        ],
+        observed_at_utc=datetime(2026, 8, 27, 13, 19, tzinfo=UTC),
+    ) == (20, 0, 0)
+    bar_store.record_successful_poll(
+        "READY",
+        local_date=date(2026, 8, 27),
+        earliest_start_date=date(2026, 4, 29),
+        requested_through_date=second.final_session_date,
+        completed_through_date=completed[-1].session_date,
+        now=datetime(2026, 8, 27, 13, 19, tzinfo=UTC),
+        returned_bar_count=20,
+        in_range_bar_count=20,
+        source_rejection_count=0,
+        validation_rejection_count=0,
+    )
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+    )
+    sealed = finalizer.finalize_pending_entry_dates(
+        config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
+    assert sealed.dates_completed == 1
+    assert [item.enrollment_state for item in trial_store.resolutions()] == [
+        "enrolled",
+        "enrolled",
+    ]
+    now = _install_terminal_outcome_bars(config, second)
+
+    result = outcome_finalizer.finalize_trial_outcomes(config, clock=lambda: now)
+
+    assert result == outcome_finalizer.OutcomeFinalizationResult(
+        "waiting",
+        outcomes_added=1,
+        outcomes_waiting=1,
+        reason="terminal_bar_or_receipt_proof_unavailable",
+    )
+    assert trial_store.outcome_candidate_ids() == frozenset({second.candidate_id})
+    assert first.candidate_id not in trial_store.outcome_candidate_ids()
 
 
 def test_finalizer_waits_for_healthy_poll_then_lapses_at_official_open(
