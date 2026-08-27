@@ -96,7 +96,11 @@
     "max_enrollment_calendar_months": 18,
     "look_count": 1,
     "seal_dataset_before_outcomes": true,
-    "entry_date_completion_proof": "append_only_completed_at_utc",
+    "entry_date_completion_proof": "append_only_pre_open_cutoff_completion_v1",
+    "decision_readiness": "evidence_recorded_and_trial_imported_strictly_before_cutoff",
+    "entry_date_lapse_policy": "append_only_mass_missed_no_backdating",
+    "bar_input_binding": "observation_sequence_watermark_and_record_digests",
+    "schedule_input_binding": "point_in_time_schedule_record_digests",
     "candidate_universe_binding": "immutable_identity_provenance_digest",
     "seal_store": "append_only_sqlite_singleton_receipts",
     "terminal_seal_command_separate": true

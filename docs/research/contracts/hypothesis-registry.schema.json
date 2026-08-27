@@ -282,6 +282,10 @@
         "look_count",
         "seal_dataset_before_outcomes",
         "entry_date_completion_proof",
+        "decision_readiness",
+        "entry_date_lapse_policy",
+        "bar_input_binding",
+        "schedule_input_binding",
         "candidate_universe_binding",
         "seal_store",
         "terminal_seal_command_separate"
@@ -295,7 +299,17 @@
         "max_enrollment_calendar_months": {"const": 18},
         "look_count": {"const": 1},
         "seal_dataset_before_outcomes": {"const": true},
-        "entry_date_completion_proof": {"const": "append_only_completed_at_utc"},
+        "entry_date_completion_proof": {
+          "const": "append_only_pre_open_cutoff_completion_v1"
+        },
+        "decision_readiness": {
+          "const": "evidence_recorded_and_trial_imported_strictly_before_cutoff"
+        },
+        "entry_date_lapse_policy": {"const": "append_only_mass_missed_no_backdating"},
+        "bar_input_binding": {
+          "const": "observation_sequence_watermark_and_record_digests"
+        },
+        "schedule_input_binding": {"const": "point_in_time_schedule_record_digests"},
         "candidate_universe_binding": {"const": "immutable_identity_provenance_digest"},
         "seal_store": {"const": "append_only_sqlite_singleton_receipts"},
         "terminal_seal_command_separate": {"const": true}
