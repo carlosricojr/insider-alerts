@@ -100,7 +100,12 @@
     "decision_readiness": "evidence_recorded_and_trial_imported_strictly_before_cutoff",
     "entry_date_lapse_policy": "append_only_mass_missed_no_backdating",
     "bar_input_binding": "observation_sequence_watermark_and_record_digests",
-    "schedule_input_binding": "point_in_time_schedule_record_digests",
+    "schedule_input_binding": "observation_sequence_watermark_and_point_in_time_record_digests",
+    "eligibility_history": "exact_shared_e07_completed_pre_signal_sessions",
+    "healthy_bar_poll_proof": "successful_zero_rejection_receipt_after_prior_required_session_close",
+    "prior_book_binding": "watermark_bounded_first_observed_records_and_occupancy_digest",
+    "seal_commit_clock": "transaction_wall_clock_strictly_before_open",
+    "missing_prior_position_policy": "occupy_through_frozen_final_session_then_expire_unconditionally",
     "candidate_universe_binding": "immutable_identity_provenance_digest",
     "seal_store": "append_only_sqlite_singleton_receipts",
     "terminal_seal_command_separate": true

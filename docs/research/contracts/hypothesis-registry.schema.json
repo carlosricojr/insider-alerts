@@ -286,6 +286,11 @@
         "entry_date_lapse_policy",
         "bar_input_binding",
         "schedule_input_binding",
+        "eligibility_history",
+        "healthy_bar_poll_proof",
+        "prior_book_binding",
+        "seal_commit_clock",
+        "missing_prior_position_policy",
         "candidate_universe_binding",
         "seal_store",
         "terminal_seal_command_separate"
@@ -309,7 +314,22 @@
         "bar_input_binding": {
           "const": "observation_sequence_watermark_and_record_digests"
         },
-        "schedule_input_binding": {"const": "point_in_time_schedule_record_digests"},
+        "schedule_input_binding": {
+          "const": "observation_sequence_watermark_and_point_in_time_record_digests"
+        },
+        "eligibility_history": {
+          "const": "exact_shared_e07_completed_pre_signal_sessions"
+        },
+        "healthy_bar_poll_proof": {
+          "const": "successful_zero_rejection_receipt_after_prior_required_session_close"
+        },
+        "prior_book_binding": {
+          "const": "watermark_bounded_first_observed_records_and_occupancy_digest"
+        },
+        "seal_commit_clock": {"const": "transaction_wall_clock_strictly_before_open"},
+        "missing_prior_position_policy": {
+          "const": "occupy_through_frozen_final_session_then_expire_unconditionally"
+        },
         "candidate_universe_binding": {"const": "immutable_identity_provenance_digest"},
         "seal_store": {"const": "append_only_sqlite_singleton_receipts"},
         "terminal_seal_command_separate": {"const": true}
