@@ -81,6 +81,7 @@ from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.research.bar_feed import bar_feed_status
 from insider_alerts.research.capture import capture_status
+from insider_alerts.research.diagnostics import diagnostic_status
 from insider_alerts.research.session_feed import session_feed_status
 from insider_alerts.research.trial_runtime import trial_runtime_status
 from insider_alerts.review.queue import (
@@ -3844,6 +3845,23 @@ def ops_research_trial_status(
     report = trial_runtime_status(trial_db)
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
     if report.get("integrity_status") != "valid":
+        raise typer.Exit(code=3)
+
+
+@ops_app.command("research-diagnostics-status")
+def ops_research_diagnostics_status(
+    diagnostics_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/diagnostics.db"), "--diagnostics-db"
+    ),
+) -> None:
+    """Show isolated control-diagnostic health without reading return values."""
+
+    report = diagnostic_status(diagnostics_db)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if (
+        report.get("integrity_status") != "valid"
+        or report.get("operational_status") != "healthy"
+    ):
         raise typer.Exit(code=3)
 
 

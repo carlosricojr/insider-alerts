@@ -96,8 +96,12 @@ def _request(now: datetime, *, through: date | None = None) -> BarRequest:
 def test_feed_is_append_only_idempotent_and_preserves_revisions(tmp_path: Path) -> None:
     now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
     store = BarFeedStore(tmp_path / "feed.db")
+    assert store.has_request(_request(now).request_id) is False
     digest = store.request(_request(now))
+    assert store.has_request(_request(now).request_id) is True
     assert store.request(_request(now)) == digest
+    with pytest.raises(ValueError, match="cannot be empty"):
+        store.has_request("")
     with pytest.raises(ValueError, match="different"):
         store.request(replace(_request(now), symbol="OTHER"))
 
