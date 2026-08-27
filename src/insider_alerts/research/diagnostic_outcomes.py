@@ -52,6 +52,8 @@ def _agreement(
         "symbol": proof.symbol,
         "entry_session": proof.entry_date.isoformat(),
         "entry_price": proof.entry_price,
+        "stop_price": proof.stop_price,
+        "target_price": proof.target_price,
         "exit_session": proof.exit_date.isoformat(),
         "exit_price": proof.exit_price,
         "exit_reason": proof.exit_reason,
@@ -99,6 +101,8 @@ def _outcome_record(
         "exit_date": proof.exit_date.isoformat(),
         "exit_at_utc": _utc_text(proof.exit_at_utc),
         "entry_price": proof.entry_price,
+        "stop_price": proof.stop_price,
+        "target_price": proof.target_price,
         "exit_price": proof.exit_price,
         "exit_reason": proof.exit_reason,
         "gross_return": proof.gross_return,
@@ -294,13 +298,6 @@ def finalize_diagnostic_outcomes(
                 else:
                     outcome_disposition = "unavailable"
                     reason = "canary_research_outcome_mismatch"
-                outcome_added, receipt_added = store.append_outcome_receipt(
-                    outcome_record=outcome,
-                    receipt_record=receipt(outcome_disposition, reason),
-                )
-                outcomes_added += int(outcome_added)
-                receipts_added += int(receipt_added)
-                if agreement["status"] == "mismatch":
                     reconciliations += int(
                         store.add_reconciliation(
                             packet_id=packet_id,
@@ -312,6 +309,12 @@ def finalize_diagnostic_outcomes(
                             now=now,
                         )
                     )
+                outcome_added, receipt_added = store.append_outcome_receipt(
+                    outcome_record=outcome,
+                    receipt_record=receipt(outcome_disposition, reason),
+                )
+                outcomes_added += int(outcome_added)
+                receipts_added += int(receipt_added)
                 continue
         _, receipt_added = store.append_outcome_receipt(
             outcome_record=None,

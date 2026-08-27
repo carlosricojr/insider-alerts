@@ -34,6 +34,8 @@ class ResearchOutcomeProof:
     exit_date: date
     exit_at_utc: datetime
     entry_price: float
+    stop_price: float
+    target_price: float
     exit_price: float
     exit_reason: Literal["stop", "target", "time", "stop_and_target_same_day_stop_assumed"]
     gross_return: float
@@ -193,6 +195,8 @@ def materialize_research_outcome(
     )
     if (
         shadow.entry_bar is None
+        or shadow.stop_price is None
+        or shadow.target_price is None
         or shadow.exit_bar is None
         or shadow.exit_price is None
         or shadow.exit_reason is None
@@ -227,6 +231,8 @@ def materialize_research_outcome(
         exit_date=shadow.exit_bar.trade_date,
         exit_at_utc=exit_session.session.closes_at_utc,
         entry_price=entry_price,
+        stop_price=shadow.stop_price,
+        target_price=shadow.target_price,
         exit_price=shadow.exit_price,
         exit_reason=cast(
             Literal["stop", "target", "time", "stop_and_target_same_day_stop_assumed"],

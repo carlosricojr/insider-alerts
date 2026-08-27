@@ -556,10 +556,10 @@ def test_diagnostic_outcome_uses_research_authority_and_records_canary_disagreem
         row,
         quantity=20,
         entry_bar=entry_bar,
-        stop_price=9.0,
+        stop_price=8.9,
         target_price=11.0,
         exit_bar=entry_bar,
-        exit_price=10.9,
+        exit_price=11.0,
         exit_reason="target",
     )
     window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
@@ -568,11 +568,25 @@ def test_diagnostic_outcome_uses_research_authority_and_records_canary_disagreem
     run_diagnostics_once(config, now=signal_at + timedelta(minutes=2))
     terminal_at = _install_terminal_control_bars(config, days=days)
 
+    append_outcome_receipt = DiagnosticStore.append_outcome_receipt
+    monkeypatch.setattr(
+        DiagnosticStore,
+        "append_outcome_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("post-reconciliation crash")),
+    )
+    with pytest.raises(RuntimeError, match="post-reconciliation crash"):
+        finalize_diagnostic_outcomes(config, now=terminal_at)
+    with sqlite3.connect(config.diagnostics_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM diagnostic_reconciliations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM diagnostic_outcomes").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM diagnostic_outcome_receipts").fetchone()[0] == 0
+    monkeypatch.setattr(DiagnosticStore, "append_outcome_receipt", append_outcome_receipt)
+
     result = finalize_diagnostic_outcomes(config, now=terminal_at)
     replay = finalize_diagnostic_outcomes(config, now=terminal_at + timedelta(minutes=1))
 
     assert result.outcomes_added == result.receipts_added == 1
-    assert result.reconciliations_added == 1
+    assert result.reconciliations_added == 0
     assert replay.outcomes_added == replay.receipts_added == 0
     assert DiagnosticStore(config.diagnostics_db).outcome_disposition_counts() == {"unavailable": 1}
     with sqlite3.connect(config.diagnostics_db) as conn:
@@ -587,6 +601,7 @@ def test_diagnostic_outcome_uses_research_authority_and_records_canary_disagreem
         }
     assert outcome["exit_price"] == 11.0
     assert outcome["canary_agreement"]["status"] == "mismatch"
+    assert outcome["canary_agreement"]["mismatched_fields"] == ["stop_price"]
     assert receipt is not None
     assert receipt[0:2] == ("unavailable", "canary_research_outcome_mismatch")
     assert receipt[2] is not None

@@ -712,6 +712,7 @@ class DiagnosticStore:
             "diagnostic_outcome_receipts",
         )
         with contextlib.closing(self._connect()) as conn:
+            conn.execute("BEGIN")
             for table in tables:
                 rows = conn.execute(f"SELECT * FROM {table} ORDER BY sequence").fetchall()
                 if [int(row["sequence"]) for row in rows] != list(range(1, len(rows) + 1)):
@@ -880,6 +881,8 @@ class DiagnosticStore:
         elif table == "diagnostic_outcomes":
             numeric = (
                 "entry_price",
+                "stop_price",
+                "target_price",
                 "exit_price",
                 "gross_return",
                 "spy_entry_price",
@@ -900,6 +903,9 @@ class DiagnosticStore:
                 or str(row["trade_id"]) != _diagnostic_trade_id(str(row["packet_id"]))
                 or not all(math.isfinite(value) for value in values.values())
                 or values["entry_price"] <= 0
+                or values["stop_price"] <= 0
+                or values["stop_price"] >= values["entry_price"]
+                or values["target_price"] <= values["entry_price"]
                 or values["exit_price"] <= 0
                 or values["spy_entry_price"] <= 0
                 or values["spy_exit_price"] <= 0

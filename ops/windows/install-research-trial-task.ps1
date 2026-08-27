@@ -19,6 +19,9 @@ $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments = @(
   "-m insider_alerts.research.trial_worker",
   "--trial-db `"$repoRoot\data\research\trial.db`"",
+  "--diagnostics-db `"$repoRoot\data\research\diagnostics.db`"",
+  "--canary-ledger-db `"$repoRoot\data\live_canary.db`"",
+  "--source-db `"$repoRoot\data\insider_alerts.db`"",
   "--evidence-db `"$repoRoot\data\research\evidence.db`"",
   "--bar-feed-db `"$repoRoot\data\research\bar_feed.db`"",
   "--session-feed-db `"$repoRoot\data\research\session_feed.db`"",

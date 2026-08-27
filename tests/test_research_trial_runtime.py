@@ -4,9 +4,11 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import rfc8785
@@ -1174,6 +1176,101 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
     assert not (tmp_path / "sessions.db").exists()
 
 
+def test_trial_worker_runs_time_sensitive_confirmatory_phases_before_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order: list[str] = []
+
+    def ordered(name: str, function: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            order.append(name)
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        trial_worker,
+        "run_trial_once",
+        ordered("candidate_runtime", trial_worker.run_trial_once),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        ordered("entry_finalizer", trial_worker.finalize_pending_entry_dates),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_trial_outcomes",
+        ordered("outcome_finalizer", trial_worker.finalize_trial_outcomes),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "run_diagnostics_once",
+        ordered("diagnostic_capture", trial_worker.run_diagnostics_once),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_diagnostic_outcomes",
+        ordered("diagnostic_outcomes", trial_worker.finalize_diagnostic_outcomes),
+    )
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(tmp_path / "trial.db"),
+            "--diagnostics-db",
+            str(tmp_path / "diagnostics.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert order == [
+        "candidate_runtime",
+        "entry_finalizer",
+        "outcome_finalizer",
+        "diagnostic_capture",
+        "diagnostic_outcomes",
+    ]
+    capsys.readouterr()
+
+
+def test_diagnostic_logger_failure_cannot_block_confirmatory_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "run_diagnostics_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("diagnostic corrupt")),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "_append_error",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("log locked")),
+    )
+    trial_db = tmp_path / "trial.db"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--diagnostics-db",
+            str(tmp_path / "diagnostics.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"]["status"] == "degraded"
+    assert TrialStore(trial_db).status()["health"]["last_result"] == "idle_registry_draft"
+
+
 def test_trial_worker_isolates_diagnostic_failure_from_confirmatory_phase(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1429,6 +1526,16 @@ def test_windows_trial_task_is_direct_hidden_pythonw() -> None:
     assert "-Hidden" in installer
     assert "New-TimeSpan -Minutes $IntervalMinutes" in installer
     assert "-MultipleInstances IgnoreNew" in installer
+    for required in (
+        "--diagnostics-db",
+        "--canary-ledger-db",
+        "--source-db",
+        "--evidence-db",
+        "--bar-feed-db",
+        "--session-feed-db",
+        "--registry-path",
+    ):
+        assert required in installer
 
 
 def _install_finalizer_inputs(

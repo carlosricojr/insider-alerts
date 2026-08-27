@@ -25,18 +25,19 @@ typed `unavailable` receipt for that candidate and do not block later candidates
 `trial.db`. The frozen canary shadow trade is compared only after the research outcome is computed;
 a disagreement preserves the independently computed research record for audit, emits append-only
 reconciliation evidence, and marks the candidate `unavailable` so it cannot enter a valid terminal
-diagnostic cohort.
+diagnostic cohort. Agreement includes the frozen stop and target prices, not only the realized exit.
 
 Outcome and receipt records are appended atomically with full synchronization. Integrity validation
 requires every evidence, state, outcome, and receipt record to have an owning diagnostic candidate,
 and checks all candidate/state/evidence/outcome digest links. Health writes are monotonic so an
 overlapping older worker cannot publish a stale heartbeat over a newer cycle.
 
-The diagnostic phases run before the confirmatory phases in the hidden trial worker. Every
-diagnostic exception is logged and written only to diagnostic health; the worker then continues the
-confirmatory phases. Capture and outcome failures are isolated from each other. Diagnostic failure
-therefore cannot mutate `trial.db`, change a challenger
-integrity gate, or prevent challenger capture. The registry remains draft until the separate
+The time-sensitive confirmatory phases run before the diagnostic phases in the hidden trial worker,
+so diagnostic lock waits or latency cannot change challenger enrollment. Every diagnostic exception
+is logged best-effort and written only to diagnostic health. Capture and outcome failures are
+isolated from each other, including when the diagnostic error log itself is unavailable. Diagnostic
+failure therefore cannot mutate `trial.db`, change a challenger integrity gate, or prevent
+challenger capture. The registry remains draft until the separate
 activation procedure, so the deployed phase initially writes only an `idle_registry_draft`
 heartbeat and no candidates or bar requests.
 
