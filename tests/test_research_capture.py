@@ -353,10 +353,13 @@ def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
     )["receipt_sha256"]
     activation_module.ActivationStore(tmp_path / "activation.db").put(registry)
     policy_path = tmp_path / "active-registry.json"
-    policy_path.write_text(json.dumps(registry), encoding="utf-8")
+    policy_path.write_bytes(rfc8785.dumps(registry))
     config = replace(_config(tmp_path, tmp_path / "source.db"), policy_path=policy_path)
 
-    assert VALIDATE_CAPTURE_WINDOW(config) == CaptureWindow(
+    assert VALIDATE_CAPTURE_WINDOW(
+        config, now=activated_at - timedelta(microseconds=1)
+    ).status == "armed"
+    assert VALIDATE_CAPTURE_WINDOW(config, now=activated_at) == CaptureWindow(
         status="active",
         policy_sha256=_policy_sha(config),
         activated_at=activated_at,
