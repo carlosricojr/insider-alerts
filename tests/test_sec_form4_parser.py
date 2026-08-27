@@ -89,3 +89,35 @@ def test_parse_form4_xml_extracts_plan_and_strategy_flags() -> None:
     assert facts.has_13d_reference is True
     assert facts.has_equity_comp_event is True
     assert facts.has_tax_withholding_language is True
+
+
+def test_parse_form4_xml_preserves_all_reporting_owner_ciks() -> None:
+    xml = """
+    <ownershipDocument>
+      <issuer><issuerCik>0000000042</issuerCik></issuer>
+      <reportingOwner><reportingOwnerId><rptOwnerCik>0000000007</rptOwnerCik></reportingOwnerId></reportingOwner>
+      <reportingOwner><reportingOwnerId><rptOwnerCik>0000000008</rptOwnerCik></reportingOwnerId></reportingOwner>
+    </ownershipDocument>
+    """
+    facts = parse_form4_xml(xml)
+
+    assert facts.reporting_owner_ciks == ("0000000007", "0000000008")
+    assert facts.reporting_owner_cik is None
+    assert facts.reporting_owner_count == 2
+
+
+def test_parse_form4_xml_does_not_call_partial_joint_owner_identity_exact() -> None:
+    xml = """
+    <ownershipDocument>
+      <issuer><issuerCik>0000000042</issuerCik></issuer>
+      <reportingOwner><reportingOwnerId><rptOwnerCik>0000000007</rptOwnerCik></reportingOwnerId></reportingOwner>
+      <reportingOwner>
+        <reportingOwnerId><rptOwnerName>UNKNOWN CIK</rptOwnerName></reportingOwnerId>
+      </reportingOwner>
+    </ownershipDocument>
+    """
+    facts = parse_form4_xml(xml)
+
+    assert facts.reporting_owner_ciks == ("0000000007",)
+    assert facts.reporting_owner_count == 2
+    assert facts.reporting_owner_cik is None

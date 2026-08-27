@@ -41,6 +41,8 @@ class Form4Facts:
     has_13d_reference: bool = False
     has_equity_comp_event: bool = False
     has_tax_withholding_language: bool = False
+    reporting_owner_ciks: tuple[str, ...] = ()
+    reporting_owner_count: int = 0
 
 
 TEN_B_FIVE_ONE_RE = re.compile(r"\b10b5\s*[- ]?\s*1\b", re.IGNORECASE)
@@ -135,12 +137,23 @@ def parse_form4_xml(xml_text: str) -> Form4Facts:
     footnotes = _collect_footnotes(root)
     joined_notes = " ".join([remarks or "", *footnotes])
 
+    owner_nodes = root.findall("reportingOwner")
+    owner_ciks = tuple(
+        dict.fromkeys(
+            value
+            for owner in owner_nodes
+            if (value := _text(owner, "reportingOwnerId/rptOwnerCik")) is not None
+        )
+    )
+
     return Form4Facts(
         issuer_cik=issuer_cik,
         issuer_name=_text(root, "issuer/issuerName"),
         issuer_symbol=_text(root, "issuer/issuerTradingSymbol"),
         reporting_owner_name=_text(root, "reportingOwner/reportingOwnerId/rptOwnerName"),
-        reporting_owner_cik=_text(root, "reportingOwner/reportingOwnerId/rptOwnerCik"),
+        reporting_owner_cik=(
+            owner_ciks[0] if len(owner_nodes) == 1 and len(owner_ciks) == 1 else None
+        ),
         is_director=_to_bool(_text(root, "reportingOwner/reportingOwnerRelationship/isDirector")),
         is_officer=_to_bool(_text(root, "reportingOwner/reportingOwnerRelationship/isOfficer")),
         officer_title=_text(root, "reportingOwner/reportingOwnerRelationship/officerTitle"),
@@ -156,4 +169,6 @@ def parse_form4_xml(xml_text: str) -> Form4Facts:
         has_13d_reference=THIRTEEN_D_RE.search(joined_notes) is not None,
         has_equity_comp_event=EQUITY_COMP_RE.search(joined_notes) is not None,
         has_tax_withholding_language=TAX_WITHHOLDING_RE.search(joined_notes) is not None,
+        reporting_owner_ciks=owner_ciks,
+        reporting_owner_count=len(owner_nodes),
     )

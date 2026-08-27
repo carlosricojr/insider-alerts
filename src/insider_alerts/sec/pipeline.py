@@ -271,6 +271,8 @@ def enqueue_review_packets(
             "issuer_cik": facts.issuer_cik,
             "owner": facts.reporting_owner_name,
             "reporting_owner_cik": facts.reporting_owner_cik,
+            "reporting_owner_ciks": list(facts.reporting_owner_ciks),
+            "reporting_owner_count": facts.reporting_owner_count,
         }
         packets_to_enqueue.append((ref, packet))
 

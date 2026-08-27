@@ -88,7 +88,7 @@ quotes, transport timing, and model state cannot be recreated later.
 
 Evidence: merged PRs #9 and #10; production baseline above.
 
-### M1 — Governance and contracts (current)
+### M1 — Governance and contracts (complete)
 
 - Add concise repository-wide agent/deployment/research rules.
 - Freeze this plan and the challenger preregistration.
@@ -98,7 +98,7 @@ Evidence: merged PRs #9 and #10; production baseline above.
 Exit gate: design critique, full local checks, reviewed PR, merge, clean/synced repositories. No
 runtime deployment is required for docs/contracts alone.
 
-### M2 — Irrecoverable point-in-time capture
+### M2 — Irrecoverable point-in-time capture (complete)
 
 - Create an append-only evidence store separate from operational canary state.
 - Capture SEC accession/CIKs and filing/event/first-observed/decision times; notification request
@@ -118,7 +118,7 @@ Exit gate: fault-injection tests prove a dead option service, invalid surface, l
 broker outage, and process restart cannot create an order, lose a signal silently, mutate a prior
 snapshot, or stop the existing canary from managing positions.
 
-### M3 — SEC history and point-in-time classifier
+### M3 — SEC history and point-in-time classifier (current)
 
 - Download SEC quarterly archives from 2006 onward into a raw content-addressed cache, preserving
   retrieval metadata and upstream hashes when supplied. Retrieve earlier authoritative Section 16
