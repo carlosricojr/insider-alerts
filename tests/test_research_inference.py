@@ -13,14 +13,14 @@ import rfc8785
 
 import insider_alerts.research.activation as activation_module
 import insider_alerts.research.inference as inference
+from tests.research_registry_support import draft_registry
 
 ROOT = Path(__file__).resolve().parents[1]
-REGISTRY_PATH = ROOT / "docs/research/registry/OPP-E07-V1.json"
 ACTIVATED_AT = datetime(2026, 1, 31, 15, 0, tzinfo=UTC)
 
 
 def _registry() -> dict[str, Any]:
-    return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+    return draft_registry(ROOT)
 
 
 def _active_registry() -> dict[str, Any]:

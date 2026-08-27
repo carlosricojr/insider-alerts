@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +25,7 @@ from insider_alerts.research.trial_runtime import (
     TrialResolution,
     TrialStore,
 )
+from tests.research_registry_support import draft_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTIVATED_AT = datetime(2026, 1, 31, 15, 0, tzinfo=UTC)
@@ -243,9 +243,7 @@ def _install_pending_diagnostic(
 
 
 def _active_registry_path(tmp_path: Path) -> Path:
-    registry = json.loads(
-        (ROOT / "docs/research/registry/OPP-E07-V1.json").read_text(encoding="utf-8")
-    )
+    registry = draft_registry(ROOT)
     registry["status"] = "active"
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -334,9 +332,7 @@ def test_builder_includes_every_boundary_date_trade_and_prevalidates(
         activated_at=ACTIVATED_AT,
         evaluated_at=evaluated,
     )
-    registry = json.loads(
-        (ROOT / "docs/research/registry/OPP-E07-V1.json").read_text(encoding="utf-8")
-    )
+    registry = draft_registry(ROOT)
     report = inference.evaluate_trial(
         registry,
         payload,

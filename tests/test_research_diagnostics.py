@@ -30,6 +30,7 @@ from insider_alerts.research.diagnostics import (
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
 from insider_alerts.research.trial_runtime import TrialStore, TrialWindow
 from insider_alerts.review.queue import ensure_review_tables
+from tests.research_registry_support import write_draft_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 NEW_YORK = ZoneInfo("America/New_York")
@@ -49,7 +50,7 @@ def _config(tmp_path: Path) -> DiagnosticConfig:
         evidence_db=tmp_path / "evidence.db",
         bar_feed_db=tmp_path / "bars.db",
         session_feed_db=tmp_path / "sessions.db",
-        registry_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
+        registry_path=write_draft_registry(ROOT, tmp_path),
         activation_db=tmp_path / "activation.db",
     )
 

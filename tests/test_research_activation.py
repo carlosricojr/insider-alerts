@@ -13,6 +13,7 @@ import rfc8785
 
 import insider_alerts.research.activation as activation
 import insider_alerts.research.inference as inference
+from tests.research_registry_support import write_draft_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 PREPARED_AT = datetime(2026, 8, 27, 20, 0, tzinfo=UTC)
@@ -30,10 +31,7 @@ def _head() -> str:
 
 
 def _config(tmp_path: Path) -> activation.ActivationConfig:
-    registry_path = tmp_path / "OPP-E07-V1.json"
-    registry_path.write_bytes(
-        (ROOT / "docs/research/registry/OPP-E07-V1.json").read_bytes()
-    )
+    registry_path = write_draft_registry(ROOT, tmp_path)
     return activation.ActivationConfig(
         evidence_db=tmp_path / "evidence.db",
         trial_db=tmp_path / "trial.db",
