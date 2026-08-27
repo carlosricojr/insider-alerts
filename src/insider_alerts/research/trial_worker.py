@@ -10,6 +10,12 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from insider_alerts.research.diagnostics import (
+    DiagnosticConfig,
+    DiagnosticRunResult,
+    DiagnosticStore,
+    run_diagnostics_once,
+)
 from insider_alerts.research.trial_finalizer import finalize_pending_entry_dates
 from insider_alerts.research.trial_outcome_finalizer import finalize_trial_outcomes
 from insider_alerts.research.trial_runtime import (
@@ -23,6 +29,11 @@ from insider_alerts.research.trial_runtime import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one prospective OPP-E07 trial cycle")
     parser.add_argument("--trial-db", type=Path, default=Path("data/research/trial.db"))
+    parser.add_argument("--diagnostics-db", type=Path)
+    parser.add_argument(
+        "--canary-ledger-db", type=Path, default=Path("data/live_canary.db")
+    )
+    parser.add_argument("--source-db", type=Path, default=Path("data/insider_alerts.db"))
     parser.add_argument("--evidence-db", type=Path, default=Path("data/research/evidence.db"))
     parser.add_argument("--bar-feed-db", type=Path, default=Path("data/research/bar_feed.db"))
     parser.add_argument(
@@ -47,6 +58,7 @@ def _append_error(path: Path, exc: BaseException) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    diagnostics_db = args.diagnostics_db or args.trial_db.with_name("diagnostics.db")
     config = TrialRuntimeConfig(
         trial_db=args.trial_db,
         evidence_db=args.evidence_db,
@@ -54,6 +66,26 @@ def main(argv: list[str] | None = None) -> int:
         session_feed_db=args.session_feed_db,
         registry_path=args.registry_path,
     )
+    diagnostic_config = DiagnosticConfig(
+        diagnostics_db=diagnostics_db,
+        canary_ledger_db=args.canary_ledger_db,
+        source_db=args.source_db,
+        evidence_db=args.evidence_db,
+        bar_feed_db=args.bar_feed_db,
+        session_feed_db=args.session_feed_db,
+        registry_path=args.registry_path,
+    )
+    try:
+        diagnostics = run_diagnostics_once(diagnostic_config, now=datetime.now(UTC))
+    except Exception as exc:
+        _append_error(args.error_log, RuntimeError(f"diagnostic phase isolated: {exc}"))
+        diagnostics = DiagnosticRunResult(
+            "degraded", error=f"{type(exc).__name__}: {exc}"[:2000]
+        )
+        with contextlib.suppress(Exception):
+            DiagnosticStore(diagnostics_db).write_health(
+                now=datetime.now(UTC), result=diagnostics
+            )
     try:
         imported = run_trial_once(config, now=datetime.now(UTC))
     except Exception as exc:
@@ -97,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             {
+                "diagnostics": asdict(diagnostics),
                 "candidate_runtime": asdict(imported),
                 "entry_finalizer": asdict(finalized),
                 "outcome_finalizer": asdict(outcomes),

@@ -353,6 +353,19 @@ class BarFeedStore:
             )
         return digest
 
+    def has_request(self, request_id: str) -> bool:
+        """Return whether an immutable request identity already exists."""
+
+        if not request_id.strip():
+            raise ValueError("request_id cannot be empty")
+        with contextlib.closing(self._connect()) as conn:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM bar_feed_requests WHERE request_id=?", (request_id,)
+                ).fetchone()
+                is not None
+            )
+
     def pending_requests(
         self,
         *,

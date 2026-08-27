@@ -1164,12 +1164,57 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["diagnostics"]["status"] == "idle_registry_draft"
     assert payload["candidate_runtime"]["status"] == "idle"
     assert payload["entry_finalizer"]["status"] == "idle_registry_draft"
     assert payload["outcome_finalizer"]["status"] == "idle_registry_draft"
     assert not error_log.exists()
     assert not (tmp_path / "bars.db").exists()
     assert not (tmp_path / "sessions.db").exists()
+
+
+def test_trial_worker_isolates_diagnostic_failure_from_confirmatory_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "run_diagnostics_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("diagnostic corrupt")),
+    )
+    diagnostics_db = tmp_path / "diagnostics.db"
+    trial_db = tmp_path / "trial.db"
+    error_log = tmp_path / "worker.err.log"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--diagnostics-db",
+            str(diagnostics_db),
+            "--evidence-db",
+            str(tmp_path / "evidence.db"),
+            "--bar-feed-db",
+            str(tmp_path / "bars.db"),
+            "--session-feed-db",
+            str(tmp_path / "sessions.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["diagnostics"]["status"] == "degraded"
+    assert payload["candidate_runtime"]["status"] == "idle"
+    assert TrialStore(trial_db).status()["health"]["last_result"] == "idle_registry_draft"
+    assert trial_worker.DiagnosticStore(diagnostics_db).status()["health"]["last_result"] == (
+        "degraded"
+    )
+    assert "diagnostic phase isolated" in error_log.read_text(encoding="utf-8")
 
 
 def test_trial_worker_records_finalizer_failure_in_durable_health(
