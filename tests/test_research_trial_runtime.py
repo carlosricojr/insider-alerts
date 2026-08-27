@@ -23,7 +23,6 @@ from insider_alerts.research.trial_runtime import (
     EntryCompletionInputs,
     EntryEligibility,
     EntryLapseInputs,
-    EvidenceNotReady,
     PriorBookPosition,
     TrialCandidate,
     TrialResolution,
@@ -862,7 +861,7 @@ def test_candidate_import_timestamp_before_concurrent_seal_is_retryable(
         imported_at=sealed_at - timedelta(seconds=1),
     )
 
-    with pytest.raises(EvidenceNotReady, match="moved_behind_entry_date_cursor"):
+    with pytest.raises(TrialRuntimeRetryable, match="moved_behind_entry_date_cursor"):
         store.append_candidate(stale_cycle_candidate)
 
     assert store.candidate_for_evidence(stale_cycle_candidate.evidence_record_sha256) is None
@@ -871,6 +870,34 @@ def test_candidate_import_timestamp_before_concurrent_seal_is_retryable(
     assert store.append_candidate(retried)
     assert store.resolutions()[-1].reason == "candidate_arrived_after_entry_date_lapse"
     store.validate_integrity()
+
+
+def test_candidate_import_large_clock_regression_against_cursor_is_permanent(
+    tmp_path: Path,
+) -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    store = TrialStore(tmp_path / "trial.db")
+    first = _trial_candidate(
+        "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
+    )
+    assert store.append_candidate(first)
+    sealed_at = datetime(2026, 8, 27, 13, 30, tzinfo=UTC)
+    store.append_entry_lapse(_lapse_inputs(lapsed_at=sealed_at, reason="future_clock"))
+    stale = _trial_candidate(
+        "b",
+        symbol="BBB",
+        rank="2",
+        evidence_recorded_at=ready,
+        imported_at=sealed_at - timedelta(minutes=5, seconds=1),
+    )
+
+    with pytest.raises(
+        TrialRuntimeInvalid, match="candidate_import_clock_regression_exceeds_limit"
+    ):
+        store.append_candidate(stale)
+
+    assert store.candidate_for_evidence(stale.evidence_record_sha256) is None
+    assert store.disposition_for_evidence(stale.evidence_record_sha256) is None
 
 
 def test_integrity_ties_lapse_resolution_reason_to_lapse_record(tmp_path: Path) -> None:

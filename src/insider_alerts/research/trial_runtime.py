@@ -679,10 +679,15 @@ class TrialStore:
                 ) ORDER BY entry_date DESC LIMIT 1
                 """
             ).fetchone()
-            if latest_seal is not None and candidate.imported_at_utc < _parse_utc(
-                str(latest_seal["sealed_at_utc"])
-            ):
-                raise EvidenceNotReady("candidate_import_time_moved_behind_entry_date_cursor")
+            if latest_seal is not None:
+                latest_sealed_at = _parse_utc(str(latest_seal["sealed_at_utc"]))
+                if candidate.imported_at_utc < latest_sealed_at:
+                    _raise_clock_regression(
+                        earlier=candidate.imported_at_utc,
+                        later=latest_sealed_at,
+                        retryable_reason="candidate_import_time_moved_behind_entry_date_cursor",
+                        invalid_reason="candidate_import_clock_regression_exceeds_limit",
+                    )
             sequence = int(
                 conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM trial_candidates").fetchone()[
                     0
@@ -723,7 +728,7 @@ class TrialStore:
             sealed = conn.execute(
                 """
                 SELECT kind,entry_date,sealed_at_utc FROM (
-                  SELECT 'completion' kind,entry_date,completed_at_utc sealed_at_utc
+                  SELECT 'completion' kind,entry_date,decision_clock_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT 'lapse' kind,entry_date,lapsed_at_utc sealed_at_utc
