@@ -40,6 +40,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
+            "activation_prepared_at_utc",
             "activated_at_utc",
             "activation_git_commit",
             "registry_definition_sha256",
@@ -48,12 +49,15 @@
             "evidence_schema_sha256",
             "inference_artifact_sha256",
             "terminal_builder_artifact_sha256",
+            "activation_artifact_sha256",
             "dependency_lock_sha256",
             "policy_sha256",
             "classifier_version",
-            "enrollment_start_sequence"
+            "enrollment_start_sequence",
+            "activation_receipt_sha256"
           ],
           "properties": {
+            "activation_prepared_at_utc": {"$ref": "#/$defs/datetime"},
             "activated_at_utc": {"$ref": "#/$defs/datetime"},
             "activation_git_commit": {
               "allOf": [{"$ref": "#/$defs/sha1"}],
@@ -68,10 +72,12 @@
             "evidence_schema_sha256": {"$ref": "#/$defs/sha256"},
             "inference_artifact_sha256": {"$ref": "#/$defs/sha256"},
             "terminal_builder_artifact_sha256": {"$ref": "#/$defs/sha256"},
+            "activation_artifact_sha256": {"$ref": "#/$defs/sha256"},
             "dependency_lock_sha256": {"$ref": "#/$defs/sha256"},
             "policy_sha256": {"$ref": "#/$defs/sha256"},
             "classifier_version": {"type": "string", "minLength": 1},
-            "enrollment_start_sequence": {"const": 1}
+            "enrollment_start_sequence": {"const": 1},
+            "activation_receipt_sha256": {"$ref": "#/$defs/sha256"}
           }
         }
       ]

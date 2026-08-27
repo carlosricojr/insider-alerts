@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import rfc8785
 
+import insider_alerts.research.activation as activation_module
 import insider_alerts.research.inference as inference
 import insider_alerts.research.terminal_builder as builder
 from insider_alerts.research.diagnostics import (
@@ -255,6 +256,9 @@ def _active_registry_path(tmp_path: Path) -> Path:
     ).stdout.strip()
     file_sha = inference._file_sha256
     registry["activation"] = {
+        "activation_prepared_at_utc": builder._utc_text(
+            ACTIVATED_AT - timedelta(hours=2)
+        ),
         "activated_at_utc": builder._utc_text(ACTIVATED_AT),
         "activation_git_commit": commit,
         "registry_definition_sha256": inference.registry_definition_sha256(registry),
@@ -269,11 +273,19 @@ def _active_registry_path(tmp_path: Path) -> Path:
         "terminal_builder_artifact_sha256": file_sha(
             ROOT / "src/insider_alerts/research/terminal_builder.py"
         ),
+        "activation_artifact_sha256": file_sha(
+            ROOT / "src/insider_alerts/research/activation.py"
+        ),
         "dependency_lock_sha256": file_sha(ROOT / "uv.lock"),
         "policy_sha256": file_sha(ROOT / registry["strategy"]["policy_artifact"]),
         "classifier_version": inference.CLASSIFIER_VERSION,
         "enrollment_start_sequence": 1,
+        "activation_receipt_sha256": "",
     }
+    registry["activation"]["activation_receipt_sha256"] = activation_module.activation_receipt(
+        registry
+    )["receipt_sha256"]
+    activation_module.ActivationStore(tmp_path / "activation.db").put(registry)
     path = tmp_path / "active-registry.json"
     path.write_text(json.dumps(registry), encoding="utf-8")
     return path
@@ -387,6 +399,7 @@ def test_locked_inputs_closes_connection_when_lock_acquisition_fails(
         registry_path=tmp_path / "registry.json",
         seal_db=tmp_path / "seals.db",
         artifact_root=tmp_path / "artifacts",
+        activation_db=tmp_path / "activation.db",
     )
 
     with (
@@ -553,6 +566,7 @@ def test_public_seal_status_and_single_decision_are_crash_idempotent(
         registry_path=_active_registry_path(tmp_path),
         seal_db=tmp_path / "seals.db",
         artifact_root=tmp_path / "artifacts",
+        activation_db=tmp_path / "activation.db",
     )
     now = datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
     ready_status = builder.terminal_status(config)
@@ -596,6 +610,7 @@ def test_retry_replays_pending_terminal_bytes_after_diagnostics_change(
         registry_path=_active_registry_path(tmp_path),
         seal_db=tmp_path / "seals.db",
         artifact_root=tmp_path / "artifacts",
+        activation_db=tmp_path / "activation.db",
     )
     now = datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
     publish = builder._publish_dataset
@@ -635,6 +650,7 @@ def test_decision_fails_closed_with_typed_missing_artifact(tmp_path: Path) -> No
         registry_path=tmp_path / "registry.json",
         seal_db=tmp_path / "seals.db",
         artifact_root=tmp_path / "artifacts",
+        activation_db=tmp_path / "activation.db",
     )
     store = inference.TrialSealStore(config.seal_db)
     receipt = inference._build_receipt(

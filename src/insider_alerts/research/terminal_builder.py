@@ -87,11 +87,19 @@ class TerminalBuildConfig:
     registry_path: Path
     seal_db: Path
     artifact_root: Path
+    activation_db: Path
 
 
 @dataclass(frozen=True, slots=True)
 class TerminalBuildResult:
-    status: Literal["idle_registry_draft", "collecting", "sealed", "decided", "invalid"]
+    status: Literal[
+        "idle_registry_draft",
+        "idle_registry_armed",
+        "collecting",
+        "sealed",
+        "decided",
+        "invalid",
+    ]
     freeze_boundary_entry_date: str | None = None
     frozen_challenger_count: int = 0
     challenger_outcomes_waiting: int = 0
@@ -635,10 +643,16 @@ def seal_terminal_dataset(
         bar_feed_db=config.trial_db.with_name("bar_feed.db"),
         session_feed_db=config.trial_db.with_name("session_feed.db"),
         registry_path=config.registry_path,
+        activation_db=config.activation_db,
     )
-    window = _validated_trial_window(trial_config)
-    if window.status == "draft":
-        return TerminalBuildResult("idle_registry_draft")
+    gate_time = requested_at or datetime.now(UTC)
+    window = _validated_trial_window(trial_config, now=gate_time)
+    if window.status != "active":
+        return (
+            TerminalBuildResult("idle_registry_draft")
+            if window.status == "draft"
+            else TerminalBuildResult("idle_registry_armed")
+        )
     if window.activated_at_utc is None:
         raise TerminalBuildInvalid("active_window_missing_activation")
     registry = json.loads(config.registry_path.read_text(encoding="utf-8"))
@@ -711,10 +725,15 @@ def terminal_status(config: TerminalBuildConfig) -> TerminalBuildResult:
         bar_feed_db=config.trial_db.with_name("bar_feed.db"),
         session_feed_db=config.trial_db.with_name("session_feed.db"),
         registry_path=config.registry_path,
+        activation_db=config.activation_db,
     )
     window = _validated_trial_window(trial_config)
-    if window.status == "draft":
-        return TerminalBuildResult("idle_registry_draft")
+    if window.status != "active":
+        return (
+            TerminalBuildResult("idle_registry_draft")
+            if window.status == "draft"
+            else TerminalBuildResult("idle_registry_armed")
+        )
     seal_store = TrialSealStore(config.seal_db)
     report = seal_store.existing_report()
     if report is not None:
@@ -833,8 +852,9 @@ def decide_terminal_dataset(
         bar_feed_db=config.trial_db.with_name("bar_feed.db"),
         session_feed_db=config.trial_db.with_name("session_feed.db"),
         registry_path=config.registry_path,
+        activation_db=config.activation_db,
     )
-    window = _validated_trial_window(trial_config)
+    window = _validated_trial_window(trial_config, now=evaluated_at)
     if window.status != "active" or window.activated_at_utc is None:
         raise TerminalBuildInvalid("decision_registry_not_active")
     registry = json.loads(config.registry_path.read_text(encoding="utf-8"))
@@ -877,6 +897,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seal-db", type=Path, default=Path("data/research/trial_seals.db"))
     parser.add_argument("--artifact-root", type=Path, default=Path("data/research/artifacts"))
+    parser.add_argument(
+        "--activation-db", type=Path, default=Path("data/research/activation.db")
+    )
     return parser
 
 
@@ -890,6 +913,7 @@ def main(argv: list[str] | None = None) -> int:
         registry_path=args.registry_path,
         seal_db=args.seal_db,
         artifact_root=args.artifact_root,
+        activation_db=args.activation_db,
     )
     try:
         if args.action == "status":

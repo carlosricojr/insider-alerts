@@ -28,6 +28,9 @@ Draft correction: 2026-08-27, before activation and with zero evidence snapshots
 candidates, to make explicit that diagnostic receipt or membership catch-up is non-blocking at
 challenger terminal readiness and is sealed as typed group-level `unavailable`, preventing an
 optional diagnostic wait from delaying or conditioning the single primary look<br>
+Draft correction: 2026-08-27, before activation and with zero evidence snapshots or challenger
+candidates, to bind a future-dated append-only activation receipt, exact canonical registry bytes,
+minimum lead time, empty-store lock proof, fail-closed deployment deadline, and retry semantics<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -51,12 +54,25 @@ The draft becomes active only after all of the following occur:
 3. an append-only activation record binds the registry definition, preregistration, both JSON
    Schemas, inference executable, terminal-dataset producer, and dependency lock SHA-256 digests;
    schema version; merged Git implementation Git commit; policy hash; classifier version; UTC
-   activation timestamp; and enrollment sequence. The implementation commit must contain the exact
+   activation-preparation timestamp; future activation timestamp; activation-tool digest; and
+   enrollment sequence. The active registry embeds the RFC 8785 receipt digest, while a separate
+   append-only SQLite singleton stores that receipt and the exact canonical active-registry bytes.
+   Every runtime consumer requires an exact registry/receipt match. The implementation commit must
+   contain the exact
    bound artifacts and
    registry definition and remain an ancestor of the deployed commit; every content-bound artifact
    must still match after platform-stable CRLF-to-LF canonicalization;
 4. the evidence store is empty for this registry ID and passes an integrity check; and
 5. no challenger outcomes from on/after the proposed activation boundary have been inspected.
+
+Preparation is permitted only from clean, synced production `main`, with every scientific store
+empty under write-preventing locks and a boundary at least two hours in the future. Preparation
+commits the receipt before publishing the content-addressed registry artifact. An identical retry
+replays the stored bytes; a different timestamp, definition, or artifact is prohibited. The active
+registry is reviewed and merged separately before the boundary. If the registry remains draft when
+the boundary arrives, the runtime fails closed and the ID is retired rather than activated late.
+If the exact active registry is deployed early, every scientific writer remains in an explicit
+armed-idle phase until the sealed instant; gate evaluation and record timestamps use the same clock.
 
 Only signals first observed at or after the sealed activation timestamp are eligible. Earlier
 signals, including all current canary observations, never count. A signal missed during a capture

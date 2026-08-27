@@ -37,6 +37,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--canary-ledger-db", type=Path, default=Path("data/live_canary.db"))
     parser.add_argument("--source-db", type=Path, default=Path("data/insider_alerts.db"))
     parser.add_argument("--evidence-db", type=Path, default=Path("data/research/evidence.db"))
+    parser.add_argument(
+        "--activation-db", type=Path, default=Path("data/research/activation.db")
+    )
     parser.add_argument("--bar-feed-db", type=Path, default=Path("data/research/bar_feed.db"))
     parser.add_argument(
         "--session-feed-db", type=Path, default=Path("data/research/session_feed.db")
@@ -74,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         bar_feed_db=args.bar_feed_db,
         session_feed_db=args.session_feed_db,
         registry_path=args.registry_path,
+        activation_db=args.activation_db,
     )
     diagnostic_config = DiagnosticConfig(
         trial_db=args.trial_db,
@@ -84,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         bar_feed_db=args.bar_feed_db,
         session_feed_db=args.session_feed_db,
         registry_path=args.registry_path,
+        activation_db=args.activation_db,
     )
     try:
         imported = run_trial_once(config, now=datetime.now(UTC))

@@ -35,7 +35,7 @@ from insider_alerts.research.trial_runtime import (
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticOutcomeResult:
-    status: Literal["idle_registry_draft", "collecting", "degraded"]
+    status: Literal["idle_registry_draft", "idle_registry_armed", "collecting", "degraded"]
     candidates_seen: int = 0
     outcomes_added: int = 0
     receipts_added: int = 0
@@ -188,10 +188,16 @@ def finalize_diagnostic_outcomes(
             bar_feed_db=config.bar_feed_db,
             session_feed_db=config.session_feed_db,
             registry_path=config.registry_path,
-        )
+            activation_db=config.activation_db,
+        ),
+        now=now,
     )
-    if window.status == "draft":
-        result = DiagnosticOutcomeResult("idle_registry_draft")
+    if window.status != "active":
+        result = (
+            DiagnosticOutcomeResult("idle_registry_draft")
+            if window.status == "draft"
+            else DiagnosticOutcomeResult("idle_registry_armed")
+        )
         store.write_outcome_health(
             now=now,
             status=result.status,

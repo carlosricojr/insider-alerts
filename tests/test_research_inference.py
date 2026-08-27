@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import rfc8785
 
+import insider_alerts.research.activation as activation_module
 import insider_alerts.research.inference as inference
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,7 @@ def _active_registry() -> dict[str, Any]:
     ).stdout.strip()
     file_sha = inference._file_sha256
     registry["activation"] = {
+        "activation_prepared_at_utc": _utc_text(ACTIVATED_AT - timedelta(hours=2)),
         "activated_at_utc": _utc_text(ACTIVATED_AT),
         "activation_git_commit": commit,
         "registry_definition_sha256": inference.registry_definition_sha256(registry),
@@ -48,11 +50,18 @@ def _active_registry() -> dict[str, Any]:
         "terminal_builder_artifact_sha256": file_sha(
             ROOT / "src/insider_alerts/research/terminal_builder.py"
         ),
+        "activation_artifact_sha256": file_sha(
+            ROOT / "src/insider_alerts/research/activation.py"
+        ),
         "dependency_lock_sha256": file_sha(ROOT / "uv.lock"),
         "policy_sha256": file_sha(ROOT / registry["strategy"]["policy_artifact"]),
         "classifier_version": inference.CLASSIFIER_VERSION,
         "enrollment_start_sequence": 1,
+        "activation_receipt_sha256": "",
     }
+    registry["activation"]["activation_receipt_sha256"] = activation_module.activation_receipt(
+        registry
+    )["receipt_sha256"]
     return registry
 
 

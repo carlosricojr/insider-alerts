@@ -5,7 +5,8 @@ sealing and the separately invoked decision. It calls the frozen
 `insider_alerts.research.inference` decision engine; neither module has broker imports or order
 capability. Production execution requires an active
 registry whose definition digest and canonical-content `inference.py` and `terminal_builder.py`
-digests match the activation record.
+digests match the activation record. Runtime entry points additionally require the deployed active
+registry to equal the exact canonical bytes in the append-only local activation receipt.
 
 The strict input object contains the activation/evaluation instants, ordered append-only entry-date
 completion receipts, the complete candidate enrollment projection, fixed integrity checks, and

@@ -853,6 +853,22 @@ def _validate_registry(registry: Mapping[str, Any], *, allow_draft: bool) -> Non
     if status != "active":
         raise TrialInvalid("registry_status_invalid")
     activation = _mapping(registry.get("activation"), "registry_activation")
+    receipt_material = {
+        "schema_version": 1,
+        "hypothesis_id": HYPOTHESIS_ID,
+        "kind": "prospective_activation",
+        **{
+            str(key): value
+            for key, value in activation.items()
+            if key != "activation_receipt_sha256"
+        },
+    }
+    if activation.get("activation_receipt_sha256") != _canonical_sha256(receipt_material):
+        raise TrialInvalid("activation_receipt_digest_mismatch")
+    prepared_at = _utc(activation.get("activation_prepared_at_utc"), "activation_prepared_at")
+    activated_at = _utc(activation.get("activated_at_utc"), "registry_activated_at")
+    if prepared_at >= activated_at:
+        raise TrialInvalid("activation_not_prospective")
     if activation.get("registry_definition_sha256") != registry_definition_sha256(registry):
         raise TrialInvalid("registry_definition_digest_mismatch")
     if activation.get("inference_artifact_sha256") != inference_artifact_sha256():
@@ -863,6 +879,7 @@ def _validate_registry(registry: Mapping[str, Any], *, allow_draft: bool) -> Non
         "evidence_schema_sha256": Path("docs/research/contracts/evidence-snapshot.schema.json"),
         "inference_artifact_sha256": Path("src/insider_alerts/research/inference.py"),
         "terminal_builder_artifact_sha256": Path("src/insider_alerts/research/terminal_builder.py"),
+        "activation_artifact_sha256": Path("src/insider_alerts/research/activation.py"),
         "dependency_lock_sha256": Path("uv.lock"),
         "policy_sha256": Path(str(registry["strategy"]["policy_artifact"])),
     }

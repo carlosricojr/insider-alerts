@@ -75,6 +75,7 @@ def _config(tmp_path: Path) -> TrialRuntimeConfig:
         bar_feed_db=tmp_path / "bars.db",
         session_feed_db=tmp_path / "sessions.db",
         registry_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
+        activation_db=tmp_path / "activation.db",
     )
 
 
@@ -1389,7 +1390,7 @@ def test_trial_worker_records_finalizer_failure_in_durable_health(
     monkeypatch.setattr(
         trial_worker,
         "finalize_pending_entry_dates",
-        lambda _config: (_ for _ in ()).throw(ValueError("corrupt session proof")),
+        lambda _config, **_kwargs: (_ for _ in ()).throw(ValueError("corrupt session proof")),
     )
     trial_db = tmp_path / "trial.db"
     error_log = tmp_path / "worker.err.log"
@@ -1420,7 +1421,9 @@ def test_trial_worker_retryable_finalizer_failure_is_degraded_not_poisoned(
     monkeypatch.setattr(
         trial_worker,
         "finalize_pending_entry_dates",
-        lambda _config: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+        lambda _config, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
     )
     trial_db = tmp_path / "trial.db"
     error_log = tmp_path / "worker.err.log"
@@ -1450,7 +1453,7 @@ def test_trial_worker_clock_regression_is_degraded_not_poisoned(
     monkeypatch.setattr(
         trial_worker,
         "finalize_pending_entry_dates",
-        lambda _config: (_ for _ in ()).throw(
+        lambda _config, **_kwargs: (_ for _ in ()).throw(
             TrialRuntimeRetryable("entry_completion_clock_moved_backwards")
         ),
     )
@@ -1500,7 +1503,7 @@ def test_trial_worker_logs_original_error_when_fault_persistence_also_fails(
     monkeypatch.setattr(
         trial_worker,
         "finalize_pending_entry_dates",
-        lambda _config: (_ for _ in ()).throw(ValueError("original finalizer error")),
+        lambda _config, **_kwargs: (_ for _ in ()).throw(ValueError("original finalizer error")),
     )
     monkeypatch.setattr(
         trial_worker,
@@ -1568,7 +1571,9 @@ def test_entry_finalizer_is_a_permanent_noop_after_cohort_freeze(
     SessionFeedStore(config.session_feed_db)
     BarFeedStore(config.bar_feed_db)
     boundary = date(2026, 8, 27)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     monkeypatch.setattr(
         TrialStore,
         "cohort_freeze",
@@ -1755,7 +1760,9 @@ def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
 ) -> None:
     config = _config(tmp_path)
     _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     original_validate = TrialStore.validate_integrity
     include_outcomes_seen: list[bool] = []
 
@@ -1789,7 +1796,9 @@ def test_trial_outcome_is_append_only_bound_and_status_blinded(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
     )
@@ -1827,9 +1836,11 @@ def test_outcome_finalizer_waits_for_terminal_proof_then_materializes_without_ag
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -1869,9 +1880,11 @@ def test_outcome_finalizer_waits_for_receipt_that_observed_terminal_bars(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -1891,9 +1904,11 @@ def test_outcome_finalizer_rejects_terminal_healthy_poll_with_missing_session(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -1922,9 +1937,11 @@ def test_outcome_finalizer_rejects_terminal_healthy_poll_with_missing_spy_endpoi
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -1945,9 +1962,11 @@ def test_outcome_finalizer_materializes_time_exit_at_frozen_early_close(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config, final_session_close=time(17, 0))
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -1970,9 +1989,11 @@ def test_outcome_finalizer_materializes_gap_down_stop_price(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -1994,7 +2015,9 @@ def test_outcome_finalizer_rejects_corrupt_frozen_schedule_binding(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
     )
@@ -2016,7 +2039,9 @@ def test_exact_horizon_binding_rejects_an_extra_schedule_digest(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
     )
@@ -2041,7 +2066,9 @@ def test_entry_completion_binding_rejects_an_unknown_schedule_digest(
 ) -> None:
     config = _config(tmp_path)
     candidate = _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
     )
@@ -2101,9 +2128,11 @@ def test_waiting_candidate_does_not_block_later_ready_outcome(
         source_rejection_count=0,
         validation_rejection_count=0,
     )
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
     monkeypatch.setattr(
-        outcome_finalizer, "_validated_trial_window", lambda _config: _active_window()
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    monkeypatch.setattr(
+        outcome_finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
     )
     sealed = finalizer.finalize_pending_entry_dates(
         config, clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
@@ -2136,7 +2165,9 @@ def test_finalizer_waits_for_healthy_poll_then_lapses_at_official_open(
     with sqlite3.connect(config.bar_feed_db) as conn:
         conn.execute("DROP TRIGGER bar_poll_receipts_no_delete")
         conn.execute("DELETE FROM bar_poll_receipts")
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     waiting = finalizer.finalize_pending_entry_dates(
         config,
@@ -2161,7 +2192,9 @@ def test_finalizer_waits_when_receipt_proves_observations_beyond_snapshot(
 ) -> None:
     config = _config(tmp_path)
     _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     monkeypatch.setattr(finalizer.BarFeedStore, "observation_watermark", lambda _store: 19)
 
     result = finalizer.finalize_pending_entry_dates(
@@ -2180,7 +2213,9 @@ def test_finalizer_rolls_boundary_race_into_lapse_without_permanent_fault(
 ) -> None:
     config = _config(tmp_path)
     _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     moments = iter(
         (
             datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
@@ -2205,7 +2240,9 @@ def test_finalizer_clock_regression_is_retryable_and_rolls_back(
 ) -> None:
     config = _config(tmp_path)
     _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     decision_at = datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
     moments = iter((decision_at, decision_at - timedelta(seconds=1)))
 
@@ -2223,7 +2260,9 @@ def test_finalizer_clock_regression_across_open_is_retryable_and_rolls_back(
 ) -> None:
     config = _config(tmp_path)
     _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     moments = iter(
         (
             datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
@@ -2247,7 +2286,9 @@ def test_finalizer_large_clock_regression_across_open_is_permanent(
 ) -> None:
     config = _config(tmp_path)
     _install_finalizer_inputs(config)
-    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        finalizer, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     moments = iter(
         (
             datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
@@ -2272,7 +2313,9 @@ def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(
     config = _config(tmp_path)
     _install_schedule(config)
     evidence = _install_evidence(config)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     now = ACTIVATED_AT + timedelta(hours=2)
 
     first = run_trial_once(config, now=now)
@@ -2318,7 +2361,9 @@ def test_non_opportunistic_evidence_is_excluded_before_candidate_or_capacity(
     config = _config(tmp_path)
     _install_schedule(config)
     _install_evidence(config, classification_state=classification_state)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=2))
 
@@ -2338,7 +2383,9 @@ def test_schedule_observed_after_signal_cannot_retroactively_plan_entry(
     observed_at = ACTIVATED_AT + timedelta(minutes=30)
     _install_schedule(config, observed_at=observed_at + timedelta(seconds=1))
     _install_evidence(config, observed_at=observed_at)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=observed_at + timedelta(minutes=1))
 
@@ -2364,7 +2411,9 @@ def test_active_runtime_rejects_both_outside_window_boundaries(
     config = _config(tmp_path)
     _install_schedule(config, observed_at=ACTIVATED_AT - timedelta(days=1))
     _install_evidence(config, observed_at=observed_at)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=observed_at + timedelta(minutes=1))
 
@@ -2382,7 +2431,9 @@ def test_active_runtime_rejects_evidence_bound_to_another_registry(
     config = _config(tmp_path)
     _install_schedule(config)
     _install_evidence(config, policy_sha256="b" * 64)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2406,7 +2457,9 @@ def test_excluded_pre_activation_evidence_does_not_block_later_candidate(
         observed_at=ACTIVATED_AT + timedelta(minutes=1),
         accession_number="0000000001-26-000002",
     )
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2430,7 +2483,9 @@ def test_invalid_symbol_is_isolated_before_append_and_later_candidate_imports(
         symbol="GOOD",
         accession_number="0000000001-26-000002",
     )
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2461,7 +2516,9 @@ def test_duplicate_accession_symbol_isolated_without_blocking_later_evidence(
         accession_number="0000000001-26-000003",
         symbol="NEXT",
     )
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2476,7 +2533,9 @@ def test_active_runtime_treats_missing_evidence_store_as_invalid(
 ) -> None:
     config = _config(tmp_path)
     _install_schedule(config)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2508,7 +2567,9 @@ def test_malformed_timestamp_is_disposed_without_blocking_later_evidence(
         observed_at=ACTIVATED_AT + timedelta(minutes=31),
         accession_number="0000000001-26-000002",
     )
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2526,7 +2587,9 @@ def test_future_recorded_time_remains_unresolved_then_imports_without_dispositio
     observed_at = ACTIVATED_AT + timedelta(minutes=30)
     recorded_at = observed_at + timedelta(minutes=10)
     _install_evidence(config, observed_at=observed_at, recorded_at=recorded_at)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     early = run_trial_once(config, now=recorded_at - timedelta(microseconds=1))
     later = run_trial_once(config, now=recorded_at)
@@ -2601,7 +2664,9 @@ def test_transient_read_only_evidence_open_failure_is_degraded_not_invalid(
     config = _config(tmp_path)
     _install_schedule(config)
     _install_evidence(config)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     real_connect = runtime.sqlite3.connect
 
     def fail_read_only(*args: object, **kwargs: object) -> sqlite3.Connection:
@@ -2624,7 +2689,9 @@ def test_runtime_candidate_import_clock_regression_is_degraded_without_fault(
     config = _config(tmp_path)
     _install_schedule(config)
     _install_evidence(config)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     monkeypatch.setattr(
         TrialStore,
         "append_candidate",
@@ -2660,7 +2727,9 @@ def test_duplicate_evidence_snapshot_identity_fails_before_any_import(
         accession_number="0000000001-26-000002",
         snapshot_id=duplicated,
     )
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
@@ -2676,7 +2745,9 @@ def test_candidate_store_reports_corrupt_bytes_as_invalid(
     config = _config(tmp_path)
     _install_schedule(config)
     _install_evidence(config)
-    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
     assert run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1)).status == "collecting"
     with sqlite3.connect(config.trial_db) as conn:
         conn.execute("DROP TRIGGER trial_candidates_no_update")
