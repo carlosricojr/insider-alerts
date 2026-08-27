@@ -17,6 +17,10 @@ from zoneinfo import ZoneInfo
 import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
+from insider_alerts.research.inference import (
+    _validate_registry,
+    enrollment_deadline,
+)
 from insider_alerts.research.sec_history import (
     CLASSIFIER_VERSION,
     HistoryStore,
@@ -56,9 +60,7 @@ class CaptureConfig:
         if len(self.history_snapshot_sha256) != 64 or any(
             char not in "0123456789abcdef" for char in self.history_snapshot_sha256
         ):
-            raise ValueError(
-                "history_snapshot_sha256 must be a lowercase 64-character SHA-256"
-            )
+            raise ValueError("history_snapshot_sha256 must be a lowercase 64-character SHA-256")
         for name in (
             "capture_delay_seconds",
             "capture_deadline_seconds",
@@ -106,6 +108,14 @@ class ProcessResult:
     stdout: str
     stderr: str
     timed_out: bool
+
+
+@dataclass(slots=True, frozen=True)
+class CaptureWindow:
+    status: Literal["draft", "active"]
+    policy_sha256: str
+    activated_at: datetime | None = None
+    deadline: datetime | None = None
 
 
 def utc_text(value: datetime) -> str:
@@ -178,13 +188,10 @@ def ensure_evidence_store(path: Path) -> None:
             """
         )
         evidence_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evidence_snapshots)")
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(evidence_snapshots)")
         }
         if "owner_history_status" not in evidence_columns:
-            conn.execute(
-                "ALTER TABLE evidence_snapshots ADD COLUMN owner_history_status TEXT"
-            )
+            conn.execute("ALTER TABLE evidence_snapshots ADD COLUMN owner_history_status TEXT")
         health_columns = {
             str(row["name"]) for row in conn.execute("PRAGMA table_info(capture_health)")
         }
@@ -198,9 +205,42 @@ def ensure_evidence_store(path: Path) -> None:
         )
 
 
-def _claim_job(config: CaptureConfig, *, worker_id: str, now: datetime) -> CaptureJob | None:
+def _claim_job(
+    config: CaptureConfig,
+    *,
+    worker_id: str,
+    now: datetime,
+    window: CaptureWindow,
+) -> CaptureJob | None:
+    if window.status != "active" or window.activated_at is None or window.deadline is None:
+        raise ValueError("capture jobs can be claimed only inside an active registry window")
     with _connect(config.source_db, write=True) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        available_rows = conn.execute(
+            """
+            SELECT * FROM research_capture_jobs
+            WHERE status IN ('pending','retry')
+               OR (status='leased' AND lease_expires_at_utc <= ?)
+            ORDER BY decision_at_utc, job_id
+            """,
+            (utc_text(now),),
+        ).fetchall()
+        for row in available_rows:
+            observed_at = parse_utc(str(row["source_first_observed_at_utc"]))
+            if window.activated_at <= observed_at < window.deadline:
+                continue
+            conn.execute(
+                """
+                UPDATE research_capture_jobs
+                SET status='failed',
+                    lease_owner=NULL, lease_expires_at_utc=NULL,
+                    last_error_kind='OUTSIDE_CONFIRMATORY_CAPTURE_WINDOW',
+                    last_error_message='signal is outside the sealed confirmatory capture window',
+                    updated_at_utc=?
+                WHERE job_id=?
+                """,
+                (utc_text(now), str(row["job_id"])),
+            )
         conn.execute(
             """
             UPDATE research_capture_jobs
@@ -217,15 +257,22 @@ def _claim_job(config: CaptureConfig, *, worker_id: str, now: datetime) -> Captu
         rows = conn.execute(
             """
             SELECT * FROM research_capture_jobs
-            WHERE (status IN ('pending', 'retry') AND attempt_count < ?)
-               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?)
+            WHERE ((status IN ('pending', 'retry') AND attempt_count < ?)
+               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?))
             ORDER BY decision_at_utc, job_id
             LIMIT 100
             """,
-            (config.max_attempts, config.max_attempts, utc_text(now)),
+            (
+                config.max_attempts,
+                config.max_attempts,
+                utc_text(now),
+            ),
         ).fetchall()
         selected: sqlite3.Row | None = None
         for row in rows:
+            observed_at = parse_utc(str(row["source_first_observed_at_utc"]))
+            if not window.activated_at <= observed_at < window.deadline:
+                raise RuntimeError("unquarantined capture job is outside the active window")
             decision_at = parse_utc(str(row["decision_at_utc"]))
             if now >= decision_at + timedelta(seconds=config.capture_delay_seconds):
                 selected = row
@@ -410,10 +457,18 @@ def _optional_sha256(value: Any) -> str | None:
     return candidate if all(char in "0123456789abcdef" for char in candidate) else None
 
 
-def _validate_snapshot(config: CaptureConfig, snapshot: dict[str, Any]) -> None:
+def _validate_snapshot(
+    config: CaptureConfig,
+    snapshot: dict[str, Any],
+    *,
+    expected_policy_sha256: str,
+) -> None:
+    policy_bytes = config.policy_path.read_bytes()
+    if sha256_bytes(policy_bytes) != expected_policy_sha256:
+        raise ValueError("prospective registry changed after the capture job was claimed")
+    registry = json.loads(policy_bytes)
     schema = json.loads(config.evidence_schema_path.read_text(encoding="utf-8"))
     Draft202012Validator(schema, format_checker=FormatChecker()).validate(snapshot)
-    registry = json.loads(config.policy_path.read_text(encoding="utf-8"))
     if registry.get("hypothesis_id") != snapshot["hypothesis_id"]:
         raise ValueError("snapshot hypothesis is not a member of the deployed registry")
     if (
@@ -660,9 +715,7 @@ def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
     }
 
 
-def _owner_history_failure(
-    baseline: dict[str, Any], *, exc: BaseException
-) -> OwnerHistoryResult:
+def _owner_history_failure(baseline: dict[str, Any], *, exc: BaseException) -> OwnerHistoryResult:
     recorded_at = datetime.now(UTC)
     error = _error(
         "owner_history",
@@ -690,9 +743,7 @@ def _capture_owner_history(
 ) -> OwnerHistoryResult:
     classification_year, cutoff_at = _classification_boundary(job.decision_at)
     baseline: dict[str, Any] = {
-        "state": (
-            "ambiguous_multi_owner" if owner_mapping == "ambiguous" else "unpartitionable"
-        ),
+        "state": ("ambiguous_multi_owner" if owner_mapping == "ambiguous" else "unpartitionable"),
         "owner_cik": owner_cik,
         "classification_year": classification_year,
         "cutoff_at_utc": utc_text(cutoff_at),
@@ -719,9 +770,7 @@ def _capture_owner_history(
         return OwnerHistoryResult(
             classifier_version=None,
             classification=baseline,
-            observation=_missing_observation(
-                source="SEC-owner-history", observed_at=recorded_at
-            ),
+            observation=_missing_observation(source="SEC-owner-history", observed_at=recorded_at),
             error=None,
             recorded_at=recorded_at,
         )
@@ -751,9 +800,7 @@ def _capture_owner_history(
             "transaction_owner_mapping": "exact",
             "history_coverage_complete": result.history_coverage_complete,
             "left_censored": result.left_censored,
-            "history_observation_start_date": (
-                result.history_observation_start_date.isoformat()
-            ),
+            "history_observation_start_date": (result.history_observation_start_date.isoformat()),
             "history_source_snapshot_sha256": result.history_source_snapshot_sha256,
             "history_input_sha256": result.history_input_sha256,
         }
@@ -830,6 +877,7 @@ def _append_snapshot(
     config: CaptureConfig,
     job: CaptureJob,
     *,
+    capture_window: CaptureWindow,
     capture_started: datetime,
     capture_finished: datetime,
     timer_started: float,
@@ -847,11 +895,7 @@ def _append_snapshot(
     payload_owner_ciks = payload.get("reporting_owner_ciks")
     if isinstance(payload_owner_ciks, list):
         owner_ciks = sorted(
-            {
-                str(value)
-                for value in payload_owner_ciks
-                if isinstance(value, str) and value
-            }
+            {str(value) for value in payload_owner_ciks if isinstance(value, str) and value}
         )
     else:
         owner_cik = payload.get("reporting_owner_cik")
@@ -917,9 +961,7 @@ def _append_snapshot(
                     "min_dte_days": option_artifact.get("min_dte_days"),
                     "max_dte_days": option_artifact.get("max_dte_days"),
                     "max_expiries": option_artifact.get("max_expiries"),
-                    "max_contracts_per_expiry": option_artifact.get(
-                        "max_contracts_per_expiry"
-                    ),
+                    "max_contracts_per_expiry": option_artifact.get("max_contracts_per_expiry"),
                 },
             },
             artifact_ref=str(option_path),
@@ -1001,7 +1043,7 @@ def _append_snapshot(
                 "versions": {
                     "git_commit": config.insider_git_commit,
                     "source_fingerprint_sha256": research_source_fingerprint(),
-                    "policy_sha256": hashlib.sha256(config.policy_path.read_bytes()).hexdigest(),
+                    "policy_sha256": capture_window.policy_sha256,
                     "classifier_version": owner_history.classifier_version,
                     "model_id": _optional_string(decision.get("model_id")),
                     "prompt_sha256": _optional_sha256(decision.get("prompt_sha256")),
@@ -1038,7 +1080,11 @@ def _append_snapshot(
         unsigned.pop("record_sha256")
         record_sha = sha256_bytes(rfc8785.dumps(unsigned))
         snapshot["record_sha256"] = record_sha
-        _validate_snapshot(config, snapshot)
+        _validate_snapshot(
+            config,
+            snapshot,
+            expected_policy_sha256=capture_window.policy_sha256,
+        )
         record_bytes = rfc8785.dumps(snapshot)
         _publish_content_addressed(config.artifact_root / "snapshots", record_bytes, suffix=".json")
         conn.execute(
@@ -1114,7 +1160,39 @@ def _heartbeat(config: CaptureConfig, *, now: datetime, result: str, job_id: str
     _write_health(config.evidence_db, now=now, result=result, job_id=job_id)
 
 
-def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResult:
+def _validated_capture_window(config: CaptureConfig) -> CaptureWindow:
+    try:
+        policy_bytes = config.policy_path.read_bytes()
+        registry = json.loads(policy_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("unable to load the prospective registry") from exc
+    if not isinstance(registry, dict):
+        raise ValueError("prospective registry must be a JSON object")
+    status = registry.get("status")
+    if status == "draft":
+        _validate_registry(registry, allow_draft=True)
+        return CaptureWindow(status="draft", policy_sha256=sha256_bytes(policy_bytes))
+    if status != "active":
+        raise ValueError("prospective registry is neither draft nor active")
+    _validate_registry(registry, allow_draft=False)
+    activation = registry.get("activation")
+    if not isinstance(activation, dict):
+        raise ValueError("active registry has no activation record")
+    activated_at = parse_utc(str(activation.get("activated_at_utc", "")))
+    return CaptureWindow(
+        status="active",
+        policy_sha256=sha256_bytes(policy_bytes),
+        activated_at=activated_at,
+        deadline=enrollment_deadline(activated_at),
+    )
+
+
+def _process_claimed_job(
+    config: CaptureConfig,
+    job: CaptureJob,
+    *,
+    capture_window: CaptureWindow,
+) -> CaptureResult:
     started = datetime.now(UTC)
     timer = monotonic()
     existing_sha = _existing_snapshot_sha(config.evidence_db, job.job_id)
@@ -1185,9 +1263,7 @@ def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResul
             error_message=error_message,
         )
         _heartbeat(config, now=finished, result="retry_scheduled", job_id=job.job_id)
-        return CaptureResult(
-            status="retry_scheduled", job_id=job.job_id, option_status=error_kind
-        )
+        return CaptureResult(status="retry_scheduled", job_id=job.job_id, option_status=error_kind)
     option_error = (
         _error("options_surface", error_kind, error_message or error_kind, retryable=False)
         if error_kind
@@ -1196,6 +1272,7 @@ def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResul
     record_sha = _append_snapshot(
         config,
         job,
+        capture_window=capture_window,
         capture_started=started,
         capture_finished=finished,
         timer_started=timer,
@@ -1242,12 +1319,16 @@ def run_capture_once(
     now = (now or datetime.now(UTC)).astimezone(UTC)
     worker_id = worker_id or f"{platform.node()}:{os.getpid()}"
     ensure_evidence_store(config.evidence_db)
-    job = _claim_job(config, worker_id=worker_id, now=now)
+    window = _validated_capture_window(config)
+    if window.status == "draft":
+        _heartbeat(config, now=now, result="idle_registry_draft", job_id=None)
+        return CaptureResult(status="idle")
+    job = _claim_job(config, worker_id=worker_id, now=now, window=window)
     if job is None:
         _heartbeat(config, now=now, result="idle", job_id=None)
         return CaptureResult(status="idle")
     try:
-        return _process_claimed_job(config, job)
+        return _process_claimed_job(config, job, capture_window=window)
     except Exception as exc:
         finished = datetime.now(UTC)
         message = f"{type(exc).__name__}: {exc}"
@@ -1324,9 +1405,7 @@ def capture_status(source_db: Path, evidence_db: Path) -> dict[str, Any]:
             ):
                 try:
                     record = json.loads(bytes(snapshot_row["record_json"]))
-                    status = str(
-                        record["payload"]["observations"]["owner_history"]["status"]
-                    )
+                    status = str(record["payload"]["observations"]["owner_history"]["status"])
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     status = "invalid_record"
                 owner_history_counts[status] = owner_history_counts.get(status, 0) + 1
@@ -1337,9 +1416,7 @@ def capture_status(source_db: Path, evidence_db: Path) -> dict[str, Any]:
 
 
 def resolve_git_commit(repo_root: Path) -> str:
-    result = run_hidden_process(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, timeout_seconds=10
-    )
+    result = run_hidden_process(["git", "rev-parse", "HEAD"], cwd=repo_root, timeout_seconds=10)
     commit = result.stdout.strip().lower()
     if result.timed_out or result.returncode != 0 or len(commit) != 40:
         raise RuntimeError("unable to resolve insider-alerts deployment commit")

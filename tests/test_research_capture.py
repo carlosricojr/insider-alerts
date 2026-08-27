@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,10 +14,12 @@ import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker
 
 import insider_alerts.research.capture as capture_module
+import insider_alerts.research.inference as inference_module
 import insider_alerts.research.worker as worker_module
 from insider_alerts.research.capture import (
     CaptureConfig,
     CaptureResult,
+    CaptureWindow,
     ProcessResult,
     capture_status,
     run_capture_once,
@@ -33,6 +36,25 @@ from insider_alerts.sec.models import FilingRef
 from insider_alerts.sec.store import upsert_filing_refs
 
 ROOT = Path(__file__).resolve().parents[1]
+VALIDATE_CAPTURE_WINDOW = capture_module._validated_capture_window
+
+
+def _policy_sha(config: CaptureConfig) -> str:
+    return sha256_bytes(config.policy_path.read_bytes())
+
+
+@pytest.fixture(autouse=True)
+def _active_capture_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(
+            status="active",
+            policy_sha256=_policy_sha(config),
+            activated_at=datetime(2000, 1, 1, tzinfo=UTC),
+            deadline=datetime(2100, 1, 1, tzinfo=UTC),
+        ),
+    )
 
 
 def _approved_job(
@@ -75,15 +97,18 @@ def _approved_job(
             "rationale": {},
         },
     )
-    assert apply_decision(
-        str(source_db),
-        {
-            "packet_id": packet_id,
-            "decision": "approve",
-            "analyst": "fixture",
-            "reason": "prospective fixture",
-        },
-    ) == 1
+    assert (
+        apply_decision(
+            str(source_db),
+            {
+                "packet_id": packet_id,
+                "decision": "approve",
+                "analyst": "fixture",
+                "reason": "prospective fixture",
+            },
+        )
+        == 1
+    )
     with sqlite3.connect(source_db) as conn:
         decision_at = datetime.fromisoformat(
             str(
@@ -111,6 +136,238 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
         evidence_schema_path=ROOT / "docs/research/contracts/evidence-snapshot.schema.json",
         capture_delay_seconds=1,
     )
+
+
+def test_draft_registry_heartbeats_without_claiming_or_writing_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(status="draft", policy_sha256=_policy_sha(config)),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "idle"
+    status = capture_status(source_db, config.evidence_db)
+    assert status["evidence_count"] == 0
+    assert status["jobs"] == {"pending": 1}
+    assert status["health"]["last_result"] == "idle_registry_draft"
+
+
+def test_active_window_excludes_pre_activation_job_without_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    activation = decision_at + timedelta(seconds=1)
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(
+            status="active",
+            policy_sha256=_policy_sha(config),
+            activated_at=activation,
+            deadline=activation + timedelta(days=30),
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "idle"
+    status = capture_status(source_db, config.evidence_db)
+    assert status["evidence_count"] == 0
+    assert status["jobs"] == {"failed": 1}
+    with sqlite3.connect(source_db) as conn:
+        assert (
+            conn.execute("SELECT last_error_kind FROM research_capture_jobs").fetchone()[0]
+            == "OUTSIDE_CONFIRMATORY_CAPTURE_WINDOW"
+        )
+
+
+def _source_observed_at(source_db: Path) -> datetime:
+    with sqlite3.connect(source_db) as conn:
+        value = conn.execute(
+            "SELECT source_first_observed_at_utc FROM research_capture_jobs"
+        ).fetchone()[0]
+    return datetime.fromisoformat(str(value)).astimezone(UTC)
+
+
+def test_active_window_excludes_exact_deadline_with_mixed_timestamp_encoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    observed_at = _source_observed_at(source_db)
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(
+            status="active",
+            policy_sha256=_policy_sha(config),
+            activated_at=observed_at - timedelta(days=1),
+            deadline=observed_at,
+        ),
+    )
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "idle"
+    assert capture_status(source_db, config.evidence_db)["jobs"] == {"failed": 1}
+
+
+def test_active_window_includes_exact_activation_with_mixed_timestamp_encoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    observed_at = _source_observed_at(source_db)
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(
+            status="active",
+            policy_sha256=_policy_sha(config),
+            activated_at=observed_at,
+            deadline=observed_at + timedelta(days=1),
+        ),
+    )
+
+    assert run_capture_once(config, now=decision_at).status == "idle"
+    assert capture_status(source_db, config.evidence_db)["jobs"] == {"pending": 1}
+
+
+def test_active_window_leaves_terminal_out_of_window_job_immutable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "UPDATE research_capture_jobs SET status='failed',last_error_kind=?",
+            ("CAPTURE_ATTEMPTS_EXHAUSTED",),
+        )
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(
+            status="active",
+            policy_sha256=_policy_sha(config),
+            activated_at=decision_at + timedelta(seconds=1),
+            deadline=decision_at + timedelta(days=1),
+        ),
+    )
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "idle"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("failed", "CAPTURE_ATTEMPTS_EXHAUSTED")
+
+
+def test_active_window_quarantines_expired_out_of_window_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            """
+            UPDATE research_capture_jobs
+            SET status='leased',attempt_count=1,lease_owner='old-worker',lease_expires_at_utc=?
+            """,
+            (capture_module.utc_text(decision_at),),
+        )
+    monkeypatch.setattr(
+        capture_module,
+        "_validated_capture_window",
+        lambda config: CaptureWindow(
+            status="active",
+            policy_sha256=_policy_sha(config),
+            activated_at=decision_at + timedelta(seconds=1),
+            deadline=decision_at + timedelta(days=1),
+        ),
+    )
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "idle"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,lease_owner,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("failed", None, "OUTSIDE_CONFIRMATORY_CAPTURE_WINDOW")
+
+
+def test_checked_in_registry_validates_as_draft_capture_window(tmp_path: Path) -> None:
+    config = _config(tmp_path, tmp_path / "source.db")
+    assert VALIDATE_CAPTURE_WINDOW(config) == CaptureWindow(
+        status="draft",
+        policy_sha256=_policy_sha(config),
+    )
+
+
+def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
+    registry = json.loads((ROOT / "docs/research/registry/OPP-E07-V1.json").read_text())
+    registry["status"] = "active"
+    activated_at = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    file_sha = inference_module._file_sha256
+    registry["activation"] = {
+        "activated_at_utc": capture_module.utc_text(activated_at),
+        "activation_git_commit": commit,
+        "registry_definition_sha256": inference_module.registry_definition_sha256(registry),
+        "preregistration_sha256": file_sha(ROOT / registry["preregistration"]),
+        "hypothesis_schema_sha256": file_sha(
+            ROOT / "docs/research/contracts/hypothesis-registry.schema.json"
+        ),
+        "evidence_schema_sha256": file_sha(
+            ROOT / "docs/research/contracts/evidence-snapshot.schema.json"
+        ),
+        "inference_artifact_sha256": inference_module.inference_artifact_sha256(),
+        "dependency_lock_sha256": file_sha(ROOT / "uv.lock"),
+        "policy_sha256": file_sha(ROOT / registry["strategy"]["policy_artifact"]),
+        "classifier_version": inference_module.CLASSIFIER_VERSION,
+        "enrollment_start_sequence": 1,
+    }
+    policy_path = tmp_path / "active-registry.json"
+    policy_path.write_text(json.dumps(registry), encoding="utf-8")
+    config = replace(_config(tmp_path, tmp_path / "source.db"), policy_path=policy_path)
+
+    assert VALIDATE_CAPTURE_WINDOW(config) == CaptureWindow(
+        status="active",
+        policy_sha256=_policy_sha(config),
+        activated_at=activated_at,
+        deadline=inference_module.enrollment_deadline(activated_at),
+    )
+
+
+def test_snapshot_rejects_registry_replacement_after_claim(tmp_path: Path) -> None:
+    policy_path = tmp_path / "registry.json"
+    policy_path.write_bytes((ROOT / "docs/research/registry/OPP-E07-V1.json").read_bytes())
+    config = replace(
+        _config(tmp_path, tmp_path / "source.db"),
+        policy_path=policy_path,
+    )
+    expected_sha = _policy_sha(config)
+    policy_path.write_bytes(policy_path.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="registry changed after"):
+        capture_module._validate_snapshot(
+            config,
+            {},
+            expected_policy_sha256=expected_sha,
+        )
 
 
 def _install_history_snapshot(
@@ -157,9 +414,7 @@ def _install_history_snapshot(
                 members.append((year, quarter, digest))
                 if quarter == 1:
                     archive_by_year[year] = digest
-        for month, year in enumerate(
-            range(classification_year - 3, classification_year), start=1
-        ):
+        for month, year in enumerate(range(classification_year - 3, classification_year), start=1):
             archive_sha = archive_by_year[year]
             accession = f"0000000002-{year % 100:02d}-{month:06d}"
             filing_date = f"{year}-{month:02d}-02"
@@ -264,9 +519,7 @@ def test_terminal_option_failure_is_persisted_as_valid_immutable_snapshot(
         assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone()[0] == 1
     assert run_capture_once(config, now=decision_at + timedelta(seconds=3)).status == "idle"
     assert packet_id in result.job_id
-    assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {
-        "error": 1
-    }
+    assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {"error": 1}
 
 
 def test_evidence_store_migrates_legacy_status_rows_without_rewriting_them(
@@ -307,14 +560,13 @@ def test_evidence_store_migrates_legacy_status_rows_without_rewriting_them(
         evidence_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(evidence_snapshots)")
         }
-        health_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(capture_health)")
-        }
+        health_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(capture_health)")}
         assert "owner_history_status" in evidence_columns
         assert {"last_error_kind", "last_error_message"} <= health_columns
-        assert conn.execute(
-            "SELECT owner_history_status FROM evidence_snapshots"
-        ).fetchone()[0] is None
+        assert (
+            conn.execute("SELECT owner_history_status FROM evidence_snapshots").fetchone()[0]
+            is None
+        )
     assert capture_status(tmp_path / "missing-source.db", evidence_db)["owner_history"] == {
         "missing": 1
     }
@@ -323,9 +575,7 @@ def test_evidence_store_migrates_legacy_status_rows_without_rewriting_them(
 def test_capture_preserves_multi_owner_ambiguity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source_db, _, decision_at = _approved_job(
-        tmp_path, owner_ciks=("0000000002", "0000000003")
-    )
+    source_db, _, decision_at = _approved_job(tmp_path, owner_ciks=("0000000002", "0000000003"))
     config = _config(tmp_path, source_db)
 
     monkeypatch.setattr(
@@ -358,9 +608,7 @@ def test_capture_preserves_multi_owner_ambiguity(
 def test_capture_treats_missing_joint_owner_cik_as_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source_db, _, decision_at = _approved_job(
-        tmp_path, owner_ciks=("0000000002",), owner_count=2
-    )
+    source_db, _, decision_at = _approved_job(tmp_path, owner_ciks=("0000000002",), owner_count=2)
     config = _config(tmp_path, source_db)
     monkeypatch.setattr(
         capture_module,
@@ -385,9 +633,7 @@ def test_exact_owner_history_is_classified_from_the_pinned_predecision_snapshot(
 ) -> None:
     source_db, _, decision_at = _approved_job(tmp_path)
     config = _config(tmp_path, source_db)
-    classification_year, expected_cutoff = capture_module._classification_boundary(
-        decision_at
-    )
+    classification_year, expected_cutoff = capture_module._classification_boundary(decision_at)
     snapshot_sha = _install_history_snapshot(
         config,
         classification_year=classification_year,
@@ -553,8 +799,7 @@ def test_postdecision_history_snapshot_is_an_explicit_isolated_error(
     assert classification["history_source_snapshot_sha256"] is None
     assert observation["status"] == "error"
     assert any(
-        error["kind"] == "OWNER_HISTORY_UNAVAILABLE"
-        for error in record["payload"]["errors"]
+        error["kind"] == "OWNER_HISTORY_UNAVAILABLE" for error in record["payload"]["errors"]
     )
 
 
@@ -580,9 +825,10 @@ def test_transient_history_database_failure_retries_without_writing_evidence(
     result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
 
     assert result.status == "retry_scheduled"
-    assert not config.evidence_db.is_file() or capture_status(
-        config.source_db, config.evidence_db
-    )["evidence_count"] == 0
+    assert (
+        not config.evidence_db.is_file()
+        or capture_status(config.source_db, config.evidence_db)["evidence_count"] == 0
+    )
 
 
 def test_permanent_history_operational_error_is_isolated_in_evidence(
@@ -607,9 +853,7 @@ def test_permanent_history_operational_error_is_isolated_in_evidence(
     result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
 
     assert result.status == "completed"
-    assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {
-        "error": 1
-    }
+    assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {"error": 1}
 
 
 def test_classification_year_uses_new_york_calendar_boundary() -> None:
@@ -859,15 +1103,13 @@ def test_worker_main_persists_and_logs_fatal_setup_failure(
     assert status["health"]["last_result"] == "worker_error"
     assert status["health"]["last_error_kind"] == "CAPTURE_WORKER_FATAL"
     assert status["health"]["last_error_message"] == "RuntimeError: setup failed"
-    assert "RuntimeError: setup failed" in (
-        tmp_path / "research-capture.err.log"
-    ).read_text(encoding="utf-8")
+    assert "RuntimeError: setup failed" in (tmp_path / "research-capture.err.log").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
-    installer = (
-        ROOT / "ops/windows/install-research-capture-task.ps1"
-    ).read_text(encoding="utf-8")
+    installer = (ROOT / "ops/windows/install-research-capture-task.ps1").read_text(encoding="utf-8")
 
     assert ".venv\\Scripts\\pythonw.exe" in installer
     assert '"--loop"' not in installer
