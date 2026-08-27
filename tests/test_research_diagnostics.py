@@ -757,6 +757,55 @@ def test_unavailable_control_does_not_block_later_ready_outcome(
     }
 
 
+def test_post_freeze_unavailable_receipt_does_not_degrade_outcome_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    SessionFeedStore(config.session_feed_db)
+    BarFeedStore(config.bar_feed_db)
+    activated_at = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
+    freeze_boundary = date(2026, 8, 28)
+    window = TrialWindow("active", "a" * 64, activated_at, activated_at + timedelta(days=30))
+    monkeypatch.setattr(diagnostic_outcomes, "_validated_trial_window", lambda _config: window)
+    monkeypatch.setattr(
+        TrialStore,
+        "cohort_freeze",
+        lambda _store: (freeze_boundary, activated_at + timedelta(days=1)),
+    )
+    candidates = [
+        {
+            "packet_id": "frozen",
+            "candidate_id": "frozen-candidate",
+            "entry_session": freeze_boundary.isoformat(),
+            "record_json": b"{}",
+            "record_sha256": "a" * 64,
+        },
+        {
+            "packet_id": "post-freeze",
+            "candidate_id": "post-freeze-candidate",
+            "entry_session": (freeze_boundary + timedelta(days=1)).isoformat(),
+            "record_json": b"{}",
+            "record_sha256": "b" * 64,
+        },
+    ]
+    monkeypatch.setattr(DiagnosticStore, "candidates", lambda _store: candidates)
+    monkeypatch.setattr(
+        DiagnosticStore,
+        "outcome_receipt",
+        lambda _store, packet_id: (
+            {"disposition": "unavailable"} if packet_id == "post-freeze" else None
+        ),
+    )
+
+    result = finalize_diagnostic_outcomes(config, now=activated_at + timedelta(days=2))
+
+    assert result.status == "collecting"
+    assert result.candidates_seen == 1
+    assert result.outcomes_waiting == 1
+    assert result.unavailable_total == 0
+    assert result.error is None
+
+
 def test_diagnostic_integrity_rejects_orphans_and_health_cannot_move_backward(
     tmp_path: Path,
 ) -> None:

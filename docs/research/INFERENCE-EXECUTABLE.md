@@ -1,7 +1,9 @@
 # Frozen OPP-E07-V1 inference executable
 
-`python -m insider_alerts.research.inference` is the single decision executable for the prospective
-trial. It has no broker imports or order capability. Production execution requires an active
+`python -m insider_alerts.research.terminal_builder` is the single production wrapper for terminal
+sealing and the separately invoked decision. It calls the frozen
+`insider_alerts.research.inference` decision engine; neither module has broker imports or order
+capability. Production execution requires an active
 registry whose definition digest and canonical-content `inference.py` and `terminal_builder.py`
 digests match the activation record.
 

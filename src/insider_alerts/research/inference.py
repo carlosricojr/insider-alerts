@@ -1058,6 +1058,8 @@ def _parse_terminal(
             raise TrialInvalid(f"{group}_trade_id_duplicate")
         if any(trade.exit_at > sealed_at for trade in trades):
             raise TrialInvalid(f"{group}_trade_exit_after_seal")
+        if any(trade.entry_date > freeze_boundary for trade in trades):
+            raise TrialInvalid(f"{group}_trade_after_freeze")
         if len(trades) != metadata["available_trade_count"]:
             raise TrialInvalid(f"{group}_available_trade_count_mismatch")
         groups[group] = trades
@@ -1167,6 +1169,14 @@ class TrialSealStore:
                   report_json BLOB NOT NULL,
                   report_sha256 TEXT NOT NULL UNIQUE
                 );
+                CREATE TABLE IF NOT EXISTS terminal_pending(
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  terminal_json BLOB NOT NULL,
+                  terminal_dataset_sha256 TEXT NOT NULL UNIQUE,
+                  candidate_projection_sha256 TEXT NOT NULL,
+                  candidate_universe_sha256 TEXT NOT NULL,
+                  enrollment_deadline_utc TEXT NOT NULL
+                );
                 CREATE TRIGGER IF NOT EXISTS trial_receipts_no_update
                 BEFORE UPDATE ON trial_receipts
                 BEGIN SELECT RAISE(ABORT,'trial receipts are append-only'); END;
@@ -1183,6 +1193,12 @@ class TrialSealStore:
                 CREATE TRIGGER IF NOT EXISTS decision_report_no_delete
                 BEFORE DELETE ON decision_report
                 BEGIN SELECT RAISE(ABORT,'decision report is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS terminal_pending_no_update
+                BEFORE UPDATE ON terminal_pending
+                BEGIN SELECT RAISE(ABORT,'pending terminal dataset is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS terminal_pending_no_delete
+                BEFORE DELETE ON terminal_pending
+                BEGIN SELECT RAISE(ABORT,'pending terminal dataset is append-only'); END;
                 """
             )
 
@@ -1200,6 +1216,10 @@ class TrialSealStore:
         encoded = rfc8785.dumps(dict(receipt))
         with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            if kind == "deadline_miss" and conn.execute(
+                "SELECT 1 FROM terminal_pending WHERE singleton=1"
+            ).fetchone() is not None:
+                raise TrialInvalid("terminal_receipt_kind_conflict")
             row = conn.execute(
                 "SELECT receipt_json FROM trial_receipts WHERE kind=?", (kind,)
             ).fetchone()
@@ -1248,6 +1268,8 @@ class TrialSealStore:
     def seal_deadline_miss(
         self, payload: Mapping[str, Any], *, recorded_at: datetime
     ) -> dict[str, Any]:
+        if self.pending_terminal() is not None:
+            raise TrialInvalid("terminal_receipt_kind_conflict")
         activated_at = _utc(payload.get("activated_at_utc"), "activated_at")
         candidates = [
             _parse_candidate(item, index)
@@ -1263,14 +1285,40 @@ class TrialSealStore:
         )
         return self._put_receipt(receipt)
 
-    def seal_terminal(
+    def pending_terminal(self) -> dict[str, Any] | None:
+        """Return and verify the first durably staged terminal dataset, if any."""
+
+        with contextlib.closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM terminal_pending WHERE singleton=1").fetchone()
+        if row is None:
+            return None
+        raw = bytes(row["terminal_json"])
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or rfc8785.dumps(parsed) != raw:
+            raise TrialInvalid("pending_terminal_dataset_not_canonical")
+        dataset_digest = _sha256(parsed.get("dataset_sha256"), "terminal_dataset_sha")
+        unsigned = dict(parsed)
+        unsigned.pop("dataset_sha256", None)
+        if (
+            _canonical_sha256(unsigned) != dataset_digest
+            or row["terminal_dataset_sha256"] != dataset_digest
+            or row["candidate_projection_sha256"]
+            != parsed.get("candidate_projection_sha256")
+        ):
+            raise TrialInvalid("pending_terminal_dataset_invalid")
+        _sha256(row["candidate_universe_sha256"], "pending_candidate_universe_sha")
+        _utc(row["enrollment_deadline_utc"], "pending_enrollment_deadline")
+        return parsed
+
+    def stage_terminal(
         self,
         registry: Mapping[str, Any],
         payload: Mapping[str, Any],
         *,
-        recorded_at: datetime | None = None,
         allow_draft: bool = False,
     ) -> dict[str, Any]:
+        """Durably bind the first valid terminal bytes before artifact publication."""
+
         validation = evaluate_trial(
             registry,
             payload,
@@ -1281,7 +1329,7 @@ class TrialSealStore:
             reasons = validation.get("reason_codes")
             reason = reasons[0] if isinstance(reasons, list) and reasons else "terminal_invalid"
             raise TrialInvalid(f"terminal_preseal_validation_failed:{reason}")
-        terminal = _mapping(payload.get("terminal_dataset"), "terminal_dataset")
+        terminal = dict(_mapping(payload.get("terminal_dataset"), "terminal_dataset"))
         dataset_digest = _sha256(terminal.get("dataset_sha256"), "terminal_dataset_sha")
         unsigned = dict(terminal)
         unsigned.pop("dataset_sha256", None)
@@ -1294,15 +1342,67 @@ class TrialSealStore:
         projection_digest = _candidate_projection_sha256(candidates)
         if terminal.get("candidate_projection_sha256") != projection_digest:
             raise TrialInvalid("terminal_candidate_projection_digest_mismatch")
+        universe_digest = _candidate_universe_sha256(candidates)
+        deadline = enrollment_deadline(_utc(payload.get("activated_at_utc"), "activated_at"))
+        encoded = rfc8785.dumps(terminal)
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conflicting = conn.execute(
+                "SELECT kind FROM trial_receipts WHERE kind='deadline_miss'"
+            ).fetchone()
+            if conflicting is not None:
+                raise TrialInvalid("terminal_receipt_kind_conflict")
+            row = conn.execute("SELECT * FROM terminal_pending WHERE singleton=1").fetchone()
+            if row is not None:
+                if (
+                    bytes(row["terminal_json"]) != encoded
+                    or row["terminal_dataset_sha256"] != dataset_digest
+                    or row["candidate_projection_sha256"] != projection_digest
+                    or row["candidate_universe_sha256"] != universe_digest
+                    or _utc(row["enrollment_deadline_utc"], "pending_enrollment_deadline")
+                    != deadline
+                ):
+                    raise TrialInvalid("alternate_terminal_dataset_prohibited")
+                return terminal
+            existing_receipt = conn.execute(
+                "SELECT receipt_json FROM trial_receipts WHERE kind='terminal_seal'"
+            ).fetchone()
+            if existing_receipt is not None:
+                existing = json.loads(bytes(existing_receipt["receipt_json"]))
+                if (
+                    existing.get("terminal_dataset_sha256") != dataset_digest
+                    or existing.get("candidate_projection_sha256") != projection_digest
+                    or existing.get("candidate_universe_sha256") != universe_digest
+                ):
+                    raise TrialInvalid("alternate_terminal_seal_receipt_prohibited")
+            conn.execute(
+                "INSERT INTO terminal_pending VALUES(1,?,?,?,?,?)",
+                (
+                    encoded,
+                    dataset_digest,
+                    projection_digest,
+                    universe_digest,
+                    _utc_text(deadline),
+                ),
+            )
+        return terminal
+
+    def seal_terminal(
+        self,
+        registry: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        recorded_at: datetime | None = None,
+        allow_draft: bool = False,
+    ) -> dict[str, Any]:
+        terminal = self.stage_terminal(registry, payload, allow_draft=allow_draft)
+        dataset_digest = _sha256(terminal.get("dataset_sha256"), "terminal_dataset_sha")
+        candidates = [
+            _parse_candidate(item, index)
+            for index, item in enumerate(_list(payload.get("candidates"), "candidates"))
+        ]
+        projection_digest = _candidate_projection_sha256(candidates)
         activated_at = _utc(payload.get("activated_at_utc"), "activated_at")
-        receipt_recorded_at = recorded_at or datetime.now(UTC)
-        if receipt_recorded_at.tzinfo is None:
-            raise TrialInvalid("terminal_seal_recorded_at_naive")
-        receipt_recorded_at = receipt_recorded_at.astimezone(UTC)
-        terminal_sealed_at = _utc(terminal.get("sealed_at_utc"), "terminal_sealed_at")
-        evaluated_at = _utc(payload.get("evaluated_at_utc"), "evaluated_at")
-        if not terminal_sealed_at <= receipt_recorded_at <= evaluated_at:
-            raise TrialInvalid("terminal_seal_recorded_at_invalid")
         candidate_universe_digest = _candidate_universe_sha256(candidates)
         existing = self.receipt("terminal_seal")
         if existing is not None:
@@ -1315,6 +1415,14 @@ class TrialSealStore:
             ):
                 raise TrialInvalid("alternate_terminal_seal_receipt_prohibited")
             return existing
+        receipt_recorded_at = recorded_at or datetime.now(UTC)
+        if receipt_recorded_at.tzinfo is None:
+            raise TrialInvalid("terminal_seal_recorded_at_naive")
+        receipt_recorded_at = receipt_recorded_at.astimezone(UTC)
+        terminal_sealed_at = _utc(terminal.get("sealed_at_utc"), "terminal_sealed_at")
+        evaluated_at = _utc(payload.get("evaluated_at_utc"), "evaluated_at")
+        if not terminal_sealed_at <= receipt_recorded_at <= evaluated_at:
+            raise TrialInvalid("terminal_seal_recorded_at_invalid")
         receipt = _build_receipt(
             kind="terminal_seal",
             recorded_at=receipt_recorded_at,

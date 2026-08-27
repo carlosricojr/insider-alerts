@@ -712,6 +712,15 @@ def test_append_only_terminal_seal_and_report_prohibit_a_second_look(
         )
         == receipt
     )
+    assert (
+        store.seal_terminal(
+            _registry(),
+            payload,
+            recorded_at=evaluated + timedelta(minutes=2),
+            allow_draft=True,
+        )
+        == receipt
+    )
     first = inference.evaluate_with_store(_registry(), payload, store, allow_draft=True)
 
     altered = json.loads(json.dumps(payload))
@@ -722,7 +731,7 @@ def test_append_only_terminal_seal_and_report_prohibit_a_second_look(
         rfc8785.dumps(unsigned)
     ).hexdigest()
 
-    with pytest.raises(inference.TrialInvalid, match="alternate_terminal_seal"):
+    with pytest.raises(inference.TrialInvalid, match="alternate_terminal_dataset_prohibited"):
         store.seal_terminal(_registry(), altered, recorded_at=evaluated, allow_draft=True)
     assert inference.evaluate_with_store(_registry(), altered, store, allow_draft=True) == first
 
@@ -846,6 +855,48 @@ def test_empty_available_diagnostic_group_is_valid_and_explicit() -> None:
     assert control["status"] == "available"
     assert control["accounting"]["membership_count"] == 0
     assert control["trade_count"] == 0
+
+
+def test_available_diagnostic_trade_after_freeze_fails_closed() -> None:
+    candidates = _candidate_rows([2] * 60)
+    terminal = _terminal_dataset(candidates, gross_return=0.03)
+    freeze_boundary = date.fromisoformat(terminal["freeze_boundary_entry_date"])
+    entry_date = freeze_boundary + timedelta(days=1)
+    entry_at = datetime.combine(entry_date, time(14, 30), tzinfo=UTC)
+    terminal["control_trades"] = [
+        {
+            "trade_id": "post-freeze-control",
+            "confirmatory_enrollment_sequence": None,
+            "evidence_record_sha256": None,
+            "entry_rank_sha256": None,
+            "symbol": "CTRL",
+            "entry_date": entry_date.isoformat(),
+            "entry_at_utc": _utc_text(entry_at),
+            "exit_at_utc": _utc_text(entry_at + timedelta(hours=1)),
+            "gross_return": 0.01,
+            "spy_return": 0.0,
+        }
+    ]
+    terminal["diagnostic_group_status"]["control"].update(
+        membership_count=1,
+        available_trade_count=1,
+    )
+    unsigned = dict(terminal)
+    unsigned.pop("dataset_sha256")
+    terminal["dataset_sha256"] = hashlib.sha256(rfc8785.dumps(unsigned)).hexdigest()
+    evaluated = datetime.fromisoformat(terminal["sealed_at_utc"].replace("Z", "+00:00"))
+
+    report = _evaluate(
+        _payload(
+            candidates,
+            evaluated_at=evaluated,
+            complete_through=freeze_boundary,
+            terminal=terminal,
+        )
+    )
+
+    assert report["state"] == "INVALID"
+    assert report["reason_codes"] == ["control_trade_after_freeze"]
 
 
 def test_diagnostic_group_accounting_and_available_rows_fail_closed() -> None:

@@ -347,6 +347,51 @@ def test_builder_waits_for_every_frozen_challenger_outcome(
             conn.close()
 
 
+def test_locked_inputs_closes_connection_when_lock_acquisition_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeConnection:
+        def __init__(self, fail_begin: bool) -> None:
+            self.fail_begin = fail_begin
+            self.closed = False
+            self.row_factory: object | None = None
+
+        def execute(self, statement: str) -> None:
+            if self.fail_begin and statement == "BEGIN IMMEDIATE":
+                raise sqlite3.OperationalError("database is locked")
+
+        def rollback(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    connections = [FakeConnection(False), FakeConnection(True)]
+    monkeypatch.setattr(
+        builder.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: connections.pop(0),
+    )
+    opened = connections.copy()
+    config = builder.TerminalBuildConfig(
+        trial_db=tmp_path / "trial.db",
+        diagnostics_db=tmp_path / "diagnostics.db",
+        canary_ledger_db=tmp_path / "canary.db",
+        source_db=tmp_path / "source.db",
+        registry_path=tmp_path / "registry.json",
+        seal_db=tmp_path / "seals.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    with (
+        pytest.raises(sqlite3.OperationalError, match="database is locked"),
+        builder._locked_inputs(config),
+    ):
+        raise AssertionError("unreachable")
+
+    assert all(connection.closed for connection in opened)
+
+
 def test_incomplete_diagnostics_are_unavailable_and_never_delay_primary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -382,6 +427,68 @@ def test_incomplete_diagnostics_are_unavailable_and_never_delay_primary(
         "not_traded_count": 0,
         "unavailable_count": 1,
     }
+
+
+def test_unavailable_diagnostic_accounting_excludes_pre_activation_source(
+    tmp_path: Path,
+) -> None:
+    diagnostics, canary, source = _empty_external_stores(tmp_path)
+    entry_date = date(2026, 2, 3)
+    pre_signal = ACTIVATED_AT + timedelta(minutes=1)
+    missing_signal = ACTIVATED_AT + timedelta(minutes=2)
+    with sqlite3.connect(canary) as conn:
+        for packet_id, signal_at in (
+            ("pre-activation-source", pre_signal),
+            ("missing-source", missing_signal),
+        ):
+            conn.execute(
+                "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    packet_id,
+                    f"accession-{packet_id}",
+                    "1234567890",
+                    "CTRL",
+                    signal_at.isoformat(),
+                    1.0,
+                    entry_date.isoformat(),
+                    "d" * 64,
+                    1,
+                    "eligible_E07_F00",
+                    10.0,
+                    1_000_000.0,
+                    20,
+                    signal_at.isoformat(),
+                ),
+            )
+    with sqlite3.connect(source) as conn:
+        conn.execute(
+            "INSERT INTO research_capture_jobs VALUES(?,?,?,?)",
+            (
+                "pre-job",
+                "pre-activation-source",
+                (ACTIVATED_AT - timedelta(seconds=1)).isoformat(),
+                pre_signal.isoformat(),
+            ),
+        )
+    connections = []
+    try:
+        for path in (diagnostics, canary, source):
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+            connections.append(connection)
+        control, routine, statuses, _recorded_at = builder._diagnostic_material(
+            *connections,
+            activated_at=ACTIVATED_AT,
+            freeze_boundary=entry_date,
+        )
+    finally:
+        for connection in connections:
+            connection.close()
+
+    assert control == routine == []
+    assert statuses["control"]["error_code"] == "control_source_capture_job_missing"
+    assert statuses["control"]["membership_count"] == 1
+    assert statuses["control"]["unavailable_count"] == 1
 
 
 def test_public_seal_status_and_single_decision_are_crash_idempotent(
@@ -425,6 +532,52 @@ def test_public_seal_status_and_single_decision_are_crash_idempotent(
     assert decision.status == decision_replay.status == "decided"
     assert decision.decision_report_sha256 == decision_replay.decision_report_sha256
     assert builder.terminal_status(config).decision_report_sha256 == decision.decision_report_sha256
+
+
+def test_retry_replays_pending_terminal_bytes_after_diagnostics_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inference, "TARGET_ENROLLED_TRADES", 2)
+    monkeypatch.setattr(inference, "MINIMUM_DISTINCT_ENTRY_DATES", 2)
+    trial = tmp_path / "trial.db"
+    _install_trial(trial)
+    diagnostics, canary, source = _empty_external_stores(tmp_path)
+    config = builder.TerminalBuildConfig(
+        trial_db=trial,
+        diagnostics_db=diagnostics,
+        canary_ledger_db=canary,
+        source_db=source,
+        registry_path=_active_registry_path(tmp_path),
+        seal_db=tmp_path / "seals.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    now = datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
+    publish = builder._publish_dataset
+    monkeypatch.setattr(
+        builder,
+        "_publish_dataset",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("publication crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="publication crash"):
+        builder.seal_terminal_dataset(config, now=now)
+    pending = inference.TrialSealStore(config.seal_db).pending_terminal()
+    assert pending is not None
+    pending_digest = pending["dataset_sha256"]
+    DiagnosticStore(diagnostics).add_reconciliation(
+        packet_id=None,
+        category="post_pending_diagnostic_change",
+        detail={"changed": True},
+        now=now + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(builder, "_publish_dataset", publish)
+
+    replay = builder.seal_terminal_dataset(config, now=now + timedelta(minutes=1))
+
+    assert replay.terminal_dataset_sha256 == pending_digest
+    artifact = config.artifact_root / "terminal-datasets" / f"{pending_digest}.json"
+    assert artifact.read_bytes() == rfc8785.dumps(pending)
+    assert inference.TrialSealStore(config.seal_db).receipt("terminal_seal") is not None
 
 
 def test_decision_fails_closed_with_typed_missing_artifact(tmp_path: Path) -> None:

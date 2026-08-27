@@ -29,6 +29,7 @@ from insider_alerts.research.inference import (
     TrialSealStore,
     _candidate_projection_sha256,
     _parse_candidate,
+    cohort_freeze_boundary,
     evaluate_with_store,
 )
 from insider_alerts.research.trial_runtime import (
@@ -163,10 +164,10 @@ def _locked_inputs(config: TerminalBuildConfig) -> Iterator[tuple[sqlite3.Connec
     try:
         for path in paths:
             conn = sqlite3.connect(path, timeout=30)
+            connections.append(conn)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("BEGIN IMMEDIATE")
-            connections.append(conn)
         yield tuple(connections)
     finally:
         for conn in reversed(connections):
@@ -317,7 +318,14 @@ def _diagnostic_material(
         (activated_at.astimezone(UTC).isoformat(), freeze_boundary.isoformat()),
     ).fetchall()
     expected: dict[str, sqlite3.Row] = {}
+    in_scope: set[str] = set()
     membership_error: str | None = None
+
+    def record_membership_error(code: str) -> None:
+        nonlocal membership_error
+        if membership_error is None:
+            membership_error = code
+
     for row in canary_rows:
         packet_id = str(row["packet_id"])
         job = source_conn.execute(
@@ -326,23 +334,25 @@ def _diagnostic_material(
             (packet_id,),
         ).fetchone()
         if job is None:
-            membership_error = "control_source_capture_job_missing"
+            in_scope.add(packet_id)
+            record_membership_error("control_source_capture_job_missing")
             continue
         source_at = _parse_utc(str(job["source_first_observed_at_utc"]))
         signal_at = _parse_utc(str(row["signal_at"]))
         decision_at = _parse_utc(str(job["decision_at_utc"]))
         if source_at < activated_at:
             continue
+        in_scope.add(packet_id)
         if source_at > signal_at or decision_at != signal_at:
-            membership_error = "control_source_timestamp_reconciliation_failed"
+            record_membership_error("control_source_timestamp_reconciliation_failed")
             continue
         expected[packet_id] = row
     if set(expected) != set(stored):
-        membership_error = "control_candidate_membership_mismatch"
+        record_membership_error("control_candidate_membership_mismatch")
     for packet_id in set(expected) & set(stored):
         projected = _selection_projection(expected[packet_id])
         if _sha256(rfc8785.dumps(projected)) != str(stored[packet_id]["canary_selection_sha256"]):
-            membership_error = "control_canary_selection_changed"
+            record_membership_error("control_canary_selection_changed")
             break
     relevant_reconciliations = diagnostic_conn.execute(
         "SELECT 1 FROM diagnostic_reconciliations WHERE packet_id IS NULL OR packet_id IN ("
@@ -351,11 +361,11 @@ def _diagnostic_material(
         (freeze_boundary.isoformat(),),
     ).fetchone()
     if relevant_reconciliations is not None:
-        membership_error = "control_reconciliation_present"
+        record_membership_error("control_reconciliation_present")
 
     membership_count = len(stored)
     if membership_error is not None:
-        membership_count = len(set(stored) | {str(row["packet_id"]) for row in canary_rows})
+        membership_count = len(set(stored) | in_scope)
         status = _unavailable_status(membership_count, membership_error)
         routine_status = _unavailable_status(
             membership_count, f"routine_membership_unavailable:{membership_error}"
@@ -510,8 +520,6 @@ def _build_dataset_locked(
         for resolution in snapshot.resolutions
         if resolution.enrollment_state == "enrolled"
     ]
-    from insider_alerts.research.inference import cohort_freeze_boundary
-
     freeze = cohort_freeze_boundary([item.entry_date for item in enrolled], completion_map)
     if freeze is None:
         raise TerminalBuildNotReady("cohort_not_frozen")
@@ -591,6 +599,12 @@ def _publish_dataset(root: Path, terminal: Mapping[str, Any]) -> Path:
         except FileExistsError:
             if path.read_bytes() != encoded:
                 raise TerminalBuildInvalid("terminal_artifact_path_collision") from None
+        if os.name != "nt":
+            directory_descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
@@ -619,6 +633,7 @@ def seal_terminal_dataset(
     registry = json.loads(config.registry_path.read_text(encoding="utf-8"))
     if not isinstance(registry, dict):
         raise TerminalBuildInvalid("registry_not_object")
+    seal_store = TrialSealStore(config.seal_db)
     trial_store = TrialStore(config.trial_db, initialize=False)
     diagnostic_store = DiagnosticStore(config.diagnostics_db, initialize=False)
     before_trial = _fingerprint(config.trial_db, TRIAL_SNAPSHOT_TABLES)
@@ -637,13 +652,24 @@ def seal_terminal_dataset(
             != expected_diagnostic
         ):
             raise TerminalBuildNotReady("terminal_inputs_changed_during_validation")
-        snapshot, terminal, counts = _build_dataset_locked(
-            trial_conn,
-            diagnostic_conn,
-            canary_conn,
-            source_conn,
-            activated_at=window.activated_at_utc,
-        )
+        pending = seal_store.pending_terminal()
+        if pending is None:
+            snapshot, terminal, counts = _build_dataset_locked(
+                trial_conn,
+                diagnostic_conn,
+                canary_conn,
+                source_conn,
+                activated_at=window.activated_at_utc,
+            )
+        else:
+            snapshot = _trial_snapshot(trial_conn)
+            terminal = pending
+            diagnostic_status = terminal["diagnostic_group_status"]
+            counts = {
+                "frozen": len(terminal["challenger_trades"]),
+                "control": int(diagnostic_status["control"]["membership_count"]),
+                "routine": int(diagnostic_status["routine"]["membership_count"]),
+            }
         sealed_at = requested_at or datetime.now(UTC)
         payload = _terminal_payload(
             snapshot,
@@ -651,10 +677,9 @@ def seal_terminal_dataset(
             activated_at=window.activated_at_utc,
             evaluated_at=sealed_at,
         )
+        terminal = seal_store.stage_terminal(registry, payload)
         _publish_dataset(config.artifact_root, terminal)
-        receipt = TrialSealStore(config.seal_db).seal_terminal(
-            registry, payload, recorded_at=sealed_at
-        )
+        receipt = seal_store.seal_terminal(registry, payload, recorded_at=sealed_at)
     return TerminalBuildResult(
         "sealed",
         freeze_boundary_entry_date=str(terminal["freeze_boundary_entry_date"]),
@@ -802,6 +827,8 @@ def decide_terminal_dataset(
     if window.status != "active" or window.activated_at_utc is None:
         raise TerminalBuildInvalid("decision_registry_not_active")
     registry = json.loads(config.registry_path.read_text(encoding="utf-8"))
+    if not isinstance(registry, dict):
+        raise TerminalBuildInvalid("registry_not_object")
     trial_store = TrialStore(config.trial_db, initialize=False)
     trial_store.validate_integrity()
     with contextlib.closing(trial_store._connect()) as conn:

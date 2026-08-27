@@ -334,7 +334,12 @@ def finalize_diagnostic_outcomes(
         )
         receipts_added += int(receipt_added)
     store.validate_integrity()
-    unavailable = store.outcome_disposition_counts().get("unavailable", 0)
+    unavailable = sum(
+        1
+        for candidate in candidates
+        if (receipt_row := store.outcome_receipt(str(candidate["packet_id"]))) is not None
+        and str(receipt_row["disposition"]) == "unavailable"
+    )
     status: Literal["collecting", "degraded"] = "degraded" if unavailable else "collecting"
     result = DiagnosticOutcomeResult(
         status,

@@ -298,8 +298,10 @@ falsification context, not additional confirmatory tests.
   terminal readiness are terminal group-level unavailability, not a reason to wait; operators may
   not time the primary seal around diagnostic catch-up. The receipt binds the dataset, complete
   candidate projection, and immutable
-  candidate-universe digests. The dataset is published content-addressed before receipt creation,
-  so a crash is safely retryable without creating an alternate scientific dataset.
+  candidate-universe digests. Before publication, its complete canonical bytes and candidate
+  bindings are committed to an append-only pending-seal record. Publication or receipt failure is
+  retried from those exact pending bytes, never from later diagnostic state, so a crash cannot
+  create an alternate scientific dataset.
 - Enrollment deadline: convert `activated_at_utc` to `America/New_York`, add exactly 18 calendar
   months while preserving the local wall-clock time, and convert the result back to UTC. If the
   activation day does not exist in the target month, use that target month's final calendar day.
