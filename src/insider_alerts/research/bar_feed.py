@@ -107,7 +107,7 @@ class BarPollReceipt:
     in_range_bar_count: int
     source_rejection_count: int
     validation_rejection_count: int
-    observation_watermark: int
+    observation_watermark: int | None
     record_sha256: str
 
 
@@ -825,8 +825,11 @@ class BarFeedStore:
         record = json.loads(raw)
         if not isinstance(record, dict) or _canonical(record) != raw:
             raise ValueError("bar poll receipt is not canonical JSON")
-        expected = {
-            "contract_version": BAR_POLL_RECEIPT_VERSION,
+        contract_version = record.get("contract_version")
+        if contract_version not in {BAR_FEED_VERSION, BAR_POLL_RECEIPT_VERSION}:
+            raise ValueError("bar poll receipt contract version is unsupported")
+        expected: dict[str, Any] = {
+            "contract_version": contract_version,
             "symbol": str(row["symbol"]),
             "polled_at_utc": str(row["polled_at_utc"]),
             "requested_start_date": str(row["requested_start_date"]),
@@ -836,8 +839,9 @@ class BarFeedStore:
             "in_range_bar_count": int(row["in_range_bar_count"]),
             "source_rejection_count": int(row["source_rejection_count"]),
             "validation_rejection_count": int(row["validation_rejection_count"]),
-            "observation_watermark": record.get("observation_watermark"),
         }
+        if contract_version == BAR_POLL_RECEIPT_VERSION:
+            expected["observation_watermark"] = record.get("observation_watermark")
         if (
             record != expected
             or str(uuid.uuid5(uuid.NAMESPACE_URL, digest)) != str(row["receipt_id"])
@@ -877,13 +881,16 @@ class BarFeedStore:
             expected["source_rejection_count"],
             expected["validation_rejection_count"],
         )
-        observation_watermark = expected["observation_watermark"]
+        observation_watermark = expected.get("observation_watermark")
         if any(value < 0 for value in counts) or expected["in_range_bar_count"] > expected[
             "returned_bar_count"
         ] or (
-            isinstance(observation_watermark, bool)
-            or not isinstance(observation_watermark, int)
-            or observation_watermark < 0
+            contract_version == BAR_POLL_RECEIPT_VERSION
+            and (
+                isinstance(observation_watermark, bool)
+                or not isinstance(observation_watermark, int)
+                or observation_watermark < 0
+            )
         ):
             raise ValueError("bar poll receipt counts are invalid")
         return BarPollReceipt(

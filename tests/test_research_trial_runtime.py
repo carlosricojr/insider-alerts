@@ -503,7 +503,7 @@ def test_entry_completion_atomically_binds_candidates_resolutions_and_inputs(
     record = json.loads(row[0])
     assert record["bar_record_sha256s"] == ["b" * 64, "c" * 64]
     assert record["bar_poll_receipt_sha256s"] == ["d" * 64]
-    assert record["committed_at_utc"] == _utc_text(completed_at + timedelta(seconds=1))
+    assert record["decision_clock_at_utc"] == _utc_text(completed_at + timedelta(seconds=1))
     assert [item["candidate_id"] for item in record["candidate_records"]] == ["a", "b", "c"]
 
     late = _trial_candidate(
@@ -1053,6 +1053,37 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
     assert not (tmp_path / "sessions.db").exists()
 
 
+def test_trial_worker_records_finalizer_failure_in_durable_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        lambda _config: (_ for _ in ()).throw(ValueError("corrupt session proof")),
+    )
+    trial_db = tmp_path / "trial.db"
+    error_log = tmp_path / "worker.err.log"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 2
+    status = TrialStore(trial_db).status()
+    assert status["faults"] == 1
+    assert status["health"]["last_result"] == "invalid"
+    assert "corrupt session proof" in str(status["health"]["last_error"])
+    assert "corrupt session proof" in error_log.read_text(encoding="utf-8")
+
+
 def test_trial_status_cli_is_read_only_and_integrity_signaling(tmp_path: Path) -> None:
     valid_store = TrialStore(tmp_path / "valid.db")
     valid = CliRunner().invoke(
@@ -1143,7 +1174,7 @@ def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
     store = TrialStore(config.trial_db)
     assert store.resolutions()[0].enrollment_state == "enrolled"
     completion = store.entry_completion_records()[0]
-    assert completion["committed_at_utc"] == _utc_text(decision_at)
+    assert completion["decision_clock_at_utc"] == _utc_text(decision_at)
     assert completion["schedule_observation_watermark"] > 0
     assert len(completion["schedule_record_sha256s"]) >= 10
     assert completion["bar_observation_watermark"] == 20
@@ -1179,6 +1210,25 @@ def test_finalizer_waits_for_healthy_poll_then_lapses_at_official_open(
     )
     assert lapsed == finalizer.FinalizationResult("complete", dates_lapsed=1)
     assert TrialStore(config.trial_db).resolutions()[0].enrollment_state == "missed"
+
+
+def test_finalizer_waits_when_receipt_proves_observations_beyond_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(finalizer.BarFeedStore, "observation_watermark", lambda _store: 19)
+
+    result = finalizer.finalize_pending_entry_dates(
+        config,
+        clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
+    )
+
+    assert result.status == "waiting"
+    assert result.reason == "healthy_bar_poll_proof_unavailable"
+    assert TrialStore(config.trial_db).resolutions() == []
 
 
 def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(
@@ -1220,6 +1270,32 @@ def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(
         ("TEST", "2026-04-29", "2026-09-09"),
     ]
     BarFeedStore(config.bar_feed_db).validate_integrity()
+
+
+@pytest.mark.parametrize(
+    "classification_state",
+    ["routine", "unpartitionable", "ambiguous_multi_owner"],
+)
+def test_non_opportunistic_evidence_is_excluded_before_candidate_or_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    classification_state: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_schedule(config)
+    _install_evidence(config, classification_state=classification_state)
+    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+
+    result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=2))
+
+    assert result.status == "collecting"
+    store = TrialStore(config.trial_db)
+    assert store.candidates() == []
+    assert store.disposition_counts() == {"excluded": 1}
+    assert _disposition_reasons(config) == [
+        f"classification_state_excluded:{classification_state}"
+    ]
+    assert BarFeedStore(config.bar_feed_db).status()["request_count"] == 0
 
 
 def test_schedule_observed_after_signal_cannot_retroactively_plan_entry(

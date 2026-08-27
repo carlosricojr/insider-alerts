@@ -91,7 +91,7 @@ def test_draft_registry_matches_frozen_contract() -> None:
             "successful_zero_rejection_receipt_after_prior_required_session_close"
         ),
         "prior_book_binding": "watermark_bounded_first_observed_records_and_occupancy_digest",
-        "seal_commit_clock": "transaction_wall_clock_strictly_before_open",
+        "seal_clock_rule": "last_in_transaction_decision_clock_strictly_before_open",
         "missing_prior_position_policy": (
             "occupy_through_frozen_final_session_then_expire_unconditionally"
         ),

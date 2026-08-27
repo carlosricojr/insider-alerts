@@ -78,11 +78,14 @@ def _healthy_receipt(
     requested_start: date,
     required_session: SessionObservationRecord,
     decision_at: datetime,
+    observation_watermark: int,
 ) -> BarPollReceipt:
     qualifying = [
         receipt
         for receipt in receipts
         if receipt.polled_at_utc <= decision_at
+        and receipt.observation_watermark is not None
+        and receipt.observation_watermark <= observation_watermark
         and receipt.polled_at_utc >= required_session.session.closes_at_utc + timedelta(minutes=1)
         and receipt.requested_start_date <= requested_start
         and receipt.requested_through_date >= required_session.session.session_date
@@ -129,7 +132,10 @@ def _candidate_eligibility(
         requested_start=requested_start,
         required_session=last_required,
         decision_at=decision_at,
+        observation_watermark=bar_watermark,
     )
+    if receipt.observation_watermark is None:
+        raise TrialRuntimeInvalid("healthy_receipt_missing_observation_watermark")
     completed_dates = {record.session.session_date for record in completed_sessions}
     records = [
         record
@@ -137,7 +143,7 @@ def _candidate_eligibility(
             candidate.symbol,
             start_date=requested_start,
             through_date=last_required.session.session_date,
-            max_sequence=min(bar_watermark, receipt.observation_watermark),
+            max_sequence=receipt.observation_watermark,
         )
         if record.bar.trade_date in completed_dates
     ]

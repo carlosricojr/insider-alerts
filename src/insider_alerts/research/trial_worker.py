@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from insider_alerts.research.trial_finalizer import finalize_pending_entry_dates
-from insider_alerts.research.trial_runtime import TrialRuntimeConfig, run_trial_once
+from insider_alerts.research.trial_runtime import TrialRuntimeConfig, TrialStore, run_trial_once
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,10 +46,25 @@ def main(argv: list[str] | None = None) -> int:
         session_feed_db=args.session_feed_db,
         registry_path=args.registry_path,
     )
+    imported = run_trial_once(config, now=datetime.now(UTC))
+    if imported.status in {"degraded", "invalid"}:
+        error = RuntimeError(f"candidate runtime is {imported.status}: {imported.error}")
+        _append_error(args.error_log, error)
+        return 2
     try:
-        imported = run_trial_once(config, now=datetime.now(UTC))
         finalized = finalize_pending_entry_dates(config)
     except Exception as exc:
+        now = datetime.now(UTC)
+        store = TrialStore(config.trial_db)
+        detail = f"{type(exc).__name__}: {exc}"[:2000]
+        store.record_fault(now=now, kind="TRIAL_FINALIZER_INVALID", detail=detail)
+        store.write_health(
+            now=now,
+            result="invalid",
+            error=detail,
+            evidence_seen=store.status().get("candidates", 0),
+            unresolved_evidence=0,
+        )
         _append_error(args.error_log, exc)
         return 2
     print(

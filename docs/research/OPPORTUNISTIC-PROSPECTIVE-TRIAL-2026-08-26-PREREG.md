@@ -11,7 +11,8 @@ Draft correction: 2026-08-27, before activation and with zero challenger snapsho
 pre-open entry-date completion, executable evidence readiness, input watermarks, and lapse
 missingness semantics<br>
 Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to bind
-schedule revisions, healthy-poll receipts, pre-signal eligibility history, transaction commit time,
+schedule revisions, healthy-poll receipts, pre-signal eligibility history, the final in-transaction
+decision clock,
 and outcome-independent prior-book occupancy to each entry-date seal<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
@@ -109,18 +110,21 @@ The fixed resolution precedence is `missed`, `ineligible`, `overlap_suppressed`,
 receipt after the last session close needed by that candidate, covers the requested history through
 that session, and reports zero source or validation rejections. Under that proof, fewer than 20
 eligible pre-signal bars is the registered E07 `ineligible` result. Invalid feed integrity, no such
-receipt, or missing data needed to decide a current candidate's E07 eligibility is systemic
+No qualifying receipt or missing data needed to decide a current candidate's E07 eligibility is systemic
 missingness: finalization waits only until the official open. Missing bars for a prior enrolled
 position instead use a conservative book rule: the position occupies its symbol and one slot
 through its frozen final session, then expires unconditionally after that session; no outcome field
-is consulted. If no valid
-transaction actually commits before the open according to transaction wall-clock time, an
+is consulted. The final in-transaction decision clock is sampled after resolution rows are staged
+and immediately before the immutable completion seal is staged. If that clock is not strictly
+before the official open, the transaction rolls back and an
 append-only lapse resolves every candidate for `D` as `missed`, including later arrivals whose
 intended date was `D`. The schedule watermark and all schedule-record digests used for the official
 open and ten-session horizon are sealed; valid revisions between candidate imports do not prevent a
 completion or lapse and therefore do not halt later dates. A lapse never backdates a completion.
-Digest, ordering, feed-integrity, or transaction-clock violations remain `INVALID` and halt
-completion.
+Digest, ordering, or feed-integrity violations remain `INVALID` and halt completion visibly. A
+completion transaction may return from its durable SQLite commit after the open due to bounded
+system latency, but it cannot incorporate any input or decision sampled after the sealed pre-open
+decision clock.
 
 The control ledger records every otherwise eligible E07/F00 signal and its opened, overlap-, or
 capacity-suppressed outcome; at most 20 control positions are open. The challenger independently

@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import hashlib
 import json
 import sqlite3
+import uuid
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import rfc8785
 from typer.testing import CliRunner
 
 import insider_alerts.research.bar_worker as bar_worker
@@ -342,6 +345,32 @@ def test_successful_poll_receipt_is_append_only_and_binds_rejections(tmp_path: P
             conn.execute("UPDATE bar_poll_receipts SET symbol='OTHER'")
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             conn.execute("DELETE FROM bar_poll_receipts")
+
+
+def test_legacy_v1_poll_receipt_remains_integrity_valid_but_has_no_proof_watermark(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
+    store = BarFeedStore(tmp_path / "feed.db")
+    store.request(_request(now))
+    asyncio.run(collect_once(store, FakeSource([_bar(date(2026, 8, 25))]), now=now))
+    with sqlite3.connect(store.path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("DROP TRIGGER bar_poll_receipts_no_update")
+        row = conn.execute("SELECT * FROM bar_poll_receipts").fetchone()
+        record = json.loads(bytes(row["record_json"]))
+        record["contract_version"] = "ibkr-completed-rth-daily-v1"
+        record.pop("observation_watermark")
+        encoded = rfc8785.dumps(record)
+        digest = hashlib.sha256(encoded).hexdigest()
+        conn.execute(
+            "UPDATE bar_poll_receipts SET receipt_id=?,record_sha256=?,record_json=?",
+            (str(uuid.uuid5(uuid.NAMESPACE_URL, digest)), digest, encoded),
+        )
+
+    store.validate_integrity()
+    receipt = store.poll_receipts()[0]
+    assert receipt.observation_watermark is None
 
 
 def test_bar_observation_watermark_freezes_first_observed_snapshot(tmp_path: Path) -> None:

@@ -27,7 +27,10 @@ prevents one bad symbol from blocking later symbols or creating pointless pacing
 Every successful symbol response also appends an immutable poll receipt in the same transaction
 that advances mutable poll state. The receipt binds the poll instant, requested range,
 officially-completed-through date, returned/in-range bar counts, and source/validation rejection
-counts. This makes a healthy short history distinguishable from a failed or unattempted fetch. The
+counts. Version-2 receipts also capture the maximum bar-observation sequence inside that receipt
+transaction. A legacy version-1 receipt remains integrity-valid for append-only audit continuity
+but cannot prove a prospective eligibility decision because it has no observation watermark. This
+makes a healthy short history distinguishable from a failed or unattempted fetch. The
 store also exposes a maximum observation-sequence watermark and first-observed bar records bounded
 by that watermark, so a later backfill or revision cannot change an already sealed trial input.
 

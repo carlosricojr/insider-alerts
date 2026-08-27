@@ -494,7 +494,7 @@ class TrialStore:
                     sequence INTEGER NOT NULL UNIQUE,
                     entry_date TEXT PRIMARY KEY,
                     completed_at_utc TEXT NOT NULL,
-                    committed_at_utc TEXT NOT NULL,
+                    decision_clock_at_utc TEXT NOT NULL,
                     record_sha256 TEXT NOT NULL UNIQUE,
                     record_json BLOB NOT NULL
                 );
@@ -644,7 +644,7 @@ class TrialStore:
             latest_seal = conn.execute(
                 """
                 SELECT sealed_at_utc FROM (
-                  SELECT entry_date,committed_at_utc sealed_at_utc
+                  SELECT entry_date,decision_clock_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
@@ -907,7 +907,7 @@ class TrialStore:
             "contract_version",
             "entry_date",
             "completed_at_utc",
-            "committed_at_utc",
+            "decision_clock_at_utc",
             "entry_opens_at_utc",
             "final_session_date",
             "schedule_observation_watermark",
@@ -928,12 +928,12 @@ class TrialStore:
         if (
             record["entry_date"] != row["entry_date"]
             or record["completed_at_utc"] != row["completed_at_utc"]
-            or record["committed_at_utc"] != row["committed_at_utc"]
+            or record["decision_clock_at_utc"] != row["decision_clock_at_utc"]
         ):
             raise TrialRuntimeInvalid("entry_completion_columns_mismatch")
         entry_date = date.fromisoformat(str(record["entry_date"]))
         completed_at = _parse_utc(str(record["completed_at_utc"]))
-        committed_at = _parse_utc(str(record["committed_at_utc"]))
+        decision_clock_at = _parse_utc(str(record["decision_clock_at_utc"]))
         entry_open = _parse_utc(str(record["entry_opens_at_utc"]))
         final_session_date = date.fromisoformat(str(record["final_session_date"]))
         cutoff_utc = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK).astimezone(UTC)
@@ -941,7 +941,7 @@ class TrialStore:
             completed_at.astimezone(NEW_YORK).date() != entry_date
             or entry_open.astimezone(NEW_YORK).date() != entry_date
             or final_session_date < entry_date
-            or not cutoff_utc <= completed_at <= committed_at < entry_open
+            or not cutoff_utc <= completed_at <= decision_clock_at < entry_open
         ):
             raise TrialRuntimeInvalid("entry_completion_local_date_mismatch")
         for name in (
@@ -1139,7 +1139,7 @@ class TrialStore:
             latest = conn.execute(
                 """
                 SELECT entry_date,sealed_at_utc FROM (
-                  SELECT entry_date,committed_at_utc sealed_at_utc
+                  SELECT entry_date,decision_clock_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
@@ -1184,14 +1184,10 @@ class TrialStore:
                 tzinfo=NEW_YORK,
             ).astimezone(UTC)
             entry_open = inputs.entry_opens_at_utc.astimezone(UTC)
-            committed_at = self._clock()
-            if committed_at.tzinfo is None:
-                raise TrialRuntimeInvalid("entry_completion_commit_clock_naive")
-            committed_at = committed_at.astimezone(UTC)
             if (
                 inputs.completed_at_utc.astimezone(NEW_YORK).date() != inputs.entry_date
                 or entry_open.astimezone(NEW_YORK).date() != inputs.entry_date
-                or not cutoff_utc <= inputs.completed_at_utc <= committed_at < entry_open
+                or not cutoff_utc <= inputs.completed_at_utc < entry_open
             ):
                 raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
             expected_ids = [candidate.candidate_id for candidate in candidates]
@@ -1239,11 +1235,17 @@ class TrialStore:
             resolution_set_sha = _sha256(
                 _canonical({"resolution_record_sha256s": resolution_digests})
             )
+            decision_clock_at = self._clock()
+            if decision_clock_at.tzinfo is None:
+                raise TrialRuntimeInvalid("entry_completion_decision_clock_naive")
+            decision_clock_at = decision_clock_at.astimezone(UTC)
+            if not inputs.completed_at_utc <= decision_clock_at < entry_open:
+                raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
             record: dict[str, Any] = {
                 "contract_version": TRIAL_CONTRACT_VERSION,
                 "entry_date": inputs.entry_date.isoformat(),
                 "completed_at_utc": _utc_text(inputs.completed_at_utc),
-                "committed_at_utc": _utc_text(committed_at),
+                "decision_clock_at_utc": _utc_text(decision_clock_at),
                 "entry_opens_at_utc": _utc_text(entry_open),
                 "final_session_date": inputs.final_session_date.isoformat(),
                 "schedule_observation_watermark": inputs.schedule_observation_watermark,
@@ -1272,7 +1274,7 @@ class TrialStore:
                     sequence,
                     inputs.entry_date.isoformat(),
                     _utc_text(inputs.completed_at_utc),
-                    _utc_text(committed_at),
+                    _utc_text(decision_clock_at),
                     digest,
                     encoded,
                 ),
@@ -1797,9 +1799,9 @@ class TrialStore:
                 cutoff = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK).astimezone(
                     UTC
                 )
-                committed_at = _parse_utc(str(completion["committed_at_utc"]))
+                decision_clock_at = _parse_utc(str(completion["decision_clock_at_utc"]))
                 entry_open = _parse_utc(str(completion["entry_opens_at_utc"]))
-                if not cutoff <= completed_at <= committed_at < entry_open:
+                if not cutoff <= completed_at <= decision_clock_at < entry_open:
                     raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
                 _validate_cutoff_resolution_states(
                     [
@@ -1857,7 +1859,7 @@ class TrialStore:
             sealed_rows = conn.execute(
                 """
                 SELECT kind,entry_date,sealed_at_utc FROM (
-                  SELECT 'completion' kind,entry_date,committed_at_utc sealed_at_utc
+                  SELECT 'completion' kind,entry_date,decision_clock_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT 'lapse' kind,entry_date,lapsed_at_utc sealed_at_utc
@@ -2044,8 +2046,6 @@ def _candidate_from_evidence(
         raise TrialRuntimeInvalid("evidence_import_clock_order_invalid")
     if now < recorded_at:
         raise EvidenceNotReady("evidence_recorded_after_runtime_clock")
-    schedule = session_store.schedule_as_known_at(observed_at)
-    entry, final_date = planned_entry_session(observed_at, schedule)
     symbol = _normalized_symbol(str(signal.get("issuer_symbol", "")))
     packet_id = str(signal.get("packet_id", ""))
     accession = str(signal.get("accession_number", ""))
@@ -2067,6 +2067,14 @@ def _candidate_from_evidence(
         raise TrialRuntimeInvalid("evidence_owner_mapping_invalid")
     if not isinstance(history_complete, bool):
         raise TrialRuntimeInvalid("evidence_history_coverage_not_boolean")
+    if classification_state != "opportunistic":
+        raise EvidenceExcluded(f"classification_state_excluded:{classification_state}")
+    if owner_mapping != "exact":
+        raise EvidenceExcluded(f"transaction_owner_mapping_excluded:{owner_mapping}")
+    if history_complete is not True:
+        raise EvidenceExcluded("classification_history_coverage_incomplete")
+    schedule = session_store.schedule_as_known_at(observed_at)
+    entry, final_date = planned_entry_session(observed_at, schedule)
     return TrialCandidate(
         candidate_id=str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"{HYPOTHESIS_ID}|candidate|{snapshot_id}")

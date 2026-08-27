@@ -290,7 +290,7 @@
         "eligibility_history",
         "healthy_bar_poll_proof",
         "prior_book_binding",
-        "seal_commit_clock",
+        "seal_clock_rule",
         "missing_prior_position_policy",
         "candidate_universe_binding",
         "seal_store",
@@ -330,7 +330,9 @@
         "prior_book_binding": {
           "const": "watermark_bounded_first_observed_records_and_occupancy_digest"
         },
-        "seal_commit_clock": {"const": "transaction_wall_clock_strictly_before_open"},
+        "seal_clock_rule": {
+          "const": "last_in_transaction_decision_clock_strictly_before_open"
+        },
         "missing_prior_position_policy": {
           "const": "occupy_through_frozen_final_session_then_expire_unconditionally"
         },
