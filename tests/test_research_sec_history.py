@@ -195,6 +195,41 @@ def test_bulk_sync_is_resumable_and_binds_snapshot_to_manifest(tmp_path: Path) -
     ]
 
 
+def test_archive_alias_reuse_is_bound_to_expected_quarter(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "history.db")
+    raw = RawObjectStore(tmp_path / "raw")
+    retrieved_at = datetime(2026, 8, 26, 20, 0, tzinfo=UTC)
+    archive = raw.publish(_archive_bytes())
+    store.record_retrieval(
+        url="https://www.sec.gov/files/moved/2006q1_form345.zip",
+        retrieved_at=retrieved_at,
+        raw_object=archive,
+        status_code=200,
+        etag=None,
+        last_modified=None,
+        content_type="application/zip",
+    )
+    store.ingest_archive(
+        ArchiveRef(2006, 2, "https://www.sec.gov/files/2006q2_form345.zip"),
+        raw_object=archive,
+        retrieved_at=retrieved_at,
+    )
+
+    assert (
+        store.archived_object_for_url(
+            "https://www.sec.gov/files/moved/2006q1_form345.zip",
+            year=2006,
+            quarter=1,
+        )
+        is None
+    )
+    assert store.archived_object_for_url(
+        "https://www.sec.gov/files/moved/2006q1_form345.zip",
+        year=2006,
+        quarter=2,
+    ) == archive
+
+
 def test_raw_objects_and_normalized_rows_are_immutable(tmp_path: Path) -> None:
     raw = RawObjectStore(tmp_path / "raw")
     archive_bytes = _archive_bytes()

@@ -586,7 +586,9 @@ class HistoryStore:
             )
         return snapshot_sha
 
-    def archived_object_for_url(self, url: str) -> RawObject | None:
+    def archived_object_for_url(
+        self, url: str, *, year: int, quarter: int
+    ) -> RawObject | None:
         with self.connect() as conn:
             row = conn.execute(
                 """
@@ -594,10 +596,10 @@ class HistoryStore:
                 FROM raw_retrievals r
                 JOIN archive_releases a ON a.archive_sha256=r.raw_sha256
                 JOIN raw_objects o ON o.sha256=a.archive_sha256
-                WHERE r.url=? OR r.final_url=?
+                WHERE (r.url=? OR r.final_url=?) AND a.year=? AND a.quarter=?
                 ORDER BY r.retrieved_at_utc DESC LIMIT 1
                 """,
-                (url, url),
+                (url, url, year, quarter),
             ).fetchone()
         if row is None:
             return None
@@ -931,7 +933,13 @@ def sync_bulk_archives(
     downloaded = 0
     reused = 0
     for ref in refs:
-        raw_object = None if refresh else store.archived_object_for_url(ref.url)
+        raw_object = (
+            None
+            if refresh
+            else store.archived_object_for_url(
+                ref.url, year=ref.year, quarter=ref.quarter
+            )
+        )
         if raw_object is None:
             retrieved_at = clock()
             resource = client.get_resource(ref.url)
