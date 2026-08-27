@@ -57,8 +57,10 @@ The draft becomes active only after all of the following occur:
    activation-preparation timestamp; future activation timestamp; activation-tool digest; and
    enrollment sequence. The active registry embeds the RFC 8785 receipt digest, while a separate
    append-only SQLite singleton stores that receipt and the exact canonical active-registry bytes.
-   Every runtime consumer requires an exact registry/receipt match. The implementation commit must
-   contain the exact
+   Every runtime consumer requires byte-for-byte registry/receipt agreement. The first observation
+   of those exact deployed active bytes before the boundary creates a second append-only singleton
+   armed attestation; activation at or after the boundary requires that pre-boundary proof. The
+   implementation commit must contain the exact
    bound artifacts and
    registry definition and remain an ancestor of the deployed commit; every content-bound artifact
    must still match after platform-stable CRLF-to-LF canonicalization;
@@ -71,8 +73,10 @@ commits the receipt before publishing the content-addressed registry artifact. A
 replays the stored bytes; a different timestamp, definition, or artifact is prohibited. The active
 registry is reviewed and merged separately before the boundary. If the registry remains draft when
 the boundary arrives, the runtime fails closed and the ID is retired rather than activated late.
-If the exact active registry is deployed early, every scientific writer remains in an explicit
-armed-idle phase until the sealed instant; gate evaluation and record timestamps use the same clock.
+If the exact active registry is deployed early, every scientific writer records or verifies the
+armed attestation and remains in an explicit armed-idle phase until the sealed instant; gate
+evaluation and record timestamps use the same clock. A registry first observed at or after the
+boundary fails closed and the ID is retired rather than activated late.
 
 Only signals first observed at or after the sealed activation timestamp are eligible. Earlier
 signals, including all current canary observations, never count. A signal missed during a capture

@@ -32,9 +32,13 @@ branch. Do not regenerate or hand-edit the activation block. Review, merge, and 
 PR before the boundary. Stop only the research tasks during the fast-forward pull, then restart
 them hidden; the live canary remains running. A draft registry is valid before the prepared
 boundary but becomes fail-closed invalid at the boundary. An active registry without the matching
-local append-only receipt is also invalid, so deployment cannot invent or shift the cohort start.
-Before the sealed instant, consumers report `idle_registry_armed` and cannot append scientific
-rows; they transition to collecting against the same clock exactly at the boundary.
+local append-only receipt or byte-for-byte equality with its stored canonical registry is also
+invalid, so deployment cannot invent or shift the cohort start. The first pre-boundary observation
+of those exact deployed bytes records a singleton append-only armed attestation. A registry first
+observed at or after the boundary is invalid, even if its receipt is otherwise correct. Before the
+sealed instant, consumers report `idle_registry_armed` and cannot append scientific rows; they
+transition to collecting against the same clock exactly at the boundary only when that attestation
+exists.
 
 Verify before the boundary:
 

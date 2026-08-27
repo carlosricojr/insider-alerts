@@ -251,12 +251,22 @@ def _validated_trial_window(
     try:
         if status == "draft":
             _validate_registry(registry, allow_draft=True)
-            validate_deployed_registry_state(registry, config.activation_db, now=now)
+            validate_deployed_registry_state(
+                registry,
+                config.activation_db,
+                registry_bytes=registry_bytes,
+                now=now,
+            )
             return TrialWindow("draft", _sha256(registry_bytes))
         if status != "active":
             raise TrialRuntimeInvalid("prospective_registry_not_draft_or_active")
         _validate_registry(registry, allow_draft=False)
-        phase = validate_deployed_registry_state(registry, config.activation_db, now=now)
+        phase = validate_deployed_registry_state(
+            registry,
+            config.activation_db,
+            registry_bytes=registry_bytes,
+            now=now,
+        )
     except (ValueError, ActivationInvalid) as exc:
         raise TrialRuntimeInvalid(f"prospective_registry_invalid:{exc}") from exc
     activation = registry.get("activation")

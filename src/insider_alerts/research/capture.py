@@ -1176,12 +1176,22 @@ def _validated_capture_window(
     status = registry.get("status")
     if status == "draft":
         _validate_registry(registry, allow_draft=True)
-        validate_deployed_registry_state(registry, config.activation_db, now=now)
+        validate_deployed_registry_state(
+            registry,
+            config.activation_db,
+            registry_bytes=policy_bytes,
+            now=now,
+        )
         return CaptureWindow(status="draft", policy_sha256=sha256_bytes(policy_bytes))
     if status != "active":
         raise ValueError("prospective registry is neither draft nor active")
     _validate_registry(registry, allow_draft=False)
-    phase = validate_deployed_registry_state(registry, config.activation_db, now=now)
+    phase = validate_deployed_registry_state(
+        registry,
+        config.activation_db,
+        registry_bytes=policy_bytes,
+        now=now,
+    )
     activation = registry.get("activation")
     if not isinstance(activation, dict):
         raise ValueError("active registry has no activation record")

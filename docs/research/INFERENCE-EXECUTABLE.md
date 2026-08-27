@@ -6,7 +6,8 @@ sealing and the separately invoked decision. It calls the frozen
 capability. Production execution requires an active
 registry whose definition digest and canonical-content `inference.py` and `terminal_builder.py`
 digests match the activation record. Runtime entry points additionally require the deployed active
-registry to equal the exact canonical bytes in the append-only local activation receipt.
+registry to equal the exact canonical bytes in the append-only local activation receipt and a
+matching append-only attestation proving those bytes were observed before the activation boundary.
 
 The strict input object contains the activation/evaluation instants, ordered append-only entry-date
 completion receipts, the complete candidate enrollment projection, fixed integrity checks, and

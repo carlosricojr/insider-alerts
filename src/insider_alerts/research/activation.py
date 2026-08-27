@@ -168,6 +168,17 @@ class ActivationStore:
                 CREATE TRIGGER IF NOT EXISTS activation_receipt_no_delete
                 BEFORE DELETE ON activation_receipt
                 BEGIN SELECT RAISE(ABORT,'activation receipt is append-only'); END;
+                CREATE TABLE IF NOT EXISTS activation_armed_attestation(
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  active_registry_sha256 TEXT NOT NULL UNIQUE,
+                  armed_at_utc TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS activation_armed_attestation_no_update
+                BEFORE UPDATE ON activation_armed_attestation
+                BEGIN SELECT RAISE(ABORT,'armed attestation is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS activation_armed_attestation_no_delete
+                BEFORE DELETE ON activation_armed_attestation
+                BEGIN SELECT RAISE(ABORT,'armed attestation is append-only'); END;
                 """
             )
 
@@ -233,6 +244,13 @@ class ActivationStore:
             raise ActivationInvalid("stored_active_registry_not_object")
         return parsed
 
+    def active_registry_bytes(self) -> bytes | None:
+        row = self._row()
+        if row is None:
+            return None
+        self.receipt()
+        return bytes(row["active_registry_json"])
+
     def put(self, registry: Mapping[str, Any]) -> dict[str, Any]:
         receipt = validate_activation_receipt_digest(registry)
         receipt_bytes = rfc8785.dumps(receipt)
@@ -263,20 +281,80 @@ class ActivationStore:
             )
         return receipt
 
-    def verify_active(self, registry: Mapping[str, Any]) -> dict[str, Any]:
+    def verify_active(
+        self, registry: Mapping[str, Any], deployed_registry_bytes: bytes
+    ) -> dict[str, Any]:
         receipt = self.receipt()
         if receipt is None:
             raise ActivationInvalid("activation_receipt_missing")
-        if self.active_registry() != dict(registry):
+        stored_bytes = self.active_registry_bytes()
+        if stored_bytes is None:
+            raise ActivationInvalid("prepared_active_registry_missing")
+        if deployed_registry_bytes != stored_bytes:
+            raise ActivationInvalid("active_registry_bytes_do_not_match_receipt")
+        deployed = json.loads(deployed_registry_bytes)
+        if not isinstance(deployed, dict) or deployed != dict(registry):
+            raise ActivationInvalid("deployed_registry_parse_mismatch")
+        if self.active_registry() != deployed:
             raise ActivationInvalid("active_registry_does_not_match_receipt")
-        expected = validate_activation_receipt_digest(registry)
+        expected = validate_activation_receipt_digest(deployed)
         if receipt != expected:
             raise ActivationInvalid("active_registry_receipt_mismatch")
         return receipt
 
+    def attest_armed(
+        self,
+        deployed_registry_bytes: bytes,
+        *,
+        armed_at: datetime,
+        activated_at: datetime,
+    ) -> None:
+        if armed_at >= activated_at:
+            raise ActivationInvalid("activation_armed_attestation_not_pre_boundary")
+        registry_digest = _sha256(deployed_registry_bytes)
+        armed_text = _utc_text(armed_at)
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM activation_armed_attestation WHERE singleton=1"
+            ).fetchone()
+            if row is not None:
+                if row["active_registry_sha256"] != registry_digest:
+                    raise ActivationInvalid("alternate_armed_attestation_prohibited")
+                existing_armed_at = _parse_utc(row["armed_at_utc"], "armed_at")
+                if existing_armed_at >= activated_at:
+                    raise ActivationInvalid("activation_armed_attestation_not_pre_boundary")
+                return
+            conn.execute(
+                "INSERT INTO activation_armed_attestation VALUES(1,?,?)",
+                (registry_digest, armed_text),
+            )
+
+    def verify_armed(
+        self, deployed_registry_bytes: bytes, *, activated_at: datetime
+    ) -> None:
+        try:
+            with contextlib.closing(self._read_connect()) as conn:
+                row = conn.execute(
+                    "SELECT * FROM activation_armed_attestation WHERE singleton=1"
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise ActivationInvalid("activation_store_invalid") from exc
+        if row is None:
+            raise ActivationInvalid("activation_armed_attestation_missing")
+        if row["active_registry_sha256"] != _sha256(deployed_registry_bytes):
+            raise ActivationInvalid("activation_armed_attestation_registry_mismatch")
+        armed_at = _parse_utc(row["armed_at_utc"], "armed_at")
+        if armed_at >= activated_at:
+            raise ActivationInvalid("activation_armed_attestation_not_pre_boundary")
+
 
 def validate_deployed_registry_state(
-    registry: Mapping[str, Any], activation_db: Path, *, now: datetime | None = None
+    registry: Mapping[str, Any],
+    activation_db: Path,
+    *,
+    registry_bytes: bytes,
+    now: datetime | None = None,
 ) -> Literal["draft", "armed", "active"]:
     """Enforce the prepared-to-active state transition for every runtime consumer."""
 
@@ -298,12 +376,20 @@ def validate_deployed_registry_state(
         return "draft"
     if status != "active":
         raise ActivationInvalid("deployed_registry_status_invalid")
-    store.verify_active(registry)
+    store.verify_active(registry, registry_bytes)
     activation = registry.get("activation")
     if not isinstance(activation, Mapping):
         raise ActivationInvalid("activation_record_missing")
     activated_at = _parse_utc(activation.get("activated_at_utc"), "activated_at")
-    return "armed" if checked_at < activated_at else "active"
+    if checked_at < activated_at:
+        store.attest_armed(
+            registry_bytes,
+            armed_at=checked_at,
+            activated_at=activated_at,
+        )
+        return "armed"
+    store.verify_armed(registry_bytes, activated_at=activated_at)
+    return "active"
 
 
 def _artifact_expectations(registry: Mapping[str, Any]) -> dict[str, Path]:
@@ -494,7 +580,10 @@ def prepare_activation(
         if registry_definition_sha256(existing) != registry_definition_sha256(draft):
             raise ActivationInvalid("stored_active_registry_definition_mismatch")
         with _locked_empty_stores(config):
-            receipt = store.verify_active(existing)
+            stored_bytes = store.active_registry_bytes()
+            if stored_bytes is None:
+                raise ActivationInvalid("prepared_active_registry_missing")
+            receipt = store.verify_active(existing, stored_bytes)
         artifact = _publish_registry_artifact(config.artifact_root, existing)
         return ActivationResult(
             "prepared",
@@ -533,11 +622,17 @@ def prepare_activation(
 
 def activation_status(config: ActivationConfig, *, now: datetime | None = None) -> ActivationResult:
     try:
-        registry = json.loads(config.registry_path.read_text(encoding="utf-8"))
+        registry_bytes = config.registry_path.read_bytes()
+        registry = json.loads(registry_bytes)
         if not isinstance(registry, dict):
             raise ActivationInvalid("deployed_registry_not_object")
         _validate_registry(registry, allow_draft=registry.get("status") == "draft")
-        validate_deployed_registry_state(registry, config.activation_db, now=now)
+        validate_deployed_registry_state(
+            registry,
+            config.activation_db,
+            registry_bytes=registry_bytes,
+            now=now,
+        )
         store = ActivationStore(config.activation_db, initialize=False)
         receipt = store.receipt()
         if receipt is None:

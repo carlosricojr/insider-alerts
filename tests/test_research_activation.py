@@ -121,14 +121,23 @@ def test_status_cannot_miss_receipt_committed_during_validation(
     real_validate = activation.validate_deployed_registry_state
 
     def prepare_during_validation(
-        registry: dict[str, object], activation_db: Path, *, now: datetime | None = None
+        registry: dict[str, object],
+        activation_db: Path,
+        *,
+        registry_bytes: bytes,
+        now: datetime | None = None,
     ) -> None:
         activation.prepare_activation(
             config,
             activated_at=ACTIVATED_AT,
             now=PREPARED_AT,
         )
-        real_validate(registry, activation_db, now=now)
+        real_validate(
+            registry,
+            activation_db,
+            registry_bytes=registry_bytes,
+            now=now,
+        )
 
     monkeypatch.setattr(
         activation,
@@ -206,6 +215,7 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
         activation.validate_deployed_registry_state(
             registry,
             config.activation_db,
+            registry_bytes=rfc8785.dumps(registry),
             now=ACTIVATED_AT - timedelta(microseconds=1),
         )
         == "draft"
@@ -219,6 +229,7 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
         activation.validate_deployed_registry_state(
             changed_draft,
             config.activation_db,
+            registry_bytes=rfc8785.dumps(changed_draft),
             now=ACTIVATED_AT - timedelta(microseconds=1),
         )
     with pytest.raises(
@@ -228,6 +239,7 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
         activation.validate_deployed_registry_state(
             registry,
             config.activation_db,
+            registry_bytes=rfc8785.dumps(registry),
             now=ACTIVATED_AT,
         )
     with pytest.raises(activation.ActivationInvalid, match="alternate_activation_prohibited"):
@@ -243,6 +255,7 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
         activation.validate_deployed_registry_state(
             active,
             config.activation_db,
+            registry_bytes=rfc8785.dumps(active),
             now=PREPARED_AT,
         )
         == "armed"
@@ -251,6 +264,16 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
         activation.validate_deployed_registry_state(
             active,
             config.activation_db,
+            registry_bytes=rfc8785.dumps(active),
+            now=PREPARED_AT + timedelta(minutes=1),
+        )
+        == "armed"
+    )
+    assert (
+        activation.validate_deployed_registry_state(
+            active,
+            config.activation_db,
+            registry_bytes=rfc8785.dumps(active),
             now=ACTIVATED_AT,
         )
         == "active"
@@ -260,9 +283,13 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
         ACTIVATED_AT + timedelta(seconds=1)
     )
     with pytest.raises(
-        activation.ActivationInvalid, match="active_registry_does_not_match_receipt"
+        activation.ActivationInvalid, match="active_registry_bytes_do_not_match_receipt"
     ):
-        activation.validate_deployed_registry_state(tampered, config.activation_db)
+        activation.validate_deployed_registry_state(
+            tampered,
+            config.activation_db,
+            registry_bytes=rfc8785.dumps(tampered),
+        )
     with pytest.raises(inference.TrialInvalid, match="activation_receipt_digest_mismatch"):
         inference._validate_registry(tampered, allow_draft=False)
 
@@ -276,6 +303,43 @@ def test_prepared_draft_has_one_irrevocable_boundary_and_active_copy(
             config,
             activated_at=ACTIVATED_AT,
             now=PREPARED_AT,
+        )
+
+
+def test_active_registry_requires_exact_bytes_and_pre_boundary_armed_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _allow_synced_main(monkeypatch)
+    config = _config(tmp_path)
+    result = activation.prepare_activation(
+        config,
+        activated_at=ACTIVATED_AT,
+        now=PREPARED_AT,
+    )
+    canonical_bytes = Path(str(result.registry_artifact_path)).read_bytes()
+    active = json.loads(canonical_bytes)
+    noncanonical_bytes = json.dumps(active, indent=2).encode("utf-8")
+
+    with pytest.raises(
+        activation.ActivationInvalid,
+        match="active_registry_bytes_do_not_match_receipt",
+    ):
+        activation.validate_deployed_registry_state(
+            active,
+            config.activation_db,
+            registry_bytes=noncanonical_bytes,
+            now=PREPARED_AT,
+        )
+
+    with pytest.raises(
+        activation.ActivationInvalid,
+        match="activation_armed_attestation_missing",
+    ):
+        activation.validate_deployed_registry_state(
+            active,
+            config.activation_db,
+            registry_bytes=canonical_bytes,
+            now=ACTIVATED_AT,
         )
 
 
@@ -295,13 +359,29 @@ def test_active_registry_requires_append_only_receipt(
         activation.validate_deployed_registry_state(
             active,
             tmp_path / "missing-activation.db",
+            registry_bytes=rfc8785.dumps(active),
             now=PREPARED_AT,
         )
+    canonical_bytes = Path(str(result.registry_artifact_path)).read_bytes()
+    assert (
+        activation.validate_deployed_registry_state(
+            active,
+            config.activation_db,
+            registry_bytes=canonical_bytes,
+            now=PREPARED_AT,
+        )
+        == "armed"
+    )
     with (
         sqlite3.connect(config.activation_db) as conn,
         pytest.raises(sqlite3.IntegrityError, match="activation receipt is append-only"),
     ):
         conn.execute("DELETE FROM activation_receipt")
+    with (
+        sqlite3.connect(config.activation_db) as conn,
+        pytest.raises(sqlite3.IntegrityError, match="armed attestation is append-only"),
+    ):
+        conn.execute("DELETE FROM activation_armed_attestation")
 
 
 def test_activation_module_has_no_broker_or_order_capability() -> None:
