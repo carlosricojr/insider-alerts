@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://insider-alerts.local/schemas/evidence-snapshot-v1.json",
+  "$id": "https://insider-alerts.local/schemas/evidence-snapshot-v1-v2.json",
   "title": "Append-only point-in-time evidence snapshot",
   "type": "object",
   "additionalProperties": false,
@@ -16,7 +16,7 @@
     "payload"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "snapshot_id": {"type": "string", "format": "uuid"},
     "hypothesis_id": {"type": "string", "pattern": "^[A-Z0-9]+(?:-[A-Z0-9]+)*-V[0-9]+$"},
     "recorded_at_utc": {"$ref": "#/$defs/datetime"},
@@ -159,6 +159,13 @@
             "transaction_owner_mapping": {"enum": ["exact", "ambiguous", "missing"]},
             "history_coverage_complete": {"type": "boolean"},
             "left_censored": {"type": "boolean"},
+            "history_observation_start_date": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "string", "format": "date", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+              ]
+            },
+            "history_source_snapshot_sha256": {"$ref": "#/$defs/nullable_sha256"},
             "history_input_sha256": {"$ref": "#/$defs/sha256"}
           }
         },
@@ -222,8 +229,7 @@
                   "state": {"const": "opportunistic"},
                   "owner_cik": {"type": "string", "pattern": "^[0-9]{1,10}$"},
                   "transaction_owner_mapping": {"const": "exact"},
-                  "history_coverage_complete": {"const": true},
-                  "left_censored": {"const": false}
+                  "history_coverage_complete": {"const": true}
                 }
               },
               "observations": {
@@ -239,6 +245,83 @@
       },
       "else": {
         "properties": {"confirmatory_enrollment_sequence": {"type": "null"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": 2}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "classification": {
+                "required": [
+                  "history_observation_start_date",
+                  "history_source_snapshot_sha256"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"const": 1},
+          "enrollment_state": {"const": "enrolled"}
+        },
+        "required": ["schema_version", "enrollment_state"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "classification": {
+                "properties": {"left_censored": {"const": false}}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"const": 2},
+          "payload": {
+            "properties": {
+              "observations": {
+                "properties": {
+                  "owner_history": {
+                    "properties": {"status": {"const": "captured"}},
+                    "required": ["status"]
+                  }
+                },
+                "required": ["owner_history"]
+              }
+            },
+            "required": ["observations"]
+          }
+        },
+        "required": ["schema_version", "payload"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "classification": {
+                "properties": {
+                  "left_censored": {"const": true},
+                  "history_observation_start_date": {"const": "2006-01-01"},
+                  "history_source_snapshot_sha256": {"$ref": "#/$defs/sha256"}
+                }
+              }
+            }
+          }
+        }
       }
     }
   ],

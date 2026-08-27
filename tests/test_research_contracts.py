@@ -61,6 +61,12 @@ def test_draft_registry_matches_frozen_contract() -> None:
     assert strategy["primary_round_trip_bps"] == 20
     assert strategy["stress_round_trip_bps"] == 50
 
+    classifier = registry["classifier"]
+    assert classifier["history_observation_start_date"] == "2006-01-01"
+    assert classifier["history_source_snapshot_required"] is True
+    assert classifier["pre_observation_history"] == "left_censored_measurement_limitation"
+    assert classifier["opportunistic_persists_until_routine"] is True
+
     assert registry["feature_policy"]["confirmatory_features"] == ["owner_classification"]
     assert registry["inference"]["interim_looks"] == 0
     assert registry["terminal_information_time"] == {
@@ -164,7 +170,7 @@ def test_evidence_contract_accepts_explicit_missingness_and_rejects_omission() -
         "error": None,
     }
     snapshot = {
-        "schema_version": 1,
+        "schema_version": 2,
         "snapshot_id": "0f1ebdfa-c859-4a29-998e-837e64cb82f0",
         "hypothesis_id": "OPP-E07-V1",
         "recorded_at_utc": "2026-08-26T20:00:02Z",
@@ -208,7 +214,9 @@ def test_evidence_contract_accepts_explicit_missingness_and_rejects_omission() -
                 "cutoff_at_utc": "2026-01-01T05:00:00Z",
                 "transaction_owner_mapping": "exact",
                 "history_coverage_complete": True,
-                "left_censored": False,
+                "left_censored": True,
+                "history_observation_start_date": "2006-01-01",
+                "history_source_snapshot_sha256": "0" * 64,
                 "history_input_sha256": "0" * 64,
             },
             "observations": {
@@ -230,6 +238,13 @@ def test_evidence_contract_accepts_explicit_missingness_and_rejects_omission() -
 
     validator.validate(snapshot)
 
+    legacy = json.loads(json.dumps(snapshot))
+    legacy["schema_version"] = 1
+    legacy["payload"]["classification"]["left_censored"] = False
+    del legacy["payload"]["classification"]["history_observation_start_date"]
+    del legacy["payload"]["classification"]["history_source_snapshot_sha256"]
+    validator.validate(legacy)
+
     snapshot["payload"]["signal"]["decision"] = "reject"
     with pytest.raises(ValidationError):
         validator.validate(snapshot)
@@ -245,6 +260,26 @@ def test_evidence_contract_accepts_explicit_missingness_and_rejects_omission() -
         validator.validate(snapshot)
     snapshot["confirmatory_enrollment_sequence"] = None
     validator.validate(snapshot)
+
+    snapshot["payload"]["classification"]["left_censored"] = False
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["left_censored"] = True
+
+    snapshot["payload"]["classification"]["history_observation_start_date"] = (
+        "2007-01-01"
+    )
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["history_observation_start_date"] = (
+        "2006-01-01"
+    )
+
+    snapshot["payload"]["classification"]["history_source_snapshot_sha256"] = None
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["history_source_snapshot_sha256"] = "0" * 64
+
     snapshot["confirmatory_enrollment_sequence"] = 1
     snapshot["enrollment_state"] = "enrolled"
 
@@ -258,15 +293,25 @@ def test_evidence_contract_accepts_explicit_missingness_and_rejects_omission() -
         validator.validate(snapshot)
     snapshot["payload"]["signal"]["reporting_owner_ciks"] = ["2"]
 
-    snapshot["payload"]["classification"]["left_censored"] = True
+    snapshot["payload"]["classification"]["left_censored"] = False
     with pytest.raises(ValidationError):
         validator.validate(snapshot)
-    snapshot["payload"]["classification"]["left_censored"] = False
+    snapshot["payload"]["classification"]["left_censored"] = True
 
     snapshot["payload"]["classification"]["history_coverage_complete"] = False
     with pytest.raises(ValidationError):
         validator.validate(snapshot)
     snapshot["payload"]["classification"]["history_coverage_complete"] = True
+
+    snapshot["payload"]["classification"]["history_observation_start_date"] = "2007-01-01"
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["history_observation_start_date"] = "2006-01-01"
+
+    snapshot["payload"]["classification"]["history_source_snapshot_sha256"] = None
+    with pytest.raises(ValidationError):
+        validator.validate(snapshot)
+    snapshot["payload"]["classification"]["history_source_snapshot_sha256"] = "0" * 64
 
     snapshot["recorded_at_utc"] = "2026-08-26T16:00:02-04:00"
     with pytest.raises(ValidationError):

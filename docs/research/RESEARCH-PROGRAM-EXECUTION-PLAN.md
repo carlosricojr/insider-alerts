@@ -121,9 +121,9 @@ snapshot, or stop the existing canary from managing positions.
 ### M3 — SEC history and point-in-time classifier (current)
 
 - Download SEC quarterly archives from 2006 onward into a raw content-addressed cache, preserving
-  retrieval metadata and upstream hashes when supplied. Retrieve earlier authoritative Section 16
-  history for candidate owners where available; unresolved pre-coverage state is left-censored and
-  `unpartitionable`, never assumed opportunistic.
+  retrieval metadata and upstream hashes when supplied. Fix `2006-01-01` as the observable-history
+  boundary, bind each classification to an immutable gap-free snapshot, and disclose earlier
+  history as left-censored rather than falsely claim lifetime completeness.
 - Normalize submissions, reporting owners, and non-derivative open-market P/S transactions without
   destroying as-filed records. Resolve amendments by filing time; do not replace the past.
 - Build annual owner classifications using only filings public before each classification cutoff.

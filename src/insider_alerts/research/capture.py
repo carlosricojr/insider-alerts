@@ -16,7 +16,7 @@ from typing import Any, Literal
 import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
-CAPTURE_CONTRACT_VERSION = "insider-evidence-capture-v1"
+CAPTURE_CONTRACT_VERSION = "insider-evidence-capture-v2"
 HYPOTHESIS_ID = "OPP-E07-V1"
 MAX_ERROR_LENGTH = 2_000
 
@@ -732,7 +732,7 @@ def _append_snapshot(
         sequence = int(sequence_row[0])
         snapshot_id = str(uuid.uuid5(uuid.NAMESPACE_URL, job.job_id))
         snapshot: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "snapshot_id": snapshot_id,
             "hypothesis_id": HYPOTHESIS_ID,
             "recorded_at_utc": utc_text(capture_finished),
@@ -779,6 +779,8 @@ def _append_snapshot(
                     "transaction_owner_mapping": owner_mapping,
                     "history_coverage_complete": False,
                     "left_censored": True,
+                    "history_observation_start_date": None,
+                    "history_source_snapshot_sha256": None,
                     "history_input_sha256": sha256_bytes(b"owner-history-not-yet-captured"),
                 },
                 "observations": {
