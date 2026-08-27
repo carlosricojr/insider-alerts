@@ -19,6 +19,7 @@
     "endpoint",
     "inference",
     "terminal_information_time",
+    "diagnostics",
     "economic_gates",
     "feature_policy",
     "amendment_policy",
@@ -359,6 +360,60 @@
         "candidate_universe_binding": {"const": "immutable_identity_provenance_digest"},
         "seal_store": {"const": "append_only_sqlite_singleton_receipts"},
         "terminal_seal_command_separate": {"const": true}
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "groups",
+        "selection_authority",
+        "membership_window",
+        "timestamp_binding",
+        "candidate_provenance",
+        "control_outcome_authority",
+        "canary_outcome_role",
+        "routine_membership",
+        "storage",
+        "missingness",
+        "confirmatory_effect",
+        "shadow_book_reconciliation_scope"
+      ],
+      "properties": {
+        "groups": {
+          "type": "array",
+          "minItems": 2,
+          "prefixItems": [
+            {"const": "full_e07_f00_control"},
+            {"const": "routine_control_subset"}
+          ],
+          "items": false
+        },
+        "selection_authority": {
+          "const": "existing_live_canary_e07_f00_shadow_ledger_only"
+        },
+        "membership_window": {
+          "const": "source_and_canary_signal_at_gte_activation_through_challenger_freeze_entry_date"
+        },
+        "timestamp_binding": {
+          "const": "source_first_observed_at_lte_canary_approval_signal_at"
+        },
+        "candidate_provenance": {
+          "const": "content_addressed_canary_row_and_activation_metadata"
+        },
+        "control_outcome_authority": {
+          "const": "research_feeds_and_shared_e07_kernel_after_frozen_tenth_session"
+        },
+        "canary_outcome_role": {"const": "diagnostic_agreement_evidence_only"},
+        "routine_membership": {
+          "const": "first_valid_pre_cutoff_snapshot_routine_exact_single_owner_complete_history"
+        },
+        "storage": {"const": "separate_append_only_diagnostics_sqlite"},
+        "missingness": {"const": "typed_per_trade_or_group_unavailable"},
+        "confirmatory_effect": {
+          "const": "cannot_veto_rescue_delay_or_mutate_challenger"
+        },
+        "shadow_book_reconciliation_scope": {"const": "challenger_only"}
       }
     },
     "economic_gates": {
