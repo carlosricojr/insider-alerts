@@ -13,8 +13,10 @@ from insider_alerts.research.trial_runtime import (
     BAR_LOOKBACK_CALENDAR_DAYS,
     MAX_CHALLENGER_SLOTS,
     MAX_SESSIONS,
+    MAX_TRANSIENT_CLOCK_REGRESSION,
     NEW_YORK,
     SIGNAL_CUTOFF,
+    EntryCompletionDecisionAfterOpen,
     EntryCompletionInputs,
     EntryEligibility,
     EntryLapseInputs,
@@ -23,6 +25,7 @@ from insider_alerts.research.trial_runtime import (
     TrialCandidate,
     TrialRuntimeConfig,
     TrialRuntimeInvalid,
+    TrialRuntimeRetryable,
     TrialStore,
     _validated_trial_window,
     resolve_ranked_entry_date,
@@ -123,10 +126,9 @@ def _candidate_eligibility(
     if not completed_sessions:
         raise EvidenceNotReady("no_completed_pre_signal_session_schedule")
     last_required = completed_sessions[-1]
-    requested_start = (
-        candidate.source_first_observed_at_utc.astimezone(NEW_YORK).date()
-        - timedelta(days=BAR_LOOKBACK_CALENDAR_DAYS)
-    )
+    requested_start = candidate.source_first_observed_at_utc.astimezone(
+        NEW_YORK
+    ).date() - timedelta(days=BAR_LOOKBACK_CALENDAR_DAYS)
     receipt = _healthy_receipt(
         bar_store.poll_receipts(candidate.symbol, max_sequence=receipt_watermark),
         requested_start=requested_start,
@@ -190,9 +192,9 @@ def _prior_book(
         digests = tuple(record.record_sha256 for record in records)
         all_bar_digests.update(digests)
         bars = [record.bar for record in records]
-        basis: Literal[
-            "bars_no_exit_before_entry_open", "missing_bars_conservative"
-        ] = "missing_bars_conservative"
+        basis: Literal["bars_no_exit_before_entry_open", "missing_bars_conservative"] = (
+            "missing_bars_conservative"
+        )
         if bars and bars[0].trade_date == resolution.entry_date:
             shadow = evaluate_shadow(E07, bars, resolution.entry_date)
             if shadow.exit_bar is not None and shadow.exit_bar.trade_date < entry_date:
@@ -325,27 +327,34 @@ def finalize_pending_entry_dates(
             entry_opens_at_utc=entry_open,
         )
         completion_inputs = EntryCompletionInputs(
-                entry_date=entry_date,
-                completed_at_utc=now,
-                entry_opens_at_utc=entry_open,
-                final_session_date=final_session,
-                schedule_observation_watermark=schedule_watermark,
-                schedule_record_sha256s=tuple(sorted(used_schedule_digests)),
-                bar_observation_watermark=bar_watermark,
-                bar_poll_receipt_watermark=receipt_watermark,
-                bar_record_sha256s=tuple(sorted(bar_digests)),
-                bar_poll_receipt_sha256s=tuple(sorted(poll_digests)),
-                prior_book_positions=prior_positions,
-            )
+            entry_date=entry_date,
+            completed_at_utc=now,
+            entry_opens_at_utc=entry_open,
+            final_session_date=final_session,
+            schedule_observation_watermark=schedule_watermark,
+            schedule_record_sha256s=tuple(sorted(used_schedule_digests)),
+            bar_observation_watermark=bar_watermark,
+            bar_poll_receipt_watermark=receipt_watermark,
+            bar_record_sha256s=tuple(sorted(bar_digests)),
+            bar_poll_receipt_sha256s=tuple(sorted(poll_digests)),
+            prior_book_positions=prior_positions,
+        )
         try:
             trial_store.append_entry_completion(completion_inputs, resolutions)
-        except TrialRuntimeInvalid as exc:
+        except EntryCompletionDecisionAfterOpen as exc:
             rolled_at = clock()
             if rolled_at.tzinfo is None:
                 raise ValueError("trial finalizer clock cannot be naive") from exc
             rolled_at = rolled_at.astimezone(UTC)
-            if str(exc) != "entry_completion_outside_pre_open_window" or rolled_at < entry_open:
-                raise
+            if rolled_at < entry_open:
+                regression = exc.decision_clock_at_utc - rolled_at
+                if regression <= MAX_TRANSIENT_CLOCK_REGRESSION:
+                    raise TrialRuntimeRetryable(
+                        "entry_completion_clock_moved_backwards_across_open"
+                    ) from exc
+                raise TrialRuntimeInvalid(
+                    "entry_completion_clock_regression_exceeds_limit"
+                ) from exc
             trial_store.append_entry_lapse(
                 EntryLapseInputs(
                     entry_date=entry_date,

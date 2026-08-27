@@ -538,9 +538,7 @@ def test_entry_completion_candidate_mismatch_rolls_back_everything(tmp_path: Pat
     candidate = _trial_candidate(
         "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
     )
-    store = _store_at(
-        tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
-    )
+    store = _store_at(tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC))
     assert store.append_candidate(candidate)
     inputs = _completion_inputs()
 
@@ -601,7 +599,7 @@ def test_completion_uses_bound_official_open_and_rejects_backdated_commit(
     late = _store_at(tmp_path / "late.db", official_open)
     for candidate in (first, second):
         assert late.append_candidate(candidate)
-    with pytest.raises(TrialRuntimeInvalid, match="outside_pre_open_window"):
+    with pytest.raises(TrialRuntimeInvalid, match="decision_clock_reached_official_open"):
         late.append_entry_completion(
             _completion_inputs(completed_at=completed_at, entry_open=official_open), resolutions
         )
@@ -707,9 +705,7 @@ def test_entry_completion_rejects_resolution_state_outside_closed_vocabulary(
     candidate = _trial_candidate(
         "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
     )
-    store = _store_at(
-        tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
-    )
+    store = _store_at(tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC))
     assert store.append_candidate(candidate)
     invalid = TrialResolution(
         candidate_id="a",
@@ -805,9 +801,7 @@ def test_late_candidate_uses_earliest_covering_seal_across_multiple_dates(
         imported_at=first_ready,
     )
     assert store.append_candidate(first)
-    store.append_entry_lapse(
-        _lapse_inputs(reason="day_one_outage")
-    )
+    store.append_entry_lapse(_lapse_inputs(reason="day_one_outage"))
 
     second_ready = datetime(2026, 8, 28, 13, 10, tzinfo=UTC)
     second = replace(
@@ -859,9 +853,7 @@ def test_candidate_import_timestamp_before_concurrent_seal_is_retryable(
     )
     assert store.append_candidate(first)
     sealed_at = datetime(2026, 8, 27, 13, 30, tzinfo=UTC)
-    store.append_entry_lapse(
-        _lapse_inputs(lapsed_at=sealed_at, reason="concurrent_cycle")
-    )
+    store.append_entry_lapse(_lapse_inputs(lapsed_at=sealed_at, reason="concurrent_cycle"))
     stale_cycle_candidate = _trial_candidate(
         "b",
         symbol="BBB",
@@ -892,9 +884,7 @@ def test_integrity_ties_lapse_resolution_reason_to_lapse_record(tmp_path: Path) 
         imported_at=ready,
     )
     assert store.append_candidate(candidate)
-    store.append_entry_lapse(
-        _lapse_inputs(reason="bar_feed_not_ready_before_open")
-    )
+    store.append_entry_lapse(_lapse_inputs(reason="bar_feed_not_ready_before_open"))
 
     with sqlite3.connect(store.path) as conn:
         conn.row_factory = sqlite3.Row
@@ -948,10 +938,10 @@ def test_entry_lapse_before_open_rolls_back(
     assert store.status()["entry_date_lapses"] == 0
 
 
-def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) -> None:
-    store = _store_at(
-        tmp_path / "trial.db", datetime(2026, 8, 28, 13, 21, tzinfo=UTC)
-    )
+def test_small_clock_regressions_before_candidate_import_or_prior_seal_are_retryable(
+    tmp_path: Path,
+) -> None:
+    store = _store_at(tmp_path / "trial.db", datetime(2026, 8, 28, 13, 21, tzinfo=UTC))
     imported_late = _trial_candidate(
         "a",
         symbol="AAA",
@@ -970,11 +960,11 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
         resolved_at_utc=completion_inputs.completed_at_utc,
     )
 
-    with pytest.raises(TrialRuntimeInvalid, match="predates_candidate_import"):
+    with pytest.raises(TrialRuntimeRetryable, match="moved_behind_candidate_import"):
         store.append_entry_completion(completion_inputs, [resolution])
 
     late_lapse = _lapse_inputs(
-        lapsed_at=datetime(2026, 8, 28, 14, 0, tzinfo=UTC),
+        lapsed_at=datetime(2026, 8, 28, 13, 21, tzinfo=UTC),
         reason="extended_outage",
     )
     assert store.append_entry_lapse(late_lapse)
@@ -984,7 +974,7 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
             symbol="BBB",
             rank="2",
             evidence_recorded_at=datetime(2026, 8, 28, 13, 10, tzinfo=UTC),
-            imported_at=datetime(2026, 8, 28, 14, 1, tzinfo=UTC),
+            imported_at=datetime(2026, 8, 28, 13, 22, tzinfo=UTC),
         ),
         source_first_observed_at_utc=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
         planned_entry_date=date(2026, 8, 28),
@@ -1007,6 +997,104 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
 
     with pytest.raises(TrialRuntimeRetryable, match="seal_time_moved_backwards"):
         store.append_entry_completion(next_inputs, [next_resolution])
+
+
+def test_large_clock_regression_against_candidate_import_is_permanent(tmp_path: Path) -> None:
+    store = _store_at(tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC))
+    candidate = _trial_candidate(
+        "a",
+        symbol="AAA",
+        rank="1",
+        evidence_recorded_at=datetime(2026, 8, 27, 13, 10, tzinfo=UTC),
+        imported_at=datetime(2026, 8, 27, 13, 26, tzinfo=UTC),
+    )
+    assert store.append_candidate(candidate)
+    inputs = _completion_inputs()
+    resolution = TrialResolution(
+        candidate_id="a",
+        entry_date=date(2026, 8, 27),
+        enrollment_state="missed",
+        reason="candidate_not_imported_before_entry_cutoff",
+        confirmatory_enrollment_sequence=None,
+        resolved_at_utc=inputs.completed_at_utc,
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="import_clock_regression_exceeds_limit"):
+        store.append_entry_completion(inputs, [resolution])
+
+    assert store.resolutions() == []
+    assert store.status()["entry_date_completions"] == 0
+
+
+def test_large_clock_regression_against_prior_seal_is_permanent(tmp_path: Path) -> None:
+    store = TrialStore(tmp_path / "trial.db")
+    first = _trial_candidate(
+        "a",
+        symbol="AAA",
+        rank="1",
+        evidence_recorded_at=datetime(2026, 8, 27, 13, 10, tzinfo=UTC),
+        imported_at=datetime(2026, 8, 27, 13, 10, tzinfo=UTC),
+    )
+    assert store.append_candidate(first)
+    store.append_entry_lapse(
+        _lapse_inputs(
+            lapsed_at=datetime(2026, 8, 28, 13, 26, tzinfo=UTC),
+            reason="extended_outage",
+        )
+    )
+    second = replace(
+        _trial_candidate(
+            "b",
+            symbol="BBB",
+            rank="2",
+            evidence_recorded_at=datetime(2026, 8, 28, 13, 10, tzinfo=UTC),
+            imported_at=datetime(2026, 8, 28, 13, 27, tzinfo=UTC),
+        ),
+        source_first_observed_at_utc=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        planned_entry_date=date(2026, 8, 28),
+        entry_opens_at_utc=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
+    )
+    assert store.append_candidate(second)
+    inputs = _completion_inputs(
+        entry_date=date(2026, 8, 28),
+        completed_at=datetime(2026, 8, 28, 13, 20, tzinfo=UTC),
+        entry_open=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
+    )
+    resolution = TrialResolution(
+        candidate_id="b",
+        entry_date=date(2026, 8, 28),
+        enrollment_state="enrolled",
+        reason="eligible_E07_F00",
+        confirmatory_enrollment_sequence=1,
+        resolved_at_utc=inputs.completed_at_utc,
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="seal_clock_regression_exceeds_limit"):
+        store.append_entry_completion(inputs, [resolution])
+
+    assert len(store.resolutions()) == 1
+    assert store.status()["entry_date_completions"] == 0
+
+
+def test_small_clock_regression_before_lapse_candidate_import_is_retryable(
+    tmp_path: Path,
+) -> None:
+    imported_at = ENTRY_OPEN + timedelta(seconds=30)
+    store = TrialStore(tmp_path / "trial.db")
+    candidate = _trial_candidate(
+        "a",
+        symbol="AAA",
+        rank="1",
+        evidence_recorded_at=datetime(2026, 8, 27, 13, 10, tzinfo=UTC),
+        imported_at=imported_at,
+    )
+    assert store.append_candidate(candidate)
+
+    with pytest.raises(TrialRuntimeRetryable, match="moved_behind_candidate_import"):
+        store.append_entry_lapse(_lapse_inputs(reason="clock_regression"))
+
+    assert store.resolutions() == []
+    assert store.status()["entry_date_lapses"] == 0
 
 
 def test_draft_registry_only_heartbeats_and_creates_no_candidates(tmp_path: Path) -> None:
@@ -1211,9 +1299,7 @@ def test_trial_status_cli_is_read_only_and_integrity_signaling(tmp_path: Path) -
 
 
 def test_windows_trial_task_is_direct_hidden_pythonw() -> None:
-    installer = (
-        ROOT / "ops/windows/install-research-trial-task.ps1"
-    ).read_text(encoding="utf-8")
+    installer = (ROOT / "ops/windows/install-research-trial-task.ps1").read_text(encoding="utf-8")
     assert ".venv\\Scripts\\pythonw.exe" in installer
     action = installer.split("$action =", maxsplit=1)[1].split("$logonTrigger", maxsplit=1)[0]
     assert "-Execute $pythonExe" in action
@@ -1386,6 +1472,54 @@ def test_finalizer_clock_regression_is_retryable_and_rolls_back(
     assert store.status()["entry_date_completions"] == 0
 
 
+def test_finalizer_clock_regression_across_open_is_retryable_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    moments = iter(
+        (
+            datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
+            ENTRY_OPEN,
+            ENTRY_OPEN - timedelta(seconds=1),
+        )
+    )
+
+    with pytest.raises(TrialRuntimeRetryable, match="moved_backwards_across_open"):
+        finalizer.finalize_pending_entry_dates(config, clock=lambda: next(moments))
+
+    store = TrialStore(config.trial_db)
+    assert store.resolutions() == []
+    assert store.status()["entry_date_completions"] == 0
+    assert store.status()["entry_date_lapses"] == 0
+
+
+def test_finalizer_large_clock_regression_across_open_is_permanent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    moments = iter(
+        (
+            datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
+            ENTRY_OPEN + timedelta(minutes=6),
+            ENTRY_OPEN - timedelta(seconds=1),
+        )
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="clock_regression_exceeds_limit"):
+        finalizer.finalize_pending_entry_dates(config, clock=lambda: next(moments))
+
+    store = TrialStore(config.trial_db)
+    assert store.resolutions() == []
+    assert store.status()["entry_date_completions"] == 0
+    assert store.status()["entry_date_lapses"] == 0
+
+
 def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1447,9 +1581,7 @@ def test_non_opportunistic_evidence_is_excluded_before_candidate_or_capacity(
     store = TrialStore(config.trial_db)
     assert store.candidates() == []
     assert store.disposition_counts() == {"excluded": 1}
-    assert _disposition_reasons(config) == [
-        f"classification_state_excluded:{classification_state}"
-    ]
+    assert _disposition_reasons(config) == [f"classification_state_excluded:{classification_state}"]
     assert BarFeedStore(config.bar_feed_db).status()["request_count"] == 0
 
 

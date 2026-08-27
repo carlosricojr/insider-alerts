@@ -32,6 +32,7 @@ SIGNAL_CUTOFF = time(9, 20)
 MAX_SESSIONS = 10
 BAR_LOOKBACK_CALENDAR_DAYS = 120
 MAX_CHALLENGER_SLOTS = 20
+MAX_TRANSIENT_CLOCK_REGRESSION = timedelta(minutes=5)
 ENTRY_STATES = frozenset(
     {"enrolled", "ineligible", "overlap_suppressed", "capacity_suppressed", "missed"}
 )
@@ -43,6 +44,14 @@ class TrialRuntimeInvalid(RuntimeError):
 
 class TrialRuntimeRetryable(RuntimeError):
     """A transient runtime condition that must not poison prospective state."""
+
+
+class EntryCompletionDecisionAfterOpen(TrialRuntimeInvalid):
+    """The transactional decision clock crossed the official entry open."""
+
+    def __init__(self, decision_clock_at_utc: datetime) -> None:
+        self.decision_clock_at_utc = decision_clock_at_utc
+        super().__init__("entry_completion_decision_clock_reached_official_open")
 
 
 class EvidenceExcluded(RuntimeError):
@@ -64,6 +73,21 @@ def _parse_utc(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("persisted trial-runtime timestamp is naive")
     return parsed.astimezone(UTC)
+
+
+def _raise_clock_regression(
+    *,
+    earlier: datetime,
+    later: datetime,
+    retryable_reason: str,
+    invalid_reason: str,
+) -> None:
+    """Retry small wall-clock steps but fault when timestamp trust is materially broken."""
+
+    regression = later - earlier
+    if timedelta(0) < regression <= MAX_TRANSIENT_CLOCK_REGRESSION:
+        raise TrialRuntimeRetryable(retryable_reason)
+    raise TrialRuntimeInvalid(invalid_reason)
 
 
 def _sha256(value: bytes) -> str:
@@ -1024,10 +1048,7 @@ class TrialStore:
             prior_book_positions
         ) or len({item["symbol"] for item in prior_book_positions}) != len(prior_book_positions):
             raise TrialRuntimeInvalid("prior_book_positions_duplicate")
-        if (
-            _sha256(_canonical({"positions": prior_book_positions}))
-            != record["prior_book_sha256"]
-        ):
+        if _sha256(_canonical({"positions": prior_book_positions})) != record["prior_book_sha256"]:
             raise TrialRuntimeInvalid("completion_prior_book_digest_mismatch")
         expected_candidate_records: list[dict[str, str]] = []
         for candidate in candidate_records:
@@ -1093,9 +1114,9 @@ class TrialStore:
             (self._prior_book_record(position) for position in inputs.prior_book_positions),
             key=lambda item: (item["symbol"], item["candidate_id"]),
         )
-        if len({item["candidate_id"] for item in prior_positions}) != len(
-            prior_positions
-        ) or len({item["symbol"] for item in prior_positions}) != len(prior_positions):
+        if len({item["candidate_id"] for item in prior_positions}) != len(prior_positions) or len(
+            {item["symbol"] for item in prior_positions}
+        ) != len(prior_positions):
             raise TrialRuntimeInvalid("prior_book_positions_duplicate")
         prior_book_sha = _sha256(_canonical({"positions": prior_positions}))
         replay_resolution_digests = [
@@ -1153,8 +1174,14 @@ class TrialStore:
             if latest is not None:
                 if date.fromisoformat(str(latest["entry_date"])) >= inputs.entry_date:
                     raise TrialRuntimeInvalid("entry_dates_not_strictly_ordered")
-                if inputs.completed_at_utc < _parse_utc(str(latest["sealed_at_utc"])):
-                    raise TrialRuntimeRetryable("entry_seal_time_moved_backwards")
+                latest_sealed_at = _parse_utc(str(latest["sealed_at_utc"]))
+                if inputs.completed_at_utc < latest_sealed_at:
+                    _raise_clock_regression(
+                        earlier=inputs.completed_at_utc,
+                        later=latest_sealed_at,
+                        retryable_reason="entry_seal_time_moved_backwards",
+                        invalid_reason="entry_seal_clock_regression_exceeds_limit",
+                    )
             earlier_pending = conn.execute(
                 """
                 SELECT 1 FROM trial_candidates candidate
@@ -1180,8 +1207,14 @@ class TrialStore:
             if not candidate_rows:
                 raise TrialRuntimeInvalid("entry_completion_has_no_pending_candidates")
             candidates = [self._verify_candidate_row(row) for row in candidate_rows]
-            if any(candidate.imported_at_utc > inputs.completed_at_utc for candidate in candidates):
-                raise TrialRuntimeInvalid("entry_completion_predates_candidate_import")
+            latest_import = max(candidate.imported_at_utc for candidate in candidates)
+            if inputs.completed_at_utc < latest_import:
+                _raise_clock_regression(
+                    earlier=inputs.completed_at_utc,
+                    later=latest_import,
+                    retryable_reason="entry_completion_clock_moved_behind_candidate_import",
+                    invalid_reason="entry_completion_import_clock_regression_exceeds_limit",
+                )
             cutoff_utc = datetime.combine(
                 inputs.entry_date,
                 SIGNAL_CUTOFF,
@@ -1244,9 +1277,14 @@ class TrialStore:
                 raise TrialRuntimeInvalid("entry_completion_decision_clock_naive")
             decision_clock_at = decision_clock_at.astimezone(UTC)
             if decision_clock_at < inputs.completed_at_utc:
-                raise TrialRuntimeRetryable("entry_completion_clock_moved_backwards")
+                _raise_clock_regression(
+                    earlier=decision_clock_at,
+                    later=inputs.completed_at_utc,
+                    retryable_reason="entry_completion_clock_moved_backwards",
+                    invalid_reason="entry_completion_clock_regression_exceeds_limit",
+                )
             if decision_clock_at >= entry_open:
-                raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
+                raise EntryCompletionDecisionAfterOpen(decision_clock_at)
             record: dict[str, Any] = {
                 "contract_version": TRIAL_CONTRACT_VERSION,
                 "entry_date": inputs.entry_date.isoformat(),
@@ -1321,8 +1359,7 @@ class TrialStore:
         entry_open = _parse_utc(str(record["entry_opens_at_utc"]))
         lapsed_at = _parse_utc(str(record["lapsed_at_utc"]))
         if (
-            entry_open.astimezone(NEW_YORK).date()
-            != date.fromisoformat(str(record["entry_date"]))
+            entry_open.astimezone(NEW_YORK).date() != date.fromisoformat(str(record["entry_date"]))
             or lapsed_at < entry_open
         ):
             raise TrialRuntimeInvalid("entry_lapse_official_open_date_mismatch")
@@ -1405,8 +1442,7 @@ class TrialStore:
                 if (
                     existing_lapse["lapsed_at_utc"] == _utc_text(inputs.lapsed_at_utc)
                     and existing_lapse["reason"] == inputs.reason
-                    and existing_lapse["entry_opens_at_utc"]
-                    == _utc_text(inputs.entry_opens_at_utc)
+                    and existing_lapse["entry_opens_at_utc"] == _utc_text(inputs.entry_opens_at_utc)
                     and existing_lapse["schedule_observation_watermark"]
                     == inputs.schedule_observation_watermark
                     and existing_lapse["schedule_record_sha256s"] == list(schedule_digests)
@@ -1416,7 +1452,7 @@ class TrialStore:
             latest = conn.execute(
                 """
                 SELECT entry_date,sealed_at_utc FROM (
-                  SELECT entry_date,completed_at_utc sealed_at_utc
+                  SELECT entry_date,decision_clock_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
@@ -1426,8 +1462,14 @@ class TrialStore:
             if latest is not None:
                 if date.fromisoformat(str(latest["entry_date"])) >= inputs.entry_date:
                     raise TrialRuntimeInvalid("entry_dates_not_strictly_ordered")
-                if inputs.lapsed_at_utc < _parse_utc(str(latest["sealed_at_utc"])):
-                    raise TrialRuntimeRetryable("entry_seal_time_moved_backwards")
+                latest_sealed_at = _parse_utc(str(latest["sealed_at_utc"]))
+                if inputs.lapsed_at_utc < latest_sealed_at:
+                    _raise_clock_regression(
+                        earlier=inputs.lapsed_at_utc,
+                        later=latest_sealed_at,
+                        retryable_reason="entry_seal_time_moved_backwards",
+                        invalid_reason="entry_seal_clock_regression_exceeds_limit",
+                    )
             earlier_pending = conn.execute(
                 """
                 SELECT 1 FROM trial_candidates candidate
@@ -1453,8 +1495,14 @@ class TrialStore:
             if not candidate_rows:
                 raise TrialRuntimeInvalid("entry_lapse_has_no_pending_candidates")
             candidates = [self._verify_candidate_row(row) for row in candidate_rows]
-            if any(candidate.imported_at_utc > inputs.lapsed_at_utc for candidate in candidates):
-                raise TrialRuntimeInvalid("entry_lapse_predates_candidate_import")
+            latest_import = max(candidate.imported_at_utc for candidate in candidates)
+            if inputs.lapsed_at_utc < latest_import:
+                _raise_clock_regression(
+                    earlier=inputs.lapsed_at_utc,
+                    later=latest_import,
+                    retryable_reason="entry_lapse_clock_moved_behind_candidate_import",
+                    invalid_reason="entry_lapse_import_clock_regression_exceeds_limit",
+                )
             entry_open = inputs.entry_opens_at_utc.astimezone(UTC)
             if (
                 entry_open.astimezone(NEW_YORK).date() != inputs.entry_date
@@ -1855,8 +1903,7 @@ class TrialStore:
                     resolution.entry_date != entry_date
                     or resolution.resolved_at_utc != lapsed_at
                     or resolution.enrollment_state != "missed"
-                    or resolution.reason
-                    != f"entry_date_completion_lapsed:{lapse['reason']}"
+                    or resolution.reason != f"entry_date_completion_lapsed:{lapse['reason']}"
                     for resolution in lapse_resolutions
                 ):
                     raise TrialRuntimeInvalid("lapse_resolution_binding_mismatch")
