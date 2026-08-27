@@ -33,7 +33,8 @@ ARCHIVE_MANIFEST_URL = (
     "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets"
 )
 ARCHIVE_RE = re.compile(r"(?P<year>20\d{2})q(?P<quarter>[1-4])_form345\.zip$", re.I)
-CLASSIFIER_VERSION = "cmp-owner-calendar-v1"
+CLASSIFIER_VERSION = "cmp-owner-calendar-v2"
+HISTORY_OBSERVATION_START = date(2006, 1, 1)
 _MONTHS = {
     "JAN": 1,
     "FEB": 2,
@@ -76,20 +77,20 @@ class RawObject:
 class Coverage:
     complete_from: date
     complete_through: date
-    prehistory_complete: bool
+    source_snapshot_sha256: str
     missing_quarters: tuple[str, ...] = ()
-    prehistory_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.complete_from > self.complete_through:
             raise ValueError("coverage start cannot be after coverage end")
-        digest = self.prehistory_evidence_sha256
-        if self.prehistory_complete and (
-            digest is None
-            or len(digest) != 64
+        if self.complete_from != HISTORY_OBSERVATION_START:
+            raise ValueError("history observation boundary must be 2006-01-01")
+        digest = self.source_snapshot_sha256
+        if (
+            len(digest) != 64
             or any(char not in "0123456789abcdef" for char in digest)
         ):
-            raise ValueError("complete prehistory requires a SHA-256 evidence binding")
+            raise ValueError("history coverage requires a source snapshot SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,8 @@ class Classification:
     cutoff_date: date
     history_coverage_complete: bool
     left_censored: bool
+    history_observation_start_date: date
+    history_source_snapshot_sha256: str
     routine_since_year: int | None
     history_input_sha256: str
 
@@ -735,9 +738,8 @@ def _history_digest(
         "coverage": {
             "complete_from": coverage.complete_from.isoformat(),
             "complete_through": coverage.complete_through.isoformat(),
-            "prehistory_complete": coverage.prehistory_complete,
+            "source_snapshot_sha256": coverage.source_snapshot_sha256,
             "missing_quarters": list(coverage.missing_quarters),
-            "prehistory_evidence_sha256": coverage.prehistory_evidence_sha256,
         },
         "filings": [
             {
@@ -769,79 +771,91 @@ def classify_owner(
     filings: Sequence[OwnerFiling],
     coverage: Coverage,
 ) -> Classification:
-    """Apply the frozen trader-calendar rule using information public before Jan 1."""
+    """Replay the trader-calendar state using information public at each Jan 1."""
 
     normalized_owner = _normalize_cik(owner_cik)
     cutoff = date(classification_year, 1, 1)
     visible = [filing for filing in filings if filing.filing_date < cutoff]
     digest = _history_digest(normalized_owner, classification_year, visible, coverage)
-    left_censored = not coverage.prehistory_complete
+    first_complete_year = HISTORY_OBSERVATION_START.year
+    bounded_coverage_complete = (
+        not coverage.missing_quarters
+        and coverage.complete_through >= date(classification_year - 1, 12, 31)
+    )
 
     def result(
         state: ClassificationState, reason: str, routine_since: int | None = None
     ) -> Classification:
-        complete = (
-            coverage.prehistory_complete
-            and not coverage.missing_quarters
-            and coverage.complete_through >= date(classification_year - 1, 12, 31)
-        )
         return Classification(
             state=state,
             reason=reason,
             owner_cik=normalized_owner,
             classification_year=classification_year,
             cutoff_date=cutoff,
-            history_coverage_complete=complete,
-            left_censored=left_censored,
+            history_coverage_complete=bounded_coverage_complete,
+            left_censored=True,
+            history_observation_start_date=coverage.complete_from,
+            history_source_snapshot_sha256=coverage.source_snapshot_sha256,
             routine_since_year=routine_since,
             history_input_sha256=digest,
         )
 
+    if coverage.complete_through < date(classification_year - 1, 12, 31):
+        return result("unpartitionable", "coverage_not_current")
+    if coverage.missing_quarters:
+        return result("unpartitionable", "coverage_gap")
     if any(normalized_owner not in filing.owner_ciks for filing in visible):
         return result("unpartitionable", "owner_identity_mismatch")
     if any(len(filing.owner_ciks) != 1 for filing in visible):
         return result("unpartitionable", "ambiguous_owner_history")
     if any(filing.has_invalid_transaction for filing in visible):
         return result("unpartitionable", "invalid_transaction")
+    _, current_resolution_error = _effective_filings(visible)
+    if current_resolution_error is not None:
+        return result("unpartitionable", current_resolution_error)
 
-    effective, resolution_error = _effective_filings(visible)
-    if resolution_error is not None:
-        return result("unpartitionable", resolution_error)
+    state: Literal["routine", "opportunistic"] | None = None
+    routine_since: int | None = None
+    first_partitionable_year = first_complete_year + 3
+    for evaluation_year in range(first_partitionable_year, classification_year + 1):
+        evaluation_cutoff = date(evaluation_year, 1, 1)
+        then_visible = [
+            filing for filing in visible if filing.filing_date < evaluation_cutoff
+        ]
+        effective, resolution_error = _effective_filings(then_visible)
+        if resolution_error is not None:
+            if evaluation_year == classification_year:
+                return result("unpartitionable", resolution_error)
+            continue
 
-    months_by_year: dict[int, set[int]] = defaultdict(set)
-    for filing in effective:
-        for transaction_date in filing.transaction_dates:
-            if transaction_date < cutoff:
-                months_by_year[transaction_date.year].add(transaction_date.month)
+        months_by_year: dict[int, set[int]] = defaultdict(set)
+        for filing in effective:
+            for transaction_date in filing.transaction_dates:
+                if transaction_date < evaluation_cutoff:
+                    months_by_year[transaction_date.year].add(transaction_date.month)
 
-    first_complete_year = coverage.complete_from.year
-    if coverage.complete_from != date(coverage.complete_from.year, 1, 1):
-        first_complete_year += 1
-    earliest_window_end = max(first_complete_year + 2, 3)
-    for end_year in range(earliest_window_end, classification_year):
-        years = (end_year - 2, end_year - 1, end_year)
+        years = (
+            evaluation_year - 3,
+            evaluation_year - 2,
+            evaluation_year - 1,
+        )
         month_sets = [months_by_year[year] for year in years]
-        if all(month_sets) and set.intersection(*month_sets):
-            return result("routine", "absorbing_routine_pattern", end_year + 1)
+        has_complete_window = all(month_sets)
+        has_routine_pattern = has_complete_window and bool(
+            set.intersection(*month_sets)
+        )
+        if has_routine_pattern:
+            state = "routine"
+            routine_since = evaluation_year
+            break
+        if state is None and has_complete_window:
+            state = "opportunistic"
 
-    if coverage.complete_through < date(classification_year - 1, 12, 31):
-        return result("unpartitionable", "coverage_not_current")
-    if coverage.missing_quarters:
-        return result("unpartitionable", "coverage_gap")
-
-    target_years = (
-        classification_year - 3,
-        classification_year - 2,
-        classification_year - 1,
-    )
-    target_sets = [months_by_year[year] for year in target_years]
-    if not all(target_sets):
-        return result("unpartitionable", "incomplete_trade_years")
-    if set.intersection(*target_sets):
-        return result("routine", "same_month_in_three_prior_years", classification_year)
-    if left_censored:
-        return result("unpartitionable", "left_censored")
-    return result("opportunistic", "disjoint_months_in_three_prior_years")
+    if state == "routine":
+        return result("routine", "absorbing_routine_pattern", routine_since)
+    if state == "opportunistic":
+        return result("opportunistic", "opportunistic_until_routine")
+    return result("unpartitionable", "no_partitionable_three_year_window")
 
 
 def quarter_labels(refs: Iterable[ArchiveRef]) -> tuple[str, ...]:

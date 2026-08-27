@@ -12,9 +12,11 @@ live canary.
 - The [SEC dataset documentation](https://www.sec.gov/files/insider_transactions_readme.pdf)
   defines the submission, reporting-owner, and non-derivative transaction keys and states that
   amendments remain present as filed.
-- The [SEC submissions API](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)
-  and EDGAR filing documents are the future source for owner-specific pre-2006 investigation.
-  Their existence does not, by itself, prove that pre-electronic or paper history is complete.
+- The [SEC electronic-filing rule](https://www.sec.gov/files/rules/final/33-8230.htm) mandated
+  electronic Forms 3, 4, and 5 only from June 30, 2003. Earlier EDGAR records can omit paper filings
+  and cannot establish lifetime history. The registered observation boundary is therefore the bulk
+  archive's first full calendar year, `2006-01-01`, rather than a false claim of prehistory
+  completeness.
 
 Each manifest and ZIP response is stored by SHA-256 before parsing. Retrieval rows preserve the
 request and final URLs, retrieval time, status, media type, ETag, Last-Modified value, and an HTTP
@@ -28,25 +30,25 @@ archive becomes another release and another snapshot; it never overwrites the ea
 ## Classifier behavior
 
 At the January 1 cutoff for year `Y`, only filings dated before the cutoff and transactions dated
-in prior years are visible. The classifier:
+in prior years are visible. The classifier replays annual states from the fixed boundary and:
 
 1. keeps only non-derivative open-market `P`/`S` rows with consistent acquired/disposed codes;
 2. requires an exact reporting-owner CIK and rejects transaction attribution from multi-owner
    filings;
 3. treats an amendment as a replacement only when it maps uniquely to an original filing visible
    at that cutoff, and rejects unresolved or same-day conflicting amendment order;
-4. returns `routine` after a positive same-calendar-month pattern in three consecutive years and
-   keeps that state absorbing;
-5. returns `opportunistic` only when the preceding three years all have qualifying trades with no
-   common month **and** the caller has separately established complete prehistory; and
-6. otherwise returns `unpartitionable` with a typed reason.
+4. starts `unpartitionable`, then assigns the first complete three-year window to `routine` when a
+   common calendar month exists or `opportunistic` when it does not;
+5. preserves opportunistic status through later incomplete or disjoint windows, while checking each
+   later complete window for a transition to routine;
+6. keeps routine absorbing; and
+7. otherwise returns `unpartitionable` with a typed reason.
 
-The asymmetry is intentional: incomplete early history can positively prove that an owner became
-routine, but it can never prove that the owner was opportunistic. The bulk archive's 2006 start is
-therefore always left-censored unless separate authoritative evidence clears it. The synchronizer
-does not set `prehistory_complete`; that state is rejected unless it also carries the SHA-256 of a
-reviewed coverage artifact. Producing that artifact requires the owner-specific work and evidence
-review in the remaining M3 slice.
+Every result carries the observation start date, immutable source snapshot SHA-256, and a digest of
+the exact bounded history input. Pre-2006 left-censoring remains explicit but is a measurement
+limitation, matching the paper's finite-dataset implementation, rather than a reason to exclude the
+entire opportunistic cohort. A stale snapshot, any archive gap, unresolved amendment, invalid
+transaction, or ambiguous owner mapping still fails closed to `unpartitionable`.
 
 ## Operation
 

@@ -47,10 +47,14 @@
     "level": "reporting_owner",
     "identity_key": "reporting_owner_cik",
     "lookback_calendar_years": 3,
+    "history_observation_start_date": "2006-01-01",
+    "history_source_snapshot_required": true,
+    "pre_observation_history": "left_censored_measurement_limitation",
     "qualifying_transaction_codes": ["P", "S"],
     "classification_cutoff": "start_of_calendar_year_america_new_york",
     "routine_rule": "same_transaction_month_present_in_each_of_three_prior_years",
     "routine_is_absorbing": true,
+    "opportunistic_persists_until_routine": true,
     "eligible_state": "opportunistic",
     "excluded_states": ["routine", "unpartitionable", "ambiguous_multi_owner"],
     "multi_owner_policy": "exclude_from_confirmatory_cohort"
@@ -110,14 +114,17 @@
     "unregistered_subgroups": "prohibited"
   },
   "amendment_policy": {
-    "material_change": "retire_and_require_new_id_and_fresh_sample",
+    "draft_correction": "allowed_before_activation_only_with_empty_challenger_store",
+    "material_change": "after_activation_retire_and_require_new_id_and_fresh_sample",
     "outcome_informed_change": "prohibited",
     "corrections": "append_only_with_supersession_reference"
   },
   "decision_states": ["COLLECTING", "PROMOTE_RECOMMENDED", "KILL", "INVALID"],
   "references": [
     "https://www.nber.org/papers/w16454",
+    "https://dash.harvard.edu/server/api/core/bitstreams/7312037e-2b77-6bd4-e053-0100007fdf3b/content",
     "https://www.nber.org/papers/w20592",
-    "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets"
+    "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets",
+    "https://www.sec.gov/files/rules/final/33-8230.htm"
   ]
 }

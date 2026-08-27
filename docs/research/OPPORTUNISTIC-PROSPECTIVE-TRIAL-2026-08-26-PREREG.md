@@ -3,6 +3,8 @@
 Registry ID: `OPP-E07-V1`<br>
 Status: draft; activates only through the procedure below<br>
 Drafted: 2026-08-26, before implementation or inspection of challenger outcomes<br>
+Draft correction: 2026-08-26, before activation and with zero challenger snapshots, to match the
+published finite-observation state machine rather than require unknowable lifetime history<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -32,8 +34,10 @@ The draft becomes active only after all of the following occur:
 Only signals first observed at or after the sealed activation timestamp are eligible. Earlier
 signals, including all current canary observations, never count. A signal missed during a capture
 pause is recorded as missed and cannot be enrolled later. An amendment that changes cohort,
-strategy, classifier, endpoint, test, alpha, sample size, or decision gates retires this registry
-entry and requires a new ID and fresh activation boundary.
+strategy, classifier, endpoint, test, alpha, sample size, or decision gates **after activation**
+retires this registry entry and requires a new ID and fresh activation boundary. Before activation,
+a draft correction is permitted only while the evidence store contains no challenger snapshots; it
+changes the definition digest that will later be sealed.
 
 The registry definition SHA-256 is computed over RFC 8785 canonical JSON after removing the
 top-level `status` and `activation` members. This avoids a self-referential digest while keeping the
@@ -72,29 +76,34 @@ opportunistic eligible set. Neither book changes live slot selection or orders.
 Classification follows the trader-level rule in Cohen, Malloy, and Pomorski, with explicit states
 for records their study would not partition. It uses reporting-owner CIK, never a normalized name.
 
-At the start of calendar year `Y`, use only non-derivative open-market purchase or sale transaction
-codes `P` and `S` whose SEC filing was public before `Y-01-01T00:00:00 America/New_York` and whose
-transaction date falls in `Y-3`, `Y-2`, or `Y-1`. Use the EDGAR acceptance timestamp when present;
-when the quarterly bulk data exposes only a filing date, include dates no later than December 31 of
-`Y-1`. For each owner:
+The fixed observation boundary is `2006-01-01`, the first day of the first full calendar year in the
+SEC quarterly bulk archive. Every classification is bound to the SHA-256 of an immutable, gap-free
+archive snapshot covering that boundary through December 31 before the classification year. Public
+history before the boundary is left-censored and is disclosed as a measurement limitation; it is
+not treated as lifetime-complete history. Changing the boundary after activation requires a new
+registry ID and sample.
 
-1. `unpartitionable`: the owner has no qualifying trade in any one of the three preceding calendar
-   years, or the required SEC archive/history coverage is incomplete;
-2. `routine`: the owner has qualifying trades in all three years and the intersection of the three
-   sets of transaction calendar months is non-empty;
-3. `opportunistic`: the owner has qualifying trades in all three years but that month intersection
-   is empty.
+Replay the owner state at each January 1 from 2009 through classification year `Y`. At cutoff `y`,
+use only non-derivative open-market purchase or sale transaction codes `P` and `S` whose SEC filing
+was public before `y-01-01T00:00:00 America/New_York`. Use the EDGAR acceptance timestamp when
+present; when the quarterly bulk data exposes only a filing date, include filing dates no later
+than December 31 of the prior year. Current-year trades cannot affect current-year status.
 
-Once an owner becomes `routine`, the owner remains routine for later years, matching the published
-trader-level rule. Otherwise classification is recalculated only at the next calendar-year cutoff;
-current-year trades cannot change current-year status. Amendments public after a cutoff cannot
-rewrite that cutoff; a later classification record may reference the correction.
+1. The initial state is `unpartitionable`. It remains so until the owner has at least one qualifying
+   trade in each of a cutoff's three preceding calendar years.
+2. At the first partitionable cutoff, a non-empty intersection of the three transaction-month sets
+   makes the owner `routine`; an empty intersection makes the owner `opportunistic`.
+3. An `opportunistic` owner retains that state. At each later cutoff with qualifying trades in all
+   three preceding years, a common transaction month changes the owner to `routine`; a disjoint or
+   incomplete newest window leaves the prior opportunistic state unchanged.
+4. Once `routine`, the owner remains routine for every later year.
 
-Because the SEC quarterly bulk archive begins in 2006, it cannot by itself prove that an owner did
-not become routine earlier under the absorbing rule. Before activation, the history builder must
-acquire earlier authoritative Section 16 history where available and define its verified coverage
-boundary. If an owner's pre-boundary state cannot be established, that owner is left-censored and
-must remain `unpartitionable`; an absence of bulk rows is never evidence of opportunism.
+This is the published trader-level state machine applied to a finite observable dataset, as the
+paper applies it to its January 1986 data boundary. It does not claim that pre-2006 history is
+absent. Archive gaps, stale coverage, unresolved amendments, invalid transactions, or ambiguous
+owner identity produce `unpartitionable` at the affected current cutoff. Replay uses only amendments
+public at each historical cutoff, so a later amendment cannot rewrite a previously recorded event
+classification; later classification records bind the then-visible correction.
 
 A confirmatory event must contain exactly one reporting-owner CIK associated with the qualifying
 purchase. Multiple-owner filings are `ambiguous_multi_owner`; missing CIKs and any failure to map

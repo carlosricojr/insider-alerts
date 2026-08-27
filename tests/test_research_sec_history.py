@@ -76,6 +76,21 @@ def _filing(year: int, month: int, *, accession_suffix: int = 1) -> OwnerFiling:
     )
 
 
+def _coverage(
+    *,
+    complete_from: date = date(2006, 1, 1),
+    complete_through: date = date(2026, 12, 31),
+    snapshot_sha256: str = "a" * 64,
+    missing_quarters: tuple[str, ...] = (),
+) -> Coverage:
+    return Coverage(
+        complete_from=complete_from,
+        complete_through=complete_through,
+        source_snapshot_sha256=snapshot_sha256,
+        missing_quarters=missing_quarters,
+    )
+
+
 def test_manifest_discovery_uses_link_targets_and_requires_unique_quarters() -> None:
     html = (
         '<a href="/files/structureddata/data/insider-transactions-data-sets/'
@@ -291,25 +306,23 @@ def test_raw_objects_and_normalized_rows_are_immutable(tmp_path: Path) -> None:
         conn.execute("UPDATE sec_submissions SET issuer_cik='99'")
 
 
-def test_classifier_finds_routine_pattern_even_when_left_censored() -> None:
+def test_classifier_finds_routine_pattern_with_observable_left_censoring() -> None:
     filings = [_filing(year, 3, accession_suffix=year) for year in (2021, 2022, 2023)]
     result = classify_owner(
         owner_cik="7",
         classification_year=2024,
         filings=filings,
-        coverage=Coverage(
-            complete_from=date(2006, 1, 1),
-            complete_through=date(2023, 12, 31),
-            prehistory_complete=False,
-        ),
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
     )
 
     assert result.state == "routine"
     assert result.left_censored is True
     assert result.routine_since_year == 2024
+    assert result.history_observation_start_date == date(2006, 1, 1)
+    assert result.history_source_snapshot_sha256 == "a" * 64
 
 
-def test_classifier_never_calls_left_censored_owner_opportunistic() -> None:
+def test_classifier_calls_bounded_disjoint_history_opportunistic() -> None:
     filings = [
         _filing(2021, 1, accession_suffix=1),
         _filing(2022, 2, accession_suffix=2),
@@ -319,46 +332,81 @@ def test_classifier_never_calls_left_censored_owner_opportunistic() -> None:
         owner_cik="7",
         classification_year=2024,
         filings=filings,
-        coverage=Coverage(
-            complete_from=date(2006, 1, 1),
-            complete_through=date(2023, 12, 31),
-            prehistory_complete=False,
-        ),
-    )
-
-    assert result.state == "unpartitionable"
-    assert result.reason == "left_censored"
-
-
-def test_complete_prehistory_requires_evidence_digest() -> None:
-    with pytest.raises(ValueError, match="evidence binding"):
-        Coverage(
-            complete_from=date(1994, 7, 1),
-            complete_through=date(2023, 12, 31),
-            prehistory_complete=True,
-        )
-
-
-def test_classifier_calls_fully_covered_disjoint_months_opportunistic() -> None:
-    filings = [
-        _filing(2021, 1, accession_suffix=1),
-        _filing(2022, 2, accession_suffix=2),
-        _filing(2023, 3, accession_suffix=3),
-    ]
-    result = classify_owner(
-        owner_cik="7",
-        classification_year=2024,
-        filings=filings,
-        coverage=Coverage(
-            complete_from=date(1994, 7, 1),
-            complete_through=date(2023, 12, 31),
-            prehistory_complete=True,
-            prehistory_evidence_sha256="a" * 64,
-        ),
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
     )
 
     assert result.state == "opportunistic"
+    assert result.reason == "opportunistic_until_routine"
     assert result.history_coverage_complete is True
+    assert result.left_censored is True
+
+
+def test_history_coverage_requires_source_snapshot_digest() -> None:
+    with pytest.raises(ValueError, match="source snapshot"):
+        Coverage(
+            complete_from=date(2006, 1, 1),
+            complete_through=date(2023, 12, 31),
+            source_snapshot_sha256="not-a-digest",
+        )
+
+    with pytest.raises(ValueError, match="observation boundary"):
+        _coverage(complete_from=date(2021, 1, 1))
+
+
+def test_history_digest_binds_observation_boundary_and_snapshot() -> None:
+    filings = [
+        _filing(2021, 1, accession_suffix=1),
+        _filing(2022, 2, accession_suffix=2),
+        _filing(2023, 3, accession_suffix=3),
+    ]
+    first = classify_owner(
+        owner_cik="7",
+        classification_year=2024,
+        filings=filings,
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
+    )
+    changed_snapshot = classify_owner(
+        owner_cik="7",
+        classification_year=2024,
+        filings=filings,
+        coverage=_coverage(
+            complete_through=date(2023, 12, 31), snapshot_sha256="b" * 64
+        ),
+    )
+
+    assert first.history_input_sha256 != changed_snapshot.history_input_sha256
+
+
+def test_opportunistic_state_persists_until_a_later_routine_window() -> None:
+    initial = [
+        _filing(2018, 1, accession_suffix=1),
+        _filing(2019, 2, accession_suffix=2),
+        _filing(2020, 3, accession_suffix=3),
+    ]
+    persisted = classify_owner(
+        owner_cik="7",
+        classification_year=2024,
+        filings=initial,
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
+    )
+    became_routine = classify_owner(
+        owner_cik="7",
+        classification_year=2027,
+        filings=[
+            *initial,
+            _filing(2024, 5, accession_suffix=4),
+            _filing(2025, 5, accession_suffix=5),
+            _filing(2026, 5, accession_suffix=6),
+        ],
+        coverage=_coverage(),
+    )
+
+    assert (persisted.state, persisted.reason) == (
+        "opportunistic",
+        "opportunistic_until_routine",
+    )
+    assert became_routine.state == "routine"
+    assert became_routine.routine_since_year == 2027
 
 
 def test_classifier_fails_closed_for_missing_year_multiowner_and_amendment() -> None:
@@ -366,14 +414,12 @@ def test_classifier_fails_closed_for_missing_year_multiowner_and_amendment() -> 
         owner_cik="7",
         classification_year=2024,
         filings=[_filing(2021, 1), _filing(2023, 3, accession_suffix=3)],
-        coverage=Coverage(
-            date(1994, 7, 1),
-            date(2023, 12, 31),
-            True,
-            prehistory_evidence_sha256="a" * 64,
-        ),
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
     )
-    assert (missing.state, missing.reason) == ("unpartitionable", "incomplete_trade_years")
+    assert (missing.state, missing.reason) == (
+        "unpartitionable",
+        "no_partitionable_three_year_window",
+    )
 
     multiowner = _filing(2022, 2, accession_suffix=2)
     multiowner = OwnerFiling(
@@ -390,12 +436,7 @@ def test_classifier_fails_closed_for_missing_year_multiowner_and_amendment() -> 
         owner_cik="7",
         classification_year=2024,
         filings=[_filing(2021, 1), multiowner, _filing(2023, 3, accession_suffix=3)],
-        coverage=Coverage(
-            date(1994, 7, 1),
-            date(2023, 12, 31),
-            True,
-            prehistory_evidence_sha256="a" * 64,
-        ),
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
     )
     assert (ambiguous.state, ambiguous.reason) == (
         "unpartitionable",
@@ -417,12 +458,7 @@ def test_classifier_fails_closed_for_missing_year_multiowner_and_amendment() -> 
         owner_cik="7",
         classification_year=2024,
         filings=[original, orphan_amendment, _filing(2022, 2), _filing(2023, 3)],
-        coverage=Coverage(
-            date(1994, 7, 1),
-            date(2023, 12, 31),
-            True,
-            prehistory_evidence_sha256="a" * 64,
-        ),
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
     )
     assert (amended.state, amended.reason) == (
         "unpartitionable",
@@ -448,24 +484,57 @@ def test_classifier_resolves_amendment_only_as_of_filing_cutoff() -> None:
         owner_cik="7",
         classification_year=2023,
         filings=[original, amendment, *common],
-        coverage=Coverage(
-            date(1994, 7, 1),
-            date(2022, 12, 31),
-            True,
-            prehistory_evidence_sha256="a" * 64,
-        ),
+        coverage=_coverage(complete_through=date(2022, 12, 31)),
     )
     after = classify_owner(
         owner_cik="7",
         classification_year=2024,
         filings=[original, amendment, *common],
-        coverage=Coverage(
-            date(1994, 7, 1),
-            date(2023, 12, 31),
-            True,
-            prehistory_evidence_sha256="a" * 64,
-        ),
+        coverage=_coverage(complete_through=date(2023, 12, 31)),
     )
 
     assert before.state == "unpartitionable"
     assert after.state == "routine"
+
+
+def test_later_unresolved_amendment_invalidates_an_absorbed_routine_state() -> None:
+    routine = [_filing(year, 3, accession_suffix=year) for year in (2018, 2019, 2020)]
+    orphan = OwnerFiling(
+        accession_number="0000000001-24-000099",
+        filing_date=date(2024, 6, 1),
+        form_type="4/A",
+        issuer_cik="42",
+        owner_ciks=("7",),
+        original_submission_date=date(2024, 1, 2),
+        transaction_dates=(date(2024, 1, 1),),
+        has_invalid_transaction=False,
+    )
+    result = classify_owner(
+        owner_cik="7",
+        classification_year=2025,
+        filings=[*routine, orphan],
+        coverage=_coverage(complete_through=date(2024, 12, 31)),
+    )
+
+    assert (result.state, result.reason) == ("unpartitionable", "unresolved_amendment")
+
+
+def test_classifier_fails_closed_for_archive_gap_or_stale_coverage() -> None:
+    filings = [_filing(year, 3, accession_suffix=year) for year in (2021, 2022, 2023)]
+    gap = classify_owner(
+        owner_cik="7",
+        classification_year=2024,
+        filings=filings,
+        coverage=_coverage(
+            complete_through=date(2023, 12, 31), missing_quarters=("2010Q2",)
+        ),
+    )
+    stale = classify_owner(
+        owner_cik="7",
+        classification_year=2024,
+        filings=filings,
+        coverage=_coverage(complete_through=date(2023, 9, 30)),
+    )
+
+    assert (gap.state, gap.reason) == ("unpartitionable", "coverage_gap")
+    assert (stale.state, stale.reason) == ("unpartitionable", "coverage_not_current")
