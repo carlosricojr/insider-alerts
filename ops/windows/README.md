@@ -41,9 +41,15 @@ Install the separate prospective evidence worker after deploying its pinned alph
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\ops\windows\install-research-capture-task.ps1 `
   -AlphaRoot C:\path\to\clean-alpha-core-runtime `
+  -HistorySnapshotSha256 <pinned-lowercase-sha256> `
   -Start
 ```
 
-The task runs one bounded capture per minute through `pythonw.exe`. It has no order code, cannot
-block the live canary, ignores overlapping launches, hides all windows, and kills a timed-out
-alpha-core capture process tree. Health is available from `ops research-capture-status`.
+The task runs a hidden bounded capture cycle through `pythonw.exe` once per interval, has no order
+code, cannot block the live canary, ignores overlaps, hides all windows, and kills a timed-out
+alpha-core capture process tree. Idle cycles do not hash the multi-gigabyte history store; every
+exact-owner classification fully authenticates the sealed snapshot immediately before consuming
+it. A 15-minute task limit recovers a hung cycle. Full pin validation also happens before task
+replacement. The default history database is
+`data/research/sec_history.db`; override it with `-HistoryDatabase` when needed. Health is
+available from `ops research-capture-status`.

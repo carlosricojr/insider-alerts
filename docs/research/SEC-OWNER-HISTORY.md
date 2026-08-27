@@ -22,7 +22,10 @@ Each manifest and ZIP response is stored by SHA-256 before parsing. Retrieval ro
 request and final URLs, retrieval time, status, media type, ETag, Last-Modified value, and an HTTP
 content digest when supplied. Normalized rows retain their source archive digest. Archive
 snapshots bind exactly one release to every quarter and fail if any quarter from 2006 Q1 through
-the requested boundary is absent.
+the requested boundary is absent. Sealed format-v2 snapshots also bind their creation timestamp
+and a canonical digest of every normalized submission, owner, and transaction row. Creating a v2
+seal streams and verifies every manifest/archive byte against its content address, then prevents
+later normalized inserts for member archives.
 
 All source, retrieval, normalized, and snapshot tables reject updates and deletes. A refreshed SEC
 archive becomes another release and another snapshot; it never overwrites the earlier view.
@@ -63,6 +66,20 @@ is resumable: already verified releases are reused. `--refresh` deliberately re-
 published releases so SEC corrections produce a new immutable snapshot. `--through-year` and
 `--through-quarter` must be supplied together and exist primarily for bounded validation.
 
-Use `pythonw.exe` with hidden/no-window task settings for unattended operation. This milestone does
-not install a recurring task; owner-history refresh is not latency-sensitive and activation remains
-blocked until the remainder of M3 and the frozen inference executable are reviewed and deployed.
+Seal a previously verified legacy member selection once, then validate the exact resulting pin:
+
+```powershell
+.venv\Scripts\python.exe -m insider_alerts.research.history_worker `
+  --seal-existing-snapshot <legacy-sha256>
+.venv\Scripts\python.exe -m insider_alerts.research.history_worker `
+  --validate-snapshot <sealed-v2-sha256>
+```
+
+Sealing can take several minutes because it verifies the complete raw archive and normalized
+history. The evidence worker accepts only sealed v2 pins, and its scheduled-task installer runs
+the validation command before replacing an existing task definition.
+
+Use `pythonw.exe` with hidden/no-window task settings for unattended operation. The installer
+registers or replaces a recurring, bounded one-shot evidence-capture task. Owner-history refresh is
+not latency-sensitive and remains manual; trial activation remains blocked until the remainder of
+M3 and the frozen inference executable are reviewed and deployed.
