@@ -32,6 +32,9 @@ SIGNAL_CUTOFF = time(9, 20)
 MAX_SESSIONS = 10
 BAR_LOOKBACK_CALENDAR_DAYS = 120
 MAX_CHALLENGER_SLOTS = 20
+ENTRY_STATES = frozenset(
+    {"enrolled", "ineligible", "overlap_suppressed", "capacity_suppressed", "missed"}
+)
 
 
 class TrialRuntimeInvalid(RuntimeError):
@@ -65,6 +68,12 @@ def _sha256(value: bytes) -> str:
 
 def _canonical(value: dict[str, Any]) -> bytes:
     return rfc8785.dumps(value)
+
+
+def _require_sha256(value: str, context: str) -> str:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise TrialRuntimeInvalid(f"{context}_not_sha256")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +139,24 @@ class TrialResolution:
     reason: str
     confirmatory_enrollment_sequence: int | None
     resolved_at_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EntryCompletionInputs:
+    entry_date: date
+    completed_at_utc: datetime
+    schedule_record_sha256: str
+    bar_observation_watermark: int
+    bar_record_sha256s: tuple[str, ...]
+    prior_book_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class EntryLapseInputs:
+    entry_date: date
+    lapsed_at_utc: datetime
+    reason: str
+    schedule_record_sha256: str
 
 
 def _validated_trial_window(config: TrialRuntimeConfig) -> TrialWindow:
@@ -302,6 +329,31 @@ def resolve_ranked_entry_date(
     return resolutions
 
 
+def _validate_cutoff_resolution_states(
+    candidates: Sequence[TrialCandidate],
+    resolutions: Sequence[TrialResolution],
+    *,
+    cutoff_utc: datetime,
+) -> None:
+    """Re-enforce the timestamp-derived states at the persistence boundary."""
+    for candidate, resolution in zip(candidates, resolutions, strict=True):
+        if candidate.source_first_observed_at_utc >= cutoff_utc:
+            raise TrialRuntimeInvalid("same_date_candidate_source_not_before_cutoff")
+        expected_reason: str | None = None
+        if candidate.evidence_recorded_at_utc >= cutoff_utc:
+            expected_reason = "evidence_not_recorded_before_entry_cutoff"
+        elif candidate.imported_at_utc >= cutoff_utc:
+            expected_reason = "candidate_not_imported_before_entry_cutoff"
+        if expected_reason is not None and (
+            resolution.enrollment_state != "missed"
+            or resolution.reason != expected_reason
+            or resolution.confirmatory_enrollment_sequence is not None
+        ):
+            raise TrialRuntimeInvalid("completion_candidate_cutoff_state_mismatch")
+        if expected_reason is None and resolution.enrollment_state == "missed":
+            raise TrialRuntimeInvalid("completion_candidate_cutoff_state_mismatch")
+
+
 class TrialStore:
     """Append-only candidate universe plus mutable operational health."""
 
@@ -431,6 +483,27 @@ class TrialStore:
                 BEFORE DELETE ON trial_entry_date_completions
                 BEGIN SELECT RAISE(ABORT, 'entry-date completions are immutable'); END;
 
+                CREATE TABLE IF NOT EXISTS trial_entry_date_lapses (
+                    sequence INTEGER NOT NULL UNIQUE,
+                    entry_date TEXT PRIMARY KEY,
+                    lapsed_at_utc TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    record_sha256 TEXT NOT NULL UNIQUE,
+                    record_json BLOB NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS trial_entry_date_lapses_sequence
+                BEFORE INSERT ON trial_entry_date_lapses
+                WHEN NEW.sequence<>(
+                  SELECT COALESCE(MAX(sequence),0)+1 FROM trial_entry_date_lapses
+                )
+                BEGIN SELECT RAISE(ABORT, 'entry-date lapse sequence must be gap-free'); END;
+                CREATE TRIGGER IF NOT EXISTS trial_entry_date_lapses_no_update
+                BEFORE UPDATE ON trial_entry_date_lapses
+                BEGIN SELECT RAISE(ABORT, 'entry-date lapses are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS trial_entry_date_lapses_no_delete
+                BEFORE DELETE ON trial_entry_date_lapses
+                BEGIN SELECT RAISE(ABORT, 'entry-date lapses are immutable'); END;
+
                 CREATE TABLE IF NOT EXISTS trial_outcomes (
                     sequence INTEGER NOT NULL UNIQUE,
                     outcome_id TEXT PRIMARY KEY,
@@ -540,6 +613,20 @@ class TrialStore:
                 if expected_fields != persisted_fields:
                     raise TrialRuntimeInvalid("candidate_identity_reused_with_different_content")
                 return False
+            latest_seal = conn.execute(
+                """
+                SELECT sealed_at_utc FROM (
+                  SELECT entry_date,completed_at_utc sealed_at_utc
+                  FROM trial_entry_date_completions
+                  UNION ALL
+                  SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
+                ) ORDER BY entry_date DESC LIMIT 1
+                """
+            ).fetchone()
+            if latest_seal is not None and candidate.imported_at_utc < _parse_utc(
+                str(latest_seal["sealed_at_utc"])
+            ):
+                raise EvidenceNotReady("candidate_import_time_moved_behind_entry_date_cursor")
             sequence = int(
                 conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM trial_candidates").fetchone()[
                     0
@@ -577,6 +664,38 @@ class TrialStore:
                     encoded,
                 ),
             )
+            sealed = conn.execute(
+                """
+                SELECT kind,entry_date,sealed_at_utc FROM (
+                  SELECT 'completion' kind,entry_date,completed_at_utc sealed_at_utc
+                  FROM trial_entry_date_completions
+                  UNION ALL
+                  SELECT 'lapse' kind,entry_date,lapsed_at_utc sealed_at_utc
+                  FROM trial_entry_date_lapses
+                ) WHERE entry_date>=? ORDER BY entry_date ASC LIMIT 1
+                """,
+                (candidate.planned_entry_date.isoformat(),),
+            ).fetchone()
+            if sealed is not None:
+                sealed_at = _parse_utc(str(sealed["sealed_at_utc"]))
+                if candidate.imported_at_utc < sealed_at:
+                    raise EvidenceNotReady("candidate_import_predates_existing_entry_date_seal")
+                reason = (
+                    f"candidate_arrived_after_entry_date_{sealed['kind']}"
+                    if str(sealed["entry_date"]) == candidate.planned_entry_date.isoformat()
+                    else "candidate_arrived_behind_entry_date_cursor"
+                )
+                self._insert_resolution(
+                    conn,
+                    TrialResolution(
+                        candidate_id=candidate.candidate_id,
+                        entry_date=candidate.planned_entry_date,
+                        enrollment_state="missed",
+                        reason=reason,
+                        confirmatory_enrollment_sequence=None,
+                        resolved_at_utc=candidate.imported_at_utc,
+                    ),
+                )
         return True
 
     @classmethod
@@ -632,6 +751,554 @@ class TrialStore:
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute("SELECT * FROM trial_candidates ORDER BY sequence").fetchall()
         return [self._verify_candidate_row(row) for row in rows]
+
+    @staticmethod
+    def _resolution_record(resolution: TrialResolution) -> dict[str, Any]:
+        return {
+            "contract_version": TRIAL_CONTRACT_VERSION,
+            "candidate_id": resolution.candidate_id,
+            "entry_date": resolution.entry_date.isoformat(),
+            "enrollment_state": resolution.enrollment_state,
+            "reason": resolution.reason,
+            "confirmatory_enrollment_sequence": resolution.confirmatory_enrollment_sequence,
+            "resolved_at_utc": _utc_text(resolution.resolved_at_utc),
+        }
+
+    @classmethod
+    def _insert_resolution(cls, conn: sqlite3.Connection, resolution: TrialResolution) -> str:
+        if not resolution.reason.strip():
+            raise TrialRuntimeInvalid("trial_resolution_reason_empty")
+        if resolution.enrollment_state not in ENTRY_STATES:
+            raise TrialRuntimeInvalid("trial_resolution_state_invalid")
+        if (resolution.enrollment_state == "enrolled") != (
+            resolution.confirmatory_enrollment_sequence is not None
+        ):
+            raise TrialRuntimeInvalid("trial_resolution_sequence_state_mismatch")
+        record = cls._resolution_record(resolution)
+        encoded = _canonical(record)
+        digest = _sha256(encoded)
+        sequence = int(
+            conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM trial_resolutions").fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO trial_resolutions(
+              sequence,resolution_id,candidate_id,entry_date,enrollment_state,reason,
+              confirmatory_enrollment_sequence,resolved_at_utc,record_sha256,record_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                sequence,
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"{HYPOTHESIS_ID}|resolution|{digest}")),
+                resolution.candidate_id,
+                resolution.entry_date.isoformat(),
+                resolution.enrollment_state,
+                resolution.reason,
+                resolution.confirmatory_enrollment_sequence,
+                _utc_text(resolution.resolved_at_utc),
+                digest,
+                encoded,
+            ),
+        )
+        return digest
+
+    @classmethod
+    def _verify_resolution_row(cls, row: sqlite3.Row) -> TrialResolution:
+        raw = bytes(row["record_json"])
+        if _sha256(raw) != str(row["record_sha256"]):
+            raise TrialRuntimeInvalid("trial_resolution_digest_mismatch")
+        record = json.loads(raw)
+        if not isinstance(record, dict) or _canonical(record) != raw:
+            raise TrialRuntimeInvalid("trial_resolution_not_canonical")
+        resolution = TrialResolution(
+            candidate_id=str(row["candidate_id"]),
+            entry_date=date.fromisoformat(str(row["entry_date"])),
+            enrollment_state=str(row["enrollment_state"]),  # type: ignore[arg-type]
+            reason=str(row["reason"]),
+            confirmatory_enrollment_sequence=(
+                None
+                if row["confirmatory_enrollment_sequence"] is None
+                else int(row["confirmatory_enrollment_sequence"])
+            ),
+            resolved_at_utc=_parse_utc(str(row["resolved_at_utc"])),
+        )
+        if resolution.enrollment_state not in ENTRY_STATES:
+            raise TrialRuntimeInvalid("trial_resolution_state_invalid")
+        if record != cls._resolution_record(resolution):
+            raise TrialRuntimeInvalid("trial_resolution_columns_mismatch")
+        if (resolution.enrollment_state == "enrolled") != (
+            resolution.confirmatory_enrollment_sequence is not None
+        ):
+            raise TrialRuntimeInvalid("trial_resolution_sequence_state_mismatch")
+        return resolution
+
+    def resolutions(self) -> list[TrialResolution]:
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute("SELECT * FROM trial_resolutions ORDER BY sequence").fetchall()
+        return [self._verify_resolution_row(row) for row in rows]
+
+    @staticmethod
+    def _verify_completion_row(row: sqlite3.Row) -> dict[str, Any]:
+        raw = bytes(row["record_json"])
+        if _sha256(raw) != str(row["record_sha256"]):
+            raise TrialRuntimeInvalid("entry_completion_digest_mismatch")
+        record = json.loads(raw)
+        if not isinstance(record, dict) or _canonical(record) != raw:
+            raise TrialRuntimeInvalid("entry_completion_not_canonical")
+        required = {
+            "contract_version",
+            "entry_date",
+            "completed_at_utc",
+            "schedule_record_sha256",
+            "bar_observation_watermark",
+            "bar_record_sha256s",
+            "candidate_records",
+            "candidate_set_sha256",
+            "prior_book_sha256",
+            "resolution_record_sha256s",
+            "resolution_set_sha256",
+        }
+        if set(record) != required or record["contract_version"] != TRIAL_CONTRACT_VERSION:
+            raise TrialRuntimeInvalid("entry_completion_record_shape_invalid")
+        if (
+            record["entry_date"] != row["entry_date"]
+            or record["completed_at_utc"] != row["completed_at_utc"]
+        ):
+            raise TrialRuntimeInvalid("entry_completion_columns_mismatch")
+        entry_date = date.fromisoformat(str(record["entry_date"]))
+        completed_at = _parse_utc(str(record["completed_at_utc"]))
+        if completed_at.astimezone(NEW_YORK).date() != entry_date:
+            raise TrialRuntimeInvalid("entry_completion_local_date_mismatch")
+        _require_sha256(str(record["schedule_record_sha256"]), "completion_schedule_record")
+        _require_sha256(str(record["prior_book_sha256"]), "completion_prior_book")
+        if (
+            isinstance(record["bar_observation_watermark"], bool)
+            or not isinstance(record["bar_observation_watermark"], int)
+            or record["bar_observation_watermark"] < 0
+        ):
+            raise TrialRuntimeInvalid("completion_bar_watermark_invalid")
+        bar_digests = record["bar_record_sha256s"]
+        resolution_digests = record["resolution_record_sha256s"]
+        candidate_records = record["candidate_records"]
+        if not all(
+            isinstance(value, list)
+            for value in (bar_digests, resolution_digests, candidate_records)
+        ):
+            raise TrialRuntimeInvalid("entry_completion_digest_lists_invalid")
+        if bar_digests != sorted(set(bar_digests)):
+            raise TrialRuntimeInvalid("entry_completion_bar_digests_not_canonical")
+        if (
+            not resolution_digests
+            or len(resolution_digests) != len(set(resolution_digests))
+            or not candidate_records
+            or len(candidate_records) != len(resolution_digests)
+        ):
+            raise TrialRuntimeInvalid("entry_completion_bound_sets_invalid")
+        for digest in [*bar_digests, *resolution_digests]:
+            _require_sha256(str(digest), "entry_completion_bound_record")
+        expected_candidate_records: list[dict[str, str]] = []
+        for candidate in candidate_records:
+            if not isinstance(candidate, dict) or set(candidate) != {
+                "candidate_id",
+                "record_sha256",
+            }:
+                raise TrialRuntimeInvalid("entry_completion_candidate_binding_invalid")
+            expected_candidate_records.append(
+                {
+                    "candidate_id": str(candidate["candidate_id"]),
+                    "record_sha256": _require_sha256(
+                        str(candidate["record_sha256"]), "completion_candidate_record"
+                    ),
+                }
+            )
+        candidate_ids = [candidate["candidate_id"] for candidate in expected_candidate_records]
+        candidate_digests = [candidate["record_sha256"] for candidate in expected_candidate_records]
+        if len(candidate_ids) != len(set(candidate_ids)) or len(candidate_digests) != len(
+            set(candidate_digests)
+        ):
+            raise TrialRuntimeInvalid("entry_completion_candidate_bindings_duplicate")
+        if expected_candidate_records != candidate_records:
+            raise TrialRuntimeInvalid("entry_completion_candidate_binding_not_canonical")
+        if _sha256(_canonical({"candidates": candidate_records})) != record["candidate_set_sha256"]:
+            raise TrialRuntimeInvalid("entry_completion_candidate_set_digest_mismatch")
+        if (
+            _sha256(_canonical({"resolution_record_sha256s": resolution_digests}))
+            != record["resolution_set_sha256"]
+        ):
+            raise TrialRuntimeInvalid("entry_completion_resolution_set_digest_mismatch")
+        return record
+
+    def append_entry_completion(
+        self,
+        inputs: EntryCompletionInputs,
+        resolutions: Sequence[TrialResolution],
+    ) -> str:
+        if inputs.completed_at_utc.tzinfo is None:
+            raise TrialRuntimeInvalid("entry_completion_timestamp_naive")
+        _require_sha256(inputs.schedule_record_sha256, "completion_schedule_record")
+        _require_sha256(inputs.prior_book_sha256, "completion_prior_book")
+        if (
+            isinstance(inputs.bar_observation_watermark, bool)
+            or not isinstance(inputs.bar_observation_watermark, int)
+            or inputs.bar_observation_watermark < 0
+        ):
+            raise TrialRuntimeInvalid("completion_bar_watermark_invalid")
+        bar_digests = tuple(sorted(set(inputs.bar_record_sha256s)))
+        if len(bar_digests) != len(inputs.bar_record_sha256s):
+            raise TrialRuntimeInvalid("completion_bar_digest_duplicate")
+        for digest in bar_digests:
+            _require_sha256(digest, "completion_bar_record")
+        replay_resolution_digests = [
+            _sha256(_canonical(self._resolution_record(resolution))) for resolution in resolutions
+        ]
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM trial_entry_date_lapses WHERE entry_date=?",
+                (inputs.entry_date.isoformat(),),
+            ).fetchone():
+                raise TrialRuntimeInvalid("completion_conflicts_with_entry_date_lapse")
+            existing = conn.execute(
+                "SELECT * FROM trial_entry_date_completions WHERE entry_date=?",
+                (inputs.entry_date.isoformat(),),
+            ).fetchone()
+            if existing is not None:
+                existing_record = self._verify_completion_row(existing)
+                replay_matches = (
+                    existing_record["completed_at_utc"] == _utc_text(inputs.completed_at_utc)
+                    and existing_record["schedule_record_sha256"] == inputs.schedule_record_sha256
+                    and existing_record["bar_observation_watermark"]
+                    == inputs.bar_observation_watermark
+                    and existing_record["bar_record_sha256s"] == list(bar_digests)
+                    and existing_record["prior_book_sha256"] == inputs.prior_book_sha256
+                    and existing_record["resolution_record_sha256s"] == replay_resolution_digests
+                    and [
+                        str(candidate["candidate_id"])
+                        for candidate in existing_record["candidate_records"]
+                    ]
+                    == [resolution.candidate_id for resolution in resolutions]
+                )
+                if replay_matches:
+                    return str(existing["record_sha256"])
+                raise TrialRuntimeInvalid("entry_date_completion_conflicting_replay")
+            latest = conn.execute(
+                """
+                SELECT entry_date,sealed_at_utc FROM (
+                  SELECT entry_date,completed_at_utc sealed_at_utc
+                  FROM trial_entry_date_completions
+                  UNION ALL
+                  SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
+                ) ORDER BY entry_date DESC LIMIT 1
+                """
+            ).fetchone()
+            if latest is not None:
+                if date.fromisoformat(str(latest["entry_date"])) >= inputs.entry_date:
+                    raise TrialRuntimeInvalid("entry_dates_not_strictly_ordered")
+                if inputs.completed_at_utc < _parse_utc(str(latest["sealed_at_utc"])):
+                    raise TrialRuntimeInvalid("entry_seal_time_moved_backwards")
+            earlier_pending = conn.execute(
+                """
+                SELECT 1 FROM trial_candidates candidate
+                WHERE candidate.planned_entry_date<? AND NOT EXISTS(
+                  SELECT 1 FROM trial_resolutions resolution
+                  WHERE resolution.candidate_id=candidate.candidate_id
+                ) LIMIT 1
+                """,
+                (inputs.entry_date.isoformat(),),
+            ).fetchone()
+            if earlier_pending is not None:
+                raise TrialRuntimeInvalid("completion_skips_earlier_pending_candidate")
+            candidate_rows = conn.execute(
+                """
+                SELECT * FROM trial_candidates candidate
+                WHERE candidate.planned_entry_date=? AND NOT EXISTS(
+                  SELECT 1 FROM trial_resolutions resolution
+                  WHERE resolution.candidate_id=candidate.candidate_id
+                ) ORDER BY candidate.entry_rank_sha256,candidate.candidate_id
+                """,
+                (inputs.entry_date.isoformat(),),
+            ).fetchall()
+            if not candidate_rows:
+                raise TrialRuntimeInvalid("entry_completion_has_no_pending_candidates")
+            candidates = [self._verify_candidate_row(row) for row in candidate_rows]
+            if any(candidate.imported_at_utc > inputs.completed_at_utc for candidate in candidates):
+                raise TrialRuntimeInvalid("entry_completion_predates_candidate_import")
+            cutoff_utc = datetime.combine(
+                inputs.entry_date,
+                SIGNAL_CUTOFF,
+                tzinfo=NEW_YORK,
+            ).astimezone(UTC)
+            entry_opens = {candidate.entry_opens_at_utc for candidate in candidates}
+            if (
+                len(entry_opens) != 1
+                or inputs.completed_at_utc.tzinfo is None
+                or inputs.completed_at_utc.astimezone(NEW_YORK).date() != inputs.entry_date
+                or not cutoff_utc <= inputs.completed_at_utc < next(iter(entry_opens))
+            ):
+                raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
+            expected_ids = [candidate.candidate_id for candidate in candidates]
+            if [resolution.candidate_id for resolution in resolutions] != expected_ids:
+                raise TrialRuntimeInvalid("completion_resolution_candidate_set_mismatch")
+            if any(
+                resolution.entry_date != inputs.entry_date
+                or resolution.resolved_at_utc != inputs.completed_at_utc
+                for resolution in resolutions
+            ):
+                raise TrialRuntimeInvalid("completion_resolution_time_or_date_mismatch")
+            _validate_cutoff_resolution_states(
+                candidates,
+                resolutions,
+                cutoff_utc=cutoff_utc,
+            )
+            expected_next = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(confirmatory_enrollment_sequence),0)+1 "
+                    "FROM trial_resolutions"
+                ).fetchone()[0]
+            )
+            enrolled_sequences = [
+                resolution.confirmatory_enrollment_sequence
+                for resolution in resolutions
+                if resolution.enrollment_state == "enrolled"
+            ]
+            if enrolled_sequences != list(
+                range(expected_next, expected_next + len(enrolled_sequences))
+            ):
+                raise TrialRuntimeInvalid("completion_enrollment_sequence_not_gap_free")
+            candidate_material = {
+                "candidates": [
+                    {
+                        "candidate_id": str(row["candidate_id"]),
+                        "record_sha256": str(row["record_sha256"]),
+                    }
+                    for row in candidate_rows
+                ]
+            }
+            candidate_set_sha = _sha256(_canonical(candidate_material))
+            resolution_digests = [
+                self._insert_resolution(conn, resolution) for resolution in resolutions
+            ]
+            resolution_set_sha = _sha256(
+                _canonical({"resolution_record_sha256s": resolution_digests})
+            )
+            record: dict[str, Any] = {
+                "contract_version": TRIAL_CONTRACT_VERSION,
+                "entry_date": inputs.entry_date.isoformat(),
+                "completed_at_utc": _utc_text(inputs.completed_at_utc),
+                "schedule_record_sha256": inputs.schedule_record_sha256,
+                "bar_observation_watermark": inputs.bar_observation_watermark,
+                "bar_record_sha256s": list(bar_digests),
+                "candidate_records": candidate_material["candidates"],
+                "candidate_set_sha256": candidate_set_sha,
+                "prior_book_sha256": inputs.prior_book_sha256,
+                "resolution_record_sha256s": resolution_digests,
+                "resolution_set_sha256": resolution_set_sha,
+            }
+            encoded = _canonical(record)
+            digest = _sha256(encoded)
+            sequence = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM trial_entry_date_completions"
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO trial_entry_date_completions VALUES(?,?,?,?,?)",
+                (
+                    sequence,
+                    inputs.entry_date.isoformat(),
+                    _utc_text(inputs.completed_at_utc),
+                    digest,
+                    encoded,
+                ),
+            )
+        return digest
+
+    @staticmethod
+    def _verify_lapse_row(row: sqlite3.Row) -> dict[str, Any]:
+        raw = bytes(row["record_json"])
+        if _sha256(raw) != str(row["record_sha256"]):
+            raise TrialRuntimeInvalid("entry_lapse_digest_mismatch")
+        record = json.loads(raw)
+        if not isinstance(record, dict) or _canonical(record) != raw:
+            raise TrialRuntimeInvalid("entry_lapse_not_canonical")
+        required = {
+            "contract_version",
+            "entry_date",
+            "lapsed_at_utc",
+            "reason",
+            "schedule_record_sha256",
+            "candidate_records",
+            "candidate_set_sha256",
+            "resolution_record_sha256s",
+            "resolution_set_sha256",
+        }
+        if set(record) != required or record["contract_version"] != TRIAL_CONTRACT_VERSION:
+            raise TrialRuntimeInvalid("entry_lapse_record_shape_invalid")
+        if (
+            record["entry_date"] != row["entry_date"]
+            or record["lapsed_at_utc"] != row["lapsed_at_utc"]
+            or record["reason"] != row["reason"]
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_columns_mismatch")
+        if not isinstance(record["reason"], str) or not record["reason"].strip():
+            raise TrialRuntimeInvalid("entry_lapse_reason_empty")
+        _require_sha256(str(record["schedule_record_sha256"]), "lapse_schedule_record")
+        candidate_records = record["candidate_records"]
+        resolution_digests = record["resolution_record_sha256s"]
+        if (
+            not isinstance(candidate_records, list)
+            or not isinstance(resolution_digests, list)
+            or not candidate_records
+            or len(candidate_records) != len(resolution_digests)
+            or len(resolution_digests) != len(set(resolution_digests))
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_bound_sets_invalid")
+        candidate_ids: list[str] = []
+        for candidate in candidate_records:
+            if not isinstance(candidate, dict) or set(candidate) != {
+                "candidate_id",
+                "record_sha256",
+            }:
+                raise TrialRuntimeInvalid("entry_lapse_candidate_binding_invalid")
+            candidate_ids.append(str(candidate["candidate_id"]))
+            _require_sha256(str(candidate["record_sha256"]), "lapse_candidate_record")
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise TrialRuntimeInvalid("entry_lapse_candidate_binding_duplicate")
+        for digest in resolution_digests:
+            _require_sha256(str(digest), "lapse_resolution_record")
+        if _sha256(_canonical({"candidates": candidate_records})) != record["candidate_set_sha256"]:
+            raise TrialRuntimeInvalid("entry_lapse_candidate_set_digest_mismatch")
+        if (
+            _sha256(_canonical({"resolution_record_sha256s": resolution_digests}))
+            != record["resolution_set_sha256"]
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_resolution_set_digest_mismatch")
+        return record
+
+    def append_entry_lapse(self, inputs: EntryLapseInputs) -> str:
+        if inputs.lapsed_at_utc.tzinfo is None:
+            raise ValueError("entry lapse timestamp cannot be naive")
+        if not inputs.reason.strip():
+            raise TrialRuntimeInvalid("entry_lapse_reason_empty")
+        _require_sha256(inputs.schedule_record_sha256, "lapse_schedule_record")
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM trial_entry_date_completions WHERE entry_date=?",
+                (inputs.entry_date.isoformat(),),
+            ).fetchone():
+                raise TrialRuntimeInvalid("lapse_conflicts_with_entry_date_completion")
+            existing = conn.execute(
+                "SELECT * FROM trial_entry_date_lapses WHERE entry_date=?",
+                (inputs.entry_date.isoformat(),),
+            ).fetchone()
+            if existing is not None:
+                existing_lapse = self._verify_lapse_row(existing)
+                if (
+                    existing_lapse["lapsed_at_utc"] == _utc_text(inputs.lapsed_at_utc)
+                    and existing_lapse["reason"] == inputs.reason
+                    and existing_lapse["schedule_record_sha256"] == inputs.schedule_record_sha256
+                ):
+                    return str(existing["record_sha256"])
+                raise TrialRuntimeInvalid("entry_date_lapse_conflicting_replay")
+            latest = conn.execute(
+                """
+                SELECT entry_date,sealed_at_utc FROM (
+                  SELECT entry_date,completed_at_utc sealed_at_utc
+                  FROM trial_entry_date_completions
+                  UNION ALL
+                  SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
+                ) ORDER BY entry_date DESC LIMIT 1
+                """
+            ).fetchone()
+            if latest is not None:
+                if date.fromisoformat(str(latest["entry_date"])) >= inputs.entry_date:
+                    raise TrialRuntimeInvalid("entry_dates_not_strictly_ordered")
+                if inputs.lapsed_at_utc < _parse_utc(str(latest["sealed_at_utc"])):
+                    raise TrialRuntimeInvalid("entry_seal_time_moved_backwards")
+            earlier_pending = conn.execute(
+                """
+                SELECT 1 FROM trial_candidates candidate
+                WHERE candidate.planned_entry_date<? AND NOT EXISTS(
+                  SELECT 1 FROM trial_resolutions resolution
+                  WHERE resolution.candidate_id=candidate.candidate_id
+                ) LIMIT 1
+                """,
+                (inputs.entry_date.isoformat(),),
+            ).fetchone()
+            if earlier_pending is not None:
+                raise TrialRuntimeInvalid("lapse_skips_earlier_pending_candidate")
+            candidate_rows = conn.execute(
+                """
+                SELECT * FROM trial_candidates candidate
+                WHERE candidate.planned_entry_date=? AND NOT EXISTS(
+                  SELECT 1 FROM trial_resolutions resolution
+                  WHERE resolution.candidate_id=candidate.candidate_id
+                ) ORDER BY candidate.entry_rank_sha256,candidate.candidate_id
+                """,
+                (inputs.entry_date.isoformat(),),
+            ).fetchall()
+            if not candidate_rows:
+                raise TrialRuntimeInvalid("entry_lapse_has_no_pending_candidates")
+            candidates = [self._verify_candidate_row(row) for row in candidate_rows]
+            if any(candidate.imported_at_utc > inputs.lapsed_at_utc for candidate in candidates):
+                raise TrialRuntimeInvalid("entry_lapse_predates_candidate_import")
+            entry_opens = {candidate.entry_opens_at_utc for candidate in candidates}
+            if len(entry_opens) != 1 or inputs.lapsed_at_utc < next(iter(entry_opens)):
+                raise TrialRuntimeInvalid("entry_lapse_before_official_open")
+            resolutions = [
+                TrialResolution(
+                    candidate_id=candidate.candidate_id,
+                    entry_date=inputs.entry_date,
+                    enrollment_state="missed",
+                    reason=f"entry_date_completion_lapsed:{inputs.reason}",
+                    confirmatory_enrollment_sequence=None,
+                    resolved_at_utc=inputs.lapsed_at_utc,
+                )
+                for candidate in candidates
+            ]
+            candidate_records = [
+                {
+                    "candidate_id": str(row["candidate_id"]),
+                    "record_sha256": str(row["record_sha256"]),
+                }
+                for row in candidate_rows
+            ]
+            resolution_digests = [
+                self._insert_resolution(conn, resolution) for resolution in resolutions
+            ]
+            lapse_record: dict[str, Any] = {
+                "contract_version": TRIAL_CONTRACT_VERSION,
+                "entry_date": inputs.entry_date.isoformat(),
+                "lapsed_at_utc": _utc_text(inputs.lapsed_at_utc),
+                "reason": inputs.reason,
+                "schedule_record_sha256": inputs.schedule_record_sha256,
+                "candidate_records": candidate_records,
+                "candidate_set_sha256": _sha256(_canonical({"candidates": candidate_records})),
+                "resolution_record_sha256s": resolution_digests,
+                "resolution_set_sha256": _sha256(
+                    _canonical({"resolution_record_sha256s": resolution_digests})
+                ),
+            }
+            encoded = _canonical(lapse_record)
+            digest = _sha256(encoded)
+            sequence = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM trial_entry_date_lapses"
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO trial_entry_date_lapses VALUES(?,?,?,?,?,?)",
+                (
+                    sequence,
+                    inputs.entry_date.isoformat(),
+                    _utc_text(inputs.lapsed_at_utc),
+                    inputs.reason,
+                    digest,
+                    encoded,
+                ),
+            )
+        return digest
 
     def disposition_for_evidence(self, evidence_record_sha256: str) -> str | None:
         with contextlib.closing(self._connect()) as conn:
@@ -830,6 +1497,7 @@ class TrialStore:
                 "trial_evidence_dispositions",
                 "trial_resolutions",
                 "trial_entry_date_completions",
+                "trial_entry_date_lapses",
                 "trial_outcomes",
                 "trial_faults",
             ):
@@ -852,6 +1520,198 @@ class TrialStore:
             disposition_snapshots = {str(row["evidence_snapshot_id"]) for row in disposition_rows}
             if candidate_snapshots & disposition_snapshots:
                 raise TrialRuntimeInvalid("snapshot_has_candidate_and_disposition")
+            resolution_rows = conn.execute(
+                "SELECT * FROM trial_resolutions ORDER BY sequence"
+            ).fetchall()
+            resolutions = [self._verify_resolution_row(row) for row in resolution_rows]
+            enrollment_sequences = [
+                resolution.confirmatory_enrollment_sequence
+                for resolution in resolutions
+                if resolution.enrollment_state == "enrolled"
+            ]
+            if enrollment_sequences != list(range(1, len(enrollment_sequences) + 1)):
+                raise TrialRuntimeInvalid("confirmatory_enrollment_sequence_not_gap_free")
+            candidates_by_id = {str(row["candidate_id"]): row for row in rows}
+            for resolution in resolutions:
+                candidate_row = candidates_by_id.get(resolution.candidate_id)
+                if candidate_row is None:
+                    raise TrialRuntimeInvalid("resolution_candidate_missing")
+                if str(candidate_row["planned_entry_date"]) != resolution.entry_date.isoformat():
+                    raise TrialRuntimeInvalid("resolution_candidate_entry_date_mismatch")
+            completion_rows = conn.execute(
+                "SELECT * FROM trial_entry_date_completions ORDER BY sequence"
+            ).fetchall()
+            completion_dates: list[date] = []
+            bound_resolution_sha256s: set[str] = set()
+            resolution_by_sha256 = {
+                str(row["record_sha256"]): resolution
+                for row, resolution in zip(resolution_rows, resolutions, strict=True)
+            }
+            for completion_row in completion_rows:
+                completion = self._verify_completion_row(completion_row)
+                entry_date = date.fromisoformat(str(completion["entry_date"]))
+                completed_at = _parse_utc(str(completion["completed_at_utc"]))
+                completion_dates.append(entry_date)
+                completion_candidate_ids: list[str] = []
+                completion_entry_opens: set[datetime] = set()
+                for candidate_binding in completion["candidate_records"]:
+                    candidate_id = str(candidate_binding["candidate_id"])
+                    completion_candidate_ids.append(candidate_id)
+                    candidate_row = candidates_by_id.get(candidate_id)
+                    if (
+                        candidate_row is None
+                        or str(candidate_row["planned_entry_date"]) != entry_date.isoformat()
+                        or str(candidate_row["record_sha256"])
+                        != str(candidate_binding["record_sha256"])
+                        or _parse_utc(str(candidate_row["imported_at_utc"])) > completed_at
+                    ):
+                        raise TrialRuntimeInvalid("completion_candidate_binding_mismatch")
+                    completion_entry_opens.add(_parse_utc(str(candidate_row["entry_opens_at_utc"])))
+                try:
+                    bound_resolutions = [
+                        resolution_by_sha256[str(digest)]
+                        for digest in completion["resolution_record_sha256s"]
+                    ]
+                except KeyError as exc:
+                    raise TrialRuntimeInvalid("completion_resolution_binding_missing") from exc
+                bound_resolution_sha256s.update(
+                    str(digest) for digest in completion["resolution_record_sha256s"]
+                )
+                if [
+                    resolution.candidate_id for resolution in bound_resolutions
+                ] != completion_candidate_ids or any(
+                    resolution.entry_date != entry_date
+                    or resolution.resolved_at_utc != completed_at
+                    for resolution in bound_resolutions
+                ):
+                    raise TrialRuntimeInvalid("completion_resolution_binding_mismatch")
+                cutoff = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK).astimezone(
+                    UTC
+                )
+                if len(completion_entry_opens) != 1 or not cutoff <= completed_at < next(
+                    iter(completion_entry_opens)
+                ):
+                    raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
+                _validate_cutoff_resolution_states(
+                    [
+                        self._verify_candidate_row(candidates_by_id[candidate_id])
+                        for candidate_id in completion_candidate_ids
+                    ],
+                    bound_resolutions,
+                    cutoff_utc=cutoff,
+                )
+            if completion_dates != sorted(set(completion_dates)):
+                raise TrialRuntimeInvalid("entry_completion_dates_not_strictly_ordered")
+            lapse_rows = conn.execute(
+                "SELECT * FROM trial_entry_date_lapses ORDER BY sequence"
+            ).fetchall()
+            for lapse_row in lapse_rows:
+                lapse = self._verify_lapse_row(lapse_row)
+                entry_date = date.fromisoformat(str(lapse["entry_date"]))
+                lapsed_at = _parse_utc(str(lapse["lapsed_at_utc"]))
+                lapse_candidate_ids: list[str] = []
+                lapse_entry_opens: set[datetime] = set()
+                for candidate_binding in lapse["candidate_records"]:
+                    candidate_id = str(candidate_binding["candidate_id"])
+                    lapse_candidate_ids.append(candidate_id)
+                    candidate_row = candidates_by_id.get(candidate_id)
+                    if (
+                        candidate_row is None
+                        or str(candidate_row["planned_entry_date"]) != entry_date.isoformat()
+                        or str(candidate_row["record_sha256"])
+                        != str(candidate_binding["record_sha256"])
+                        or _parse_utc(str(candidate_row["imported_at_utc"])) > lapsed_at
+                    ):
+                        raise TrialRuntimeInvalid("lapse_candidate_binding_mismatch")
+                    lapse_entry_opens.add(_parse_utc(str(candidate_row["entry_opens_at_utc"])))
+                try:
+                    lapse_resolutions = [
+                        resolution_by_sha256[str(digest)]
+                        for digest in lapse["resolution_record_sha256s"]
+                    ]
+                except KeyError as exc:
+                    raise TrialRuntimeInvalid("lapse_resolution_binding_missing") from exc
+                bound_resolution_sha256s.update(
+                    str(digest) for digest in lapse["resolution_record_sha256s"]
+                )
+                if [
+                    resolution.candidate_id for resolution in lapse_resolutions
+                ] != lapse_candidate_ids or any(
+                    resolution.entry_date != entry_date
+                    or resolution.resolved_at_utc != lapsed_at
+                    or resolution.enrollment_state != "missed"
+                    or resolution.reason
+                    != f"entry_date_completion_lapsed:{lapse['reason']}"
+                    for resolution in lapse_resolutions
+                ):
+                    raise TrialRuntimeInvalid("lapse_resolution_binding_mismatch")
+                if len(lapse_entry_opens) != 1 or lapsed_at < next(iter(lapse_entry_opens)):
+                    raise TrialRuntimeInvalid("entry_lapse_before_official_open")
+            sealed_rows = conn.execute(
+                """
+                SELECT kind,entry_date,sealed_at_utc FROM (
+                  SELECT 'completion' kind,entry_date,completed_at_utc sealed_at_utc
+                  FROM trial_entry_date_completions
+                  UNION ALL
+                  SELECT 'lapse' kind,entry_date,lapsed_at_utc sealed_at_utc
+                  FROM trial_entry_date_lapses
+                ) ORDER BY entry_date
+                """
+            ).fetchall()
+            sealed_dates = [date.fromisoformat(str(row["entry_date"])) for row in sealed_rows]
+            sealed_times = [_parse_utc(str(row["sealed_at_utc"])) for row in sealed_rows]
+            if sealed_dates != sorted(set(sealed_dates)):
+                raise TrialRuntimeInvalid("sealed_entry_dates_not_strictly_ordered")
+            if sealed_times != sorted(sealed_times):
+                raise TrialRuntimeInvalid("entry_seal_time_moved_backwards")
+            for resolution_row, resolution in zip(
+                resolution_rows,
+                resolutions,
+                strict=True,
+            ):
+                if str(resolution_row["record_sha256"]) in bound_resolution_sha256s:
+                    continue
+                candidate_row = candidates_by_id[resolution.candidate_id]
+                candidate_date = date.fromisoformat(str(candidate_row["planned_entry_date"]))
+                covering_seal = next(
+                    (
+                        row
+                        for row in sealed_rows
+                        if date.fromisoformat(str(row["entry_date"])) >= candidate_date
+                    ),
+                    None,
+                )
+                if covering_seal is None:
+                    raise TrialRuntimeInvalid("unbound_resolution_has_no_covering_entry_seal")
+                covering_date = date.fromisoformat(str(covering_seal["entry_date"]))
+                covering_at = _parse_utc(str(covering_seal["sealed_at_utc"]))
+                imported_at = _parse_utc(str(candidate_row["imported_at_utc"]))
+                expected_reason = (
+                    f"candidate_arrived_after_entry_date_{covering_seal['kind']}"
+                    if covering_date == candidate_date
+                    else "candidate_arrived_behind_entry_date_cursor"
+                )
+                if (
+                    resolution.enrollment_state != "missed"
+                    or resolution.confirmatory_enrollment_sequence is not None
+                    or resolution.reason != expected_reason
+                    or imported_at < covering_at
+                    or resolution.resolved_at_utc != imported_at
+                ):
+                    raise TrialRuntimeInvalid("unbound_resolution_not_late_arrival_missed")
+            if sealed_dates:
+                unresolved_behind_cursor = conn.execute(
+                    """
+                    SELECT 1 FROM trial_candidates candidate
+                    WHERE candidate.planned_entry_date<=? AND NOT EXISTS(
+                      SELECT 1 FROM trial_resolutions resolution
+                      WHERE resolution.candidate_id=candidate.candidate_id
+                    ) LIMIT 1
+                    """,
+                    (max(sealed_dates).isoformat(),),
+                ).fetchone()
+                if unresolved_behind_cursor is not None:
+                    raise TrialRuntimeInvalid("candidate_unresolved_behind_entry_date_cursor")
             fault_rows = conn.execute("SELECT * FROM trial_faults ORDER BY sequence").fetchall()
             for row in fault_rows:
                 self._verify_fault_row(row)
@@ -870,6 +1730,9 @@ class TrialStore:
                 ),
                 "entry_date_completions": int(
                     conn.execute("SELECT COUNT(*) FROM trial_entry_date_completions").fetchone()[0]
+                ),
+                "entry_date_lapses": int(
+                    conn.execute("SELECT COUNT(*) FROM trial_entry_date_lapses").fetchone()[0]
                 ),
                 "outcomes": int(conn.execute("SELECT COUNT(*) FROM trial_outcomes").fetchone()[0]),
                 "faults": int(conn.execute("SELECT COUNT(*) FROM trial_faults").fetchone()[0]),
