@@ -80,6 +80,13 @@ capacity-suppressed outcome; at most 20 control positions are open. The challeng
 applies the same 20-slot, same-symbol, and ascending deterministic-rank policy within the
 opportunistic eligible set. Neither book changes live slot selection or orders.
 
+Because the frozen execution policy deliberately evaluates stop/target barriers from completed
+daily bars, it does not infer an unobserved intraday barrier-hit minute. Gross trade return uses the
+frozen stop-first barrier price. Matched SPY return is the SPY entry-session RTH open through the
+exit-session RTH close, exactly matching the earlier daily E07 study convention. Persisted trade
+entry/exit timestamps are the official exchange RTH open/close boundaries from the point-in-time
+IBKR SPY schedule; early closes therefore use their actual close, not 16:00 ET.
+
 ## Point-in-time owner classification
 
 Classification follows the trader-level rule in Cohen, Malloy, and Pomorski, with explicit states
@@ -136,7 +143,8 @@ falsification context, not additional confirmatory tests.
 
 - Unit: one eligible position after same-symbol overlap suppression.
 - Primary endpoint: equal-notional arithmetic mean of trade return net of 20 bps minus matched SPY
-  return over the same timestamps.
+  return from the entry session's RTH open through the exit session's RTH close. The stock barrier
+  price remains the frozen daily-bar stop-first outcome; no unobserved intraday hit time is imputed.
 - Statistical test: one-sided circular moving-block bootstrap over chronologically ordered
   entry-date clusters, block length 10 dates, 10,000 resamples, deterministic seed `260826`.
   Within a resample, concatenate every trade from each sampled date and calculate the trade-weighted

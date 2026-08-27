@@ -66,5 +66,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 `install-research-bar-feed-task.ps1` registers a separate direct-`pythonw.exe` task that collects
 only requested, completed IBKR daily bars through a narrow client ID. It does not run in the live
 canary process and does not expose account or order operations. Inspect it with
-`ops research-bar-feed-status`. See [the completed-bar feed contract](../../docs/research/COMPLETED-BAR-FEED.md)
-for request, pacing, and integrity semantics.
+`ops research-bar-feed-status`. See
+[the completed-bar feed contract](../../docs/research/COMPLETED-BAR-FEED.md) for request, pacing,
+and integrity semantics.
+
+`install-research-session-feed-task.ps1` similarly runs a bounded hourly direct-`pythonw.exe`
+worker on client ID 177. It appends point-in-time SPY RTH schedule observations, including early
+closes, and exposes health through `ops research-session-feed-status`.

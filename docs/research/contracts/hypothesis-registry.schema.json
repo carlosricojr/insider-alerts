@@ -206,11 +206,25 @@
     "endpoint": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "aggregation", "benchmark", "cost_bps", "alternative"],
+      "required": [
+        "name",
+        "aggregation",
+        "benchmark",
+        "benchmark_price_window",
+        "trade_timestamp_convention",
+        "cost_bps",
+        "alternative"
+      ],
       "properties": {
         "name": {"const": "mean_post_cost_spy_relative_trade_return"},
         "aggregation": {"const": "equal_notional_arithmetic_mean"},
         "benchmark": {"const": "SPY_matched_entry_exit"},
+        "benchmark_price_window": {
+          "const": "spy_entry_session_rth_open_to_exit_session_rth_close"
+        },
+        "trade_timestamp_convention": {
+          "const": "official_exchange_rth_open_and_close_session_boundaries"
+        },
         "cost_bps": {"const": 20},
         "alternative": {"const": "greater_than_zero"}
       }

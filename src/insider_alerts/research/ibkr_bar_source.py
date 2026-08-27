@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import HistoricalBarSessionReset, SourceBarBatch
+from insider_alerts.research.session_feed import ExchangeSession, SourceSessionBatch
 
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _QUALIFY_TIMEOUT_SECONDS = 8.0
@@ -142,4 +143,49 @@ class IbkrHistoricalBarSource:
             )
         return SourceBarBatch(
             tuple(sorted(output, key=lambda item: item.trade_date)), tuple(rejections)
+        )
+
+    async def exchange_sessions(
+        self,
+        *,
+        end: datetime,
+        calendar_days: int,
+    ) -> SourceSessionBatch:
+        contract = await self.__contract("SPY")
+        schedule = await self.__ib.reqHistoricalScheduleAsync(
+            contract,
+            calendar_days,
+            end.astimezone(UTC) + timedelta(days=45),
+            True,
+        )
+        try:
+            schedule_zone = ZoneInfo(str(schedule.timeZone))
+        except (KeyError, ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError(
+                f"IBKR returned unsupported schedule timezone {schedule.timeZone!r}"
+            ) from exc
+        output: list[ExchangeSession] = []
+        rejections: list[str] = []
+        for raw in schedule.sessions:
+            try:
+                session_date = datetime.strptime(str(raw.refDate), "%Y%m%d").date()
+                opens_local = datetime.strptime(str(raw.startDateTime), "%Y%m%d-%H:%M:%S").replace(
+                    tzinfo=schedule_zone
+                )
+                closes_local = datetime.strptime(str(raw.endDateTime), "%Y%m%d-%H:%M:%S").replace(
+                    tzinfo=schedule_zone
+                )
+                if opens_local.date() != session_date or closes_local.date() != session_date:
+                    raise ValueError("session boundary date differs from reference date")
+                output.append(
+                    ExchangeSession(
+                        session_date,
+                        opens_local.astimezone(UTC),
+                        closes_local.astimezone(UTC),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                rejections.append(f"{raw.refDate!s}:invalid_schedule:{exc}")
+        return SourceSessionBatch(
+            tuple(sorted(output, key=lambda item: item.session_date)), tuple(rejections)
         )

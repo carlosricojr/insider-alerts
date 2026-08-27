@@ -81,6 +81,7 @@ from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.research.bar_feed import bar_feed_status
 from insider_alerts.research.capture import capture_status
+from insider_alerts.research.session_feed import session_feed_status
 from insider_alerts.review.queue import (
     DecisionValidationError,
     apply_decision,
@@ -3815,6 +3816,17 @@ def ops_research_bar_feed_status(
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
     if report.get("integrity_status") != "valid":
         raise typer.Exit(code=3)
+
+
+@ops_app.command("research-session-feed-status")
+def ops_research_session_feed_status(
+    feed_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/session_feed.db"), "--feed-db"
+    ),
+) -> None:
+    """Show exchange-session feed health without connecting to IBKR."""
+
+    typer.echo(json.dumps(session_feed_status(feed_db), indent=2, sort_keys=True))
 
 
 @ops_app.command("live-canary-watchdog")
