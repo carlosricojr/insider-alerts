@@ -131,6 +131,25 @@ class SyncResult:
     last_quarter: str
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotMetadata:
+    snapshot_sha256: str
+    manifest_sha256: str
+    normalized_sha256: str
+    created_at: datetime
+    members: tuple[tuple[int, int, str], ...]
+
+    @property
+    def first_quarter(self) -> str:
+        year, quarter, _ = self.members[0]
+        return f"{year}Q{quarter}"
+
+    @property
+    def last_quarter(self) -> str:
+        year, quarter, _ = self.members[-1]
+        return f"{year}Q{quarter}"
+
+
 class _ManifestLinks(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -325,8 +344,23 @@ class HistoryStore:
                 archive_sha256 TEXT NOT NULL REFERENCES archive_releases(archive_sha256),
                 PRIMARY KEY(snapshot_sha256, year, quarter)
             );
+            CREATE TABLE IF NOT EXISTS sealed_archive_snapshots(
+                snapshot_sha256 TEXT PRIMARY KEY
+                    REFERENCES archive_snapshots(snapshot_sha256)
+            );
             """
         )
+        snapshot_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(archive_snapshots)").fetchall()
+        }
+        if "format_version" not in snapshot_columns:
+            conn.execute(
+                "ALTER TABLE archive_snapshots ADD COLUMN format_version INTEGER NOT NULL "
+                "DEFAULT 1"
+            )
+        if "normalized_sha256" not in snapshot_columns:
+            conn.execute("ALTER TABLE archive_snapshots ADD COLUMN normalized_sha256 TEXT")
         immutable_tables = (
             "raw_objects",
             "raw_retrievals",
@@ -336,6 +370,7 @@ class HistoryStore:
             "sec_nonderiv_transactions",
             "archive_snapshots",
             "archive_snapshot_members",
+            "sealed_archive_snapshots",
         )
         for table in immutable_tables:
             conn.execute(
@@ -352,6 +387,95 @@ class HistoryStore:
                 BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END
                 """
             )
+        for table in (
+            "sec_submissions",
+            "sec_reporting_owners",
+            "sec_nonderiv_transactions",
+        ):
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {table}_sealed_insert
+                BEFORE INSERT ON {table}
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM archive_snapshot_members member
+                    JOIN sealed_archive_snapshots sealed
+                      ON sealed.snapshot_sha256=member.snapshot_sha256
+                    WHERE member.archive_sha256=NEW.archive_sha256
+                )
+                BEGIN SELECT RAISE(ABORT, '{table} archive is sealed'); END
+                """
+            )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS archive_snapshot_members_sealed_insert
+            BEFORE INSERT ON archive_snapshot_members
+            WHEN EXISTS (
+                SELECT 1 FROM sealed_archive_snapshots
+                WHERE snapshot_sha256=NEW.snapshot_sha256
+            )
+            BEGIN SELECT RAISE(ABORT, 'archive snapshot membership is sealed'); END
+            """
+        )
+
+    @staticmethod
+    def _verify_raw_object(conn: sqlite3.Connection, digest: str) -> None:
+        row = conn.execute(
+            "SELECT size_bytes,path FROM raw_objects WHERE sha256=?", (digest,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"snapshot raw object is missing: {digest}")
+        path = Path(str(row["path"]))
+        if not path.is_file():
+            raise ValueError(f"snapshot raw object file is missing: {digest}")
+        if path.stat().st_size != int(row["size_bytes"]):
+            raise ValueError(f"snapshot raw object size mismatch: {digest}")
+        content_digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                content_digest.update(chunk)
+        if content_digest.hexdigest() != digest:
+            raise ValueError(f"snapshot raw object digest mismatch: {digest}")
+
+    @staticmethod
+    def _normalized_snapshot_sha256(
+        conn: sqlite3.Connection, archive_sha256s: Sequence[str]
+    ) -> str:
+        if not archive_sha256s:
+            raise ValueError("archive snapshot has no members")
+        placeholders = ",".join("?" for _ in archive_sha256s)
+        queries = (
+            (
+                "sec_submissions",
+                "archive_sha256,accession_number,filing_date,period_of_report,"
+                "original_submission_date,document_type,issuer_cik,issuer_symbol",
+                "archive_sha256,accession_number",
+            ),
+            (
+                "sec_reporting_owners",
+                "archive_sha256,accession_number,owner_cik",
+                "archive_sha256,accession_number,owner_cik",
+            ),
+            (
+                "sec_nonderiv_transactions",
+                "archive_sha256,accession_number,transaction_key,transaction_date,"
+                "transaction_form_type,transaction_code,acquired_disposed_code,is_valid",
+                "archive_sha256,accession_number,transaction_key",
+            ),
+        )
+        digest = hashlib.sha256()
+        for table, columns, ordering in queries:
+            digest.update(table.encode("ascii"))
+            digest.update(b"\0")
+            rows = conn.execute(
+                f"SELECT {columns} FROM {table} "
+                f"WHERE archive_sha256 IN ({placeholders}) ORDER BY {ordering}",
+                tuple(archive_sha256s),
+            )
+            for row in rows:
+                digest.update(rfc8785.dumps(dict(row)))
+                digest.update(b"\n")
+        return digest.hexdigest()
 
     def record_retrieval(
         self,
@@ -552,13 +676,18 @@ class HistoryStore:
         created_at: datetime,
     ) -> str:
         ordered = sorted(members)
+        if not ordered:
+            raise ValueError("archive snapshot has no members")
         if len({(year, quarter) for year, quarter, _ in ordered}) != len(ordered):
             raise ValueError("archive snapshot has duplicate quarters")
+        created_at_utc = _utc_text(created_at)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if conn.execute(
                 "SELECT 1 FROM raw_objects WHERE sha256=?", (manifest_sha256,)
             ).fetchone() is None:
                 raise ValueError("archive snapshot manifest raw object is missing")
+            self._verify_raw_object(conn, manifest_sha256)
             for year, quarter, digest in ordered:
                 release = conn.execute(
                     "SELECT year,quarter FROM archive_releases WHERE archive_sha256=?",
@@ -569,25 +698,208 @@ class HistoryStore:
                     quarter,
                 ):
                     raise ValueError("archive snapshot member metadata mismatch")
-        body: dict[str, Any] = {
+                self._verify_raw_object(conn, digest)
+            normalized_sha256 = self._normalized_snapshot_sha256(
+                conn, [digest for _, _, digest in ordered]
+            )
+            body: dict[str, Any] = {
+                "format_version": 2,
+                "manifest_sha256": manifest_sha256,
+                "created_at_utc": created_at_utc,
+                "normalized_sha256": normalized_sha256,
+                "members": [
+                    {"year": year, "quarter": quarter, "archive_sha256": digest}
+                    for year, quarter, digest in ordered
+                ],
+            }
+            snapshot_sha = hashlib.sha256(rfc8785.dumps(body)).hexdigest()
+            already_sealed = conn.execute(
+                "SELECT 1 FROM sealed_archive_snapshots WHERE snapshot_sha256=?",
+                (snapshot_sha,),
+            ).fetchone()
+            if already_sealed is None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO archive_snapshots(
+                        snapshot_sha256,manifest_sha256,created_at_utc,
+                        format_version,normalized_sha256
+                    ) VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        snapshot_sha,
+                        manifest_sha256,
+                        created_at_utc,
+                        2,
+                        normalized_sha256,
+                    ),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO archive_snapshot_members VALUES(?,?,?,?)",
+                    [
+                        (snapshot_sha, year, quarter, digest)
+                        for year, quarter, digest in ordered
+                    ],
+                )
+                conn.execute(
+                    "INSERT INTO sealed_archive_snapshots VALUES(?)",
+                    (snapshot_sha,),
+                )
+        return snapshot_sha
+
+    def seal_existing_snapshot(
+        self, snapshot_sha256: str, *, created_at: datetime
+    ) -> str:
+        """Create a byte-verified v2 seal over a validated legacy member selection."""
+
+        with self.connect() as conn:
+            snapshot = conn.execute(
+                "SELECT manifest_sha256,format_version FROM archive_snapshots "
+                "WHERE snapshot_sha256=?",
+                (snapshot_sha256,),
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT year,quarter,archive_sha256 FROM archive_snapshot_members "
+                "WHERE snapshot_sha256=? ORDER BY year,quarter",
+                (snapshot_sha256,),
+            ).fetchall()
+        if snapshot is None or not rows:
+            raise ValueError("source archive snapshot is missing or empty")
+        if int(snapshot["format_version"]) != 1:
+            raise ValueError("only a legacy format-v1 snapshot can be sealed")
+        manifest_sha256 = str(snapshot["manifest_sha256"])
+        members = [
+            (int(row["year"]), int(row["quarter"]), str(row["archive_sha256"]))
+            for row in rows
+        ]
+        legacy_body: dict[str, Any] = {
             "manifest_sha256": manifest_sha256,
             "members": [
                 {"year": year, "quarter": quarter, "archive_sha256": digest}
-                for year, quarter, digest in ordered
+                for year, quarter, digest in members
             ],
         }
-        snapshot_sha = hashlib.sha256(rfc8785.dumps(body)).hexdigest()
+        if hashlib.sha256(rfc8785.dumps(legacy_body)).hexdigest() != snapshot_sha256:
+            raise ValueError("source legacy snapshot content digest mismatch")
+        return self.create_snapshot(
+            manifest_sha256=manifest_sha256,
+            members=members,
+            created_at=created_at,
+        )
+
+    def snapshot_metadata(self, snapshot_sha256: str) -> SnapshotMetadata:
+        if len(snapshot_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in snapshot_sha256
+        ):
+            raise ValueError("snapshot SHA-256 must be 64 lowercase hexadecimal characters")
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT OR IGNORE INTO archive_snapshots VALUES(?,?,?)",
-                (snapshot_sha, manifest_sha256, _utc_text(created_at)),
+            snapshot = conn.execute(
+                """
+                SELECT s.manifest_sha256,s.created_at_utc,
+                       s.format_version,s.normalized_sha256
+                FROM archive_snapshots s
+                JOIN raw_objects manifest ON manifest.sha256=s.manifest_sha256
+                JOIN sealed_archive_snapshots sealed
+                  ON sealed.snapshot_sha256=s.snapshot_sha256
+                WHERE s.snapshot_sha256=?
+                """,
+                (snapshot_sha256,),
+            ).fetchone()
+            if snapshot is None:
+                raise ValueError("pinned archive snapshot is missing or has no manifest object")
+            if int(snapshot["format_version"]) != 2 or snapshot["normalized_sha256"] is None:
+                raise ValueError("pinned archive snapshot is not sealed format v2")
+            rows = conn.execute(
+                """
+                SELECT m.year,m.quarter,m.archive_sha256,
+                       release.year release_year,release.quarter release_quarter
+                FROM archive_snapshot_members m
+                JOIN archive_releases release
+                  ON release.archive_sha256=m.archive_sha256
+                JOIN raw_objects raw ON raw.sha256=m.archive_sha256
+                WHERE m.snapshot_sha256=?
+                ORDER BY m.year,m.quarter
+                """,
+                (snapshot_sha256,),
+            ).fetchall()
+        members = tuple(
+            (int(row["year"]), int(row["quarter"]), str(row["archive_sha256"]))
+            for row in rows
+        )
+        if not members:
+            raise ValueError("pinned archive snapshot has no members")
+        if any(
+            (int(row["year"]), int(row["quarter"]))
+            != (int(row["release_year"]), int(row["release_quarter"]))
+            for row in rows
+        ):
+            raise ValueError("pinned archive snapshot member metadata mismatch")
+        manifest_sha256 = str(snapshot["manifest_sha256"])
+        normalized_sha256 = str(snapshot["normalized_sha256"])
+        created_at_text = _utc_text(
+            datetime.fromisoformat(
+                str(snapshot["created_at_utc"]).replace("Z", "+00:00")
             )
-            conn.executemany(
-                "INSERT OR IGNORE INTO archive_snapshot_members VALUES(?,?,?,?)",
-                [(snapshot_sha, year, quarter, digest) for year, quarter, digest in ordered],
+        )
+        body: dict[str, Any] = {
+            "format_version": 2,
+            "manifest_sha256": manifest_sha256,
+            "created_at_utc": created_at_text,
+            "normalized_sha256": normalized_sha256,
+            "members": [
+                {"year": year, "quarter": quarter, "archive_sha256": digest}
+                for year, quarter, digest in members
+            ],
+        }
+        if hashlib.sha256(rfc8785.dumps(body)).hexdigest() != snapshot_sha256:
+            raise ValueError("pinned archive snapshot content digest mismatch")
+        created_at = datetime.fromisoformat(created_at_text.replace("Z", "+00:00"))
+        if created_at.tzinfo is None:
+            raise ValueError("pinned archive snapshot has a naive creation timestamp")
+        return SnapshotMetadata(
+            snapshot_sha256=snapshot_sha256,
+            manifest_sha256=manifest_sha256,
+            normalized_sha256=normalized_sha256,
+            created_at=created_at.astimezone(UTC),
+            members=members,
+        )
+
+    def verify_snapshot_material(self, snapshot_sha256: str) -> SnapshotMetadata:
+        """Re-verify every sealed input; intended for bounded deployment preflight."""
+
+        metadata = self.snapshot_metadata(snapshot_sha256)
+        with self.connect() as conn:
+            self._verify_raw_object(conn, metadata.manifest_sha256)
+            archive_sha256s = [digest for _, _, digest in metadata.members]
+            for digest in archive_sha256s:
+                self._verify_raw_object(conn, digest)
+            actual_normalized_sha256 = self._normalized_snapshot_sha256(
+                conn, archive_sha256s
             )
-        return snapshot_sha
+        if actual_normalized_sha256 != metadata.normalized_sha256:
+            raise ValueError("sealed snapshot normalized input digest mismatch")
+        return metadata
+
+    def coverage_for_classification(
+        self, snapshot_sha256: str, *, classification_year: int
+    ) -> tuple[SnapshotMetadata, Coverage]:
+        if classification_year < HISTORY_OBSERVATION_START.year + 3:
+            raise ValueError("classification year precedes the first partitionable cutoff")
+        metadata = self.snapshot_metadata(snapshot_sha256)
+        required = _quarter_range(
+            (HISTORY_OBSERVATION_START.year, 1), (classification_year - 1, 4)
+        )
+        available = {(year, quarter) for year, quarter, _ in metadata.members}
+        missing = tuple(
+            f"{year}Q{quarter}"
+            for year, quarter in required
+            if (year, quarter) not in available
+        )
+        return metadata, Coverage(
+            complete_from=HISTORY_OBSERVATION_START,
+            complete_through=date(classification_year - 1, 12, 31),
+            source_snapshot_sha256=snapshot_sha256,
+            missing_quarters=missing,
+        )
 
     def archived_object_for_url(
         self, url: str, *, year: int, quarter: int

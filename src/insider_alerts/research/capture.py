@@ -8,13 +8,21 @@ import sqlite3
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
+
+from insider_alerts.research.sec_history import (
+    CLASSIFIER_VERSION,
+    HistoryStore,
+    SnapshotMetadata,
+    classify_owner,
+)
 
 CAPTURE_CONTRACT_VERSION = "insider-evidence-capture-v2"
 HYPOTHESIS_ID = "OPP-E07-V1"
@@ -29,6 +37,8 @@ class CaptureConfig:
     alpha_python: Path
     alpha_script: Path
     canary_ledger: Path
+    history_db: Path
+    history_snapshot_sha256: str
     insider_git_commit: str
     policy_path: Path
     evidence_schema_path: Path
@@ -43,6 +53,12 @@ class CaptureConfig:
             char not in "0123456789abcdef" for char in self.insider_git_commit
         ):
             raise ValueError("insider_git_commit must be a lowercase 40-character SHA-1")
+        if len(self.history_snapshot_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in self.history_snapshot_sha256
+        ):
+            raise ValueError(
+                "history_snapshot_sha256 must be a lowercase 64-character SHA-256"
+            )
         for name in (
             "capture_delay_seconds",
             "capture_deadline_seconds",
@@ -142,7 +158,8 @@ def ensure_evidence_store(path: Path) -> None:
                 record_sha256 TEXT NOT NULL UNIQUE,
                 stored_bytes_sha256 TEXT NOT NULL,
                 record_json BLOB NOT NULL,
-                recorded_at_utc TEXT NOT NULL
+                recorded_at_utc TEXT NOT NULL,
+                owner_history_status TEXT
             );
             CREATE TRIGGER IF NOT EXISTS evidence_snapshots_no_update
             BEFORE UPDATE ON evidence_snapshots
@@ -154,9 +171,30 @@ def ensure_evidence_store(path: Path) -> None:
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 last_worker_heartbeat_utc TEXT NOT NULL,
                 last_result TEXT NOT NULL,
-                last_job_id TEXT
+                last_job_id TEXT,
+                last_error_kind TEXT,
+                last_error_message TEXT
             );
             """
+        )
+        evidence_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(evidence_snapshots)")
+        }
+        if "owner_history_status" not in evidence_columns:
+            conn.execute(
+                "ALTER TABLE evidence_snapshots ADD COLUMN owner_history_status TEXT"
+            )
+        health_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(capture_health)")
+        }
+        if "last_error_kind" not in health_columns:
+            conn.execute("ALTER TABLE capture_health ADD COLUMN last_error_kind TEXT")
+        if "last_error_message" not in health_columns:
+            conn.execute("ALTER TABLE capture_health ADD COLUMN last_error_message TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS evidence_snapshots_owner_history_status "
+            "ON evidence_snapshots(owner_history_status)"
         )
 
 
@@ -581,6 +619,197 @@ def _captured_observation(
     }
 
 
+def _not_applicable_observation(*, source: str, observed_at: datetime) -> dict[str, Any]:
+    return {
+        "status": "not_applicable",
+        "as_of_utc": None,
+        "observed_at_utc": utc_text(observed_at),
+        "source": source,
+        "artifact_ref": None,
+        "artifact_sha256": None,
+        "values": None,
+        "error": None,
+    }
+
+
+def _classification_boundary(decision_at: datetime) -> tuple[int, datetime]:
+    local = decision_at.astimezone(ZoneInfo("America/New_York"))
+    cutoff_local = datetime(local.year, 1, 1, tzinfo=local.tzinfo)
+    return local.year, cutoff_local.astimezone(UTC)
+
+
+@dataclass(slots=True, frozen=True)
+class OwnerHistoryResult:
+    classifier_version: str | None
+    classification: dict[str, Any]
+    observation: dict[str, Any]
+    error: dict[str, Any] | None
+    recorded_at: datetime
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    return str(exc).strip().lower() in {
+        "database is locked",
+        "database table is locked",
+    }
+
+
+def _owner_history_failure(
+    baseline: dict[str, Any], *, exc: BaseException
+) -> OwnerHistoryResult:
+    recorded_at = datetime.now(UTC)
+    error = _error(
+        "owner_history",
+        "OWNER_HISTORY_UNAVAILABLE",
+        f"{type(exc).__name__}: {exc}",
+        retryable=False,
+    )
+    return OwnerHistoryResult(
+        classifier_version=None,
+        classification=baseline,
+        observation=_missing_observation(
+            source="SEC-owner-history", observed_at=recorded_at, error=error
+        ),
+        error=error,
+        recorded_at=recorded_at,
+    )
+
+
+def _capture_owner_history(
+    config: CaptureConfig,
+    job: CaptureJob,
+    *,
+    owner_cik: str | None,
+    owner_mapping: str,
+) -> OwnerHistoryResult:
+    classification_year, cutoff_at = _classification_boundary(job.decision_at)
+    baseline: dict[str, Any] = {
+        "state": (
+            "ambiguous_multi_owner" if owner_mapping == "ambiguous" else "unpartitionable"
+        ),
+        "owner_cik": owner_cik,
+        "classification_year": classification_year,
+        "cutoff_at_utc": utc_text(cutoff_at),
+        "transaction_owner_mapping": owner_mapping,
+        "history_coverage_complete": False,
+        "left_censored": True,
+        "history_observation_start_date": None,
+        "history_source_snapshot_sha256": None,
+        "history_input_sha256": sha256_bytes(b"owner-history-not-captured"),
+    }
+    if owner_mapping == "ambiguous":
+        recorded_at = datetime.now(UTC)
+        return OwnerHistoryResult(
+            classifier_version=None,
+            classification=baseline,
+            observation=_not_applicable_observation(
+                source="SEC-owner-history", observed_at=recorded_at
+            ),
+            error=None,
+            recorded_at=recorded_at,
+        )
+    if owner_mapping == "missing" or owner_cik is None:
+        recorded_at = datetime.now(UTC)
+        return OwnerHistoryResult(
+            classifier_version=None,
+            classification=baseline,
+            observation=_missing_observation(
+                source="SEC-owner-history", observed_at=recorded_at
+            ),
+            error=None,
+            recorded_at=recorded_at,
+        )
+    try:
+        metadata = verify_history_runtime(config, as_of=job.decision_at)
+        store = HistoryStore(config.history_db)
+        _, coverage = store.coverage_for_classification(
+            config.history_snapshot_sha256,
+            classification_year=classification_year,
+        )
+        filings = store.owner_filings(
+            config.history_snapshot_sha256,
+            owner_cik,
+            cutoff_date=date(classification_year, 1, 1),
+        )
+        result = classify_owner(
+            owner_cik=owner_cik,
+            classification_year=classification_year,
+            filings=filings,
+            coverage=coverage,
+        )
+        classification = {
+            "state": result.state,
+            "owner_cik": result.owner_cik,
+            "classification_year": result.classification_year,
+            "cutoff_at_utc": utc_text(cutoff_at),
+            "transaction_owner_mapping": "exact",
+            "history_coverage_complete": result.history_coverage_complete,
+            "left_censored": result.left_censored,
+            "history_observation_start_date": (
+                result.history_observation_start_date.isoformat()
+            ),
+            "history_source_snapshot_sha256": result.history_source_snapshot_sha256,
+            "history_input_sha256": result.history_input_sha256,
+        }
+        recorded_at = datetime.now(UTC)
+        observation = _captured_observation(
+            source="SEC-owner-history:bulk-archives",
+            as_of=metadata.created_at,
+            observed_at=recorded_at,
+            artifact_ref=f"sec-history-snapshot:{metadata.snapshot_sha256}",
+            artifact_sha256=metadata.snapshot_sha256,
+            values={
+                "snapshot_sha256": metadata.snapshot_sha256,
+                "manifest_sha256": metadata.manifest_sha256,
+                "normalized_sha256": metadata.normalized_sha256,
+                "snapshot_created_at_utc": utc_text(metadata.created_at),
+                "first_quarter": metadata.first_quarter,
+                "last_quarter": metadata.last_quarter,
+                "coverage_complete_from": coverage.complete_from.isoformat(),
+                "coverage_complete_through": coverage.complete_through.isoformat(),
+                "missing_quarters": list(coverage.missing_quarters),
+                "filing_count": len(filings),
+                "classification_reason": result.reason,
+                "routine_since_year": result.routine_since_year,
+                "history_input_sha256": result.history_input_sha256,
+            },
+        )
+        return OwnerHistoryResult(
+            classifier_version=CLASSIFIER_VERSION,
+            classification=classification,
+            observation=observation,
+            error=None,
+            recorded_at=recorded_at,
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_transient_sqlite_error(exc):
+            raise
+        return _owner_history_failure(baseline, exc=exc)
+    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
+        return _owner_history_failure(baseline, exc=exc)
+
+
+def verify_history_runtime(
+    config: CaptureConfig, *, as_of: datetime | None = None
+) -> SnapshotMetadata:
+    """Authenticate sealed history immediately before an exact-owner classification."""
+
+    if not config.history_db.is_file():
+        raise ValueError("pinned owner-history database is missing")
+    metadata = HistoryStore(config.history_db).verify_snapshot_material(
+        config.history_snapshot_sha256
+    )
+    if metadata.created_at > (as_of or datetime.now(UTC)):
+        raise ValueError("pinned owner-history snapshot was created after the decision")
+    return metadata
+
+
 def _configuration_sha(config: CaptureConfig) -> str:
     safe = asdict(config)
     for name in ("source_db", "evidence_db", "artifact_root"):
@@ -589,6 +818,7 @@ def _configuration_sha(config: CaptureConfig) -> str:
         "alpha_python",
         "alpha_script",
         "canary_ledger",
+        "history_db",
         "policy_path",
         "evidence_schema_path",
     ):
@@ -602,7 +832,7 @@ def _append_snapshot(
     *,
     capture_started: datetime,
     capture_finished: datetime,
-    duration_ms: int,
+    timer_started: float,
     option_artifact: dict[str, Any] | None,
     option_path: Path | None,
     option_sha: str | None,
@@ -640,16 +870,22 @@ def _append_snapshot(
         if owner_count > 1 or len(owner_ciks) > 1
         else "missing"
     )
-    classification_state = (
-        "ambiguous_multi_owner" if owner_mapping == "ambiguous" else "unpartitionable"
+    owner_history = _capture_owner_history(
+        config,
+        job,
+        owner_cik=owner_cik,
+        owner_mapping=owner_mapping,
     )
+    recorded_at = owner_history.recorded_at
+    duration_ms = max(0, round((monotonic() - timer_started) * 1000))
+    owner_history_observation = owner_history.observation
     issuer_cik = str(payload.get("issuer_cik") or job.issuer_cik).lstrip("0") or "0"
     notification_at = (
         parse_utc(str(filing["notification_sent_at"]))
         if filing.get("notification_sent_at")
         else None
     )
-    errors = [option_error] if option_error else []
+    errors = [error for error in (option_error, owner_history.error) if error is not None]
     if option_artifact is not None and option_path is not None and option_sha is not None:
         completed_at = parse_utc(str(option_artifact["captured_at_utc"]))
         surfaces = option_artifact.get("surfaces", [])
@@ -735,7 +971,7 @@ def _append_snapshot(
             "schema_version": 2,
             "snapshot_id": snapshot_id,
             "hypothesis_id": HYPOTHESIS_ID,
-            "recorded_at_utc": utc_text(capture_finished),
+            "recorded_at_utc": utc_text(recorded_at),
             "enrollment_state": "pending_entry_selection",
             "confirmatory_enrollment_sequence": None,
             "supersedes_snapshot_id": None,
@@ -766,23 +1002,12 @@ def _append_snapshot(
                     "git_commit": config.insider_git_commit,
                     "source_fingerprint_sha256": research_source_fingerprint(),
                     "policy_sha256": hashlib.sha256(config.policy_path.read_bytes()).hexdigest(),
-                    "classifier_version": None,
+                    "classifier_version": owner_history.classifier_version,
                     "model_id": _optional_string(decision.get("model_id")),
                     "prompt_sha256": _optional_sha256(decision.get("prompt_sha256")),
                     "configuration_sha256": _configuration_sha(config),
                 },
-                "classification": {
-                    "state": classification_state,
-                    "owner_cik": owner_cik,
-                    "classification_year": job.decision_at.year,
-                    "cutoff_at_utc": utc_text(job.decision_at),
-                    "transaction_owner_mapping": owner_mapping,
-                    "history_coverage_complete": False,
-                    "left_censored": True,
-                    "history_observation_start_date": None,
-                    "history_source_snapshot_sha256": None,
-                    "history_input_sha256": sha256_bytes(b"owner-history-not-yet-captured"),
-                },
+                "classification": owner_history.classification,
                 "observations": {
                     "sec_source": _captured_observation(
                         source=str(filing["source"]),
@@ -797,9 +1022,7 @@ def _append_snapshot(
                     ),
                     "market_context": market_observation,
                     "options_surface": options_observation,
-                    "owner_history": _missing_observation(
-                        source="SEC-owner-history", observed_at=capture_finished
-                    ),
+                    "owner_history": owner_history_observation,
                     "notification_transport": notification_observation,
                 },
                 "errors": errors,
@@ -822,8 +1045,8 @@ def _append_snapshot(
             """
             INSERT INTO evidence_snapshots(
                 sequence, snapshot_id, job_id, record_sha256, stored_bytes_sha256,
-                record_json, recorded_at_utc
-            ) VALUES(?,?,?,?,?,?,?)
+                record_json, recorded_at_utc, owner_history_status
+            ) VALUES(?,?,?,?,?,?,?,?)
             """,
             (
                 sequence,
@@ -832,27 +1055,63 @@ def _append_snapshot(
                 record_sha,
                 sha256_bytes(record_bytes),
                 record_bytes,
-                utc_text(capture_finished),
+                utc_text(recorded_at),
+                str(owner_history_observation["status"]),
             ),
         )
         conn.commit()
     return record_sha
 
 
-def _heartbeat(config: CaptureConfig, *, now: datetime, result: str, job_id: str | None) -> None:
-    ensure_evidence_store(config.evidence_db)
-    with _connect(config.evidence_db, write=True) as conn:
+def _write_health(
+    evidence_db: Path,
+    *,
+    now: datetime,
+    result: str,
+    job_id: str | None,
+    error_kind: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    ensure_evidence_store(evidence_db)
+    with _connect(evidence_db, write=True) as conn:
         conn.execute(
             """
-            INSERT INTO capture_health(singleton,last_worker_heartbeat_utc,last_result,last_job_id)
-            VALUES(1,?,?,?)
+            INSERT INTO capture_health(
+              singleton,last_worker_heartbeat_utc,last_result,last_job_id,
+              last_error_kind,last_error_message
+            ) VALUES(1,?,?,?,?,?)
             ON CONFLICT(singleton) DO UPDATE SET
               last_worker_heartbeat_utc=excluded.last_worker_heartbeat_utc,
               last_result=excluded.last_result,
-              last_job_id=excluded.last_job_id
+              last_job_id=excluded.last_job_id,
+              last_error_kind=excluded.last_error_kind,
+              last_error_message=excluded.last_error_message
             """,
-            (utc_text(now), result, job_id),
+            (
+                utc_text(now),
+                result,
+                job_id,
+                error_kind,
+                error_message[:MAX_ERROR_LENGTH] if error_message else None,
+            ),
         )
+
+
+def record_worker_failure(evidence_db: Path, exc: BaseException) -> None:
+    """Persist a fatal one-shot worker failure when no capture job can own it."""
+
+    _write_health(
+        evidence_db,
+        now=datetime.now(UTC),
+        result="worker_error",
+        job_id=None,
+        error_kind="CAPTURE_WORKER_FATAL",
+        error_message=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _heartbeat(config: CaptureConfig, *, now: datetime, result: str, job_id: str | None) -> None:
+    _write_health(config.evidence_db, now=now, result=result, job_id=job_id)
 
 
 def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResult:
@@ -939,17 +1198,18 @@ def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResul
         job,
         capture_started=started,
         capture_finished=finished,
-        duration_ms=max(0, round((monotonic() - timer) * 1000)),
+        timer_started=timer,
         option_artifact=option_artifact,
         option_path=option_path,
         option_sha=option_sha,
         option_error=option_error,
     )
+    completed = datetime.now(UTC)
     _record_attempt(
         config,
         job,
         started_at=started,
-        finished_at=finished,
+        finished_at=completed,
         status="completed",
         error_kind=error_kind,
         error_message=error_message,
@@ -959,12 +1219,12 @@ def _process_claimed_job(config: CaptureConfig, job: CaptureJob) -> CaptureResul
         config,
         job,
         state="complete",
-        now=finished,
+        now=completed,
         error_kind=error_kind,
         error_message=error_message,
         record_sha256=record_sha,
     )
-    _heartbeat(config, now=finished, result="completed", job_id=job.job_id)
+    _heartbeat(config, now=completed, result="completed", job_id=job.job_id)
     return CaptureResult(
         status="completed",
         job_id=job.job_id,
@@ -1027,7 +1287,12 @@ def run_capture_once(
 
 
 def capture_status(source_db: Path, evidence_db: Path) -> dict[str, Any]:
-    result: dict[str, Any] = {"jobs": {}, "evidence_count": 0, "health": None}
+    result: dict[str, Any] = {
+        "jobs": {},
+        "evidence_count": 0,
+        "owner_history": {},
+        "health": None,
+    }
     if source_db.is_file():
         with _connect(source_db, write=False) as conn:
             exists = conn.execute(
@@ -1045,6 +1310,27 @@ def capture_status(source_db: Path, evidence_db: Path) -> dict[str, Any]:
             result["evidence_count"] = int(
                 conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone()[0]
             )
+            owner_history_counts: dict[str, int] = {
+                str(row["owner_history_status"]): int(row["count"])
+                for row in conn.execute(
+                    "SELECT owner_history_status,COUNT(*) count "
+                    "FROM evidence_snapshots WHERE owner_history_status IS NOT NULL "
+                    "GROUP BY owner_history_status"
+                )
+            }
+            for snapshot_row in conn.execute(
+                "SELECT record_json FROM evidence_snapshots "
+                "WHERE owner_history_status IS NULL ORDER BY sequence"
+            ):
+                try:
+                    record = json.loads(bytes(snapshot_row["record_json"]))
+                    status = str(
+                        record["payload"]["observations"]["owner_history"]["status"]
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    status = "invalid_record"
+                owner_history_counts[status] = owner_history_counts.get(status, 0) + 1
+            result["owner_history"] = owner_history_counts
             row = conn.execute("SELECT * FROM capture_health WHERE singleton=1").fetchone()
             result["health"] = dict(row) if row else None
     return result

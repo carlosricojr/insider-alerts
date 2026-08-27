@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
+import rfc8785
 
 from insider_alerts.research.sec_history import (
     ArchiveRef,
@@ -282,7 +284,28 @@ def test_raw_objects_and_normalized_rows_are_immutable(tmp_path: Path) -> None:
         raw_object=published,
         retrieved_at=retrieved_at,
     )
-    snapshot_sha = store.create_snapshot(
+    legacy_body = {
+        "manifest_sha256": manifest.sha256,
+        "members": [
+            {"year": 2006, "quarter": 1, "archive_sha256": published.sha256}
+        ],
+    }
+    legacy_sha = hashlib.sha256(rfc8785.dumps(legacy_body)).hexdigest()
+    with store.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO archive_snapshots(
+                snapshot_sha256,manifest_sha256,created_at_utc
+            ) VALUES(?,?,?)
+            """,
+            (legacy_sha, manifest.sha256, retrieved_at.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO archive_snapshot_members VALUES(?,?,?,?)",
+            (legacy_sha, 2006, 1, published.sha256),
+        )
+    snapshot_sha = store.seal_existing_snapshot(legacy_sha, created_at=retrieved_at)
+    assert snapshot_sha == store.create_snapshot(
         manifest_sha256=manifest.sha256,
         members=[(2006, 1, published.sha256)],
         created_at=retrieved_at,
@@ -304,6 +327,32 @@ def test_raw_objects_and_normalized_rows_are_immutable(tmp_path: Path) -> None:
 
     with store.connect() as conn, pytest.raises(Exception, match="immutable"):
         conn.execute("UPDATE sec_submissions SET issuer_cik='99'")
+    with store.connect() as conn, pytest.raises(Exception, match="sealed"):
+        conn.execute(
+            "INSERT INTO sec_reporting_owners VALUES(?,?,?)",
+            (published.sha256, "0000000001-24-000001", "8"),
+        )
+    with store.connect() as conn, pytest.raises(Exception, match="membership is sealed"):
+        conn.execute(
+            "INSERT INTO archive_snapshot_members VALUES(?,?,?,?)",
+            (snapshot_sha, 2006, 2, published.sha256),
+        )
+
+    metadata = store.snapshot_metadata(snapshot_sha)
+    assert metadata.created_at == retrieved_at
+    assert len(metadata.normalized_sha256) == 64
+    assert store.verify_snapshot_material(snapshot_sha) == metadata
+
+    manifest.path.write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="raw object size mismatch"):
+        store.verify_snapshot_material(snapshot_sha)
+    manifest.path.write_bytes(b"manifest")
+
+    with store.connect() as conn:
+        conn.execute("DROP TRIGGER sec_submissions_immutable_update")
+        conn.execute("UPDATE sec_submissions SET issuer_cik='99'")
+    with pytest.raises(ValueError, match="normalized input digest mismatch"):
+        store.verify_snapshot_material(snapshot_sha)
 
 
 def test_classifier_finds_routine_pattern_with_observable_left_censoring() -> None:

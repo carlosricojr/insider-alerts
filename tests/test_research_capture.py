@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,12 +13,17 @@ import rfc8785
 from jsonschema import Draft202012Validator, FormatChecker
 
 import insider_alerts.research.capture as capture_module
+import insider_alerts.research.worker as worker_module
 from insider_alerts.research.capture import (
     CaptureConfig,
+    CaptureResult,
     ProcessResult,
+    capture_status,
     run_capture_once,
     sha256_bytes,
+    verify_history_runtime,
 )
+from insider_alerts.research.sec_history import HistoryStore
 from insider_alerts.review.queue import (
     apply_decision,
     enqueue_review_packet,
@@ -97,10 +104,91 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
         alpha_python=tmp_path / "alpha-python.exe",
         alpha_script=tmp_path / "alpha" / "scripts" / "capture.py",
         canary_ledger=tmp_path / "canary.db",
+        history_db=tmp_path / "history.db",
+        history_snapshot_sha256="b" * 64,
         insider_git_commit="a" * 40,
         policy_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
         evidence_schema_path=ROOT / "docs/research/contracts/evidence-snapshot.schema.json",
         capture_delay_seconds=1,
+    )
+
+
+def _install_history_snapshot(
+    config: CaptureConfig,
+    *,
+    classification_year: int,
+    created_at: datetime,
+    missing_quarter: tuple[int, int] | None = None,
+) -> str:
+    store = HistoryStore(config.history_db)
+    manifest_content = b"manifest"
+    manifest_sha = hashlib.sha256(manifest_content).hexdigest()
+    manifest_path = config.history_db.parent / "manifest"
+    manifest_path.write_bytes(manifest_content)
+    members: list[tuple[int, int, str]] = []
+    archive_by_year: dict[int, str] = {}
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO raw_objects VALUES(?,?,?)",
+            (manifest_sha, len(manifest_content), str(manifest_path)),
+        )
+        for year in range(2006, classification_year):
+            for quarter in range(1, 5):
+                if missing_quarter == (year, quarter):
+                    continue
+                content = f"{year}Q{quarter}".encode()
+                digest = hashlib.sha256(content).hexdigest()
+                archive_path = config.history_db.parent / digest
+                archive_path.write_bytes(content)
+                conn.execute(
+                    "INSERT INTO raw_objects VALUES(?,?,?)",
+                    (digest, len(content), str(archive_path)),
+                )
+                conn.execute(
+                    "INSERT INTO archive_releases VALUES(?,?,?,?,?)",
+                    (
+                        digest,
+                        year,
+                        quarter,
+                        f"https://www.sec.gov/{year}q{quarter}.zip",
+                        created_at.isoformat(),
+                    ),
+                )
+                members.append((year, quarter, digest))
+                if quarter == 1:
+                    archive_by_year[year] = digest
+        for month, year in enumerate(
+            range(classification_year - 3, classification_year), start=1
+        ):
+            archive_sha = archive_by_year[year]
+            accession = f"0000000002-{year % 100:02d}-{month:06d}"
+            filing_date = f"{year}-{month:02d}-02"
+            transaction_date = f"{year}-{month:02d}-01"
+            conn.execute(
+                "INSERT INTO sec_submissions VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    archive_sha,
+                    accession,
+                    filing_date,
+                    transaction_date,
+                    None,
+                    "4",
+                    "1",
+                    "TEST",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO sec_reporting_owners VALUES(?,?,?)",
+                (archive_sha, accession, "2"),
+            )
+            conn.execute(
+                "INSERT INTO sec_nonderiv_transactions VALUES(?,?,?,?,?,?,?,?)",
+                (archive_sha, accession, "1", transaction_date, "4", "P", "A", 1),
+            )
+    return store.create_snapshot(
+        manifest_sha256=manifest_sha,
+        members=members,
+        created_at=created_at,
     )
 
 
@@ -176,6 +264,60 @@ def test_terminal_option_failure_is_persisted_as_valid_immutable_snapshot(
         assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone()[0] == 1
     assert run_capture_once(config, now=decision_at + timedelta(seconds=3)).status == "idle"
     assert packet_id in result.job_id
+    assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {
+        "error": 1
+    }
+
+
+def test_evidence_store_migrates_legacy_status_rows_without_rewriting_them(
+    tmp_path: Path,
+) -> None:
+    evidence_db = tmp_path / "legacy-evidence.db"
+    legacy_record = json.dumps(
+        {"payload": {"observations": {"owner_history": {"status": "missing"}}}}
+    ).encode()
+    with sqlite3.connect(evidence_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE evidence_snapshots (
+                sequence INTEGER PRIMARY KEY,
+                snapshot_id TEXT NOT NULL UNIQUE,
+                job_id TEXT NOT NULL UNIQUE,
+                record_sha256 TEXT NOT NULL UNIQUE,
+                stored_bytes_sha256 TEXT NOT NULL,
+                record_json BLOB NOT NULL,
+                recorded_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE capture_health (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                last_worker_heartbeat_utc TEXT NOT NULL,
+                last_result TEXT NOT NULL,
+                last_job_id TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO evidence_snapshots VALUES(1,'snapshot','job','record','stored',?,?)",
+            (legacy_record, datetime.now(UTC).isoformat()),
+        )
+
+    capture_module.ensure_evidence_store(evidence_db)
+
+    with sqlite3.connect(evidence_db) as conn:
+        evidence_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(evidence_snapshots)")
+        }
+        health_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(capture_health)")
+        }
+        assert "owner_history_status" in evidence_columns
+        assert {"last_error_kind", "last_error_message"} <= health_columns
+        assert conn.execute(
+            "SELECT owner_history_status FROM evidence_snapshots"
+        ).fetchone()[0] is None
+    assert capture_status(tmp_path / "missing-source.db", evidence_db)["owner_history"] == {
+        "missing": 1
+    }
 
 
 def test_capture_preserves_multi_owner_ambiguity(
@@ -236,6 +378,247 @@ def test_capture_treats_missing_joint_owner_cik_as_ambiguous(
     assert classification["state"] == "ambiguous_multi_owner"
     assert classification["owner_cik"] is None
     assert classification["transaction_owner_mapping"] == "ambiguous"
+
+
+def test_exact_owner_history_is_classified_from_the_pinned_predecision_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    classification_year, expected_cutoff = capture_module._classification_boundary(
+        decision_at
+    )
+    snapshot_sha = _install_history_snapshot(
+        config,
+        classification_year=classification_year,
+        created_at=decision_at - timedelta(days=1),
+    )
+    config = replace(config, history_snapshot_sha256=snapshot_sha)
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "fixture", False),
+    )
+    original_history_capture = capture_module._capture_owner_history
+    history_complete = False
+
+    def tracked_history_capture(*args: Any, **kwargs: Any) -> Any:
+        nonlocal history_complete
+        result = original_history_capture(*args, **kwargs)
+        history_complete = True
+        return result
+
+    monotonic_calls = 0
+
+    def tracked_monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if monotonic_calls == 1:
+            return 10.0
+        assert history_complete
+        return 15.0
+
+    monkeypatch.setattr(capture_module, "_capture_owner_history", tracked_history_capture)
+    monkeypatch.setattr(capture_module, "monotonic", tracked_monotonic)
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "completed"
+
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+        assert row is not None
+        record = json.loads(bytes(row[0]))
+    classification = record["payload"]["classification"]
+    observation = record["payload"]["observations"]["owner_history"]
+    assert record["enrollment_state"] == "pending_entry_selection"
+    assert record["payload"]["versions"]["classifier_version"] is not None
+    assert classification["state"] == "opportunistic"
+    assert classification["owner_cik"] == "2"
+    assert classification["classification_year"] == classification_year
+    assert classification["cutoff_at_utc"] == capture_module.utc_text(expected_cutoff)
+    assert classification["history_coverage_complete"] is True
+    assert classification["history_source_snapshot_sha256"] == snapshot_sha
+    assert observation["status"] == "captured"
+    assert observation["artifact_sha256"] == snapshot_sha
+    assert observation["values"]["classification_reason"] == "opportunistic_until_routine"
+    assert observation["values"]["filing_count"] == 3
+    assert observation["observed_at_utc"] == record["recorded_at_utc"]
+    assert record["payload"]["timing"]["monotonic_capture_duration_ms"] == 5_000
+
+    with HistoryStore(config.history_db).connect() as conn:
+        conn.execute("DROP TRIGGER sec_submissions_immutable_update")
+        conn.execute("UPDATE sec_submissions SET issuer_cik='tampered'")
+    with pytest.raises(ValueError, match="normalized input digest mismatch"):
+        verify_history_runtime(config)
+
+
+def test_history_coverage_gap_is_captured_but_unpartitionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    classification_year, _ = capture_module._classification_boundary(decision_at)
+    snapshot_sha = _install_history_snapshot(
+        config,
+        classification_year=classification_year,
+        created_at=decision_at - timedelta(days=1),
+        missing_quarter=(2007, 2),
+    )
+    config = replace(config, history_snapshot_sha256=snapshot_sha)
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "fixture", False),
+    )
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "completed"
+
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+        assert row is not None
+        record = json.loads(bytes(row[0]))
+    classification = record["payload"]["classification"]
+    observation = record["payload"]["observations"]["owner_history"]
+    assert classification["state"] == "unpartitionable"
+    assert classification["history_coverage_complete"] is False
+    assert observation["status"] == "captured"
+    assert observation["values"]["missing_quarters"] == ["2007Q2"]
+    assert observation["values"]["classification_reason"] == "coverage_gap"
+
+
+def test_exact_owner_capture_reauthenticates_history_material_at_point_of_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    classification_year, _ = capture_module._classification_boundary(decision_at)
+    snapshot_sha = _install_history_snapshot(
+        config,
+        classification_year=classification_year,
+        created_at=decision_at - timedelta(days=1),
+    )
+    config = replace(config, history_snapshot_sha256=snapshot_sha)
+    with HistoryStore(config.history_db).connect() as conn:
+        conn.execute("DROP TRIGGER sec_submissions_immutable_update")
+        conn.execute("UPDATE sec_submissions SET issuer_cik='tampered'")
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "fixture", False),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute(
+            "SELECT record_json,owner_history_status FROM evidence_snapshots"
+        ).fetchone()
+    assert row is not None
+    record = json.loads(bytes(row[0]))
+    assert row[1] == "error"
+    assert record["payload"]["classification"]["state"] == "unpartitionable"
+    assert any(
+        "normalized input digest mismatch" in error["message"]
+        for error in record["payload"]["errors"]
+    )
+
+
+def test_postdecision_history_snapshot_is_an_explicit_isolated_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    classification_year, _ = capture_module._classification_boundary(decision_at)
+    snapshot_sha = _install_history_snapshot(
+        config,
+        classification_year=classification_year,
+        created_at=decision_at + timedelta(microseconds=1),
+    )
+    config = replace(config, history_snapshot_sha256=snapshot_sha)
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "fixture", False),
+    )
+
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=2)).status == "completed"
+
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+        assert row is not None
+        record = json.loads(bytes(row[0]))
+    classification = record["payload"]["classification"]
+    observation = record["payload"]["observations"]["owner_history"]
+    assert classification["state"] == "unpartitionable"
+    assert classification["history_source_snapshot_sha256"] is None
+    assert observation["status"] == "error"
+    assert any(
+        error["kind"] == "OWNER_HISTORY_UNAVAILABLE"
+        for error in record["payload"]["errors"]
+    )
+
+
+def test_transient_history_database_failure_retries_without_writing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    config.history_db.touch()
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "fixture", False),
+    )
+    monkeypatch.setattr(
+        HistoryStore,
+        "verify_snapshot_material",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "retry_scheduled"
+    assert not config.evidence_db.is_file() or capture_status(
+        config.source_db, config.evidence_db
+    )["evidence_count"] == 0
+
+
+def test_permanent_history_operational_error_is_isolated_in_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    config.history_db.touch()
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (None, None, None, "OPTION_INVALID", "fixture", False),
+    )
+    monkeypatch.setattr(
+        HistoryStore,
+        "verify_snapshot_material",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("no such table: corrupted")
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {
+        "error": 1
+    }
+
+
+def test_classification_year_uses_new_york_calendar_boundary() -> None:
+    decision_at = datetime(2027, 1, 1, 0, 30, tzinfo=UTC)
+
+    classification_year, cutoff = capture_module._classification_boundary(decision_at)
+
+    assert classification_year == 2026
+    assert cutoff == datetime(2026, 1, 1, 5, 0, tzinfo=UTC)
 
 
 def test_successful_option_capture_is_content_addressed_and_referenced(
@@ -414,3 +797,79 @@ def test_worker_entrypoint_is_structurally_order_incapable() -> None:
     assert "placeOrder" not in combined
     assert "submit_market" not in combined
     assert "cancel_order" not in combined
+    assert "verify_history_runtime(config, as_of=job.decision_at)" in capture
+
+
+def _worker_args(tmp_path: Path) -> list[str]:
+    return [
+        "--database-path",
+        str(tmp_path / "source.db"),
+        "--evidence-db",
+        str(tmp_path / "evidence.db"),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--canary-ledger",
+        str(tmp_path / "canary.db"),
+        "--history-db",
+        str(tmp_path / "history.db"),
+        "--history-snapshot-sha256",
+        "b" * 64,
+        "--alpha-python",
+        str(tmp_path / "alpha-python.exe"),
+        "--alpha-script",
+        str(tmp_path / "alpha-capture.py"),
+        "--error-log",
+        str(tmp_path / "research-capture.err.log"),
+    ]
+
+
+def test_worker_main_runs_exactly_one_bounded_capture_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[CaptureConfig] = []
+    monkeypatch.setattr(worker_module, "ensure_review_tables", lambda _path: None)
+    monkeypatch.setattr(worker_module, "resolve_git_commit", lambda _root: "a" * 40)
+
+    def capture_once(config: CaptureConfig) -> CaptureResult:
+        calls.append(config)
+        return CaptureResult(status="idle")
+
+    monkeypatch.setattr(worker_module, "run_capture_once", capture_once)
+
+    assert worker_module.main(_worker_args(tmp_path)) == 0
+    assert len(calls) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "job_id": None,
+        "option_status": None,
+        "snapshot_sha256": None,
+        "status": "idle",
+    }
+
+
+def test_worker_main_persists_and_logs_fatal_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_setup(_path: str) -> None:
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(worker_module, "ensure_review_tables", fail_setup)
+
+    assert worker_module.main(_worker_args(tmp_path)) == 2
+    status = capture_status(tmp_path / "source.db", tmp_path / "evidence.db")
+    assert status["health"]["last_result"] == "worker_error"
+    assert status["health"]["last_error_kind"] == "CAPTURE_WORKER_FATAL"
+    assert status["health"]["last_error_message"] == "RuntimeError: setup failed"
+    assert "RuntimeError: setup failed" in (
+        tmp_path / "research-capture.err.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
+    installer = (
+        ROOT / "ops/windows/install-research-capture-task.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert ".venv\\Scripts\\pythonw.exe" in installer
+    assert '"--loop"' not in installer
+    assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 15)" in installer
+    assert "-MultipleInstances IgnoreNew" in installer
