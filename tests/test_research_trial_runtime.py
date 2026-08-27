@@ -1084,6 +1084,87 @@ def test_trial_worker_records_finalizer_failure_in_durable_health(
     assert "corrupt session proof" in error_log.read_text(encoding="utf-8")
 
 
+def test_trial_worker_retryable_finalizer_failure_is_degraded_not_poisoned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        lambda _config: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+    trial_db = tmp_path / "trial.db"
+    error_log = tmp_path / "worker.err.log"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 2
+    status = TrialStore(trial_db).status()
+    assert status["faults"] == 0
+    assert status["health"]["last_result"] == "degraded"
+    assert "database is locked" in error_log.read_text(encoding="utf-8")
+
+
+def test_trial_worker_logs_when_trial_database_cannot_be_opened(tmp_path: Path) -> None:
+    trial_db = tmp_path / "trial.db"
+    trial_db.write_bytes(b"not sqlite")
+    error_log = tmp_path / "worker.err.log"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(trial_db),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "DatabaseError" in error_log.read_text(encoding="utf-8")
+
+
+def test_trial_worker_logs_original_error_when_fault_persistence_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        lambda _config: (_ for _ in ()).throw(ValueError("original finalizer error")),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "TrialStore",
+        lambda _path: (_ for _ in ()).throw(sqlite3.OperationalError("still locked")),
+    )
+    error_log = tmp_path / "worker.err.log"
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(tmp_path / "trial.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "original finalizer error" in error_log.read_text(encoding="utf-8")
+
+
 def test_trial_status_cli_is_read_only_and_integrity_signaling(tmp_path: Path) -> None:
     valid_store = TrialStore(tmp_path / "valid.db")
     valid = CliRunner().invoke(
@@ -1229,6 +1310,31 @@ def test_finalizer_waits_when_receipt_proves_observations_beyond_snapshot(
     assert result.status == "waiting"
     assert result.reason == "healthy_bar_poll_proof_unavailable"
     assert TrialStore(config.trial_db).resolutions() == []
+
+
+def test_finalizer_rolls_boundary_race_into_lapse_without_permanent_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    moments = iter(
+        (
+            datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
+            ENTRY_OPEN,
+            ENTRY_OPEN,
+        )
+    )
+
+    result = finalizer.finalize_pending_entry_dates(config, clock=lambda: next(moments))
+
+    assert result == finalizer.FinalizationResult("complete", dates_lapsed=1)
+    store = TrialStore(config.trial_db)
+    assert store.status()["faults"] == 0
+    assert store.resolutions()[0].reason == (
+        "entry_date_completion_lapsed:decision_clock_reached_official_open_before_seal"
+    )
 
 
 def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(

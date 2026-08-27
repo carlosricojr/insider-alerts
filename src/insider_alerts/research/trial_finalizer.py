@@ -324,8 +324,7 @@ def finalize_pending_entry_dates(
             completed_at_utc=now,
             entry_opens_at_utc=entry_open,
         )
-        trial_store.append_entry_completion(
-            EntryCompletionInputs(
+        completion_inputs = EntryCompletionInputs(
                 entry_date=entry_date,
                 completed_at_utc=now,
                 entry_opens_at_utc=entry_open,
@@ -337,8 +336,27 @@ def finalize_pending_entry_dates(
                 bar_record_sha256s=tuple(sorted(bar_digests)),
                 bar_poll_receipt_sha256s=tuple(sorted(poll_digests)),
                 prior_book_positions=prior_positions,
-            ),
-            resolutions,
-        )
+            )
+        try:
+            trial_store.append_entry_completion(completion_inputs, resolutions)
+        except TrialRuntimeInvalid as exc:
+            rolled_at = clock()
+            if rolled_at.tzinfo is None:
+                raise ValueError("trial finalizer clock cannot be naive") from exc
+            rolled_at = rolled_at.astimezone(UTC)
+            if str(exc) != "entry_completion_outside_pre_open_window" or rolled_at < entry_open:
+                raise
+            trial_store.append_entry_lapse(
+                EntryLapseInputs(
+                    entry_date=entry_date,
+                    lapsed_at_utc=rolled_at,
+                    reason="decision_clock_reached_official_open_before_seal",
+                    entry_opens_at_utc=entry_open,
+                    schedule_observation_watermark=schedule_watermark,
+                    schedule_record_sha256s=tuple(sorted(used_schedule_digests)),
+                )
+            )
+            lapsed += 1
+            continue
         completed += 1
     return FinalizationResult("complete", completed, lapsed)

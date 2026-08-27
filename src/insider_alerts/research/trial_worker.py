@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import sqlite3
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,26 +48,44 @@ def main(argv: list[str] | None = None) -> int:
         session_feed_db=args.session_feed_db,
         registry_path=args.registry_path,
     )
-    imported = run_trial_once(config, now=datetime.now(UTC))
+    try:
+        imported = run_trial_once(config, now=datetime.now(UTC))
+    except Exception as exc:
+        _append_error(args.error_log, exc)
+        return 2
     if imported.status in {"degraded", "invalid"}:
         error = RuntimeError(f"candidate runtime is {imported.status}: {imported.error}")
         _append_error(args.error_log, error)
         return 2
     try:
         finalized = finalize_pending_entry_dates(config)
+    except (sqlite3.OperationalError, OSError) as exc:
+        now = datetime.now(UTC)
+        detail = f"{type(exc).__name__}: {exc}"[:2000]
+        _append_error(args.error_log, exc)
+        with contextlib.suppress(Exception):
+            TrialStore(config.trial_db).write_health(
+                now=now,
+                result="degraded",
+                error=detail,
+                evidence_seen=0,
+                unresolved_evidence=0,
+            )
+        return 2
     except Exception as exc:
         now = datetime.now(UTC)
-        store = TrialStore(config.trial_db)
         detail = f"{type(exc).__name__}: {exc}"[:2000]
-        store.record_fault(now=now, kind="TRIAL_FINALIZER_INVALID", detail=detail)
-        store.write_health(
-            now=now,
-            result="invalid",
-            error=detail,
-            evidence_seen=store.status().get("candidates", 0),
-            unresolved_evidence=0,
-        )
         _append_error(args.error_log, exc)
+        with contextlib.suppress(Exception):
+            store = TrialStore(config.trial_db)
+            store.record_fault(now=now, kind="TRIAL_FINALIZER_INVALID", detail=detail)
+            store.write_health(
+                now=now,
+                result="invalid",
+                error=detail,
+                evidence_seen=0,
+                unresolved_evidence=0,
+            )
         return 2
     print(
         json.dumps(
