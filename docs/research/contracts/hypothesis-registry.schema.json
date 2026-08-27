@@ -53,7 +53,10 @@
           ],
           "properties": {
             "activated_at_utc": {"$ref": "#/$defs/datetime"},
-            "activation_git_commit": {"$ref": "#/$defs/sha1"},
+            "activation_git_commit": {
+              "allOf": [{"$ref": "#/$defs/sha1"}],
+              "description": "Frozen implementation commit containing the bound artifacts and registry definition; it must remain an ancestor of the deployed commit while each text artifact's CRLF-to-LF canonical content remains exact."
+            },
             "registry_definition_sha256": {
               "allOf": [{"$ref": "#/$defs/sha256"}],
               "description": "RFC 8785 canonical registry digest after removing top-level status and activation."
@@ -99,6 +102,7 @@
       "additionalProperties": false,
       "required": [
         "base_policy",
+        "policy_artifact",
         "entry",
         "signal_cutoff_et",
         "price_min_usd",
@@ -114,6 +118,7 @@
         "shadow_slot_budget_usd",
         "max_concurrent_shadow_positions",
         "capacity_rank",
+        "capacity_rank_salt",
         "capacity_order",
         "capacity_scope",
         "whole_share_planning",
@@ -121,6 +126,7 @@
       ],
       "properties": {
         "base_policy": {"const": "E07/F00"},
+        "policy_artifact": {"const": "docs/runbook/LIVE_CANARY.md"},
         "entry": {"const": "next_regular_session_opening_auction"},
         "signal_cutoff_et": {"const": "09:20:00"},
         "price_min_usd": {"const": 2},
@@ -138,6 +144,7 @@
         "capacity_rank": {
           "const": "sha256(policy_salt|entry_session|packet_id|accession_number|symbol)"
         },
+        "capacity_rank_salt": {"const": "E07-F00-live-canary-v1"},
         "capacity_order": {"const": "ascending"},
         "capacity_scope": {"const": "challenger_eligible_candidates"},
         "whole_share_planning": {"const": true},
@@ -211,7 +218,23 @@
     "inference": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["test", "side", "cluster", "block_length_clusters", "resamples", "seed", "p_value_formula", "interim_looks"],
+      "required": [
+        "test",
+        "side",
+        "cluster",
+        "block_length_clusters",
+        "resamples",
+        "seed",
+        "p_value_formula",
+        "interim_looks",
+        "prng",
+        "prng_domain",
+        "bounded_integer_sampling",
+        "cluster_order",
+        "trade_order",
+        "confidence_interval",
+        "exceedance_tie_rule"
+      ],
       "properties": {
         "test": {"const": "null_centered_circular_moving_block_bootstrap_trade_weighted_mean"},
         "side": {"const": "one_sided_greater"},
@@ -220,7 +243,16 @@
         "resamples": {"const": 10000},
         "seed": {"const": 260826},
         "p_value_formula": {"const": "(1 + exceedances) / (1 + resamples)"},
-        "interim_looks": {"const": 0}
+        "interim_looks": {"const": 0},
+        "prng": {"const": "sha256_counter_u64_rejection_v1"},
+        "prng_domain": {"const": "OPP-E07-V1|circular-moving-block-bootstrap|v1"},
+        "bounded_integer_sampling": {"const": "u64_big_endian_rejection_before_modulo"},
+        "cluster_order": {"const": "entry_date_ascending"},
+        "trade_order": {"const": "entry_at_utc_sequence_trade_id_ascending"},
+        "confidence_interval": {"const": "two_sided_95pct_uncentered_same_resamples_type7"},
+        "exceedance_tie_rule": {
+          "const": "null_mean_greater_than_or_equal_observed_mean"
+        }
       }
     },
     "terminal_information_time": {
@@ -234,7 +266,11 @@
         "all_frozen_outcomes_required",
         "max_enrollment_calendar_months",
         "look_count",
-        "seal_dataset_before_outcomes"
+        "seal_dataset_before_outcomes",
+        "entry_date_completion_proof",
+        "candidate_universe_binding",
+        "seal_store",
+        "terminal_seal_command_separate"
       ],
       "properties": {
         "target_enrolled_trades": {"const": 100},
@@ -244,7 +280,11 @@
         "all_frozen_outcomes_required": {"const": true},
         "max_enrollment_calendar_months": {"const": 18},
         "look_count": {"const": 1},
-        "seal_dataset_before_outcomes": {"const": true}
+        "seal_dataset_before_outcomes": {"const": true},
+        "entry_date_completion_proof": {"const": "append_only_completed_at_utc"},
+        "candidate_universe_binding": {"const": "immutable_identity_provenance_digest"},
+        "seal_store": {"const": "append_only_sqlite_singleton_receipts"},
+        "terminal_seal_command_separate": {"const": true}
       }
     },
     "economic_gates": {

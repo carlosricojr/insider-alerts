@@ -78,6 +78,10 @@ def test_draft_registry_matches_frozen_contract() -> None:
         "max_enrollment_calendar_months": 18,
         "look_count": 1,
         "seal_dataset_before_outcomes": True,
+        "entry_date_completion_proof": "append_only_completed_at_utc",
+        "candidate_universe_binding": "immutable_identity_provenance_digest",
+        "seal_store": "append_only_sqlite_singleton_receipts",
+        "terminal_seal_command_separate": True,
     }
 
     fixed_arrays = (

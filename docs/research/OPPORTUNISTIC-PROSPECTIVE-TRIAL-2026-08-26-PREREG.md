@@ -5,6 +5,8 @@ Status: draft; activates only through the procedure below<br>
 Drafted: 2026-08-26, before implementation or inspection of challenger outcomes<br>
 Draft correction: 2026-08-26, before activation and with zero challenger snapshots, to match the
 published finite-observation state machine rather than require unknowable lifetime history<br>
+Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to freeze the
+inference byte stream, ordering, percentile, tie, and economic-gate arithmetic<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -27,7 +29,10 @@ The draft becomes active only after all of the following occur:
    reviewed, and merged before activation;
 3. an append-only activation record binds the registry definition, preregistration, both JSON
    Schemas, inference executable, and dependency lock SHA-256 digests; schema version; merged Git
-   commit; policy hash; classifier version; UTC activation timestamp; and enrollment sequence;
+   implementation Git commit; policy hash; classifier version; UTC activation timestamp; and
+   enrollment sequence. The implementation commit must contain the exact bound artifacts and
+   registry definition and remain an ancestor of the deployed commit; every content-bound artifact
+   must still match after platform-stable CRLF-to-LF canonicalization;
 4. the evidence store is empty for this registry ID and passes an integrity check; and
 5. no challenger outcomes from on/after the proposed activation boundary have been inspected.
 
@@ -44,8 +49,12 @@ top-level `status` and `activation` members. This avoids a self-referential dige
 scientific definition stable across activation. The first enrolled position accession is not
 knowable at activation; it is sealed by confirmatory sequence 1 in its immutable enrollment
 snapshot.
-An opportunistic signal is first recorded as `pending_entry_selection`. After the complete entry
-date is deterministically ranked, a new immutable snapshot supersedes it with `enrolled`,
+Text artifact SHA-256 values use raw content after replacing CRLF pairs with LF so the reviewed Git
+blob and its Windows checkout have one platform-stable identity. No other byte transformation is
+permitted.
+An opportunistic signal is first recorded as `pending_entry_selection` with its deterministic
+planned entry date and capacity-rank digest already fixed. After the complete entry date is ranked,
+a new immutable snapshot supersedes it with `enrolled`,
 `overlap_suppressed`, or `capacity_suppressed`. Only `enrolled` positions receive a positive,
 gap-free confirmatory sequence, assigned transactionally in ascending rank; every other state has a
 null sequence. The original point-in-time snapshot is never rewritten.
@@ -135,16 +144,28 @@ falsification context, not additional confirmatory tests.
   subtract the observed all-trade mean from every trade before sampling; truncate the final block
   to exactly the original number of date clusters. The raw p-value is
   `(1 + count(null_bootstrap_mean >= observed_mean)) / 10001`.
+- Deterministic byte stream: bounded draws use the first unsigned big-endian 64 bits of
+  `SHA256(domain || NUL || seed_u64_be || counter_u128_be)`, with domain
+  `OPP-E07-V1|circular-moving-block-bootstrap|v1`, seed `260826`, counter starting at zero, and
+  rejection of values at or above `2^64 - (2^64 mod cluster_count)` before modulo. Dates are sorted
+  ascending; trades within dates are sorted by entry UTC, confirmatory sequence, then trade ID.
+  Each resample draws circular block starts until exactly the original number of date clusters is
+  present. The same sampled clusters produce the centered null mean and uncentered interval mean;
+  equality with the observed mean counts as an exceedance.
 - Confidence interval: two-sided 95% percentile interval from the otherwise identical uncentered
-  circular moving-block resamples, reported for effect-size context and not substituted for the
-  registered p-value.
+  circular moving-block resamples using type-7 linear percentiles at 0.025 and 0.975, reported for
+  effect-size context and not substituted for the registered p-value.
 - Cohort freeze: after each entry date is complete, freeze the cohort on the first date for which
   cumulative enrollment contains at least 100 challenger positions and at least 60 distinct entry
   dates. Include every enrolled position on that boundary date, even when this exceeds 100. The
-  trigger uses only entry/enrollment state, never exit timing or returns.
+  trigger uses only entry/enrollment state, never exit timing or returns. Entry-date completeness
+  is an ordered append-only pair of entry date and completion UTC; its New York local date must
+  equal the entry date, and it cannot skip a pending candidate planned for that date.
 - Terminal information time: after cohort freeze, wait until every frozen position has a final E07
-  outcome and all integrity checks pass, then seal the terminal dataset digest before any aggregate
-  outcome calculation.
+  outcome and all integrity checks pass. A separate no-aggregation command then writes a terminal
+  dataset receipt to the append-only seal store before the decision command can calculate any
+  aggregate outcome. The receipt binds the dataset, complete mutable candidate projection, and
+  immutable candidate-universe digests.
 - Enrollment deadline: convert `activated_at_utc` to `America/New_York`, add exactly 18 calendar
   months while preserving the local wall-clock time, and convert the result back to UTC. If the
   activation day does not exist in the target month, use that target month's final calendar day.
@@ -153,15 +174,19 @@ falsification context, not additional confirmatory tests.
   at or after that UTC instant are excluded. If the cohort-freeze thresholds have not been reached
   before the deadline, stop admitting new signals, allow every pre-deadline
   `pending_entry_selection` record to reach its deterministic entry-selection result, and only then
-  return `KILL` with reason `insufficient_enrollment` without calculating a confirmatory p-value or
-  outcome aggregates.
+  write an append-only deadline-miss receipt binding the immutable pre-deadline candidate universe,
+  then return `KILL` with reason `insufficient_enrollment` without calculating a confirmatory
+  p-value or outcome aggregates. Later candidate resolution cannot rescind that receipt, add or
+  remove a candidate, or rescue the trial.
 - There are no confirmatory interim p-values, optional stopping, extensions, or second looks.
   Health and exposure counts may be monitored; return aggregates and inferential statistics remain
   unavailable until the sealed terminal look.
 
-If data integrity is invalid at the information time, the result is `INVALID`, not a pass or fail,
-and no outcome is inspected until the integrity issue is adjudicated. A correction made without
-outcome access may produce a new sealed digest under the same look; otherwise the trial is retired.
+The seal store is SQLite with full synchronization, append-only update/delete triggers, one receipt
+per receipt kind, and one terminal decision report. Alternate terminal receipts and a second
+inferential report are prohibited. If data integrity is invalid before terminal sealing, the result
+is `INVALID`, not a pass or fail, and a correction may be made only without outcome access. After a
+terminal receipt exists, its digest cannot be replaced; a material invalidity retires the trial.
 
 ## Economic and robustness co-gates
 
@@ -181,9 +206,23 @@ outcome access may produce a new sealed digest under the same look; otherwise th
 8. timestamp ordering, snapshot hashes, SEC archive coverage, classification provenance, outcome
    completeness, and shadow-book reconciliation all pass.
 
+For exact gate arithmetic, gross trade return and matched SPY return are decimal fractions. Net
+absolute return subtracts 0.002 (primary) or 0.005 (stress); alpha additionally subtracts matched
+SPY return. Profit factor is the sum of positive 20-bps net absolute returns divided by the absolute
+sum of negative returns; positive gains with no losses are positive infinity and pass. The unique
+entry dates are split before date `floor(n_dates / 2)` (the latter date starts the second half).
+The single best stress-alpha trade is removed with earliest frozen trade order breaking a tie. The
+best entry calendar month is the month with greatest summed stress alpha, earliest month breaking a
+tie. Symbol concentration is the largest positive symbol-level sum of primary alpha divided by all
+positive symbol-level sums. Month concentration is the largest entry-month primary-alpha sum
+divided by total primary alpha. Undefined or empty gate arithmetic fails closed. The 20-slot replay
+gate is the sum of stress-cost net absolute returns over the already capacity-, overlap-, and
+same-symbol-reconciled frozen challenger book.
+
 The full E07/F00 control and routine subgroup must be reported with counts, effect sizes, and
 confidence intervals as descriptive falsification context. They cannot rescue a failed primary
-test or create a different promoted rule.
+test or create a different promoted rule. A corrupt diagnostic group is reported as typed
+`unavailable`; it cannot change the primary decision.
 
 ## Decision rule
 
