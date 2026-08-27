@@ -147,9 +147,10 @@ merged, deployed, and hashable before any confirmatory enrollment.
 ### M5 — Activate challenger, collect, and decide (current)
 
 The order-incapable challenger runtime, point-in-time session/bar feeds, outcome materializer, and
-prospective control-diagnostic capture are deployed. Diagnostic outcome materialization and the
-terminal dataset/seal remain activation prerequisites. The registry is still draft, so no
-confirmatory enrollment has begun.
+prospective control-diagnostic capture are deployed. Deployment of the diagnostic outcome
+materializer and terminal dataset/seal tooling remains an activation prerequisite; the terminal
+dataset itself can exist only after the prospective sample freezes. The registry is still draft,
+so no confirmatory enrollment has begun.
 
 - Activate `OPP-E07-V1` only after M2, M3, and M4 are deployed from known merged commits and every
   required artifact digest is sealed.
