@@ -65,6 +65,8 @@
     "name": "mean_post_cost_spy_relative_trade_return",
     "aggregation": "equal_notional_arithmetic_mean",
     "benchmark": "SPY_matched_entry_exit",
+    "benchmark_price_window": "spy_entry_session_rth_open_to_exit_session_rth_close",
+    "trade_timestamp_convention": "official_exchange_rth_open_and_close_session_boundaries",
     "cost_bps": 20,
     "alternative": "greater_than_zero"
   },

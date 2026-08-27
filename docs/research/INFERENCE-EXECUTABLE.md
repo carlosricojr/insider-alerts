@@ -15,6 +15,10 @@ Before freeze or outcome maturity, the report contains no return aggregate. At t
 deadline, an append-only receipt binds the immutable candidate universe; pre-deadline pending
 entries then drain before an outcome-free `KILL/insufficient_enrollment` result.
 
+Trade timestamps are the official exchange RTH open and close boundaries. Under the frozen
+daily-bar policy, SPY is measured from entry-session open through exit-session close; a stop or
+target changes the stock exit price but does not invent an unavailable intraday barrier-hit time.
+
 The terminal dataset contains the frozen challenger outcomes plus full-control and routine
 diagnostic outcomes. Its RFC 8785 SHA-256 is checked before any outcome is parsed into an aggregate;
 challenger IDs, evidence digests, ranks, dates, and sequences must exactly equal the frozen cohort.

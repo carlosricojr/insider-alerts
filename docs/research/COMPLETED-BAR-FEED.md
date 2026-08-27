@@ -6,10 +6,16 @@ The prospective challenger never imports an IBKR client. A separate bounded work
 no order method in its source module.
 
 The worker reads immutable symbol/date requests and appends content-addressed observations to
-`data/research/bar_feed.db`. It discards the current New York date even after an early close; a bar
-therefore becomes eligible on the following calendar day, when it cannot be an incomplete session.
+`data/research/bar_feed.db`. It rejects the current New York date by default. Once the append-only
+exchange schedule observed by that instant proves the official RTH close has passed, the integrated
+worker may admit that date after a one-minute finalization buffer; before then, a provisional daily
+bar remains ineligible. This
+supports same-date trial finalization after actual closes, including early-close sessions, without
+accepting incomplete bars.
 Exact repeated values are idempotent. A later vendor revision is appended with a new digest; the
 trial always consumes the earliest observed value for each symbol/date.
+The completion proof is the registered SPY US-equity RTH calendar and is valid only for the trial's
+US-listed equity and SPY requests; a different trading calendar requires a new feed contract.
 Requests remain collectible until their exact final session is observed; they are never silently
 abandoned. Unresolved requests older than 30 days are explicitly reported as overdue.
 Each symbol is fetched at most once per New York calendar day after a successful fetch (unless a

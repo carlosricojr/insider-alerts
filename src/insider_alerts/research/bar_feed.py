@@ -185,7 +185,8 @@ class BarFeedStore:
                     symbol TEXT PRIMARY KEY,
                     last_success_local_date TEXT NOT NULL,
                     earliest_start_date TEXT NOT NULL,
-                    last_success_utc TEXT NOT NULL
+                    last_success_utc TEXT NOT NULL,
+                    completed_through_date TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS bar_feed_failures (
@@ -209,6 +210,11 @@ class BarFeedStore:
                 BEGIN SELECT RAISE(ABORT, 'bar feed failures are immutable'); END;
                 """
             )
+            poll_columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(bar_poll_state)")
+            }
+            if "completed_through_date" not in poll_columns:
+                conn.execute("ALTER TABLE bar_poll_state ADD COLUMN completed_through_date TEXT")
 
     def request(self, request: BarRequest) -> str:
         symbol = _normalized_symbol(request.symbol)
@@ -264,7 +270,12 @@ class BarFeedStore:
             )
         return digest
 
-    def pending_requests(self, *, as_of: date) -> list[BarRequest]:
+    def pending_requests(
+        self,
+        *,
+        as_of: date,
+        completed_through_date: date | None = None,
+    ) -> list[BarRequest]:
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
                 """
@@ -283,10 +294,15 @@ class BarFeedStore:
             }
         requests = [self._verify_request_row(row) for row in rows]
         earliest_by_symbol: dict[str, date] = {}
+        latest_by_symbol: dict[str, date] = {}
         for request in requests:
             earliest_by_symbol[request.symbol] = min(
                 request.start_date,
                 earliest_by_symbol.get(request.symbol, request.start_date),
+            )
+            latest_by_symbol[request.symbol] = max(
+                request.through_date,
+                latest_by_symbol.get(request.symbol, request.through_date),
             )
         due_symbols = {
             symbol
@@ -294,6 +310,15 @@ class BarFeedStore:
             if symbol not in poll_rows
             or date.fromisoformat(str(poll_rows[symbol]["last_success_local_date"])) < as_of
             or earliest < date.fromisoformat(str(poll_rows[symbol]["earliest_start_date"]))
+            or (
+                completed_through_date is not None
+                and earliest <= completed_through_date <= latest_by_symbol[symbol]
+                and (
+                    poll_rows[symbol]["completed_through_date"] is None
+                    or date.fromisoformat(str(poll_rows[symbol]["completed_through_date"]))
+                    < completed_through_date
+                )
+            )
         }
         return [request for request in requests if request.symbol in due_symbols]
 
@@ -334,6 +359,7 @@ class BarFeedStore:
         *,
         local_date: date,
         earliest_start_date: date,
+        completed_through_date: date | None,
         now: datetime,
     ) -> None:
         normalized = _normalized_symbol(symbol)
@@ -341,20 +367,31 @@ class BarFeedStore:
             conn.execute(
                 """
                 INSERT INTO bar_poll_state(
-                    symbol,last_success_local_date,earliest_start_date,last_success_utc
-                ) VALUES(?,?,?,?)
+                    symbol,last_success_local_date,earliest_start_date,last_success_utc,
+                    completed_through_date
+                ) VALUES(?,?,?,?,?)
                 ON CONFLICT(symbol) DO UPDATE SET
                   last_success_local_date=excluded.last_success_local_date,
                   earliest_start_date=MIN(
                     bar_poll_state.earliest_start_date,excluded.earliest_start_date
                   ),
-                  last_success_utc=excluded.last_success_utc
+                  last_success_utc=excluded.last_success_utc,
+                  completed_through_date=CASE
+                    WHEN bar_poll_state.completed_through_date IS NULL
+                      THEN excluded.completed_through_date
+                    WHEN excluded.completed_through_date IS NULL
+                      THEN bar_poll_state.completed_through_date
+                    ELSE MAX(
+                      bar_poll_state.completed_through_date,excluded.completed_through_date
+                    )
+                  END
                 """,
                 (
                     normalized,
                     local_date.isoformat(),
                     earliest_start_date.isoformat(),
                     _utc_text(now),
+                    completed_through_date.isoformat() if completed_through_date else None,
                 ),
             )
 
@@ -451,8 +488,9 @@ class BarFeedStore:
         bars: Sequence[DailyBar],
         *,
         observed_at_utc: datetime,
+        completed_through_date: date | None = None,
     ) -> tuple[int, int, int]:
-        """Append finite bars strictly before the current New York date.
+        """Append finite bars proven complete by date or strictly before today.
 
         The first exact value is de-duplicated forever. A changed value for the same symbol/date
         is an append-only revision and never replaces the first-observed value.
@@ -460,10 +498,14 @@ class BarFeedStore:
 
         observed_text = _utc_text(observed_at_utc)
         completed_before = observed_at_utc.astimezone(NEW_YORK).date()
+        if completed_through_date is not None and completed_through_date > completed_before:
+            raise ValueError("completed-through date cannot be in the future")
         added = revisions = rejected = 0
         with contextlib.closing(self._connect()) as conn, conn:
             for bar in sorted(bars, key=lambda item: (item.symbol.upper(), item.trade_date)):
-                if bar.trade_date >= completed_before:
+                if bar.trade_date >= completed_before and (
+                    completed_through_date is None or bar.trade_date > completed_through_date
+                ):
                     continue
                 symbol = _normalized_symbol(bar.symbol)
                 validation_error = _bar_validation_error(bar)
@@ -793,6 +835,7 @@ async def collect_once(
     minimum_interval_seconds: float = 11.0,
     max_symbols_per_cycle: int = 50,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    completed_through_date: date | None = None,
 ) -> BarFeedResult:
     if now.tzinfo is None:
         raise ValueError("bar-feed collection time cannot be naive")
@@ -800,7 +843,10 @@ async def collect_once(
         raise ValueError("bar-feed request interval cannot be negative")
     if max_symbols_per_cycle < 1:
         raise ValueError("bar-feed symbol limit must be positive")
-    requests = store.pending_requests(as_of=now.astimezone(NEW_YORK).date())
+    requests = store.pending_requests(
+        as_of=now.astimezone(NEW_YORK).date(),
+        completed_through_date=completed_through_date,
+    )
     symbols = store.fair_symbol_order([request.symbol for request in requests])[
         :max_symbols_per_cycle
     ]
@@ -855,11 +901,13 @@ async def collect_once(
                 symbol_added, symbol_revisions, symbol_rejected = store.append_completed(
                     bars,
                     observed_at_utc=now,
+                    completed_through_date=completed_through_date,
                 )
                 store.mark_polled(
                     symbol,
                     local_date=now.astimezone(NEW_YORK).date(),
                     earliest_start_date=start,
+                    completed_through_date=completed_through_date,
                     now=now,
                 )
                 added += symbol_added
