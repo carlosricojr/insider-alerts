@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -59,6 +61,10 @@ def _record_id(kind: str, digest: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{HYPOTHESIS_ID}|diagnostic|{kind}|{digest}"))
 
 
+def _diagnostic_trade_id(packet_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{HYPOTHESIS_ID}|diagnostic-trade|{packet_id}"))
+
+
 @dataclass(frozen=True, slots=True)
 class DiagnosticConfig:
     diagnostics_db: Path
@@ -96,6 +102,8 @@ class DiagnosticStore:
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=FULL")
         return conn
 
     def _initialize(self) -> None:
@@ -148,6 +156,30 @@ class DiagnosticStore:
                     record_json BLOB NOT NULL,
                     recorded_at_utc TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS diagnostic_outcomes (
+                    sequence INTEGER NOT NULL UNIQUE,
+                    outcome_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL UNIQUE,
+                    packet_id TEXT NOT NULL UNIQUE,
+                    trade_id TEXT NOT NULL UNIQUE,
+                    record_sha256 TEXT NOT NULL UNIQUE,
+                    record_json BLOB NOT NULL,
+                    recorded_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS diagnostic_outcome_receipts (
+                    sequence INTEGER NOT NULL UNIQUE,
+                    receipt_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL UNIQUE,
+                    packet_id TEXT NOT NULL UNIQUE,
+                    disposition TEXT NOT NULL CHECK(
+                      disposition IN ('available','not_traded','unavailable')
+                    ),
+                    reason TEXT NOT NULL,
+                    outcome_record_sha256 TEXT UNIQUE,
+                    record_sha256 TEXT NOT NULL UNIQUE,
+                    record_json BLOB NOT NULL,
+                    recorded_at_utc TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS diagnostic_health (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                     last_worker_heartbeat_utc TEXT NOT NULL,
@@ -155,6 +187,14 @@ class DiagnosticStore:
                     last_error TEXT,
                     candidates_seen INTEGER NOT NULL,
                     unresolved_candidates INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS diagnostic_outcome_health (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    last_worker_heartbeat_utc TEXT NOT NULL,
+                    last_result TEXT NOT NULL,
+                    last_error TEXT,
+                    candidates_seen INTEGER NOT NULL,
+                    outcomes_waiting INTEGER NOT NULL
                 );
                 CREATE TRIGGER IF NOT EXISTS diagnostic_candidates_sequence
                 BEFORE INSERT ON diagnostic_candidates
@@ -180,6 +220,18 @@ class DiagnosticStore:
                 BEGIN
                   SELECT RAISE(ABORT, 'diagnostic reconciliation sequence must be gap-free');
                 END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_outcomes_sequence
+                BEFORE INSERT ON diagnostic_outcomes
+                WHEN NEW.sequence<>(SELECT COALESCE(MAX(sequence),0)+1 FROM diagnostic_outcomes)
+                BEGIN SELECT RAISE(ABORT, 'diagnostic outcome sequence must be gap-free'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_outcome_receipts_sequence
+                BEFORE INSERT ON diagnostic_outcome_receipts
+                WHEN NEW.sequence<>(
+                  SELECT COALESCE(MAX(sequence),0)+1 FROM diagnostic_outcome_receipts
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'diagnostic outcome receipt sequence must be gap-free');
+                END;
                 CREATE TRIGGER IF NOT EXISTS diagnostic_candidates_no_update
                 BEFORE UPDATE ON diagnostic_candidates
                 BEGIN SELECT RAISE(ABORT, 'diagnostic candidates are immutable'); END;
@@ -204,6 +256,18 @@ class DiagnosticStore:
                 CREATE TRIGGER IF NOT EXISTS diagnostic_reconciliation_no_delete
                 BEFORE DELETE ON diagnostic_reconciliations
                 BEGIN SELECT RAISE(ABORT, 'diagnostic reconciliations are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_outcomes_no_update
+                BEFORE UPDATE ON diagnostic_outcomes
+                BEGIN SELECT RAISE(ABORT, 'diagnostic outcomes are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_outcomes_no_delete
+                BEFORE DELETE ON diagnostic_outcomes
+                BEGIN SELECT RAISE(ABORT, 'diagnostic outcomes are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_outcome_receipts_no_update
+                BEFORE UPDATE ON diagnostic_outcome_receipts
+                BEGIN SELECT RAISE(ABORT, 'diagnostic outcome receipts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_outcome_receipts_no_delete
+                BEFORE DELETE ON diagnostic_outcome_receipts
+                BEGIN SELECT RAISE(ABORT, 'diagnostic outcome receipts are immutable'); END;
                 """
             )
 
@@ -262,9 +326,12 @@ class DiagnosticStore:
     def candidate_packet_ids(self) -> set[str]:
         with contextlib.closing(self._connect()) as conn:
             return {
-                str(row[0])
-                for row in conn.execute("SELECT packet_id FROM diagnostic_candidates")
+                str(row[0]) for row in conn.execute("SELECT packet_id FROM diagnostic_candidates")
             }
+
+    def candidates(self) -> list[sqlite3.Row]:
+        with contextlib.closing(self._connect()) as conn:
+            return conn.execute("SELECT * FROM diagnostic_candidates ORDER BY sequence").fetchall()
 
     def add_candidate(self, record: dict[str, Any]) -> bool:
         return self._append(
@@ -320,6 +387,212 @@ class DiagnosticStore:
             },
             record,
         )
+
+    def outcome_receipt(self, packet_id: str) -> sqlite3.Row | None:
+        with contextlib.closing(self._connect()) as conn:
+            row: sqlite3.Row | None = conn.execute(
+                "SELECT * FROM diagnostic_outcome_receipts WHERE packet_id=?", (packet_id,)
+            ).fetchone()
+        return row
+
+    def outcome_disposition_counts(self) -> dict[str, int]:
+        with contextlib.closing(self._connect()) as conn:
+            return {
+                str(row["disposition"]): int(row["count"])
+                for row in conn.execute(
+                    "SELECT disposition,COUNT(*) count FROM diagnostic_outcome_receipts "
+                    "GROUP BY disposition"
+                )
+            }
+
+    @staticmethod
+    def _scientific_record(record: dict[str, Any], *, receipt: bool = False) -> bytes:
+        stable = dict(record)
+        stable.pop("recorded_at_utc", None)
+        if receipt:
+            stable.pop("outcome_record_sha256", None)
+        return _canonical(stable)
+
+    def append_outcome_receipt(
+        self,
+        *,
+        outcome_record: dict[str, Any] | None,
+        receipt_record: dict[str, Any],
+    ) -> tuple[bool, bool]:
+        """Atomically append a terminal disposition and its optional economic outcome."""
+
+        disposition = str(receipt_record.get("disposition"))
+        if disposition == "available" and outcome_record is None:
+            raise ValueError("available diagnostic disposition must own an outcome")
+        if disposition == "not_traded" and outcome_record is not None:
+            raise ValueError("not-traded diagnostic disposition cannot own an outcome")
+        packet_id = str(receipt_record.get("packet_id"))
+        candidate_id = str(receipt_record.get("candidate_id"))
+        outcome_encoded: bytes | None = None
+        outcome_digest: str | None = None
+        outcome_id: str | None = None
+        if outcome_record is not None:
+            if (
+                str(outcome_record.get("packet_id")) != packet_id
+                or str(outcome_record.get("candidate_id")) != candidate_id
+            ):
+                raise ValueError("diagnostic outcome and receipt identity mismatch")
+            outcome_encoded = _canonical(outcome_record)
+            outcome_digest = _sha256(outcome_encoded)
+            outcome_id = _record_id("diagnostic_outcomes", outcome_digest)
+        receipt_record = {**receipt_record, "outcome_record_sha256": outcome_digest}
+        receipt_encoded = _canonical(receipt_record)
+        receipt_digest = _sha256(receipt_encoded)
+        receipt_id = _record_id("diagnostic_outcome_receipts", receipt_digest)
+        if outcome_record is not None:
+            assert outcome_digest is not None
+            assert outcome_id is not None
+            self._validate_row(
+                "diagnostic_outcomes",
+                {
+                    "outcome_id": outcome_id,
+                    "candidate_id": candidate_id,
+                    "packet_id": packet_id,
+                    "trade_id": outcome_record.get("trade_id"),
+                    "record_sha256": outcome_digest,
+                    "recorded_at_utc": outcome_record.get("recorded_at_utc"),
+                },
+                outcome_record,
+                outcome_digest,
+            )
+        self._validate_row(
+            "diagnostic_outcome_receipts",
+            {
+                "receipt_id": receipt_id,
+                "candidate_id": candidate_id,
+                "packet_id": packet_id,
+                "disposition": disposition,
+                "reason": receipt_record.get("reason"),
+                "outcome_record_sha256": outcome_digest,
+                "record_sha256": receipt_digest,
+                "recorded_at_utc": receipt_record.get("recorded_at_utc"),
+            },
+            receipt_record,
+            receipt_digest,
+        )
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate = conn.execute(
+                "SELECT candidate_id,record_sha256 FROM diagnostic_candidates WHERE packet_id=?",
+                (packet_id,),
+            ).fetchone()
+            if candidate is None or str(candidate["candidate_id"]) != candidate_id:
+                raise ValueError("diagnostic outcome receipt has no owning candidate")
+            if receipt_record.get("candidate_record_sha256") != candidate["record_sha256"]:
+                raise ValueError("diagnostic outcome receipt candidate digest mismatch")
+            state = conn.execute(
+                "SELECT record_sha256 FROM diagnostic_state_bindings WHERE packet_id=?",
+                (packet_id,),
+            ).fetchone()
+            if (
+                state is None
+                or receipt_record.get("state_binding_record_sha256") != state["record_sha256"]
+            ):
+                raise ValueError("diagnostic outcome receipt state digest mismatch")
+            evidence_sha = receipt_record.get("evidence_binding_record_sha256")
+            if evidence_sha is not None:
+                evidence = conn.execute(
+                    "SELECT record_sha256 FROM diagnostic_evidence_bindings WHERE packet_id=?",
+                    (packet_id,),
+                ).fetchone()
+                if evidence is None or evidence_sha != evidence["record_sha256"]:
+                    raise ValueError("diagnostic outcome receipt evidence digest mismatch")
+            if outcome_record is not None and (
+                outcome_record.get("candidate_record_sha256") != candidate["record_sha256"]
+                or outcome_record.get("state_binding_record_sha256") != state["record_sha256"]
+            ):
+                raise ValueError("diagnostic outcome provenance digest mismatch")
+            existing_receipt = conn.execute(
+                "SELECT * FROM diagnostic_outcome_receipts WHERE packet_id=?", (packet_id,)
+            ).fetchone()
+            existing_outcome = conn.execute(
+                "SELECT * FROM diagnostic_outcomes WHERE packet_id=?", (packet_id,)
+            ).fetchone()
+            if existing_receipt is not None:
+                persisted_receipt = json.loads(bytes(existing_receipt["record_json"]))
+                if not isinstance(persisted_receipt, dict) or self._scientific_record(
+                    persisted_receipt, receipt=True
+                ) != self._scientific_record(receipt_record, receipt=True):
+                    raise ValueError("diagnostic outcome receipt conflicts with persisted content")
+                if outcome_record is None:
+                    if existing_outcome is not None:
+                        raise ValueError("diagnostic receipt unexpectedly owns outcome")
+                else:
+                    if existing_outcome is None:
+                        raise ValueError("diagnostic receipt is missing its outcome")
+                    persisted_outcome = json.loads(bytes(existing_outcome["record_json"]))
+                    if not isinstance(persisted_outcome, dict) or self._scientific_record(
+                        persisted_outcome
+                    ) != self._scientific_record(outcome_record):
+                        raise ValueError("diagnostic outcome conflicts with persisted content")
+                    if (
+                        existing_receipt["outcome_record_sha256"]
+                        != existing_outcome["record_sha256"]
+                    ):
+                        raise ValueError("diagnostic outcome receipt digest link is corrupt")
+                return False, False
+            if existing_outcome is not None:
+                raise ValueError("orphan diagnostic outcome exists without a receipt")
+            outcome_added = False
+            if outcome_record is not None:
+                assert outcome_encoded is not None
+                assert outcome_digest is not None
+                assert outcome_id is not None
+                outcome_sequence = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence),0)+1 FROM diagnostic_outcomes"
+                    ).fetchone()[0]
+                )
+                conn.execute(
+                    """
+                    INSERT INTO diagnostic_outcomes(
+                      sequence,outcome_id,candidate_id,packet_id,trade_id,record_sha256,
+                      record_json,recorded_at_utc
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        outcome_sequence,
+                        outcome_id,
+                        candidate_id,
+                        packet_id,
+                        outcome_record["trade_id"],
+                        outcome_digest,
+                        outcome_encoded,
+                        outcome_record["recorded_at_utc"],
+                    ),
+                )
+                outcome_added = True
+            receipt_sequence = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM diagnostic_outcome_receipts"
+                ).fetchone()[0]
+            )
+            conn.execute(
+                """
+                INSERT INTO diagnostic_outcome_receipts(
+                  sequence,receipt_id,candidate_id,packet_id,disposition,reason,
+                  outcome_record_sha256,record_sha256,record_json,recorded_at_utc
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    receipt_sequence,
+                    receipt_id,
+                    candidate_id,
+                    packet_id,
+                    disposition,
+                    receipt_record["reason"],
+                    outcome_digest,
+                    receipt_digest,
+                    receipt_encoded,
+                    receipt_record["recorded_at_utc"],
+                ),
+            )
+        return outcome_added, True
 
     def add_reconciliation(
         self,
@@ -386,6 +659,8 @@ class DiagnosticStore:
                   last_error=excluded.last_error,
                   candidates_seen=excluded.candidates_seen,
                   unresolved_candidates=excluded.unresolved_candidates
+                WHERE excluded.last_worker_heartbeat_utc>=
+                      diagnostic_health.last_worker_heartbeat_utc
                 """,
                 (
                     _utc_text(now),
@@ -396,12 +671,45 @@ class DiagnosticStore:
                 ),
             )
 
+    def write_outcome_health(
+        self,
+        *,
+        now: datetime,
+        status: str,
+        error: str | None,
+        candidates_seen: int,
+        outcomes_waiting: int,
+    ) -> None:
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO diagnostic_outcome_health VALUES(1,?,?,?,?,?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                  last_worker_heartbeat_utc=excluded.last_worker_heartbeat_utc,
+                  last_result=excluded.last_result,
+                  last_error=excluded.last_error,
+                  candidates_seen=excluded.candidates_seen,
+                  outcomes_waiting=excluded.outcomes_waiting
+                WHERE excluded.last_worker_heartbeat_utc>=
+                      diagnostic_outcome_health.last_worker_heartbeat_utc
+                """,
+                (
+                    _utc_text(now),
+                    status,
+                    error,
+                    candidates_seen,
+                    outcomes_waiting,
+                ),
+            )
+
     def validate_integrity(self) -> None:
         tables = (
             "diagnostic_candidates",
             "diagnostic_evidence_bindings",
             "diagnostic_state_bindings",
             "diagnostic_reconciliations",
+            "diagnostic_outcomes",
+            "diagnostic_outcome_receipts",
         )
         with contextlib.closing(self._connect()) as conn:
             for table in tables:
@@ -417,9 +725,81 @@ class DiagnosticStore:
                     if not isinstance(value, dict) or _canonical(value) != raw:
                         raise ValueError(f"{table} record is not canonical JSON")
                     self._validate_row(table, row, value, digest)
+            candidates = {
+                str(row["packet_id"]): row
+                for row in conn.execute("SELECT * FROM diagnostic_candidates")
+            }
+            for table in (
+                "diagnostic_evidence_bindings",
+                "diagnostic_state_bindings",
+                "diagnostic_outcomes",
+                "diagnostic_outcome_receipts",
+            ):
+                for row in conn.execute(f"SELECT * FROM {table}"):
+                    candidate = candidates.get(str(row["packet_id"]))
+                    if candidate is None:
+                        raise ValueError(f"{table} has no owning diagnostic candidate")
+                    if (
+                        table in {"diagnostic_outcomes", "diagnostic_outcome_receipts"}
+                        and row["candidate_id"] != candidate["candidate_id"]
+                    ):
+                        raise ValueError(f"{table} candidate identity mismatch")
+            evidence = {
+                str(row["packet_id"]): str(row["record_sha256"])
+                for row in conn.execute("SELECT * FROM diagnostic_evidence_bindings")
+            }
+            states = {
+                str(row["packet_id"]): str(row["record_sha256"])
+                for row in conn.execute("SELECT * FROM diagnostic_state_bindings")
+            }
+            outcomes = {
+                str(row["packet_id"]): row
+                for row in conn.execute("SELECT * FROM diagnostic_outcomes")
+            }
+            receipts = {
+                str(row["packet_id"]): row
+                for row in conn.execute("SELECT * FROM diagnostic_outcome_receipts")
+            }
+            if set(outcomes) != {
+                packet_id
+                for packet_id, row in receipts.items()
+                if row["outcome_record_sha256"] is not None
+            }:
+                raise ValueError("diagnostic outcomes and receipt links do not match")
+            for packet_id, outcome in outcomes.items():
+                if receipts[packet_id]["outcome_record_sha256"] != outcome["record_sha256"]:
+                    raise ValueError("diagnostic outcome receipt digest link mismatch")
+                record = json.loads(bytes(outcome["record_json"]))
+                candidate = candidates[packet_id]
+                candidate_record = json.loads(bytes(candidate["record_json"]))
+                selection = candidate_record.get("canary_selection")
+                if (
+                    record.get("candidate_record_sha256") != candidate["record_sha256"]
+                    or record.get("state_binding_record_sha256") != states.get(packet_id)
+                    or not isinstance(selection, dict)
+                    or record.get("symbol") != selection.get("symbol")
+                ):
+                    raise ValueError("diagnostic outcome provenance link mismatch")
+            for packet_id, row in receipts.items():
+                record = json.loads(bytes(row["record_json"]))
+                candidate = candidates[packet_id]
+                if (
+                    record.get("candidate_record_sha256") != candidate["record_sha256"]
+                    or record.get("state_binding_record_sha256") != states.get(packet_id)
+                    or (
+                        record.get("evidence_binding_record_sha256") is not None
+                        and record.get("evidence_binding_record_sha256") != evidence.get(packet_id)
+                    )
+                ):
+                    raise ValueError("diagnostic outcome receipt provenance link mismatch")
 
     @staticmethod
-    def _validate_row(table: str, row: sqlite3.Row, record: dict[str, Any], digest: str) -> None:
+    def _validate_row(
+        table: str,
+        row: Mapping[str, Any] | sqlite3.Row,
+        record: dict[str, Any],
+        digest: str,
+    ) -> None:
         if record.get("contract_version") != DIAGNOSTIC_CONTRACT_VERSION:
             raise ValueError(f"{table} contract version mismatch")
         if record.get("hypothesis_id") != HYPOTHESIS_ID:
@@ -445,7 +825,13 @@ class DiagnosticStore:
             ):
                 raise ValueError("diagnostic reconciliation columns mismatch")
             return
-        id_column = "candidate_id" if table == "diagnostic_candidates" else "binding_id"
+        id_column = {
+            "diagnostic_candidates": "candidate_id",
+            "diagnostic_evidence_bindings": "binding_id",
+            "diagnostic_state_bindings": "binding_id",
+            "diagnostic_outcomes": "outcome_id",
+            "diagnostic_outcome_receipts": "receipt_id",
+        }[table]
         if str(row[id_column]) != _record_id(table, digest):
             raise ValueError(f"{table} identity mismatch")
         if str(record.get("packet_id")) != str(row["packet_id"]):
@@ -491,6 +877,66 @@ class DiagnosticStore:
                 or record.get("shadow_trade_sha256") != row["shadow_trade_sha256"]
             ):
                 raise ValueError("diagnostic state columns mismatch")
+        elif table == "diagnostic_outcomes":
+            numeric = (
+                "entry_price",
+                "exit_price",
+                "gross_return",
+                "spy_entry_price",
+                "spy_exit_price",
+                "spy_return",
+            )
+            try:
+                values = {name: float(record[name]) for name in numeric}
+                entry_at = _parse_utc(str(record["entry_at_utc"]))
+                exit_at = _parse_utc(str(record["exit_at_utc"]))
+                entry_date = date.fromisoformat(str(record["entry_date"]))
+                exit_date = date.fromisoformat(str(record["exit_date"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("diagnostic outcome value is invalid") from exc
+            if (
+                str(record.get("candidate_id")) != str(row["candidate_id"])
+                or str(record.get("trade_id")) != str(row["trade_id"])
+                or str(row["trade_id"]) != _diagnostic_trade_id(str(row["packet_id"]))
+                or not all(math.isfinite(value) for value in values.values())
+                or values["entry_price"] <= 0
+                or values["exit_price"] <= 0
+                or values["spy_entry_price"] <= 0
+                or values["spy_exit_price"] <= 0
+                or exit_at <= entry_at
+                or entry_at.astimezone(NEW_YORK).date() != entry_date
+                or exit_at.astimezone(NEW_YORK).date() != exit_date
+                or str(record.get("symbol")).upper() != record.get("symbol")
+                or record.get("exit_reason")
+                not in {"stop", "target", "time", "stop_and_target_same_day_stop_assumed"}
+                or values["gross_return"] < -1.0
+                or values["spy_return"] < -1.0
+                or not math.isclose(
+                    values["gross_return"],
+                    values["exit_price"] / values["entry_price"] - 1.0,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                or not math.isclose(
+                    values["spy_return"],
+                    values["spy_exit_price"] / values["spy_entry_price"] - 1.0,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("diagnostic outcome columns or arithmetic mismatch")
+        elif table == "diagnostic_outcome_receipts":
+            disposition = str(record.get("disposition"))
+            outcome_digest = record.get("outcome_record_sha256")
+            if (
+                str(record.get("candidate_id")) != str(row["candidate_id"])
+                or disposition != str(row["disposition"])
+                or str(record.get("reason")) != str(row["reason"])
+                or outcome_digest != row["outcome_record_sha256"]
+                or (disposition == "available" and outcome_digest is None)
+                or (disposition == "not_traded" and outcome_digest is not None)
+            ):
+                raise ValueError("diagnostic outcome receipt columns mismatch")
 
     def status(self, *, now: datetime | None = None) -> dict[str, object]:
         checked_at = (now or datetime.now(UTC)).astimezone(UTC)
@@ -514,9 +960,27 @@ class DiagnosticStore:
                             0
                         ]
                     ),
+                    "outcomes": int(
+                        conn.execute("SELECT COUNT(*) FROM diagnostic_outcomes").fetchone()[0]
+                    ),
+                    "outcome_receipts": int(
+                        conn.execute("SELECT COUNT(*) FROM diagnostic_outcome_receipts").fetchone()[
+                            0
+                        ]
+                    ),
+                    "outcome_dispositions": {
+                        str(row["disposition"]): int(row["count"])
+                        for row in conn.execute(
+                            "SELECT disposition,COUNT(*) count "
+                            "FROM diagnostic_outcome_receipts GROUP BY disposition"
+                        )
+                    },
                 }
                 health = conn.execute(
                     "SELECT * FROM diagnostic_health WHERE singleton=1"
+                ).fetchone()
+                outcome_health = conn.execute(
+                    "SELECT * FROM diagnostic_outcome_health WHERE singleton=1"
                 ).fetchone()
         except (OSError, ValueError, sqlite3.DatabaseError) as exc:
             return {
@@ -528,32 +992,39 @@ class DiagnosticStore:
                 "evidence_bindings": None,
                 "state_bindings": None,
                 "reconciliations": None,
+                "outcomes": None,
+                "outcome_receipts": None,
+                "outcome_dispositions": None,
                 "health": None,
+                "outcome_health": None,
             }
         health_dict = dict(health) if health is not None else None
-        if health_dict is None:
-            operational = "never_ran"
-        else:
+        outcome_health_dict = dict(outcome_health) if outcome_health is not None else None
+
+        def health_state(value: dict[str, object] | None) -> str:
+            if value is None:
+                return "never_ran"
             try:
-                heartbeat = _parse_utc(str(health_dict["last_worker_heartbeat_utc"]))
+                heartbeat = _parse_utc(str(value["last_worker_heartbeat_utc"]))
             except (KeyError, ValueError):
-                operational = "invalid_health"
-            else:
-                age = checked_at - heartbeat
-                if age < -timedelta(minutes=5):
-                    operational = "heartbeat_in_future"
-                elif age > HEARTBEAT_STALE_AFTER:
-                    operational = "stale"
-                elif health_dict.get("last_result") not in {
-                    "idle_registry_draft",
-                    "collecting",
-                    "degraded",
-                }:
-                    operational = "invalid_health"
-                elif health_dict.get("last_result") == "degraded":
-                    operational = "degraded"
-                else:
-                    operational = "healthy"
+                return "invalid_health"
+            age = checked_at - heartbeat
+            if age < -timedelta(minutes=5):
+                return "heartbeat_in_future"
+            if age > HEARTBEAT_STALE_AFTER:
+                return "stale"
+            if value.get("last_result") not in {
+                "idle_registry_draft",
+                "collecting",
+                "degraded",
+            }:
+                return "invalid_health"
+            if value.get("last_result") == "degraded":
+                return "degraded"
+            return "healthy"
+
+        states = (health_state(health_dict), health_state(outcome_health_dict))
+        operational = next((state for state in states if state != "healthy"), "healthy")
         return {
             "path": str(self.path),
             "exists": self.path.is_file(),
@@ -561,6 +1032,7 @@ class DiagnosticStore:
             "operational_status": operational,
             **counts,
             "health": health_dict,
+            "outcome_health": outcome_health_dict,
         }
 
 
@@ -592,7 +1064,7 @@ def _selection_projection(row: sqlite3.Row) -> dict[str, Any]:
 def _state_projection(row: sqlite3.Row, shadow_trade: sqlite3.Row | None) -> dict[str, Any]:
     trade = None
     if shadow_trade is not None:
-        trade = {key: shadow_trade[key] for key in shadow_trade}
+        trade = dict(zip(shadow_trade.keys(), tuple(shadow_trade), strict=True))
     return {
         "packet_id": str(row["packet_id"]),
         "shadow_state": str(row["shadow_state"]),
@@ -1105,6 +1577,10 @@ def diagnostic_status(path: Path | str) -> dict[str, object]:
             "evidence_bindings": 0,
             "state_bindings": 0,
             "reconciliations": 0,
+            "outcomes": 0,
+            "outcome_receipts": 0,
+            "outcome_dispositions": {},
             "health": None,
+            "outcome_health": None,
         }
     return DiagnosticStore(selected, initialize=False).status()

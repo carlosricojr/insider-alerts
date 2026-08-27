@@ -10,6 +10,10 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from insider_alerts.research.diagnostic_outcomes import (
+    DiagnosticOutcomeResult,
+    finalize_diagnostic_outcomes,
+)
 from insider_alerts.research.diagnostics import (
     DiagnosticConfig,
     DiagnosticRunResult,
@@ -30,9 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one prospective OPP-E07 trial cycle")
     parser.add_argument("--trial-db", type=Path, default=Path("data/research/trial.db"))
     parser.add_argument("--diagnostics-db", type=Path)
-    parser.add_argument(
-        "--canary-ledger-db", type=Path, default=Path("data/live_canary.db")
-    )
+    parser.add_argument("--canary-ledger-db", type=Path, default=Path("data/live_canary.db"))
     parser.add_argument("--source-db", type=Path, default=Path("data/insider_alerts.db"))
     parser.add_argument("--evidence-db", type=Path, default=Path("data/research/evidence.db"))
     parser.add_argument("--bar-feed-db", type=Path, default=Path("data/research/bar_feed.db"))
@@ -79,12 +81,23 @@ def main(argv: list[str] | None = None) -> int:
         diagnostics = run_diagnostics_once(diagnostic_config, now=datetime.now(UTC))
     except Exception as exc:
         _append_error(args.error_log, RuntimeError(f"diagnostic phase isolated: {exc}"))
-        diagnostics = DiagnosticRunResult(
+        diagnostics = DiagnosticRunResult("degraded", error=f"{type(exc).__name__}: {exc}"[:2000])
+        with contextlib.suppress(Exception):
+            DiagnosticStore(diagnostics_db).write_health(now=datetime.now(UTC), result=diagnostics)
+    try:
+        diagnostic_outcomes = finalize_diagnostic_outcomes(diagnostic_config, now=datetime.now(UTC))
+    except Exception as exc:
+        _append_error(args.error_log, RuntimeError(f"diagnostic outcome phase isolated: {exc}"))
+        diagnostic_outcomes = DiagnosticOutcomeResult(
             "degraded", error=f"{type(exc).__name__}: {exc}"[:2000]
         )
         with contextlib.suppress(Exception):
-            DiagnosticStore(diagnostics_db).write_health(
-                now=datetime.now(UTC), result=diagnostics
+            DiagnosticStore(diagnostics_db).write_outcome_health(
+                now=datetime.now(UTC),
+                status=diagnostic_outcomes.status,
+                error=diagnostic_outcomes.error,
+                candidates_seen=diagnostic_outcomes.candidates_seen,
+                outcomes_waiting=diagnostic_outcomes.outcomes_waiting,
             )
     try:
         imported = run_trial_once(config, now=datetime.now(UTC))
@@ -130,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "diagnostics": asdict(diagnostics),
+                "diagnostic_outcomes": asdict(diagnostic_outcomes),
                 "candidate_runtime": asdict(imported),
                 "entry_finalizer": asdict(finalized),
                 "outcome_finalizer": asdict(outcomes),

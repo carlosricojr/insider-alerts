@@ -5,6 +5,12 @@ finalizer has durably enrolled a candidate and the candidate's frozen tenth offi
 closed. It does not connect to IBKR, place orders, calculate aggregate returns, freeze a terminal
 cohort, or run inference.
 
+The challenger and diagnostic-control paths call the same order-incapable
+`research.outcome_proof` kernel. Each caller supplies its own immutable schedule binding and storage
+authority; the kernel reconstructs the bound ten-session schedule, selects healthy stock/SPY poll
+receipts, evaluates the pure stop-first E07 rule, and returns the economic result with exact feed
+watermarks and record digests.
+
 For both the stock and SPY, a successful zero-rejection poll receipt must cover the frozen final
 session. The stock receipt's transactionally captured observation watermark must contain the
 contiguous first-observed path through the registered exit, and SPY must contain the entry and exit
@@ -27,5 +33,13 @@ If healthy terminal polls prove that a required pre-exit stock bar or SPY endpoi
 trial fails closed as `INVALID`; it never drops that trade. If required bars exist but the receipts
 predate those observations, the materializer waits for a later poll receipt. A waiting symbol does
 not block independent later-enrolled outcomes; its unresolved record remains required for the
-terminal cohort. All three worker phases are sequential in one hidden `pythonw.exe` task,
+terminal cohort. All diagnostic and confirmatory worker phases are sequential in one hidden
+`pythonw.exe` task,
 preventing importer, entry-finalizer, and outcome-finalizer overlap.
+
+The separate diagnostic store uses the canary ledger only to decide whether a control position was
+actually selected. Closed controls are recomputed from the research feeds after the same
+tenth-session proof; canary prices and returns are agreement evidence only. Suppressed or rejected
+candidates receive explicit `not_traded` receipts. Proven terminal missingness receives a typed
+`unavailable` receipt, and processing continues with later controls. Diagnostic outcomes and their
+disposition receipts are committed atomically and never read by the challenger finalizer.
