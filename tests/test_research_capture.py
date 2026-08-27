@@ -35,6 +35,7 @@ from insider_alerts.review.queue import (
 )
 from insider_alerts.sec.models import FilingRef
 from insider_alerts.sec.store import upsert_filing_refs
+from tests.research_registry_support import draft_registry, write_draft_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATE_CAPTURE_WINDOW = capture_module._validated_capture_window
@@ -133,7 +134,7 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
         history_db=tmp_path / "history.db",
         history_snapshot_sha256="b" * 64,
         insider_git_commit="a" * 40,
-        policy_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
+        policy_path=write_draft_registry(ROOT, tmp_path),
         evidence_schema_path=ROOT / "docs/research/contracts/evidence-snapshot.schema.json",
         activation_db=tmp_path / "activation.db",
         capture_delay_seconds=1,
@@ -305,7 +306,7 @@ def test_active_window_quarantines_expired_out_of_window_lease(
         ).fetchone() == ("failed", None, "OUTSIDE_CONFIRMATORY_CAPTURE_WINDOW")
 
 
-def test_checked_in_registry_validates_as_draft_capture_window(tmp_path: Path) -> None:
+def test_draft_fixture_validates_as_draft_capture_window(tmp_path: Path) -> None:
     config = _config(tmp_path, tmp_path / "source.db")
     assert VALIDATE_CAPTURE_WINDOW(config) == CaptureWindow(
         status="draft",
@@ -314,7 +315,7 @@ def test_checked_in_registry_validates_as_draft_capture_window(tmp_path: Path) -
 
 
 def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
-    registry = json.loads((ROOT / "docs/research/registry/OPP-E07-V1.json").read_text())
+    registry = draft_registry(ROOT)
     registry["status"] = "active"
     activated_at = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
     commit = subprocess.run(
@@ -368,8 +369,7 @@ def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
 
 
 def test_snapshot_rejects_registry_replacement_after_claim(tmp_path: Path) -> None:
-    policy_path = tmp_path / "registry.json"
-    policy_path.write_bytes((ROOT / "docs/research/registry/OPP-E07-V1.json").read_bytes())
+    policy_path = write_draft_registry(ROOT, tmp_path)
     config = replace(
         _config(tmp_path, tmp_path / "source.db"),
         policy_path=policy_path,

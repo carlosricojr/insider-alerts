@@ -41,6 +41,7 @@ from insider_alerts.research.trial_runtime import (
     run_trial_once,
     trial_runtime_status,
 )
+from tests.research_registry_support import write_draft_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTIVATED_AT = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
@@ -74,7 +75,7 @@ def _config(tmp_path: Path) -> TrialRuntimeConfig:
         evidence_db=tmp_path / "evidence.db",
         bar_feed_db=tmp_path / "bars.db",
         session_feed_db=tmp_path / "sessions.db",
-        registry_path=ROOT / "docs/research/registry/OPP-E07-V1.json",
+        registry_path=write_draft_registry(ROOT, tmp_path),
         activation_db=tmp_path / "activation.db",
     )
 
@@ -1181,7 +1182,7 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
             "--session-feed-db",
             str(tmp_path / "sessions.db"),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]
@@ -1246,7 +1247,7 @@ def test_trial_worker_runs_time_sensitive_confirmatory_phases_before_diagnostics
             "--diagnostics-db",
             str(tmp_path / "diagnostics.db"),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
         ]
     )
 
@@ -1285,7 +1286,7 @@ def test_diagnostic_logger_failure_cannot_block_confirmatory_execution(
             "--diagnostics-db",
             str(tmp_path / "diagnostics.db"),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
         ]
     )
 
@@ -1321,7 +1322,7 @@ def test_trial_worker_isolates_diagnostic_failure_from_confirmatory_phase(
             "--session-feed-db",
             str(tmp_path / "sessions.db"),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]
@@ -1365,7 +1366,7 @@ def test_trial_worker_isolates_diagnostic_outcome_failure_from_confirmatory_phas
             "--session-feed-db",
             str(tmp_path / "sessions.db"),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]
@@ -1400,7 +1401,7 @@ def test_trial_worker_records_finalizer_failure_in_durable_health(
             "--trial-db",
             str(trial_db),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]
@@ -1433,7 +1434,7 @@ def test_trial_worker_retryable_finalizer_failure_is_degraded_not_poisoned(
             "--trial-db",
             str(trial_db),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]
@@ -1464,7 +1465,7 @@ def test_trial_worker_clock_regression_is_degraded_not_poisoned(
             "--trial-db",
             str(trial_db),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(tmp_path / "worker.err.log"),
         ]
@@ -1486,7 +1487,7 @@ def test_trial_worker_logs_when_trial_database_cannot_be_opened(tmp_path: Path) 
             "--trial-db",
             str(trial_db),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]
@@ -1517,7 +1518,7 @@ def test_trial_worker_logs_original_error_when_fault_persistence_also_fails(
             "--trial-db",
             str(tmp_path / "trial.db"),
             "--registry-path",
-            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            str(write_draft_registry(ROOT, tmp_path)),
             "--error-log",
             str(error_log),
         ]

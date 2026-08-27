@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
+from insider_alerts.research.inference import _validate_registry
+
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = ROOT / "docs" / "research" / "contracts"
 REGISTRY = ROOT / "docs" / "research" / "registry" / "OPP-E07-V1.json"
@@ -33,17 +35,18 @@ def test_research_contracts_are_draft_2020_12_json_schemas() -> None:
         Draft202012Validator.check_schema(schema)
 
 
-def test_draft_registry_matches_frozen_contract() -> None:
+def test_registry_matches_frozen_contract() -> None:
     schema = _load(CONTRACTS / "hypothesis-registry.schema.json")
     registry = _load(REGISTRY)
 
     Draft202012Validator(schema, format_checker=FormatChecker()).validate(registry)
+    _validate_registry(registry, allow_draft=True)
 
     assert set(registry) == set(schema["required"])
     assert registry["schema_version"] == 1
     assert re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)*-V[0-9]+", registry["hypothesis_id"])
-    assert registry["status"] == "draft"
-    assert registry["activation"] is None
+    assert registry["status"] in {"draft", "active"}
+    assert (registry["activation"] is None) == (registry["status"] == "draft")
 
     preregistration = ROOT / registry["preregistration"]
     assert preregistration.is_file()
