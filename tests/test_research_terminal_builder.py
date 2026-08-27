@@ -170,10 +170,16 @@ def _empty_external_stores(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def _install_pending_diagnostic(
-    diagnostics: Path, canary: Path, source: Path, *, entry_date: date
+    diagnostics: Path,
+    canary: Path,
+    source: Path,
+    *,
+    entry_date: date,
+    source_observed_at: datetime | None = None,
 ) -> None:
     packet_id = "control-packet"
     signal_at = datetime(2026, 2, 1, 15, 0, tzinfo=UTC)
+    source_observed_at = source_observed_at or signal_at - timedelta(seconds=5)
     created_at = signal_at - timedelta(seconds=1)
     with sqlite3.connect(canary) as conn:
         conn.row_factory = sqlite3.Row
@@ -205,7 +211,7 @@ def _install_pending_diagnostic(
             (
                 "control-job",
                 packet_id,
-                (signal_at - timedelta(seconds=5)).isoformat(),
+                source_observed_at.isoformat(),
                 signal_at.isoformat(),
             ),
         )
@@ -222,7 +228,7 @@ def _install_pending_diagnostic(
             "canary_selection_sha256": selection_sha,
             "source": {
                 "job_id": "control-job",
-                "source_first_observed_at_utc": builder._utc_text(signal_at - timedelta(seconds=5)),
+                "source_first_observed_at_utc": builder._utc_text(source_observed_at),
                 "decision_at_utc": builder._utc_text(signal_at),
             },
             "schedule_binding": {
@@ -489,6 +495,46 @@ def test_unavailable_diagnostic_accounting_excludes_pre_activation_source(
     assert statuses["control"]["error_code"] == "control_source_capture_job_missing"
     assert statuses["control"]["membership_count"] == 1
     assert statuses["control"]["unavailable_count"] == 1
+
+
+def test_persisted_pre_activation_diagnostic_is_outside_terminal_membership(
+    tmp_path: Path,
+) -> None:
+    diagnostics, canary, source = _empty_external_stores(tmp_path)
+    entry_date = date(2026, 2, 3)
+    _install_pending_diagnostic(
+        diagnostics,
+        canary,
+        source,
+        entry_date=entry_date,
+        source_observed_at=ACTIVATED_AT - timedelta(microseconds=1),
+    )
+    connections = []
+    try:
+        for path in (diagnostics, canary, source):
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+            connections.append(connection)
+        control, routine, statuses, recorded_at = builder._diagnostic_material(
+            *connections,
+            activated_at=ACTIVATED_AT,
+            freeze_boundary=entry_date,
+        )
+    finally:
+        for connection in connections:
+            connection.close()
+
+    assert control == routine == []
+    assert recorded_at is None
+    assert statuses["control"] == {
+        "status": "available",
+        "error_code": None,
+        "membership_count": 0,
+        "available_trade_count": 0,
+        "not_traded_count": 0,
+        "unavailable_count": 0,
+    }
+    assert statuses["routine"] == statuses["control"]
 
 
 def test_public_seal_status_and_single_decision_are_crash_idempotent(

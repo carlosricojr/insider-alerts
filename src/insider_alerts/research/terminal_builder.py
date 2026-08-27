@@ -311,7 +311,11 @@ def _diagnostic_material(
         "AND entry_session<=? ORDER BY sequence",
         (freeze_boundary.isoformat(),),
     ).fetchall()
-    stored = {str(row["packet_id"]): row for row in stored_rows}
+    stored = {
+        str(row["packet_id"]): row
+        for row in stored_rows
+        if _parse_utc(str(row["source_first_observed_at_utc"])) >= activated_at
+    }
     canary_rows = canary_conn.execute(
         "SELECT * FROM candidates WHERE signal_at>=? AND entry_session IS NOT NULL "
         "AND entry_session<=? ORDER BY signal_at,packet_id",
@@ -354,13 +358,17 @@ def _diagnostic_material(
         if _sha256(rfc8785.dumps(projected)) != str(stored[packet_id]["canary_selection_sha256"]):
             record_membership_error("control_canary_selection_changed")
             break
-    relevant_reconciliations = diagnostic_conn.execute(
-        "SELECT 1 FROM diagnostic_reconciliations WHERE packet_id IS NULL OR packet_id IN ("
+    reconciliation_rows = diagnostic_conn.execute(
+        "SELECT packet_id FROM diagnostic_reconciliations "
+        "WHERE packet_id IS NULL OR packet_id IN ("
         "SELECT packet_id FROM diagnostic_candidates WHERE entry_session IS NOT NULL "
-        "AND entry_session<=?) LIMIT 1",
+        "AND entry_session<=?)",
         (freeze_boundary.isoformat(),),
-    ).fetchone()
-    if relevant_reconciliations is not None:
+    ).fetchall()
+    if any(
+        row["packet_id"] is None or str(row["packet_id"]) in stored
+        for row in reconciliation_rows
+    ):
         record_membership_error("control_reconciliation_present")
 
     membership_count = len(stored)
@@ -380,6 +388,7 @@ def _diagnostic_material(
             "AND entry_session<=?)",
             (freeze_boundary.isoformat(),),
         )
+        if str(row["packet_id"]) in stored
     }
     missing_receipts = set(stored) - set(receipts)
     if missing_receipts:
@@ -404,6 +413,7 @@ def _diagnostic_material(
             "AND entry_session<=?)",
             (freeze_boundary.isoformat(),),
         )
+        if str(row["packet_id"]) in stored
     }
     control_available = sum(str(row["disposition"]) == "available" for row in receipts.values())
     control_not_traded = sum(str(row["disposition"]) == "not_traded" for row in receipts.values())
@@ -429,6 +439,7 @@ def _diagnostic_material(
             "AND entry_session<=?)",
             (freeze_boundary.isoformat(),),
         )
+        if str(row["packet_id"]) in stored
     }
     if set(evidence) != set(stored):
         routine_status = _unavailable_status(
