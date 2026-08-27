@@ -17,6 +17,7 @@ from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import (
     BarFeedStore,
     BarRequest,
+    HistoricalBarSessionReset,
     SourceBarBatch,
     bar_feed_status,
     collect_once,
@@ -187,23 +188,70 @@ def test_bad_symbol_does_not_block_later_symbols(tmp_path: Path) -> None:
     assert store.status()["health"]["last_result"] == "partial"
 
 
-def test_source_timeout_is_durable_and_does_not_suppress_retry(tmp_path: Path) -> None:
-    class TimeoutSource(FakeSource):
+def test_session_reset_failure_reconnects_before_later_symbol(tmp_path: Path) -> None:
+    class ResetSource(FakeSource):
         async def daily_bars(self, symbol: str, *, start_date: date) -> SourceBarBatch:
-            self.symbols.append(symbol)
-            raise TimeoutError("simulated application timeout")
+            if symbol == "AAA":
+                self.symbols.append(symbol)
+                raise HistoricalBarSessionReset("qualification timed out")
+            return await super().daily_bars(symbol, start_date=start_date)
 
     now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
     store = BarFeedStore(tmp_path / "feed.db")
-    store.request(_request(now))
-    source = TimeoutSource([])
+    store.request(replace(_request(now), request_id="a", symbol="AAA"))
+    store.request(replace(_request(now), request_id="b", symbol="BBB"))
+    source = ResetSource([_bar(now.date() - timedelta(days=1))])
 
-    result = asyncio.run(collect_once(store, source, now=now))
+    result = asyncio.run(collect_once(store, source, now=now, minimum_interval_seconds=0))
 
     assert result.failed_symbols == 1
-    assert source.connected == source.disconnected == 1
+    assert result.observations_added == 1
+    assert source.symbols == ["AAA", "BBB"]
+    assert source.connected == source.disconnected == 2
+    assert store.first_observed_bars("BBB")
+
+
+def test_source_timeout_is_durable_and_does_not_suppress_retry(tmp_path: Path) -> None:
+    class TimeoutSource(FakeSource):
+        async def daily_bars(self, symbol: str, *, start_date: date) -> SourceBarBatch:
+            if symbol == "AAA":
+                self.symbols.append(symbol)
+                raise TimeoutError("simulated application timeout")
+            return await super().daily_bars(symbol, start_date=start_date)
+
+    now = datetime(2026, 8, 27, 7, 0, tzinfo=UTC)
+    store = BarFeedStore(tmp_path / "feed.db")
+    store.request(replace(_request(now), request_id="a", symbol="AAA"))
+    store.request(replace(_request(now), request_id="b", symbol="BBB"))
+    source = TimeoutSource([_bar(now.date() - timedelta(days=1))])
+
+    result = asyncio.run(collect_once(store, source, now=now, minimum_interval_seconds=0))
+
+    assert result.failed_symbols == 1
+    assert result.observations_added == 1
+    assert source.symbols == ["AAA", "BBB"]
+    assert source.connected == source.disconnected == 2
     assert len(store.pending_requests(as_of=now.astimezone(NEW_YORK).date())) == 1
+    assert store.first_observed_bars("BBB")
     assert store.status(now=now)["health"]["last_result"] == "partial"
+
+
+def test_ibkr_qualification_timeout_requires_session_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    import insider_alerts.research.ibkr_bar_source as source_module
+
+    class HungQualificationIb:
+        RaiseRequestErrors = False
+
+        async def qualifyContractsAsync(self, *_args: object) -> list[object]:
+            await asyncio.sleep(60)
+            return []
+
+    monkeypatch.setattr(source_module, "_QUALIFY_TIMEOUT_SECONDS", 0.001)
+    source = IbkrHistoricalBarSource(host="127.0.0.1", port=4001, client_id=176)
+    source._IbkrHistoricalBarSource__ib = HungQualificationIb()  # type: ignore[attr-defined]
+
+    with pytest.raises(HistoricalBarSessionReset, match="qualification timed out for TEST"):
+        asyncio.run(source.daily_bars("TEST", start_date=date(2026, 8, 1)))
 
 
 def test_ibkr_empty_response_fails_closed() -> None:

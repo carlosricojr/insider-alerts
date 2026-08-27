@@ -93,6 +93,10 @@ class HistoricalBarSource(Protocol):
     def disconnect(self) -> None: ...
 
 
+class HistoricalBarSessionReset(RuntimeError):
+    """The source session must be cleared before another symbol is attempted."""
+
+
 class BarFeedStore:
     """Content-addressed requests and observations with immutable ledger rows."""
 
@@ -861,6 +865,18 @@ async def collect_once(
                 added += symbol_added
                 revisions += symbol_revisions
                 rejected += len(batch.rejections) + symbol_rejected
+            except (HistoricalBarSessionReset, TimeoutError) as exc:
+                failed += 1
+                store.record_failure(
+                    now=now,
+                    symbol=symbol,
+                    category="symbol_collection_failed",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+                if index + 1 < len(symbols):
+                    source.disconnect()
+                    await source.connect()
+                continue
             except Exception as exc:
                 failed += 1
                 store.record_failure(

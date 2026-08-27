@@ -10,7 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from insider_alerts.backtest.models import DailyBar
-from insider_alerts.research.bar_feed import SourceBarBatch
+from insider_alerts.research.bar_feed import HistoricalBarSessionReset, SourceBarBatch
 
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _QUALIFY_TIMEOUT_SECONDS = 8.0
@@ -74,6 +74,10 @@ class IbkrHistoricalBarSource:
                 self.__ib.qualifyContractsAsync(contract),
                 timeout=_QUALIFY_TIMEOUT_SECONDS,
             )
+        except TimeoutError as exc:
+            raise HistoricalBarSessionReset(
+                f"IBKR contract qualification timed out for {normalized}"
+            ) from exc
         except RequestError as exc:
             raise LookupError(f"IBKR could not qualify US stock symbol {normalized}") from exc
         finally:
