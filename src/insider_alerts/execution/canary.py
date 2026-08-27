@@ -4,7 +4,6 @@ import hashlib
 import json
 import math
 import sqlite3
-import statistics
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -16,6 +15,13 @@ from zoneinfo import ZoneInfo
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
 from insider_alerts.execution.errors import ContractQualificationError
+from insider_alerts.strategy.e07 import (
+    deterministic_rank,
+    eligibility,
+    entry_session,
+    evaluate_shadow,
+    planned_quantity,
+)
 
 NEW_YORK = ZoneInfo("America/New_York")
 _FINGERPRINT_CACHE: dict[
@@ -163,14 +169,6 @@ class CanaryBroker(Protocol):
     async def orders(self) -> list[BrokerOrder]: ...
 
 
-def deterministic_rank(config: CanaryConfig, signal: DeliveredSignal, session: date) -> str:
-    material = (
-        f"{config.lottery_salt}|{session.isoformat()}|{signal.packet_id}|"
-        f"{signal.accession_number}|{signal.symbol}"
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
 def broker_token(packet_id: str) -> str:
     """Return a short, collision-resistant token safe for IBKR orderRef/OCA fields."""
 
@@ -192,68 +190,6 @@ def poll_delay_seconds(config: CanaryConfig, now: datetime) -> int:
     if local.weekday() < 5 and window_start <= local.time() <= window_end:
         return min(config.poll_seconds, 2)
     return config.poll_seconds
-
-
-def entry_session(
-    config: CanaryConfig,
-    signal_at: datetime,
-    sessions: Sequence[date],
-    *,
-    now: datetime,
-) -> date | None:
-    """Choose the first executable RTH open without chasing a missed auction."""
-
-    local_signal = signal_at.astimezone(NEW_YORK)
-    local_now = now.astimezone(NEW_YORK)
-    candidates = [session for session in sorted(set(sessions)) if session >= local_signal.date()]
-    for session in candidates:
-        if (
-            session == local_signal.date()
-            and local_signal.time() >= config.entry_submission_deadline
-        ):
-            continue
-        if session == local_now.date() and local_now.time() >= config.entry_submission_deadline:
-            continue
-        if session < local_now.date():
-            continue
-        return session
-    return None
-
-
-def completed_bars(bars: Sequence[DailyBar], signal_at: datetime) -> list[DailyBar]:
-    local = signal_at.astimezone(NEW_YORK)
-    same_day_complete = local.time() >= time(16, 0)
-    return [
-        bar
-        for bar in bars
-        if bar.trade_date < local.date() or (same_day_complete and bar.trade_date == local.date())
-    ]
-
-
-def eligibility(
-    config: CanaryConfig,
-    signal: DeliveredSignal,
-    bars: Sequence[DailyBar],
-) -> tuple[bool, str, float | None, float | None]:
-    completed = completed_bars(bars, signal.signal_at)
-    if len(completed) < 20:
-        return False, "fewer_than_20_completed_daily_bars", None, None
-    prior_close = completed[-1].close
-    dollar_volumes = [bar.close * bar.volume for bar in completed[-20:]]
-    if not math.isfinite(prior_close) or not config.min_price <= prior_close <= config.max_price:
-        return False, "prior_close_outside_price_bounds", prior_close, None
-    if any(not math.isfinite(value) or value <= 0 for value in dollar_volumes):
-        return False, "invalid_dollar_volume_history", prior_close, None
-    median_dollar_volume = statistics.median(dollar_volumes)
-    if median_dollar_volume < config.min_median_dollar_volume_20d:
-        return False, "median_20d_dollar_volume_below_floor", prior_close, median_dollar_volume
-    return True, "eligible_E07_F00", prior_close, median_dollar_volume
-
-
-def planned_quantity(config: CanaryConfig, reference_price: float) -> int:
-    if not math.isfinite(reference_price) or reference_price <= 0:
-        return 0
-    return max(0, math.floor(config.slot_budget / reference_price))
 
 
 def round_stock_price(value: float) -> float:
@@ -763,43 +699,30 @@ class CanaryRunner:
                     self.store.update(str(row["packet_id"]), shadow_state="overlap_suppressed")
                     continue
                 bars = await self.broker.daily_bars(symbol)
-                post_entry = [bar for bar in bars if bar.trade_date >= session]
-                if not post_entry or post_entry[0].trade_date != session:
+                evaluation = evaluate_shadow(self.config, bars, session)
+                if evaluation.entry_bar is None:
                     continue
                 if row["shadow_state"] == "queued":
                     opened += 1
-                entry_bar = post_entry[0]
-                stop = entry_bar.open * (1.0 - self.config.stop_loss_pct)
-                target = entry_bar.open * (1.0 + self.config.take_profit_pct)
-                outcome: tuple[DailyBar, float, str] | None = None
-                for index, bar in enumerate(post_entry[: self.config.max_sessions]):
-                    stop_hit = bar.low <= stop
-                    target_hit = bar.high >= target
-                    if stop_hit:
-                        outcome = (
-                            bar,
-                            min(stop, bar.open),
-                            "stop_and_target_same_day_stop_assumed" if target_hit else "stop",
-                        )
-                        break
-                    if target_hit:
-                        outcome = (bar, max(target, bar.open), "target")
-                        break
-                    if index == self.config.max_sessions - 1:
-                        outcome = (bar, bar.close, "time")
-                if outcome is None:
+                if evaluation.exit_bar is None:
                     self.store.update(str(row["packet_id"]), shadow_state="open")
                     continue
-                exit_bar, exit_price, reason = outcome
+                if (
+                    evaluation.stop_price is None
+                    or evaluation.target_price is None
+                    or evaluation.exit_price is None
+                    or evaluation.exit_reason is None
+                ):
+                    raise RuntimeError("complete E07 evaluation missing outcome fields")
                 self.store.record_shadow_trade(
                     row,
                     quantity=int(row["planned_quantity"]),
-                    entry_bar=entry_bar,
-                    stop_price=stop,
-                    target_price=target,
-                    exit_bar=exit_bar,
-                    exit_price=exit_price,
-                    exit_reason=reason,
+                    entry_bar=evaluation.entry_bar,
+                    stop_price=evaluation.stop_price,
+                    target_price=evaluation.target_price,
+                    exit_bar=evaluation.exit_bar,
+                    exit_price=evaluation.exit_price,
+                    exit_reason=evaluation.exit_reason,
                 )
                 closed += 1
         return opened, closed
