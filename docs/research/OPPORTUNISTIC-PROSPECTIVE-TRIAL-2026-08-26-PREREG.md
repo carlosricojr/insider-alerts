@@ -10,6 +10,9 @@ inference byte stream, ordering, percentile, tie, and economic-gate arithmetic<b
 Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to freeze
 pre-open entry-date completion, executable evidence readiness, input watermarks, and lapse
 missingness semantics<br>
+Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to bind
+schedule revisions, healthy-poll receipts, pre-signal eligibility history, transaction commit time,
+and outcome-independent prior-book occupancy to each entry-date seal<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -87,12 +90,16 @@ The control and challenger use the exact live-canary E07/F00 policy in
 
 For an official session date `D`, its candidate set is completed in one transaction at or after the
 registered 09:20 ET cutoff and strictly before the official open, using the point-in-time schedule
-known at that transaction. Eligibility uses the exact shared E07 history: first-observed records
-for completed sessions strictly before each signal's source-first-observed timestamp, never a
-post-signal bar merely because its date precedes `D`. The transaction first snapshots both the
-bar- and schedule-feed observation watermarks, then binds all point-in-time schedule records needed
+known at that transaction. Eligibility uses the exact shared E07 history: watermark-bounded
+first-observed records whose session close is strictly before each signal's
+source-first-observed timestamp. A qualifying session may be collected after the signal because its
+market information was already complete before the signal; no session closing at or after the
+signal is eligible merely because its date precedes `D`. The transaction first snapshots both the
+bar-observation, bar-poll-receipt, and schedule-feed observation watermarks, then binds all
+point-in-time schedule records needed
 for the entry and frozen horizon, exact watermark-bounded bar-record digests, qualifying
-poll-receipt digests, candidate-set digest, and prior-book material digest. Capacity and overlap at
+poll-receipt digests, each receipt's transactionally captured bar-observation watermark,
+candidate-set digest, and canonical prior-book material plus digest. Capacity and overlap at
 `D`'s open are recomputed from those bound inputs and the pure E07 kernel; outcome-materialization
 timing is never an enrollment input. Same-date candidates are processed in ascending rank, and
 lower-ranked enrollments immediately consume symbol and slot capacity.
@@ -102,14 +109,18 @@ The fixed resolution precedence is `missed`, `ineligible`, `overlap_suppressed`,
 receipt after the last session close needed by that candidate, covers the requested history through
 that session, and reports zero source or validation rejections. Under that proof, fewer than 20
 eligible pre-signal bars is the registered E07 `ineligible` result. Invalid feed integrity, no such
-receipt, or missing data needed to reconstruct an already-enrolled position is systemic missingness:
-finalization waits only until the official open. A prior enrolled position whose exit cannot yet be
-reconstructed conservatively occupies its symbol and one slot through its frozen final session,
-then expires unconditionally after that session; no outcome field is consulted. If no valid
+receipt, or missing data needed to decide a current candidate's E07 eligibility is systemic
+missingness: finalization waits only until the official open. Missing bars for a prior enrolled
+position instead use a conservative book rule: the position occupies its symbol and one slot
+through its frozen final session, then expires unconditionally after that session; no outcome field
+is consulted. If no valid
 transaction actually commits before the open according to transaction wall-clock time, an
 append-only lapse resolves every candidate for `D` as `missed`, including later arrivals whose
-intended date was `D`; it never backdates a completion or halts later dates. Digest, ordering, or
-backdating violations remain `INVALID` and halt completion.
+intended date was `D`. The schedule watermark and all schedule-record digests used for the official
+open and ten-session horizon are sealed; valid revisions between candidate imports do not prevent a
+completion or lapse and therefore do not halt later dates. A lapse never backdates a completion.
+Digest, ordering, feed-integrity, or transaction-clock violations remain `INVALID` and halt
+completion.
 
 The control ledger records every otherwise eligible E07/F00 signal and its opened, overlap-, or
 capacity-suppressed outcome; at most 20 control positions are open. The challenger independently

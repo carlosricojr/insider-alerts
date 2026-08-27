@@ -10,8 +10,13 @@ from pathlib import Path
 
 import pytest
 import rfc8785
+from typer.testing import CliRunner
 
+import insider_alerts.research.trial_finalizer as finalizer
 import insider_alerts.research.trial_runtime as runtime
+import insider_alerts.research.trial_worker as trial_worker
+from insider_alerts import cli
+from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.bar_feed import BarFeedStore
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
 from insider_alerts.research.trial_runtime import (
@@ -19,6 +24,7 @@ from insider_alerts.research.trial_runtime import (
     EntryEligibility,
     EntryLapseInputs,
     EvidenceNotReady,
+    PriorBookPosition,
     TrialCandidate,
     TrialResolution,
     TrialRuntimeConfig,
@@ -34,6 +40,7 @@ from insider_alerts.research.trial_runtime import (
 ROOT = Path(__file__).resolve().parents[1]
 ACTIVATED_AT = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
 REGISTRY_SHA = "a" * 64
+ENTRY_OPEN = datetime(2026, 8, 27, 13, 30, tzinfo=UTC)
 
 
 def _utc_text(value: datetime) -> str:
@@ -102,6 +109,52 @@ def _trial_candidate(
         entry_rank_sha256=rank * 64,
         imported_at_utc=imported_at,
     )
+
+
+def _completion_inputs(
+    *,
+    completed_at: datetime = datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
+    entry_date: date = date(2026, 8, 27),
+    entry_open: datetime = ENTRY_OPEN,
+    bar_watermark: int = 0,
+    bar_digests: tuple[str, ...] = (),
+    poll_digests: tuple[str, ...] = (),
+    prior_positions: tuple[PriorBookPosition, ...] = (),
+) -> EntryCompletionInputs:
+    return EntryCompletionInputs(
+        entry_date=entry_date,
+        completed_at_utc=completed_at,
+        entry_opens_at_utc=entry_open,
+        final_session_date=entry_date + timedelta(days=13),
+        schedule_observation_watermark=10,
+        schedule_record_sha256s=("a" * 64,),
+        bar_observation_watermark=bar_watermark,
+        bar_poll_receipt_watermark=10,
+        bar_record_sha256s=bar_digests,
+        bar_poll_receipt_sha256s=poll_digests,
+        prior_book_positions=prior_positions,
+    )
+
+
+def _lapse_inputs(
+    *,
+    entry_date: date = date(2026, 8, 27),
+    lapsed_at: datetime = ENTRY_OPEN,
+    entry_open: datetime = ENTRY_OPEN,
+    reason: str,
+) -> EntryLapseInputs:
+    return EntryLapseInputs(
+        entry_date=entry_date,
+        lapsed_at_utc=lapsed_at,
+        reason=reason,
+        entry_opens_at_utc=entry_open,
+        schedule_observation_watermark=10,
+        schedule_record_sha256s=("a" * 64,),
+    )
+
+
+def _store_at(path: Path, commit_at: datetime) -> TrialStore:
+    return TrialStore(path, clock=lambda: commit_at)
 
 
 def _install_schedule(
@@ -265,6 +318,7 @@ def test_ranked_entry_resolution_is_pre_open_gap_free_and_capacity_limited() -> 
         occupied_slots=18,
         next_enrollment_sequence=7,
         completed_at_utc=cutoff,
+        entry_opens_at_utc=ENTRY_OPEN,
     )
 
     assert [item.enrollment_state for item in resolved] == [
@@ -326,6 +380,7 @@ def test_entry_resolution_rejects_completion_outside_pre_open_window(
             occupied_slots=0,
             next_enrollment_sequence=1,
             completed_at_utc=completed_at,
+            entry_opens_at_utc=ENTRY_OPEN,
         )
 
 
@@ -357,6 +412,7 @@ def test_entry_resolution_normalizes_naive_candidate_timestamp_failure(field: st
             occupied_slots=0,
             next_enrollment_sequence=1,
             completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
+            entry_opens_at_utc=ENTRY_OPEN,
         )
 
 
@@ -382,6 +438,7 @@ def test_same_date_source_at_cutoff_is_an_invalid_planner_invariant() -> None:
             occupied_slots=0,
             next_enrollment_sequence=1,
             completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
+            entry_opens_at_utc=ENTRY_OPEN,
         )
 
 
@@ -401,7 +458,7 @@ def test_entry_completion_atomically_binds_candidates_resolutions_and_inputs(
             "c", symbol="CCC", rank="3", evidence_recorded_at=ready, imported_at=ready
         ),
     ]
-    store = TrialStore(tmp_path / "trial.db")
+    store = _store_at(tmp_path / "trial.db", completed_at + timedelta(seconds=1))
     for candidate in candidates:
         assert store.append_candidate(candidate)
     eligibility = {
@@ -416,14 +473,13 @@ def test_entry_completion_atomically_binds_candidates_resolutions_and_inputs(
         occupied_slots=0,
         next_enrollment_sequence=1,
         completed_at_utc=completed_at,
+        entry_opens_at_utc=ENTRY_OPEN,
     )
-    inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=completed_at,
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=42,
-        bar_record_sha256s=("c" * 64, "b" * 64),
-        prior_book_sha256="d" * 64,
+    inputs = _completion_inputs(
+        completed_at=completed_at,
+        bar_watermark=42,
+        bar_digests=("c" * 64, "b" * 64),
+        poll_digests=("d" * 64,),
     )
 
     completion_sha = store.append_entry_completion(inputs, resolutions)
@@ -431,7 +487,7 @@ def test_entry_completion_atomically_binds_candidates_resolutions_and_inputs(
     assert len(completion_sha) == 64
     assert store.append_entry_completion(inputs, resolutions) == completion_sha
     with pytest.raises(TrialRuntimeInvalid, match="conflicting_replay"):
-        store.append_entry_completion(replace(inputs, prior_book_sha256="e" * 64), resolutions)
+        store.append_entry_completion(replace(inputs, bar_observation_watermark=43), resolutions)
     assert [item.enrollment_state for item in store.resolutions()] == [
         "enrolled",
         "ineligible",
@@ -446,6 +502,8 @@ def test_entry_completion_atomically_binds_candidates_resolutions_and_inputs(
         row = conn.execute("SELECT record_json FROM trial_entry_date_completions").fetchone()
     record = json.loads(row[0])
     assert record["bar_record_sha256s"] == ["b" * 64, "c" * 64]
+    assert record["bar_poll_receipt_sha256s"] == ["d" * 64]
+    assert record["committed_at_utc"] == _utc_text(completed_at + timedelta(seconds=1))
     assert [item["candidate_id"] for item in record["candidate_records"]] == ["a", "b", "c"]
 
     late = _trial_candidate(
@@ -479,16 +537,11 @@ def test_entry_completion_candidate_mismatch_rolls_back_everything(tmp_path: Pat
     candidate = _trial_candidate(
         "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
     )
-    store = TrialStore(tmp_path / "trial.db")
-    assert store.append_candidate(candidate)
-    inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="b" * 64,
+    store = _store_at(
+        tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
     )
+    assert store.append_candidate(candidate)
+    inputs = _completion_inputs()
 
     with pytest.raises(TrialRuntimeInvalid, match="completion_timestamp_naive"):
         store.append_entry_completion(
@@ -509,6 +562,51 @@ def test_entry_completion_candidate_mismatch_rolls_back_everything(tmp_path: Pat
     assert store.resolutions() == []
 
 
+def test_completion_uses_bound_official_open_and_rejects_backdated_commit(
+    tmp_path: Path,
+) -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    first = _trial_candidate(
+        "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
+    )
+    second = replace(
+        _trial_candidate(
+            "b", symbol="BBB", rank="2", evidence_recorded_at=ready, imported_at=ready
+        ),
+        entry_opens_at_utc=ENTRY_OPEN + timedelta(minutes=1),
+    )
+    completed_at = datetime(2026, 8, 27, 13, 20, tzinfo=UTC)
+    official_open = ENTRY_OPEN + timedelta(minutes=2)
+    resolutions = resolve_ranked_entry_date(
+        [first, second],
+        eligibility={
+            "a": EntryEligibility(True, "eligible_E07_F00"),
+            "b": EntryEligibility(True, "eligible_E07_F00"),
+        },
+        occupied_symbols=frozenset(),
+        occupied_slots=0,
+        next_enrollment_sequence=1,
+        completed_at_utc=completed_at,
+        entry_opens_at_utc=official_open,
+    )
+    valid = _store_at(tmp_path / "valid.db", completed_at + timedelta(seconds=1))
+    for candidate in (first, second):
+        assert valid.append_candidate(candidate)
+    valid.append_entry_completion(
+        _completion_inputs(completed_at=completed_at, entry_open=official_open), resolutions
+    )
+    valid.validate_integrity()
+
+    late = _store_at(tmp_path / "late.db", official_open)
+    for candidate in (first, second):
+        assert late.append_candidate(candidate)
+    with pytest.raises(TrialRuntimeInvalid, match="outside_pre_open_window"):
+        late.append_entry_completion(
+            _completion_inputs(completed_at=completed_at, entry_open=official_open), resolutions
+        )
+    assert late.resolutions() == []
+
+
 def test_entry_completion_rejects_resolution_that_violates_cutoff_state(
     tmp_path: Path,
 ) -> None:
@@ -520,16 +618,9 @@ def test_entry_completion_rejects_resolution_that_violates_cutoff_state(
         evidence_recorded_at=cutoff,
         imported_at=cutoff,
     )
-    store = TrialStore(tmp_path / "trial.db")
+    store = _store_at(tmp_path / "trial.db", cutoff + timedelta(seconds=1))
     assert store.append_candidate(candidate)
-    inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=cutoff,
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="b" * 64,
-    )
+    inputs = _completion_inputs(completed_at=cutoff)
     invalid = TrialResolution(
         candidate_id="a",
         entry_date=inputs.entry_date,
@@ -558,16 +649,9 @@ def test_entry_completion_rejects_false_missed_state_for_timely_candidate(
         evidence_recorded_at=ready,
         imported_at=ready,
     )
-    store = TrialStore(tmp_path / "trial.db")
+    store = _store_at(tmp_path / "trial.db", completed_at + timedelta(seconds=1))
     assert store.append_candidate(candidate)
-    inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=completed_at,
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="b" * 64,
-    )
+    inputs = _completion_inputs(completed_at=completed_at)
     invalid = TrialResolution(
         candidate_id="a",
         entry_date=inputs.entry_date,
@@ -596,16 +680,9 @@ def test_entry_completion_rejects_source_first_observed_at_cutoff(tmp_path: Path
         ),
         source_first_observed_at_utc=cutoff,
     )
-    store = TrialStore(tmp_path / "trial.db")
+    store = _store_at(tmp_path / "trial.db", cutoff + timedelta(seconds=1))
     assert store.append_candidate(candidate)
-    inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=cutoff,
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="b" * 64,
-    )
+    inputs = _completion_inputs(completed_at=cutoff)
     missed = TrialResolution(
         candidate_id="a",
         entry_date=inputs.entry_date,
@@ -629,7 +706,9 @@ def test_entry_completion_rejects_resolution_state_outside_closed_vocabulary(
     candidate = _trial_candidate(
         "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
     )
-    store = TrialStore(tmp_path / "trial.db")
+    store = _store_at(
+        tmp_path / "trial.db", datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+    )
     assert store.append_candidate(candidate)
     invalid = TrialResolution(
         candidate_id="a",
@@ -639,14 +718,7 @@ def test_entry_completion_rejects_resolution_state_outside_closed_vocabulary(
         confirmatory_enrollment_sequence=None,
         resolved_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
     )
-    inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="b" * 64,
-    )
+    inputs = _completion_inputs()
 
     with pytest.raises(TrialRuntimeInvalid, match="state_invalid"):
         store.append_entry_completion(inputs, [invalid])
@@ -663,12 +735,7 @@ def test_entry_lapse_is_atomic_idempotent_and_advances_late_candidate_cursor(
         "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
     )
     assert store.append_candidate(first)
-    inputs = EntryLapseInputs(
-        entry_date=date(2026, 8, 27),
-        lapsed_at_utc=datetime(2026, 8, 27, 13, 30, tzinfo=UTC),
-        reason="bar_feed_not_ready_before_open",
-        schedule_record_sha256="a" * 64,
-    )
+    inputs = _lapse_inputs(reason="bar_feed_not_ready_before_open")
 
     digest = store.append_entry_lapse(inputs)
 
@@ -690,6 +757,40 @@ def test_entry_lapse_is_atomic_idempotent_and_advances_late_candidate_cursor(
     assert store.status()["integrity_status"] == "valid"
 
 
+def test_lapse_uses_bound_official_open_across_candidate_schedule_revisions(
+    tmp_path: Path,
+) -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    store = TrialStore(tmp_path / "trial.db")
+    candidates = (
+        _trial_candidate(
+            "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
+        ),
+        replace(
+            _trial_candidate(
+                "b", symbol="BBB", rank="2", evidence_recorded_at=ready, imported_at=ready
+            ),
+            entry_opens_at_utc=ENTRY_OPEN + timedelta(minutes=1),
+        ),
+    )
+    for candidate in candidates:
+        assert store.append_candidate(candidate)
+
+    store.append_entry_lapse(
+        _lapse_inputs(
+            entry_open=ENTRY_OPEN + timedelta(minutes=2),
+            lapsed_at=ENTRY_OPEN + timedelta(minutes=2),
+            reason="official_open_passed",
+        )
+    )
+
+    assert [resolution.enrollment_state for resolution in store.resolutions()] == [
+        "missed",
+        "missed",
+    ]
+    store.validate_integrity()
+
+
 def test_late_candidate_uses_earliest_covering_seal_across_multiple_dates(
     tmp_path: Path,
 ) -> None:
@@ -704,12 +805,7 @@ def test_late_candidate_uses_earliest_covering_seal_across_multiple_dates(
     )
     assert store.append_candidate(first)
     store.append_entry_lapse(
-        EntryLapseInputs(
-            entry_date=date(2026, 8, 27),
-            lapsed_at_utc=datetime(2026, 8, 27, 13, 30, tzinfo=UTC),
-            reason="day_one_outage",
-            schedule_record_sha256="a" * 64,
-        )
+        _lapse_inputs(reason="day_one_outage")
     )
 
     second_ready = datetime(2026, 8, 28, 13, 10, tzinfo=UTC)
@@ -728,11 +824,11 @@ def test_late_candidate_uses_earliest_covering_seal_across_multiple_dates(
     )
     assert store.append_candidate(second)
     store.append_entry_lapse(
-        EntryLapseInputs(
+        _lapse_inputs(
             entry_date=date(2026, 8, 28),
-            lapsed_at_utc=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
+            lapsed_at=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
+            entry_open=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
             reason="day_two_outage",
-            schedule_record_sha256="b" * 64,
         )
     )
 
@@ -763,12 +859,7 @@ def test_candidate_import_timestamp_before_concurrent_seal_is_retryable(
     assert store.append_candidate(first)
     sealed_at = datetime(2026, 8, 27, 13, 30, tzinfo=UTC)
     store.append_entry_lapse(
-        EntryLapseInputs(
-            entry_date=date(2026, 8, 27),
-            lapsed_at_utc=sealed_at,
-            reason="concurrent_cycle",
-            schedule_record_sha256="a" * 64,
-        )
+        _lapse_inputs(lapsed_at=sealed_at, reason="concurrent_cycle")
     )
     stale_cycle_candidate = _trial_candidate(
         "b",
@@ -801,12 +892,7 @@ def test_integrity_ties_lapse_resolution_reason_to_lapse_record(tmp_path: Path) 
     )
     assert store.append_candidate(candidate)
     store.append_entry_lapse(
-        EntryLapseInputs(
-            entry_date=date(2026, 8, 27),
-            lapsed_at_utc=datetime(2026, 8, 27, 13, 30, tzinfo=UTC),
-            reason="bar_feed_not_ready_before_open",
-            schedule_record_sha256="a" * 64,
-        )
+        _lapse_inputs(reason="bar_feed_not_ready_before_open")
     )
 
     with sqlite3.connect(store.path) as conn:
@@ -850,11 +936,8 @@ def test_entry_lapse_before_open_rolls_back(
         "a", symbol="AAA", rank="1", evidence_recorded_at=ready, imported_at=ready
     )
     assert store.append_candidate(candidate)
-    early = EntryLapseInputs(
-        entry_date=date(2026, 8, 27),
-        lapsed_at_utc=datetime(2026, 8, 27, 13, 29, 59, tzinfo=UTC),
-        reason="too_early",
-        schedule_record_sha256="a" * 64,
+    early = _lapse_inputs(
+        lapsed_at=datetime(2026, 8, 27, 13, 29, 59, tzinfo=UTC), reason="too_early"
     )
 
     with pytest.raises(TrialRuntimeInvalid, match="before_official_open"):
@@ -865,7 +948,9 @@ def test_entry_lapse_before_open_rolls_back(
 
 
 def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) -> None:
-    store = TrialStore(tmp_path / "trial.db")
+    store = _store_at(
+        tmp_path / "trial.db", datetime(2026, 8, 28, 13, 21, tzinfo=UTC)
+    )
     imported_late = _trial_candidate(
         "a",
         symbol="AAA",
@@ -874,14 +959,7 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
         imported_at=datetime(2026, 8, 27, 13, 25, tzinfo=UTC),
     )
     assert store.append_candidate(imported_late)
-    completion_inputs = EntryCompletionInputs(
-        entry_date=date(2026, 8, 27),
-        completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
-        schedule_record_sha256="a" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="b" * 64,
-    )
+    completion_inputs = _completion_inputs()
     resolution = TrialResolution(
         candidate_id="a",
         entry_date=date(2026, 8, 27),
@@ -894,11 +972,9 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
     with pytest.raises(TrialRuntimeInvalid, match="predates_candidate_import"):
         store.append_entry_completion(completion_inputs, [resolution])
 
-    late_lapse = EntryLapseInputs(
-        entry_date=date(2026, 8, 27),
-        lapsed_at_utc=datetime(2026, 8, 28, 14, 0, tzinfo=UTC),
+    late_lapse = _lapse_inputs(
+        lapsed_at=datetime(2026, 8, 28, 14, 0, tzinfo=UTC),
         reason="extended_outage",
-        schedule_record_sha256="c" * 64,
     )
     assert store.append_entry_lapse(late_lapse)
     next_candidate = replace(
@@ -914,13 +990,10 @@ def test_seal_cannot_predate_candidate_import_or_move_backwards(tmp_path: Path) 
         entry_opens_at_utc=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
     )
     assert store.append_candidate(next_candidate)
-    next_inputs = EntryCompletionInputs(
+    next_inputs = _completion_inputs(
         entry_date=date(2026, 8, 28),
-        completed_at_utc=datetime(2026, 8, 28, 13, 20, tzinfo=UTC),
-        schedule_record_sha256="d" * 64,
-        bar_observation_watermark=0,
-        bar_record_sha256s=(),
-        prior_book_sha256="e" * 64,
+        completed_at=datetime(2026, 8, 28, 13, 20, tzinfo=UTC),
+        entry_open=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
     )
     next_resolution = TrialResolution(
         candidate_id="b",
@@ -947,6 +1020,165 @@ def test_draft_registry_only_heartbeats_and_creates_no_candidates(tmp_path: Path
     assert status["health"]["last_result"] == "idle_registry_draft"
     assert not config.bar_feed_db.exists()
     assert not config.session_feed_db.exists()
+
+
+def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error_log = tmp_path / "worker.err.log"
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(tmp_path / "trial.db"),
+            "--evidence-db",
+            str(tmp_path / "evidence.db"),
+            "--bar-feed-db",
+            str(tmp_path / "bars.db"),
+            "--session-feed-db",
+            str(tmp_path / "sessions.db"),
+            "--registry-path",
+            str(ROOT / "docs/research/registry/OPP-E07-V1.json"),
+            "--error-log",
+            str(error_log),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["candidate_runtime"]["status"] == "idle"
+    assert payload["entry_finalizer"]["status"] == "idle_registry_draft"
+    assert not error_log.exists()
+    assert not (tmp_path / "bars.db").exists()
+    assert not (tmp_path / "sessions.db").exists()
+
+
+def test_trial_status_cli_is_read_only_and_integrity_signaling(tmp_path: Path) -> None:
+    valid_store = TrialStore(tmp_path / "valid.db")
+    valid = CliRunner().invoke(
+        cli.app, ["ops", "research-trial-status", "--trial-db", str(valid_store.path)]
+    )
+    assert valid.exit_code == 0
+    missing_path = tmp_path / "missing.db"
+    missing = CliRunner().invoke(
+        cli.app, ["ops", "research-trial-status", "--trial-db", str(missing_path)]
+    )
+    assert missing.exit_code == 3
+    assert not missing_path.exists()
+
+
+def test_windows_trial_task_is_direct_hidden_pythonw() -> None:
+    installer = (
+        ROOT / "ops/windows/install-research-trial-task.ps1"
+    ).read_text(encoding="utf-8")
+    assert ".venv\\Scripts\\pythonw.exe" in installer
+    action = installer.split("$action =", maxsplit=1)[1].split("$logonTrigger", maxsplit=1)[0]
+    assert "-Execute $pythonExe" in action
+    assert "powershell" not in action.lower()
+    assert "cmd.exe" not in action.lower()
+    assert "-Hidden" in installer
+    assert "New-TimeSpan -Minutes $IntervalMinutes" in installer
+    assert "-MultipleInstances IgnoreNew" in installer
+
+
+def _install_finalizer_inputs(config: TrialRuntimeConfig) -> TrialCandidate:
+    sessions = _sessions(first=date(2026, 7, 1), count=60)
+    SessionFeedStore(config.session_feed_db).append(
+        sessions,
+        observed_at_utc=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    candidate = _trial_candidate(
+        "a", symbol="TEST", rank="1", evidence_recorded_at=ready, imported_at=ready
+    )
+    assert TrialStore(config.trial_db).append_candidate(candidate)
+    completed_sessions = [
+        session
+        for session in sessions
+        if session.closes_at_utc < candidate.source_first_observed_at_utc
+    ]
+    bars = [
+        DailyBar("TEST", session.session_date, 10.0, 11.0, 9.0, 10.0, 100_000.0)
+        for session in completed_sessions[-20:]
+    ]
+    observed_at = datetime(2026, 8, 27, 13, 19, tzinfo=UTC)
+    bar_store = BarFeedStore(config.bar_feed_db)
+    assert bar_store.append_completed(bars, observed_at_utc=observed_at) == (20, 0, 0)
+    bar_store.record_successful_poll(
+        "TEST",
+        local_date=date(2026, 8, 27),
+        earliest_start_date=date(2026, 4, 29),
+        requested_through_date=candidate.final_session_date,
+        completed_through_date=completed_sessions[-1].session_date,
+        now=observed_at,
+        returned_bar_count=20,
+        in_range_bar_count=20,
+        source_rejection_count=0,
+        validation_rejection_count=0,
+    )
+    return candidate
+
+
+def test_finalizer_seals_point_in_time_inputs_without_outcome_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_finalizer_inputs(config)
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+    original_validate = TrialStore.validate_integrity
+    include_outcomes_seen: list[bool] = []
+
+    def traced_validate(store: TrialStore, *, include_outcomes: bool = True) -> None:
+        include_outcomes_seen.append(include_outcomes)
+        original_validate(store, include_outcomes=include_outcomes)
+
+    monkeypatch.setattr(TrialStore, "validate_integrity", traced_validate)
+    decision_at = datetime(2026, 8, 27, 13, 21, tzinfo=UTC)
+
+    result = finalizer.finalize_pending_entry_dates(config, clock=lambda: decision_at)
+
+    assert result == finalizer.FinalizationResult("complete", dates_completed=1)
+    assert include_outcomes_seen == [False]
+    store = TrialStore(config.trial_db)
+    assert store.resolutions()[0].enrollment_state == "enrolled"
+    completion = store.entry_completion_records()[0]
+    assert completion["committed_at_utc"] == _utc_text(decision_at)
+    assert completion["schedule_observation_watermark"] > 0
+    assert len(completion["schedule_record_sha256s"]) >= 10
+    assert completion["bar_observation_watermark"] == 20
+    assert completion["bar_poll_receipt_watermark"] == 1
+    assert len(completion["bar_record_sha256s"]) == 20
+    assert len(completion["bar_poll_receipt_sha256s"]) == 1
+    assert completion["prior_book_positions"] == []
+
+
+def test_finalizer_waits_for_healthy_poll_then_lapses_at_official_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    candidate = _install_finalizer_inputs(config)
+    with sqlite3.connect(config.bar_feed_db) as conn:
+        conn.execute("DROP TRIGGER bar_poll_receipts_no_delete")
+        conn.execute("DELETE FROM bar_poll_receipts")
+    monkeypatch.setattr(finalizer, "_validated_trial_window", lambda _config: _active_window())
+
+    waiting = finalizer.finalize_pending_entry_dates(
+        config,
+        clock=lambda: datetime(2026, 8, 27, 13, 21, tzinfo=UTC),
+    )
+    assert waiting.status == "waiting"
+    assert waiting.pending_date == candidate.planned_entry_date
+    assert waiting.reason == "healthy_bar_poll_proof_unavailable"
+    assert TrialStore(config.trial_db).resolutions() == []
+
+    lapsed = finalizer.finalize_pending_entry_dates(
+        config,
+        clock=lambda: ENTRY_OPEN,
+    )
+    assert lapsed == finalizer.FinalizationResult("complete", dates_lapsed=1)
+    assert TrialStore(config.trial_db).resolutions()[0].enrollment_state == "missed"
 
 
 def test_active_runtime_imports_once_and_ensures_stock_and_spy_requests(

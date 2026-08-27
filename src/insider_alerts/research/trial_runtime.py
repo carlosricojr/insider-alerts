@@ -7,7 +7,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -142,13 +142,27 @@ class TrialResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class PriorBookPosition:
+    candidate_id: str
+    symbol: str
+    occupied_through_date: date
+    basis: Literal["bars_no_exit_before_entry_open", "missing_bars_conservative"]
+    bar_record_sha256s: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EntryCompletionInputs:
     entry_date: date
     completed_at_utc: datetime
-    schedule_record_sha256: str
+    entry_opens_at_utc: datetime
+    final_session_date: date
+    schedule_observation_watermark: int
+    schedule_record_sha256s: tuple[str, ...]
     bar_observation_watermark: int
+    bar_poll_receipt_watermark: int
     bar_record_sha256s: tuple[str, ...]
-    prior_book_sha256: str
+    bar_poll_receipt_sha256s: tuple[str, ...]
+    prior_book_positions: tuple[PriorBookPosition, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +170,9 @@ class EntryLapseInputs:
     entry_date: date
     lapsed_at_utc: datetime
     reason: str
-    schedule_record_sha256: str
+    entry_opens_at_utc: datetime
+    schedule_observation_watermark: int
+    schedule_record_sha256s: tuple[str, ...]
 
 
 def _validated_trial_window(config: TrialRuntimeConfig) -> TrialWindow:
@@ -243,6 +259,7 @@ def resolve_ranked_entry_date(
     occupied_slots: int,
     next_enrollment_sequence: int,
     completed_at_utc: datetime,
+    entry_opens_at_utc: datetime,
 ) -> list[TrialResolution]:
     """Resolve one complete entry date from only pre-open, preregistered inputs."""
 
@@ -270,11 +287,14 @@ def resolve_ranked_entry_date(
         ):
             raise TrialRuntimeInvalid("entry_completion_candidate_timestamp_naive")
     entry_dates = {candidate.planned_entry_date for candidate in candidates}
-    entry_opens = {candidate.entry_opens_at_utc for candidate in candidates}
-    if len(entry_dates) != 1 or len(entry_opens) != 1:
+    if entry_opens_at_utc.tzinfo is None:
+        raise TrialRuntimeInvalid("entry_completion_official_open_naive")
+    if len(entry_dates) != 1:
         raise TrialRuntimeInvalid("entry_completion_candidate_session_mismatch")
     entry_date = next(iter(entry_dates))
-    entry_open = next(iter(entry_opens))
+    entry_open = entry_opens_at_utc.astimezone(UTC)
+    if entry_open.astimezone(NEW_YORK).date() != entry_date:
+        raise TrialRuntimeInvalid("entry_completion_official_open_date_mismatch")
     cutoff_local = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK)
     cutoff_utc = cutoff_local.astimezone(UTC)
     if (
@@ -357,8 +377,15 @@ def _validate_cutoff_resolution_states(
 class TrialStore:
     """Append-only candidate universe plus mutable operational health."""
 
-    def __init__(self, path: Path | str, *, initialize: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        initialize: bool = True,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.path = Path(path)
+        self._clock = clock or (lambda: datetime.now(UTC))
         if initialize:
             self._initialize()
 
@@ -467,6 +494,7 @@ class TrialStore:
                     sequence INTEGER NOT NULL UNIQUE,
                     entry_date TEXT PRIMARY KEY,
                     completed_at_utc TEXT NOT NULL,
+                    committed_at_utc TEXT NOT NULL,
                     record_sha256 TEXT NOT NULL UNIQUE,
                     record_json BLOB NOT NULL
                 );
@@ -616,7 +644,7 @@ class TrialStore:
             latest_seal = conn.execute(
                 """
                 SELECT sealed_at_utc FROM (
-                  SELECT entry_date,completed_at_utc sealed_at_utc
+                  SELECT entry_date,committed_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
@@ -837,6 +865,36 @@ class TrialStore:
             rows = conn.execute("SELECT * FROM trial_resolutions ORDER BY sequence").fetchall()
         return [self._verify_resolution_row(row) for row in rows]
 
+    def entry_completion_records(self) -> list[dict[str, Any]]:
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM trial_entry_date_completions ORDER BY sequence"
+            ).fetchall()
+        return [self._verify_completion_row(row) for row in rows]
+
+    @staticmethod
+    def _prior_book_record(position: PriorBookPosition) -> dict[str, Any]:
+        symbol = _normalized_symbol(position.symbol)
+        if not position.candidate_id.strip():
+            raise TrialRuntimeInvalid("prior_book_candidate_id_empty")
+        if position.basis not in {
+            "bars_no_exit_before_entry_open",
+            "missing_bars_conservative",
+        }:
+            raise TrialRuntimeInvalid("prior_book_basis_invalid")
+        digests = tuple(sorted(set(position.bar_record_sha256s)))
+        if len(digests) != len(position.bar_record_sha256s):
+            raise TrialRuntimeInvalid("prior_book_bar_digest_duplicate")
+        for digest in digests:
+            _require_sha256(digest, "prior_book_bar_record")
+        return {
+            "candidate_id": position.candidate_id,
+            "symbol": symbol,
+            "occupied_through_date": position.occupied_through_date.isoformat(),
+            "basis": position.basis,
+            "bar_record_sha256s": list(digests),
+        }
+
     @staticmethod
     def _verify_completion_row(row: sqlite3.Row) -> dict[str, Any]:
         raw = bytes(row["record_json"])
@@ -849,11 +907,18 @@ class TrialStore:
             "contract_version",
             "entry_date",
             "completed_at_utc",
-            "schedule_record_sha256",
+            "committed_at_utc",
+            "entry_opens_at_utc",
+            "final_session_date",
+            "schedule_observation_watermark",
+            "schedule_record_sha256s",
             "bar_observation_watermark",
+            "bar_poll_receipt_watermark",
             "bar_record_sha256s",
+            "bar_poll_receipt_sha256s",
             "candidate_records",
             "candidate_set_sha256",
+            "prior_book_positions",
             "prior_book_sha256",
             "resolution_record_sha256s",
             "resolution_set_sha256",
@@ -863,30 +928,62 @@ class TrialStore:
         if (
             record["entry_date"] != row["entry_date"]
             or record["completed_at_utc"] != row["completed_at_utc"]
+            or record["committed_at_utc"] != row["committed_at_utc"]
         ):
             raise TrialRuntimeInvalid("entry_completion_columns_mismatch")
         entry_date = date.fromisoformat(str(record["entry_date"]))
         completed_at = _parse_utc(str(record["completed_at_utc"]))
-        if completed_at.astimezone(NEW_YORK).date() != entry_date:
-            raise TrialRuntimeInvalid("entry_completion_local_date_mismatch")
-        _require_sha256(str(record["schedule_record_sha256"]), "completion_schedule_record")
-        _require_sha256(str(record["prior_book_sha256"]), "completion_prior_book")
+        committed_at = _parse_utc(str(record["committed_at_utc"]))
+        entry_open = _parse_utc(str(record["entry_opens_at_utc"]))
+        final_session_date = date.fromisoformat(str(record["final_session_date"]))
+        cutoff_utc = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK).astimezone(UTC)
         if (
-            isinstance(record["bar_observation_watermark"], bool)
-            or not isinstance(record["bar_observation_watermark"], int)
-            or record["bar_observation_watermark"] < 0
+            completed_at.astimezone(NEW_YORK).date() != entry_date
+            or entry_open.astimezone(NEW_YORK).date() != entry_date
+            or final_session_date < entry_date
+            or not cutoff_utc <= completed_at <= committed_at < entry_open
         ):
-            raise TrialRuntimeInvalid("completion_bar_watermark_invalid")
+            raise TrialRuntimeInvalid("entry_completion_local_date_mismatch")
+        for name in (
+            "schedule_observation_watermark",
+            "bar_observation_watermark",
+            "bar_poll_receipt_watermark",
+        ):
+            if (
+                isinstance(record[name], bool)
+                or not isinstance(record[name], int)
+                or record[name] < 0
+            ):
+                raise TrialRuntimeInvalid(f"completion_{name}_invalid")
+        schedule_digests = record["schedule_record_sha256s"]
         bar_digests = record["bar_record_sha256s"]
+        poll_digests = record["bar_poll_receipt_sha256s"]
         resolution_digests = record["resolution_record_sha256s"]
         candidate_records = record["candidate_records"]
+        prior_book_positions = record["prior_book_positions"]
         if not all(
             isinstance(value, list)
-            for value in (bar_digests, resolution_digests, candidate_records)
+            for value in (
+                schedule_digests,
+                bar_digests,
+                poll_digests,
+                resolution_digests,
+                candidate_records,
+                prior_book_positions,
+            )
         ):
             raise TrialRuntimeInvalid("entry_completion_digest_lists_invalid")
-        if bar_digests != sorted(set(bar_digests)):
-            raise TrialRuntimeInvalid("entry_completion_bar_digests_not_canonical")
+        for name, digests in (
+            ("schedule", schedule_digests),
+            ("bar", bar_digests),
+            ("poll", poll_digests),
+        ):
+            if digests != sorted(set(digests)):
+                raise TrialRuntimeInvalid(f"entry_completion_{name}_digests_not_canonical")
+            for digest in digests:
+                _require_sha256(str(digest), f"entry_completion_{name}_record")
+        if not schedule_digests:
+            raise TrialRuntimeInvalid("entry_completion_schedule_binding_empty")
         if (
             not resolution_digests
             or len(resolution_digests) != len(set(resolution_digests))
@@ -894,8 +991,40 @@ class TrialStore:
             or len(candidate_records) != len(resolution_digests)
         ):
             raise TrialRuntimeInvalid("entry_completion_bound_sets_invalid")
-        for digest in [*bar_digests, *resolution_digests]:
+        for digest in resolution_digests:
             _require_sha256(str(digest), "entry_completion_bound_record")
+        expected_prior_positions: list[dict[str, Any]] = []
+        for position in prior_book_positions:
+            if not isinstance(position, dict):
+                raise TrialRuntimeInvalid("prior_book_position_invalid")
+            try:
+                expected_prior_positions.append(
+                    TrialStore._prior_book_record(
+                        PriorBookPosition(
+                            candidate_id=str(position["candidate_id"]),
+                            symbol=str(position["symbol"]),
+                            occupied_through_date=date.fromisoformat(
+                                str(position["occupied_through_date"])
+                            ),
+                            basis=str(position["basis"]),  # type: ignore[arg-type]
+                            bar_record_sha256s=tuple(position["bar_record_sha256s"]),
+                        )
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TrialRuntimeInvalid("prior_book_position_invalid") from exc
+        expected_prior_positions.sort(key=lambda item: (item["symbol"], item["candidate_id"]))
+        if expected_prior_positions != prior_book_positions:
+            raise TrialRuntimeInvalid("prior_book_positions_not_canonical")
+        if len({item["candidate_id"] for item in prior_book_positions}) != len(
+            prior_book_positions
+        ) or len({item["symbol"] for item in prior_book_positions}) != len(prior_book_positions):
+            raise TrialRuntimeInvalid("prior_book_positions_duplicate")
+        if (
+            _sha256(_canonical({"positions": prior_book_positions}))
+            != record["prior_book_sha256"]
+        ):
+            raise TrialRuntimeInvalid("completion_prior_book_digest_mismatch")
         expected_candidate_records: list[dict[str, str]] = []
         for candidate in candidate_records:
             if not isinstance(candidate, dict) or set(candidate) != {
@@ -933,21 +1062,38 @@ class TrialStore:
         inputs: EntryCompletionInputs,
         resolutions: Sequence[TrialResolution],
     ) -> str:
-        if inputs.completed_at_utc.tzinfo is None:
+        if inputs.completed_at_utc.tzinfo is None or inputs.entry_opens_at_utc.tzinfo is None:
             raise TrialRuntimeInvalid("entry_completion_timestamp_naive")
-        _require_sha256(inputs.schedule_record_sha256, "completion_schedule_record")
-        _require_sha256(inputs.prior_book_sha256, "completion_prior_book")
-        if (
-            isinstance(inputs.bar_observation_watermark, bool)
-            or not isinstance(inputs.bar_observation_watermark, int)
-            or inputs.bar_observation_watermark < 0
+        for name, watermark in (
+            ("schedule", inputs.schedule_observation_watermark),
+            ("bar", inputs.bar_observation_watermark),
+            ("bar_poll_receipt", inputs.bar_poll_receipt_watermark),
         ):
-            raise TrialRuntimeInvalid("completion_bar_watermark_invalid")
+            if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0:
+                raise TrialRuntimeInvalid(f"completion_{name}_watermark_invalid")
+        schedule_digests = tuple(sorted(set(inputs.schedule_record_sha256s)))
         bar_digests = tuple(sorted(set(inputs.bar_record_sha256s)))
-        if len(bar_digests) != len(inputs.bar_record_sha256s):
-            raise TrialRuntimeInvalid("completion_bar_digest_duplicate")
-        for digest in bar_digests:
-            _require_sha256(digest, "completion_bar_record")
+        poll_digests = tuple(sorted(set(inputs.bar_poll_receipt_sha256s)))
+        for name, supplied, canonical in (
+            ("schedule", inputs.schedule_record_sha256s, schedule_digests),
+            ("bar", inputs.bar_record_sha256s, bar_digests),
+            ("poll", inputs.bar_poll_receipt_sha256s, poll_digests),
+        ):
+            if len(canonical) != len(supplied):
+                raise TrialRuntimeInvalid(f"completion_{name}_digest_duplicate")
+            for digest in canonical:
+                _require_sha256(digest, f"completion_{name}_record")
+        if not schedule_digests:
+            raise TrialRuntimeInvalid("completion_schedule_binding_empty")
+        prior_positions = sorted(
+            (self._prior_book_record(position) for position in inputs.prior_book_positions),
+            key=lambda item: (item["symbol"], item["candidate_id"]),
+        )
+        if len({item["candidate_id"] for item in prior_positions}) != len(
+            prior_positions
+        ) or len({item["symbol"] for item in prior_positions}) != len(prior_positions):
+            raise TrialRuntimeInvalid("prior_book_positions_duplicate")
+        prior_book_sha = _sha256(_canonical({"positions": prior_positions}))
         replay_resolution_digests = [
             _sha256(_canonical(self._resolution_record(resolution))) for resolution in resolutions
         ]
@@ -966,11 +1112,20 @@ class TrialStore:
                 existing_record = self._verify_completion_row(existing)
                 replay_matches = (
                     existing_record["completed_at_utc"] == _utc_text(inputs.completed_at_utc)
-                    and existing_record["schedule_record_sha256"] == inputs.schedule_record_sha256
+                    and existing_record["entry_opens_at_utc"]
+                    == _utc_text(inputs.entry_opens_at_utc)
+                    and existing_record["final_session_date"]
+                    == inputs.final_session_date.isoformat()
+                    and existing_record["schedule_observation_watermark"]
+                    == inputs.schedule_observation_watermark
+                    and existing_record["schedule_record_sha256s"] == list(schedule_digests)
                     and existing_record["bar_observation_watermark"]
                     == inputs.bar_observation_watermark
+                    and existing_record["bar_poll_receipt_watermark"]
+                    == inputs.bar_poll_receipt_watermark
                     and existing_record["bar_record_sha256s"] == list(bar_digests)
-                    and existing_record["prior_book_sha256"] == inputs.prior_book_sha256
+                    and existing_record["bar_poll_receipt_sha256s"] == list(poll_digests)
+                    and existing_record["prior_book_sha256"] == prior_book_sha
                     and existing_record["resolution_record_sha256s"] == replay_resolution_digests
                     and [
                         str(candidate["candidate_id"])
@@ -984,7 +1139,7 @@ class TrialStore:
             latest = conn.execute(
                 """
                 SELECT entry_date,sealed_at_utc FROM (
-                  SELECT entry_date,completed_at_utc sealed_at_utc
+                  SELECT entry_date,committed_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT entry_date,lapsed_at_utc sealed_at_utc FROM trial_entry_date_lapses
@@ -1028,12 +1183,15 @@ class TrialStore:
                 SIGNAL_CUTOFF,
                 tzinfo=NEW_YORK,
             ).astimezone(UTC)
-            entry_opens = {candidate.entry_opens_at_utc for candidate in candidates}
+            entry_open = inputs.entry_opens_at_utc.astimezone(UTC)
+            committed_at = self._clock()
+            if committed_at.tzinfo is None:
+                raise TrialRuntimeInvalid("entry_completion_commit_clock_naive")
+            committed_at = committed_at.astimezone(UTC)
             if (
-                len(entry_opens) != 1
-                or inputs.completed_at_utc.tzinfo is None
-                or inputs.completed_at_utc.astimezone(NEW_YORK).date() != inputs.entry_date
-                or not cutoff_utc <= inputs.completed_at_utc < next(iter(entry_opens))
+                inputs.completed_at_utc.astimezone(NEW_YORK).date() != inputs.entry_date
+                or entry_open.astimezone(NEW_YORK).date() != inputs.entry_date
+                or not cutoff_utc <= inputs.completed_at_utc <= committed_at < entry_open
             ):
                 raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
             expected_ids = [candidate.candidate_id for candidate in candidates]
@@ -1085,12 +1243,19 @@ class TrialStore:
                 "contract_version": TRIAL_CONTRACT_VERSION,
                 "entry_date": inputs.entry_date.isoformat(),
                 "completed_at_utc": _utc_text(inputs.completed_at_utc),
-                "schedule_record_sha256": inputs.schedule_record_sha256,
+                "committed_at_utc": _utc_text(committed_at),
+                "entry_opens_at_utc": _utc_text(entry_open),
+                "final_session_date": inputs.final_session_date.isoformat(),
+                "schedule_observation_watermark": inputs.schedule_observation_watermark,
+                "schedule_record_sha256s": list(schedule_digests),
                 "bar_observation_watermark": inputs.bar_observation_watermark,
+                "bar_poll_receipt_watermark": inputs.bar_poll_receipt_watermark,
                 "bar_record_sha256s": list(bar_digests),
+                "bar_poll_receipt_sha256s": list(poll_digests),
                 "candidate_records": candidate_material["candidates"],
                 "candidate_set_sha256": candidate_set_sha,
-                "prior_book_sha256": inputs.prior_book_sha256,
+                "prior_book_positions": prior_positions,
+                "prior_book_sha256": prior_book_sha,
                 "resolution_record_sha256s": resolution_digests,
                 "resolution_set_sha256": resolution_set_sha,
             }
@@ -1102,11 +1267,12 @@ class TrialStore:
                 ).fetchone()[0]
             )
             conn.execute(
-                "INSERT INTO trial_entry_date_completions VALUES(?,?,?,?,?)",
+                "INSERT INTO trial_entry_date_completions VALUES(?,?,?,?,?,?)",
                 (
                     sequence,
                     inputs.entry_date.isoformat(),
                     _utc_text(inputs.completed_at_utc),
+                    _utc_text(committed_at),
                     digest,
                     encoded,
                 ),
@@ -1126,7 +1292,9 @@ class TrialStore:
             "entry_date",
             "lapsed_at_utc",
             "reason",
-            "schedule_record_sha256",
+            "entry_opens_at_utc",
+            "schedule_observation_watermark",
+            "schedule_record_sha256s",
             "candidate_records",
             "candidate_set_sha256",
             "resolution_record_sha256s",
@@ -1142,7 +1310,29 @@ class TrialStore:
             raise TrialRuntimeInvalid("entry_lapse_columns_mismatch")
         if not isinstance(record["reason"], str) or not record["reason"].strip():
             raise TrialRuntimeInvalid("entry_lapse_reason_empty")
-        _require_sha256(str(record["schedule_record_sha256"]), "lapse_schedule_record")
+        entry_open = _parse_utc(str(record["entry_opens_at_utc"]))
+        lapsed_at = _parse_utc(str(record["lapsed_at_utc"]))
+        if (
+            entry_open.astimezone(NEW_YORK).date()
+            != date.fromisoformat(str(record["entry_date"]))
+            or lapsed_at < entry_open
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_official_open_date_mismatch")
+        if (
+            isinstance(record["schedule_observation_watermark"], bool)
+            or not isinstance(record["schedule_observation_watermark"], int)
+            or record["schedule_observation_watermark"] < 0
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_schedule_watermark_invalid")
+        schedule_digests = record["schedule_record_sha256s"]
+        if (
+            not isinstance(schedule_digests, list)
+            or not schedule_digests
+            or schedule_digests != sorted(set(schedule_digests))
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_schedule_digests_invalid")
+        for digest in schedule_digests:
+            _require_sha256(str(digest), "lapse_schedule_record")
         candidate_records = record["candidate_records"]
         resolution_digests = record["resolution_record_sha256s"]
         if (
@@ -1176,11 +1366,21 @@ class TrialStore:
         return record
 
     def append_entry_lapse(self, inputs: EntryLapseInputs) -> str:
-        if inputs.lapsed_at_utc.tzinfo is None:
+        if inputs.lapsed_at_utc.tzinfo is None or inputs.entry_opens_at_utc.tzinfo is None:
             raise ValueError("entry lapse timestamp cannot be naive")
         if not inputs.reason.strip():
             raise TrialRuntimeInvalid("entry_lapse_reason_empty")
-        _require_sha256(inputs.schedule_record_sha256, "lapse_schedule_record")
+        if (
+            isinstance(inputs.schedule_observation_watermark, bool)
+            or not isinstance(inputs.schedule_observation_watermark, int)
+            or inputs.schedule_observation_watermark < 0
+        ):
+            raise TrialRuntimeInvalid("entry_lapse_schedule_watermark_invalid")
+        schedule_digests = tuple(sorted(set(inputs.schedule_record_sha256s)))
+        if not schedule_digests or len(schedule_digests) != len(inputs.schedule_record_sha256s):
+            raise TrialRuntimeInvalid("entry_lapse_schedule_digests_invalid")
+        for digest in schedule_digests:
+            _require_sha256(digest, "lapse_schedule_record")
         with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             if conn.execute(
@@ -1197,7 +1397,11 @@ class TrialStore:
                 if (
                     existing_lapse["lapsed_at_utc"] == _utc_text(inputs.lapsed_at_utc)
                     and existing_lapse["reason"] == inputs.reason
-                    and existing_lapse["schedule_record_sha256"] == inputs.schedule_record_sha256
+                    and existing_lapse["entry_opens_at_utc"]
+                    == _utc_text(inputs.entry_opens_at_utc)
+                    and existing_lapse["schedule_observation_watermark"]
+                    == inputs.schedule_observation_watermark
+                    and existing_lapse["schedule_record_sha256s"] == list(schedule_digests)
                 ):
                     return str(existing["record_sha256"])
                 raise TrialRuntimeInvalid("entry_date_lapse_conflicting_replay")
@@ -1243,8 +1447,11 @@ class TrialStore:
             candidates = [self._verify_candidate_row(row) for row in candidate_rows]
             if any(candidate.imported_at_utc > inputs.lapsed_at_utc for candidate in candidates):
                 raise TrialRuntimeInvalid("entry_lapse_predates_candidate_import")
-            entry_opens = {candidate.entry_opens_at_utc for candidate in candidates}
-            if len(entry_opens) != 1 or inputs.lapsed_at_utc < next(iter(entry_opens)):
+            entry_open = inputs.entry_opens_at_utc.astimezone(UTC)
+            if (
+                entry_open.astimezone(NEW_YORK).date() != inputs.entry_date
+                or inputs.lapsed_at_utc < entry_open
+            ):
                 raise TrialRuntimeInvalid("entry_lapse_before_official_open")
             resolutions = [
                 TrialResolution(
@@ -1272,7 +1479,9 @@ class TrialStore:
                 "entry_date": inputs.entry_date.isoformat(),
                 "lapsed_at_utc": _utc_text(inputs.lapsed_at_utc),
                 "reason": inputs.reason,
-                "schedule_record_sha256": inputs.schedule_record_sha256,
+                "entry_opens_at_utc": _utc_text(entry_open),
+                "schedule_observation_watermark": inputs.schedule_observation_watermark,
+                "schedule_record_sha256s": list(schedule_digests),
                 "candidate_records": candidate_records,
                 "candidate_set_sha256": _sha256(_canonical({"candidates": candidate_records})),
                 "resolution_record_sha256s": resolution_digests,
@@ -1485,7 +1694,7 @@ class TrialStore:
                 ),
             )
 
-    def validate_integrity(self) -> None:
+    def validate_integrity(self, *, include_outcomes: bool = True) -> None:
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute("SELECT * FROM trial_candidates ORDER BY sequence").fetchall()
             candidate_count = len(rows)
@@ -1493,14 +1702,16 @@ class TrialStore:
                 raise TrialRuntimeInvalid("candidate_sequence_not_gap_free")
             for row in rows:
                 self._verify_candidate_row(row)
-            for table in (
+            tables = [
                 "trial_evidence_dispositions",
                 "trial_resolutions",
                 "trial_entry_date_completions",
                 "trial_entry_date_lapses",
-                "trial_outcomes",
                 "trial_faults",
-            ):
+            ]
+            if include_outcomes:
+                tables.append("trial_outcomes")
+            for table in tables:
                 sequences = [
                     int(row[0])
                     for row in conn.execute(f"SELECT sequence FROM {table} ORDER BY sequence")
@@ -1553,7 +1764,6 @@ class TrialStore:
                 completed_at = _parse_utc(str(completion["completed_at_utc"]))
                 completion_dates.append(entry_date)
                 completion_candidate_ids: list[str] = []
-                completion_entry_opens: set[datetime] = set()
                 for candidate_binding in completion["candidate_records"]:
                     candidate_id = str(candidate_binding["candidate_id"])
                     completion_candidate_ids.append(candidate_id)
@@ -1566,7 +1776,6 @@ class TrialStore:
                         or _parse_utc(str(candidate_row["imported_at_utc"])) > completed_at
                     ):
                         raise TrialRuntimeInvalid("completion_candidate_binding_mismatch")
-                    completion_entry_opens.add(_parse_utc(str(candidate_row["entry_opens_at_utc"])))
                 try:
                     bound_resolutions = [
                         resolution_by_sha256[str(digest)]
@@ -1588,9 +1797,9 @@ class TrialStore:
                 cutoff = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK).astimezone(
                     UTC
                 )
-                if len(completion_entry_opens) != 1 or not cutoff <= completed_at < next(
-                    iter(completion_entry_opens)
-                ):
+                committed_at = _parse_utc(str(completion["committed_at_utc"]))
+                entry_open = _parse_utc(str(completion["entry_opens_at_utc"]))
+                if not cutoff <= completed_at <= committed_at < entry_open:
                     raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
                 _validate_cutoff_resolution_states(
                     [
@@ -1610,7 +1819,6 @@ class TrialStore:
                 entry_date = date.fromisoformat(str(lapse["entry_date"]))
                 lapsed_at = _parse_utc(str(lapse["lapsed_at_utc"]))
                 lapse_candidate_ids: list[str] = []
-                lapse_entry_opens: set[datetime] = set()
                 for candidate_binding in lapse["candidate_records"]:
                     candidate_id = str(candidate_binding["candidate_id"])
                     lapse_candidate_ids.append(candidate_id)
@@ -1623,7 +1831,6 @@ class TrialStore:
                         or _parse_utc(str(candidate_row["imported_at_utc"])) > lapsed_at
                     ):
                         raise TrialRuntimeInvalid("lapse_candidate_binding_mismatch")
-                    lapse_entry_opens.add(_parse_utc(str(candidate_row["entry_opens_at_utc"])))
                 try:
                     lapse_resolutions = [
                         resolution_by_sha256[str(digest)]
@@ -1645,12 +1852,12 @@ class TrialStore:
                     for resolution in lapse_resolutions
                 ):
                     raise TrialRuntimeInvalid("lapse_resolution_binding_mismatch")
-                if len(lapse_entry_opens) != 1 or lapsed_at < next(iter(lapse_entry_opens)):
+                if lapsed_at < _parse_utc(str(lapse["entry_opens_at_utc"])):
                     raise TrialRuntimeInvalid("entry_lapse_before_official_open")
             sealed_rows = conn.execute(
                 """
                 SELECT kind,entry_date,sealed_at_utc FROM (
-                  SELECT 'completion' kind,entry_date,completed_at_utc sealed_at_utc
+                  SELECT 'completion' kind,entry_date,committed_at_utc sealed_at_utc
                   FROM trial_entry_date_completions
                   UNION ALL
                   SELECT 'lapse' kind,entry_date,lapsed_at_utc sealed_at_utc

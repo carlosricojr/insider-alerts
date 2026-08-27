@@ -285,6 +285,7 @@
         "decision_readiness",
         "entry_date_lapse_policy",
         "bar_input_binding",
+        "bar_poll_receipt_binding",
         "schedule_input_binding",
         "eligibility_history",
         "healthy_bar_poll_proof",
@@ -313,6 +314,9 @@
         "entry_date_lapse_policy": {"const": "append_only_mass_missed_no_backdating"},
         "bar_input_binding": {
           "const": "observation_sequence_watermark_and_record_digests"
+        },
+        "bar_poll_receipt_binding": {
+          "const": "receipt_sequence_watermark_digests_and_observation_watermarks"
         },
         "schedule_input_binding": {
           "const": "observation_sequence_watermark_and_point_in_time_record_digests"

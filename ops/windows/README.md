@@ -73,3 +73,18 @@ and integrity semantics.
 `install-research-session-feed-task.ps1` similarly runs a bounded hourly direct-`pythonw.exe`
 worker on client ID 177. It appends point-in-time SPY RTH schedule observations, including early
 closes, and exposes health through `ops research-session-feed-status`.
+
+## Prospective trial runtime
+
+Install the order-incapable prospective trial worker only after both point-in-time feeds are
+deployed:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\ops\windows\install-research-trial-task.ps1 -Start
+```
+
+The task runs once per minute as direct hidden `pythonw.exe`, imports newly captured immutable
+candidates, and then seals or lapses eligible entry dates in the same sequential cycle. While the
+registry remains `draft`, it only records an idle heartbeat and cannot enroll candidates. Inspect
+it without connecting to IBKR via `ops research-trial-status`.

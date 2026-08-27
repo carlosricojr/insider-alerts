@@ -23,7 +23,8 @@ from insider_alerts.backtest.models import DailyBar
 NEW_YORK = ZoneInfo("America/New_York")
 _SOURCE_TIMEOUT_SECONDS = 40.0
 BAR_FEED_VERSION = "ibkr-completed-rth-daily-v1"
-BAR_FEED_SCHEMA_VERSION = 2
+BAR_POLL_RECEIPT_VERSION = "ibkr-completed-rth-daily-poll-v2"
+BAR_FEED_SCHEMA_VERSION = 3
 
 
 def _utc_text(value: datetime) -> str:
@@ -106,6 +107,7 @@ class BarPollReceipt:
     in_range_bar_count: int
     source_rejection_count: int
     validation_rejection_count: int
+    observation_watermark: int
     record_sha256: str
 
 
@@ -468,23 +470,30 @@ class BarFeedStore:
             raise ValueError("bar poll receipt local date does not match poll timestamp")
         if completed_through_date is not None and completed_through_date > local_date:
             raise ValueError("bar poll receipt completed-through date cannot be in the future")
-        record: dict[str, object] = {
-            "contract_version": BAR_FEED_VERSION,
-            "symbol": normalized,
-            "polled_at_utc": _utc_text(now),
-            "requested_start_date": earliest_start_date.isoformat(),
-            "requested_through_date": requested_through_date.isoformat(),
-            "completed_through_date": (
-                completed_through_date.isoformat() if completed_through_date else None
-            ),
-            "returned_bar_count": returned_bar_count,
-            "in_range_bar_count": in_range_bar_count,
-            "source_rejection_count": source_rejection_count,
-            "validation_rejection_count": validation_rejection_count,
-        }
-        encoded = _canonical(record)
-        digest = _sha256(encoded)
         with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            observation_watermark = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM bar_observations"
+                ).fetchone()[0]
+            )
+            record: dict[str, object] = {
+                "contract_version": BAR_POLL_RECEIPT_VERSION,
+                "symbol": normalized,
+                "polled_at_utc": _utc_text(now),
+                "requested_start_date": earliest_start_date.isoformat(),
+                "requested_through_date": requested_through_date.isoformat(),
+                "completed_through_date": (
+                    completed_through_date.isoformat() if completed_through_date else None
+                ),
+                "returned_bar_count": returned_bar_count,
+                "in_range_bar_count": in_range_bar_count,
+                "source_rejection_count": source_rejection_count,
+                "validation_rejection_count": validation_rejection_count,
+                "observation_watermark": observation_watermark,
+            }
+            encoded = _canonical(record)
+            digest = _sha256(encoded)
             sequence = int(
                 conn.execute(
                     "SELECT COALESCE(MAX(sequence),0)+1 FROM bar_poll_receipts"
@@ -817,7 +826,7 @@ class BarFeedStore:
         if not isinstance(record, dict) or _canonical(record) != raw:
             raise ValueError("bar poll receipt is not canonical JSON")
         expected = {
-            "contract_version": BAR_FEED_VERSION,
+            "contract_version": BAR_POLL_RECEIPT_VERSION,
             "symbol": str(row["symbol"]),
             "polled_at_utc": str(row["polled_at_utc"]),
             "requested_start_date": str(row["requested_start_date"]),
@@ -827,6 +836,7 @@ class BarFeedStore:
             "in_range_bar_count": int(row["in_range_bar_count"]),
             "source_rejection_count": int(row["source_rejection_count"]),
             "validation_rejection_count": int(row["validation_rejection_count"]),
+            "observation_watermark": record.get("observation_watermark"),
         }
         if (
             record != expected
@@ -867,9 +877,14 @@ class BarFeedStore:
             expected["source_rejection_count"],
             expected["validation_rejection_count"],
         )
+        observation_watermark = expected["observation_watermark"]
         if any(value < 0 for value in counts) or expected["in_range_bar_count"] > expected[
             "returned_bar_count"
-        ]:
+        ] or (
+            isinstance(observation_watermark, bool)
+            or not isinstance(observation_watermark, int)
+            or observation_watermark < 0
+        ):
             raise ValueError("bar poll receipt counts are invalid")
         return BarPollReceipt(
             sequence=int(row["sequence"]),
@@ -882,15 +897,39 @@ class BarFeedStore:
             in_range_bar_count=expected["in_range_bar_count"],
             source_rejection_count=expected["source_rejection_count"],
             validation_rejection_count=expected["validation_rejection_count"],
+            observation_watermark=observation_watermark,
             record_sha256=digest,
         )
 
-    def poll_receipts(self, symbol: str | None = None) -> list[BarPollReceipt]:
+    def poll_receipt_watermark(self) -> int:
+        with contextlib.closing(self._connect()) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM bar_poll_receipts"
+                ).fetchone()[0]
+            )
+
+    def poll_receipts(
+        self,
+        symbol: str | None = None,
+        *,
+        max_sequence: int | None = None,
+    ) -> list[BarPollReceipt]:
         parameters: tuple[object, ...] = ()
-        where = ""
+        clauses: list[str] = []
         if symbol is not None:
-            where = "WHERE symbol=?"
+            clauses.append("symbol=?")
             parameters = (_normalized_symbol(symbol),)
+        if max_sequence is not None:
+            if (
+                isinstance(max_sequence, bool)
+                or not isinstance(max_sequence, int)
+                or max_sequence < 0
+            ):
+                raise ValueError("bar poll receipt watermark must be a non-negative integer")
+            clauses.append("sequence<=?")
+            parameters = (*parameters, max_sequence)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
                 f"SELECT * FROM bar_poll_receipts {where} ORDER BY sequence",

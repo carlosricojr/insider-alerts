@@ -82,6 +82,9 @@ def test_draft_registry_matches_frozen_contract() -> None:
         "decision_readiness": "evidence_recorded_and_trial_imported_strictly_before_cutoff",
         "entry_date_lapse_policy": "append_only_mass_missed_no_backdating",
         "bar_input_binding": "observation_sequence_watermark_and_record_digests",
+        "bar_poll_receipt_binding": (
+            "receipt_sequence_watermark_digests_and_observation_watermarks"
+        ),
         "schedule_input_binding": "observation_sequence_watermark_and_point_in_time_record_digests",
         "eligibility_history": "exact_shared_e07_completed_pre_signal_sessions",
         "healthy_bar_poll_proof": (

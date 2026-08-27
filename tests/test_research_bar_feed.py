@@ -286,6 +286,10 @@ def test_worker_stays_offline_when_idle_and_collects_only_requested_range(tmp_pa
     assert receipts[0].in_range_bar_count == 2
     assert receipts[0].source_rejection_count == 0
     assert receipts[0].validation_rejection_count == 0
+    assert store.poll_receipt_watermark() == 1
+    assert store.poll_receipts("TEST", max_sequence=0) == []
+    with pytest.raises(ValueError, match="receipt watermark"):
+        store.poll_receipts(max_sequence=True)  # type: ignore[arg-type]
     assert store.status()["health"]["last_result"] == "completed"
     second_source = FakeSource([wanted])
     second = asyncio.run(collect_once(store, second_source, now=now + timedelta(minutes=1)))
@@ -329,6 +333,7 @@ def test_successful_poll_receipt_is_append_only_and_binds_rejections(tmp_path: P
     assert receipt.in_range_bar_count == 2
     assert receipt.source_rejection_count == 1
     assert receipt.validation_rejection_count == 1
+    assert receipt.observation_watermark == 1
     assert len(receipt.record_sha256) == 64
     assert store.status()["poll_receipt_count"] == 1
     store.validate_integrity()
@@ -596,12 +601,12 @@ def test_initializer_refuses_to_downgrade_newer_schema_marker(tmp_path: Path) ->
     path = tmp_path / "future.db"
     BarFeedStore(path)
     with sqlite3.connect(path) as conn:
-        conn.execute("UPDATE bar_feed_schema SET schema_version=3 WHERE singleton=1")
+        conn.execute("UPDATE bar_feed_schema SET schema_version=4 WHERE singleton=1")
 
     with pytest.raises(ValueError, match="newer than this runtime"):
         BarFeedStore(path)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT schema_version FROM bar_feed_schema").fetchone()[0] == 3
+        assert conn.execute("SELECT schema_version FROM bar_feed_schema").fetchone()[0] == 4
     assert bar_feed_status(path)["integrity_status"] == "invalid"
 
 

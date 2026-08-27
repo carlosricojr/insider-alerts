@@ -1,0 +1,66 @@
+"""Hidden one-cycle worker for prospective candidate import and entry sealing."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import Path
+
+from insider_alerts.research.trial_finalizer import finalize_pending_entry_dates
+from insider_alerts.research.trial_runtime import TrialRuntimeConfig, run_trial_once
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run one prospective OPP-E07 trial cycle")
+    parser.add_argument("--trial-db", type=Path, default=Path("data/research/trial.db"))
+    parser.add_argument("--evidence-db", type=Path, default=Path("data/research/evidence.db"))
+    parser.add_argument("--bar-feed-db", type=Path, default=Path("data/research/bar_feed.db"))
+    parser.add_argument(
+        "--session-feed-db", type=Path, default=Path("data/research/session_feed.db")
+    )
+    parser.add_argument(
+        "--registry-path",
+        type=Path,
+        default=Path("docs/research/registry/OPP-E07-V1.json"),
+    )
+    parser.add_argument(
+        "--error-log", type=Path, default=Path("logs/research-trial-worker.err.log")
+    )
+    return parser
+
+
+def _append_error(path: Path, exc: BaseException) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    config = TrialRuntimeConfig(
+        trial_db=args.trial_db,
+        evidence_db=args.evidence_db,
+        bar_feed_db=args.bar_feed_db,
+        session_feed_db=args.session_feed_db,
+        registry_path=args.registry_path,
+    )
+    try:
+        imported = run_trial_once(config, now=datetime.now(UTC))
+        finalized = finalize_pending_entry_dates(config)
+    except Exception as exc:
+        _append_error(args.error_log, exc)
+        return 2
+    print(
+        json.dumps(
+            {"candidate_runtime": asdict(imported), "entry_finalizer": asdict(finalized)},
+            sort_keys=True,
+            default=str,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
