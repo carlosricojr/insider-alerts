@@ -3826,7 +3826,10 @@ def ops_research_session_feed_status(
 ) -> None:
     """Show exchange-session feed health without connecting to IBKR."""
 
-    typer.echo(json.dumps(session_feed_status(feed_db), indent=2, sort_keys=True))
+    report = session_feed_status(feed_db)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if report.get("integrity_status") != "valid":
+        raise typer.Exit(code=3)
 
 
 @ops_app.command("live-canary-watchdog")

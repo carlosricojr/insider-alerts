@@ -7,7 +7,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from typer.testing import CliRunner
 
+from insider_alerts import cli
 from insider_alerts.research.session_feed import (
     ExchangeSession,
     SessionFeedStore,
@@ -147,6 +149,24 @@ def test_status_does_not_create_missing_database(tmp_path: Path) -> None:
     corrupt = tmp_path / "corrupt.db"
     corrupt.write_bytes(b"not sqlite")
     assert session_feed_status(corrupt)["integrity_status"] == "invalid"
+
+
+def test_status_cli_uses_integrity_exit_code(tmp_path: Path) -> None:
+    store = SessionFeedStore(tmp_path / "sessions.db")
+    runner = CliRunner()
+
+    valid = runner.invoke(
+        cli.app,
+        ["ops", "research-session-feed-status", "--feed-db", str(store.path)],
+    )
+    assert valid.exit_code == 0
+    missing_path = tmp_path / "missing.db"
+    missing = runner.invoke(
+        cli.app,
+        ["ops", "research-session-feed-status", "--feed-db", str(missing_path)],
+    )
+    assert missing.exit_code == 3
+    assert not missing_path.exists()
 
 
 def test_windows_session_task_is_direct_hidden_pythonw() -> None:
