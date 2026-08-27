@@ -237,6 +237,12 @@ def finalize_pending_entry_dates(
     trial_store.validate_integrity(include_outcomes=False)
     session_store.validate_integrity()
     bar_store.validate_integrity()
+    frozen = trial_store.cohort_freeze()
+    if frozen is not None:
+        return FinalizationResult(
+            "cohort_frozen",
+            reason=f"freeze_boundary_entry_date={frozen[0].isoformat()}",
+        )
     resolved_ids = {resolution.candidate_id for resolution in trial_store.resolutions()}
     pending = [
         candidate
@@ -368,4 +374,6 @@ def finalize_pending_entry_dates(
             lapsed += 1
             continue
         completed += 1
+        if trial_store.cohort_freeze() is not None:
+            break
     return FinalizationResult("complete", completed, lapsed)

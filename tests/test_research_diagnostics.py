@@ -28,7 +28,7 @@ from insider_alerts.research.diagnostics import (
     run_diagnostics_once,
 )
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
-from insider_alerts.research.trial_runtime import TrialWindow
+from insider_alerts.research.trial_runtime import TrialStore, TrialWindow
 from insider_alerts.review.queue import ensure_review_tables
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +40,9 @@ def _utc_text(value: datetime) -> str:
 
 
 def _config(tmp_path: Path) -> DiagnosticConfig:
+    TrialStore(tmp_path / "trial.db")
     return DiagnosticConfig(
+        trial_db=tmp_path / "trial.db",
         diagnostics_db=tmp_path / "diagnostics.db",
         canary_ledger_db=tmp_path / "canary.db",
         source_db=tmp_path / "source.db",

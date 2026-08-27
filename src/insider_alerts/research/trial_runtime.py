@@ -22,6 +22,7 @@ from insider_alerts.research.inference import (
     CAPACITY_RANK_SALT,
     HYPOTHESIS_ID,
     _validate_registry,
+    cohort_freeze_boundary,
     enrollment_deadline,
 )
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
@@ -697,6 +698,8 @@ class TrialStore:
                 if expected_fields != persisted_fields:
                     raise TrialRuntimeInvalid("candidate_identity_reused_with_different_content")
                 return False
+            if self._cohort_freeze_in_connection(conn) is not None:
+                raise EvidenceExcluded("cohort_already_frozen")
             latest_seal = conn.execute(
                 """
                 SELECT sealed_at_utc FROM (
@@ -932,6 +935,35 @@ class TrialStore:
                 "SELECT * FROM trial_entry_date_completions ORDER BY sequence"
             ).fetchall()
         return [self._verify_completion_row(row) for row in rows]
+
+    def _cohort_freeze_in_connection(
+        self, conn: sqlite3.Connection
+    ) -> tuple[date, datetime] | None:
+        completion_rows = conn.execute(
+            "SELECT * FROM trial_entry_date_completions ORDER BY sequence"
+        ).fetchall()
+        completions = {
+            date.fromisoformat(str(record["entry_date"])): _parse_utc(
+                str(record["completed_at_utc"])
+            )
+            for record in (self._verify_completion_row(row) for row in completion_rows)
+        }
+        resolution_rows = conn.execute(
+            "SELECT * FROM trial_resolutions ORDER BY sequence"
+        ).fetchall()
+        enrolled_dates = [
+            resolution.entry_date
+            for resolution in (self._verify_resolution_row(row) for row in resolution_rows)
+            if resolution.enrollment_state == "enrolled"
+        ]
+        return cohort_freeze_boundary(enrolled_dates, completions)
+
+    def cohort_freeze(self) -> tuple[date, datetime] | None:
+        """Derive the permanent cohort boundary from immutable completions and resolutions."""
+
+        with contextlib.closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            return self._cohort_freeze_in_connection(conn)
 
     @staticmethod
     def _outcome_record(outcome: TrialOutcomeInputs) -> dict[str, Any]:

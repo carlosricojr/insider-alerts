@@ -20,6 +20,10 @@ missing-session behavior<br>
 Draft correction: 2026-08-27, before activation and with zero evidence snapshots or challenger
 candidates, to freeze prospective full-control and routine diagnostic membership, provenance,
 outcome authority, failure isolation, and reconciliation semantics<br>
+Draft correction: 2026-08-27, before activation and with zero evidence snapshots or challenger
+candidates, to bind the terminal-dataset producer, permanent cohort-freeze behavior, explicit
+diagnostic completeness accounting, stable multi-store sealing snapshot, and non-aggregating
+pre-seal validation<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -38,12 +42,13 @@ The draft becomes active only after all of the following occur:
 
 1. point-in-time evidence capture and the owner-history classifier are implemented, tested,
    independently reviewed, merged to `origin/main`, and deployed invisibly;
-2. the complete inference executable and its environment are implemented, tested, independently
-   reviewed, and merged before activation;
+2. the complete inference executable, terminal-dataset producer, and their environment are
+   implemented, tested, independently reviewed, and merged before activation;
 3. an append-only activation record binds the registry definition, preregistration, both JSON
-   Schemas, inference executable, and dependency lock SHA-256 digests; schema version; merged Git
-   implementation Git commit; policy hash; classifier version; UTC activation timestamp; and
-   enrollment sequence. The implementation commit must contain the exact bound artifacts and
+   Schemas, inference executable, terminal-dataset producer, and dependency lock SHA-256 digests;
+   schema version; merged Git implementation Git commit; policy hash; classifier version; UTC
+   activation timestamp; and enrollment sequence. The implementation commit must contain the exact
+   bound artifacts and
    registry definition and remain an ancestor of the deployed commit; every content-bound artifact
    must still match after platform-stable CRLF-to-LF canonicalization;
 4. the evidence store is empty for this registry ID and passes an integrity check; and
@@ -275,11 +280,19 @@ falsification context, not additional confirmatory tests.
   its official open, and cannot skip a candidate imported before the cutoff for
   that date. A separately ordered lapse record is the only permitted way to advance an intended
   entry date after its open; every candidate for a lapsed date is permanently `missed`.
+  Once that boundary exists, later evidence receives the immutable disposition
+  `excluded: cohort_already_frozen`, and the entry-date finalizer cannot resolve another date.
 - Terminal information time: after cohort freeze, wait until every frozen position has a final E07
   outcome and all integrity checks pass. A separate no-aggregation command then writes a terminal
   dataset receipt to the append-only seal store before the decision command can calculate any
-  aggregate outcome. The receipt binds the dataset, complete mutable candidate projection, and
-  immutable candidate-universe digests.
+  aggregate outcome. The producer validates unchanged trial and diagnostic fingerprints, then
+  holds write-preventing snapshots of the trial, diagnostic, canary, and source stores until the
+  receipt commits. It independently reconciles diagnostic membership to the authoritative canary
+  and source stores. Each diagnostic group carries exact available/not-traded/unavailable
+  accounting; group failure produces an empty, explicitly unavailable diagnostic and cannot alter
+  the challenger. The receipt binds the dataset, complete candidate projection, and immutable
+  candidate-universe digests. The dataset is published content-addressed before receipt creation,
+  so a crash is safely retryable without creating an alternate scientific dataset.
 - Enrollment deadline: convert `activated_at_utc` to `America/New_York`, add exactly 18 calendar
   months while preserving the local wall-clock time, and convert the result back to UTC. If the
   activation day does not exist in the target month, use that target month's final calendar day.

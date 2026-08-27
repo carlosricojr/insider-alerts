@@ -45,6 +45,9 @@ def _active_registry() -> dict[str, Any]:
             ROOT / "docs/research/contracts/evidence-snapshot.schema.json"
         ),
         "inference_artifact_sha256": inference.inference_artifact_sha256(),
+        "terminal_builder_artifact_sha256": file_sha(
+            ROOT / "src/insider_alerts/research/terminal_builder.py"
+        ),
         "dependency_lock_sha256": file_sha(ROOT / "uv.lock"),
         "policy_sha256": file_sha(ROOT / registry["strategy"]["policy_artifact"]),
         "classifier_version": inference.CLASSIFIER_VERSION,
@@ -188,7 +191,7 @@ def _terminal_dataset(candidates: list[dict[str, Any]], *, gross_return: float) 
         datetime.fromisoformat(item["exit_at_utc"].replace("Z", "+00:00")) for item in trades
     )
     terminal: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": inference.TERMINAL_DATASET_SCHEMA_VERSION,
         "hypothesis_id": "OPP-E07-V1",
         "freeze_boundary_entry_date": freeze_boundary,
         "sealed_at_utc": _utc_text(latest_exit + timedelta(seconds=1)),
@@ -201,6 +204,17 @@ def _terminal_dataset(candidates: list[dict[str, Any]], *, gross_return: float) 
         "challenger_trades": trades,
         "control_trades": [],
         "routine_trades": [],
+        "diagnostic_group_status": {
+            group: {
+                "status": "available",
+                "error_code": None,
+                "membership_count": 0,
+                "available_trade_count": 0,
+                "not_traded_count": 0,
+                "unavailable_count": 0,
+            }
+            for group in ("control", "routine")
+        },
         "dataset_sha256": "",
     }
     unsigned = dict(terminal)
@@ -283,6 +297,21 @@ def _evaluate(payload: dict[str, Any]) -> dict[str, Any]:
         terminal_receipt=terminal_receipt,
         deadline_miss_receipt=deadline_receipt,
     )
+
+
+def test_cohort_freeze_is_first_complete_boundary_and_includes_the_whole_date() -> None:
+    entry_dates = [date(2026, 2, 1) + timedelta(days=index) for index in range(60)]
+    enrolled = entry_dates + [entry_dates[-1]] * 40
+    completions = {
+        entry_day: datetime.combine(entry_day, time(22, 0), tzinfo=UTC) for entry_day in entry_dates
+    }
+
+    boundary = inference.cohort_freeze_boundary(enrolled, completions)
+
+    assert boundary == (entry_dates[-1], completions[entry_dates[-1]])
+    assert sum(entry_day <= boundary[0] for entry_day in enrolled) == 100
+    assert inference.cohort_freeze_boundary(enrolled[:-1], completions) is None
+    assert inference.cohort_freeze_boundary(enrolled, dict(list(completions.items())[:-1])) is None
 
 
 def test_sha256_counter_rng_has_frozen_vector() -> None:
@@ -671,7 +700,18 @@ def test_append_only_terminal_seal_and_report_prohibit_a_second_look(
     assert missing_seal["reason_codes"] == ["terminal_seal_receipt_required"]
     assert store.existing_report() is None
 
-    store.seal_terminal(payload, recorded_at=evaluated)
+    receipt = store.seal_terminal(_registry(), payload, recorded_at=evaluated, allow_draft=True)
+    replay = json.loads(json.dumps(payload))
+    replay["evaluated_at_utc"] = _utc_text(evaluated + timedelta(minutes=1))
+    assert (
+        store.seal_terminal(
+            _registry(),
+            replay,
+            recorded_at=evaluated + timedelta(minutes=1),
+            allow_draft=True,
+        )
+        == receipt
+    )
     first = inference.evaluate_with_store(_registry(), payload, store, allow_draft=True)
 
     altered = json.loads(json.dumps(payload))
@@ -683,18 +723,89 @@ def test_append_only_terminal_seal_and_report_prohibit_a_second_look(
     ).hexdigest()
 
     with pytest.raises(inference.TrialInvalid, match="alternate_terminal_seal"):
-        store.seal_terminal(altered, recorded_at=evaluated)
+        store.seal_terminal(_registry(), altered, recorded_at=evaluated, allow_draft=True)
     assert inference.evaluate_with_store(_registry(), altered, store, allow_draft=True) == first
 
 
-def test_diagnostic_corruption_is_typed_and_cannot_change_primary_decision() -> None:
+def test_terminal_preseal_validates_completeness_without_aggregation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     candidates = _candidate_rows([2] * 60)
     terminal = _terminal_dataset(candidates, gross_return=0.03)
-    diagnostic = dict(terminal["challenger_trades"][0])
-    diagnostic["confirmatory_enrollment_sequence"] = None
-    diagnostic["evidence_record_sha256"] = None
-    diagnostic["entry_rank_sha256"] = None
-    terminal["control_trades"] = [diagnostic, dict(diagnostic)]
+    evaluated = datetime.fromisoformat(terminal["sealed_at_utc"].replace("Z", "+00:00"))
+    payload = _payload(
+        candidates,
+        evaluated_at=evaluated,
+        complete_through=date.fromisoformat(terminal["freeze_boundary_entry_date"]),
+        terminal=terminal,
+    )
+    store = inference.TrialSealStore(tmp_path / "seals.db")
+
+    incomplete = json.loads(json.dumps(payload))
+    incomplete["terminal_dataset"]["challenger_trades"].pop()
+    unsigned = dict(incomplete["terminal_dataset"])
+    unsigned.pop("dataset_sha256")
+    incomplete["terminal_dataset"]["dataset_sha256"] = hashlib.sha256(
+        rfc8785.dumps(unsigned)
+    ).hexdigest()
+    with pytest.raises(
+        inference.TrialInvalid,
+        match="terminal_preseal_validation_failed:challenger_outcomes_do_not_match_frozen_cohort",
+    ):
+        store.seal_terminal(_registry(), incomplete, recorded_at=evaluated, allow_draft=True)
+    assert store.receipt("terminal_seal") is None
+
+    def aggregation_must_not_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("terminal preseal attempted aggregation")
+
+    monkeypatch.setattr(inference, "_bootstrap", aggregation_must_not_run)
+    receipt = store.seal_terminal(_registry(), payload, recorded_at=evaluated, allow_draft=True)
+    assert receipt["kind"] == "terminal_seal"
+
+
+def test_deadline_and_terminal_receipts_are_mutually_exclusive(tmp_path: Path) -> None:
+    candidates = _candidate_rows([2] * 60)
+    terminal = _terminal_dataset(candidates, gross_return=0.03)
+    evaluated = datetime.fromisoformat(terminal["sealed_at_utc"].replace("Z", "+00:00"))
+    terminal_payload = _payload(
+        candidates,
+        evaluated_at=evaluated,
+        complete_through=date.fromisoformat(terminal["freeze_boundary_entry_date"]),
+        terminal=terminal,
+    )
+    monitoring_payload = _payload(
+        _candidate_rows([1]),
+        evaluated_at=ACTIVATED_AT + timedelta(days=1),
+        complete_through=None,
+    )
+    deadline = inference.enrollment_deadline(ACTIVATED_AT)
+
+    deadline_first = inference.TrialSealStore(tmp_path / "deadline-first.db")
+    deadline_first.seal_deadline_miss(monitoring_payload, recorded_at=deadline)
+    with pytest.raises(inference.TrialInvalid, match="terminal_receipt_kind_conflict"):
+        deadline_first.seal_terminal(
+            _registry(), terminal_payload, recorded_at=evaluated, allow_draft=True
+        )
+
+    terminal_first = inference.TrialSealStore(tmp_path / "terminal-first.db")
+    terminal_first.seal_terminal(
+        _registry(), terminal_payload, recorded_at=evaluated, allow_draft=True
+    )
+    with pytest.raises(inference.TrialInvalid, match="terminal_receipt_kind_conflict"):
+        terminal_first.seal_deadline_miss(monitoring_payload, recorded_at=deadline)
+
+
+def test_diagnostic_unavailability_is_typed_and_cannot_change_primary_decision() -> None:
+    candidates = _candidate_rows([2] * 60)
+    terminal = _terminal_dataset(candidates, gross_return=0.03)
+    terminal["diagnostic_group_status"]["control"] = {
+        "status": "unavailable",
+        "error_code": "control_reconciliation_incomplete",
+        "membership_count": 2,
+        "available_trade_count": 0,
+        "not_traded_count": 0,
+        "unavailable_count": 2,
+    }
     unsigned = dict(terminal)
     unsigned.pop("dataset_sha256")
     terminal["dataset_sha256"] = hashlib.sha256(rfc8785.dumps(unsigned)).hexdigest()
@@ -712,8 +823,69 @@ def test_diagnostic_corruption_is_typed_and_cannot_change_primary_decision() -> 
     assert report["state"] == "PROMOTE_RECOMMENDED"
     assert report["falsification_context"]["control"] == {
         "status": "unavailable",
-        "error_code": "control_trade_id_duplicate",
+        "error_code": "control_reconciliation_incomplete",
+        "accounting": terminal["diagnostic_group_status"]["control"],
     }
+
+
+def test_empty_available_diagnostic_group_is_valid_and_explicit() -> None:
+    candidates = _candidate_rows([2] * 60)
+    terminal = _terminal_dataset(candidates, gross_return=0.03)
+    evaluated = datetime.fromisoformat(terminal["sealed_at_utc"].replace("Z", "+00:00"))
+
+    report = _evaluate(
+        _payload(
+            candidates,
+            evaluated_at=evaluated,
+            complete_through=date.fromisoformat(terminal["freeze_boundary_entry_date"]),
+            terminal=terminal,
+        )
+    )
+
+    control = report["falsification_context"]["control"]
+    assert control["status"] == "available"
+    assert control["accounting"]["membership_count"] == 0
+    assert control["trade_count"] == 0
+
+
+def test_diagnostic_group_accounting_and_available_rows_fail_closed() -> None:
+    candidates = _candidate_rows([2] * 60)
+    terminal = _terminal_dataset(candidates, gross_return=0.03)
+    terminal["diagnostic_group_status"]["control"]["membership_count"] = 1
+    unsigned = dict(terminal)
+    unsigned.pop("dataset_sha256")
+    terminal["dataset_sha256"] = hashlib.sha256(rfc8785.dumps(unsigned)).hexdigest()
+    evaluated = datetime.fromisoformat(terminal["sealed_at_utc"].replace("Z", "+00:00"))
+
+    report = _evaluate(
+        _payload(
+            candidates,
+            evaluated_at=evaluated,
+            complete_through=date.fromisoformat(terminal["freeze_boundary_entry_date"]),
+            terminal=terminal,
+        )
+    )
+    assert report["state"] == "INVALID"
+    assert report["reason_codes"] == ["control_group_accounting_mismatch"]
+
+    terminal = _terminal_dataset(candidates, gross_return=0.03)
+    terminal["diagnostic_group_status"]["control"].update(
+        membership_count=1,
+        available_trade_count=1,
+    )
+    unsigned = dict(terminal)
+    unsigned.pop("dataset_sha256")
+    terminal["dataset_sha256"] = hashlib.sha256(rfc8785.dumps(unsigned)).hexdigest()
+    report = _evaluate(
+        _payload(
+            candidates,
+            evaluated_at=evaluated,
+            complete_through=date.fromisoformat(terminal["freeze_boundary_entry_date"]),
+            terminal=terminal,
+        )
+    )
+    assert report["state"] == "INVALID"
+    assert report["reason_codes"] == ["control_available_trade_count_mismatch"]
 
 
 def test_extreme_finite_returns_fail_closed_instead_of_crashing() -> None:

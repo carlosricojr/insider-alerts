@@ -76,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         registry_path=args.registry_path,
     )
     diagnostic_config = DiagnosticConfig(
+        trial_db=args.trial_db,
         diagnostics_db=diagnostics_db,
         canary_ledger_db=args.canary_ledger_db,
         source_db=args.source_db,

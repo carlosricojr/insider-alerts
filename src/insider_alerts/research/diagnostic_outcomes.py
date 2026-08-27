@@ -28,6 +28,7 @@ from insider_alerts.research.trial_finalizer import E07
 from insider_alerts.research.trial_runtime import (
     TrialRuntimeConfig,
     TrialRuntimeInvalid,
+    TrialStore,
     _validated_trial_window,
 )
 
@@ -182,7 +183,7 @@ def finalize_diagnostic_outcomes(
     store = DiagnosticStore(config.diagnostics_db)
     window = _validated_trial_window(
         TrialRuntimeConfig(
-            trial_db=config.diagnostics_db.with_name("unused-diagnostic-trial.db"),
+            trial_db=config.trial_db,
             evidence_db=config.evidence_db,
             bar_feed_db=config.bar_feed_db,
             session_feed_db=config.session_feed_db,
@@ -204,7 +205,18 @@ def finalize_diagnostic_outcomes(
     bar_store = BarFeedStore(config.bar_feed_db, initialize=False)
     session_store.validate_integrity()
     bar_store.validate_integrity()
+    trial_store = TrialStore(config.trial_db, initialize=False)
+    trial_store.validate_integrity(include_outcomes=False)
+    frozen = trial_store.cohort_freeze()
+    freeze_boundary = frozen[0] if frozen is not None else None
     candidates = store.candidates()
+    if freeze_boundary is not None:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["entry_session"] is not None
+            and date.fromisoformat(str(candidate["entry_session"])) <= freeze_boundary
+        ]
     outcomes_added = receipts_added = waiting = reconciliations = 0
     for candidate in candidates:
         packet_id = str(candidate["packet_id"])
