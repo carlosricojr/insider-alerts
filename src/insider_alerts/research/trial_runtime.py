@@ -7,6 +7,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -30,6 +31,7 @@ BAR_REQUESTER = "OPP-E07-V1-completed-bar-input-v1"
 SIGNAL_CUTOFF = time(9, 20)
 MAX_SESSIONS = 10
 BAR_LOOKBACK_CALENDAR_DAYS = 120
+MAX_CHALLENGER_SLOTS = 20
 
 
 class TrialRuntimeInvalid(RuntimeError):
@@ -112,6 +114,24 @@ class TrialRuntimeResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class EntryEligibility:
+    eligible: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class TrialResolution:
+    candidate_id: str
+    entry_date: date
+    enrollment_state: Literal[
+        "enrolled", "ineligible", "overlap_suppressed", "capacity_suppressed", "missed"
+    ]
+    reason: str
+    confirmatory_enrollment_sequence: int | None
+    resolved_at_utc: datetime
+
+
 def _validated_trial_window(config: TrialRuntimeConfig) -> TrialWindow:
     try:
         registry_bytes = config.registry_path.read_bytes()
@@ -186,6 +206,100 @@ def _entry_rank(
         f"{CAPACITY_RANK_SALT}|{entry_date.isoformat()}|{packet_id}|{accession_number}|{symbol}"
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def resolve_ranked_entry_date(
+    candidates: Sequence[TrialCandidate],
+    *,
+    eligibility: Mapping[str, EntryEligibility],
+    occupied_symbols: frozenset[str],
+    occupied_slots: int,
+    next_enrollment_sequence: int,
+    completed_at_utc: datetime,
+) -> list[TrialResolution]:
+    """Resolve one complete entry date from only pre-open, preregistered inputs."""
+
+    if not candidates:
+        raise TrialRuntimeInvalid("entry_completion_has_no_candidates")
+    if completed_at_utc.tzinfo is None:
+        raise ValueError("entry completion timestamp cannot be naive")
+    if occupied_slots != len(occupied_symbols) or not 0 <= occupied_slots <= MAX_CHALLENGER_SLOTS:
+        raise TrialRuntimeInvalid("prior_book_occupancy_invalid")
+    if next_enrollment_sequence < 1:
+        raise TrialRuntimeInvalid("next_enrollment_sequence_invalid")
+    if len({candidate.candidate_id for candidate in candidates}) != len(candidates):
+        raise TrialRuntimeInvalid("entry_completion_candidate_duplicate")
+    if len({candidate.entry_rank_sha256 for candidate in candidates}) != len(candidates):
+        raise TrialRuntimeInvalid("entry_completion_rank_duplicate")
+    for candidate in candidates:
+        if any(
+            value.tzinfo is None
+            for value in (
+                candidate.source_first_observed_at_utc,
+                candidate.evidence_recorded_at_utc,
+                candidate.imported_at_utc,
+                candidate.entry_opens_at_utc,
+            )
+        ):
+            raise TrialRuntimeInvalid("entry_completion_candidate_timestamp_naive")
+    entry_dates = {candidate.planned_entry_date for candidate in candidates}
+    entry_opens = {candidate.entry_opens_at_utc for candidate in candidates}
+    if len(entry_dates) != 1 or len(entry_opens) != 1:
+        raise TrialRuntimeInvalid("entry_completion_candidate_session_mismatch")
+    entry_date = next(iter(entry_dates))
+    entry_open = next(iter(entry_opens))
+    cutoff_local = datetime.combine(entry_date, SIGNAL_CUTOFF, tzinfo=NEW_YORK)
+    cutoff_utc = cutoff_local.astimezone(UTC)
+    if (
+        completed_at_utc.astimezone(NEW_YORK).date() != entry_date
+        or not cutoff_utc <= completed_at_utc < entry_open
+    ):
+        raise TrialRuntimeInvalid("entry_completion_outside_pre_open_window")
+    if set(eligibility) != {candidate.candidate_id for candidate in candidates}:
+        raise TrialRuntimeInvalid("entry_completion_eligibility_set_mismatch")
+
+    active_symbols = set(occupied_symbols)
+    active_slots = occupied_slots
+    sequence = next_enrollment_sequence
+    resolutions: list[TrialResolution] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item.entry_rank_sha256, item.candidate_id),
+    ):
+        state: Literal[
+            "enrolled", "ineligible", "overlap_suppressed", "capacity_suppressed", "missed"
+        ]
+        reason: str
+        enrollment_sequence: int | None = None
+        if candidate.source_first_observed_at_utc >= cutoff_utc:
+            raise TrialRuntimeInvalid("same_date_candidate_source_not_before_cutoff")
+        if candidate.evidence_recorded_at_utc >= cutoff_utc:
+            state, reason = "missed", "evidence_not_recorded_before_entry_cutoff"
+        elif candidate.imported_at_utc >= cutoff_utc:
+            state, reason = "missed", "candidate_not_imported_before_entry_cutoff"
+        elif not eligibility[candidate.candidate_id].eligible:
+            state, reason = "ineligible", eligibility[candidate.candidate_id].reason
+        elif candidate.symbol in active_symbols:
+            state, reason = "overlap_suppressed", "same_symbol_position_active_at_entry_open"
+        elif active_slots >= MAX_CHALLENGER_SLOTS:
+            state, reason = "capacity_suppressed", "challenger_book_at_20_slot_capacity"
+        else:
+            state, reason = "enrolled", eligibility[candidate.candidate_id].reason
+            enrollment_sequence = sequence
+            sequence += 1
+            active_slots += 1
+            active_symbols.add(candidate.symbol)
+        resolutions.append(
+            TrialResolution(
+                candidate_id=candidate.candidate_id,
+                entry_date=entry_date,
+                enrollment_state=state,
+                reason=reason,
+                confirmatory_enrollment_sequence=enrollment_sequence,
+                resolved_at_utc=completed_at_utc,
+            )
+        )
+    return resolutions
 
 
 class TrialStore:

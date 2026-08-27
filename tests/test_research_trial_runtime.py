@@ -15,11 +15,14 @@ import insider_alerts.research.trial_runtime as runtime
 from insider_alerts.research.bar_feed import BarFeedStore
 from insider_alerts.research.session_feed import ExchangeSession, SessionFeedStore
 from insider_alerts.research.trial_runtime import (
+    EntryEligibility,
+    TrialCandidate,
     TrialRuntimeConfig,
     TrialRuntimeInvalid,
     TrialStore,
     TrialWindow,
     planned_entry_session,
+    resolve_ranked_entry_date,
     run_trial_once,
     trial_runtime_status,
 )
@@ -65,6 +68,35 @@ def _active_window() -> TrialWindow:
         REGISTRY_SHA,
         ACTIVATED_AT,
         runtime.enrollment_deadline(ACTIVATED_AT),
+    )
+
+
+def _trial_candidate(
+    candidate_id: str,
+    *,
+    symbol: str,
+    rank: str,
+    evidence_recorded_at: datetime,
+    imported_at: datetime,
+) -> TrialCandidate:
+    entry_date = date(2026, 8, 27)
+    return TrialCandidate(
+        candidate_id=candidate_id,
+        evidence_snapshot_id=f"snapshot-{candidate_id}",
+        evidence_record_sha256=(candidate_id[-1] * 64),
+        packet_id=f"packet-{candidate_id}",
+        accession_number=f"accession-{candidate_id}",
+        symbol=symbol,
+        source_first_observed_at_utc=datetime(2026, 8, 27, 13, 0, tzinfo=UTC),
+        evidence_recorded_at_utc=evidence_recorded_at,
+        classification_state="opportunistic",
+        transaction_owner_mapping="exact",
+        history_coverage_complete=True,
+        planned_entry_date=entry_date,
+        entry_opens_at_utc=datetime(2026, 8, 27, 13, 30, tzinfo=UTC),
+        final_session_date=date(2026, 9, 9),
+        entry_rank_sha256=rank * 64,
+        imported_at_utc=imported_at,
     )
 
 
@@ -170,6 +202,183 @@ def test_planned_entry_is_pure_at_cutoff_and_does_not_consult_now() -> None:
 def test_planned_entry_fails_closed_without_ten_session_horizon() -> None:
     with pytest.raises(TrialRuntimeInvalid, match="entry_horizon"):
         planned_entry_session(ACTIVATED_AT, _sessions(count=9))
+
+
+def test_ranked_entry_resolution_is_pre_open_gap_free_and_capacity_limited() -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    cutoff = datetime(2026, 8, 27, 13, 20, tzinfo=UTC)
+    candidates = [
+        _trial_candidate(
+            "z", symbol="NEW", rank="1", evidence_recorded_at=ready, imported_at=ready
+        ),
+        _trial_candidate(
+            "a", symbol="NEW", rank="2", evidence_recorded_at=ready, imported_at=ready
+        ),
+        _trial_candidate(
+            "m", symbol="OLD0", rank="3", evidence_recorded_at=ready, imported_at=ready
+        ),
+        _trial_candidate(
+            "y", symbol="SECOND", rank="4", evidence_recorded_at=ready, imported_at=ready
+        ),
+        _trial_candidate(
+            "c", symbol="NEXT", rank="5", evidence_recorded_at=ready, imported_at=ready
+        ),
+        _trial_candidate(
+            "d", symbol="BAD", rank="6", evidence_recorded_at=ready, imported_at=ready
+        ),
+        _trial_candidate(
+            "e",
+            symbol="LATE",
+            rank="7",
+            evidence_recorded_at=cutoff,
+            imported_at=cutoff,
+        ),
+        _trial_candidate(
+            "f",
+            symbol="IMPORTLATE",
+            rank="8",
+            evidence_recorded_at=ready,
+            imported_at=cutoff,
+        ),
+    ]
+    eligibility = {
+        candidate.candidate_id: EntryEligibility(
+            candidate.candidate_id not in {"d", "e"},
+            (
+                "eligible_E07_F00"
+                if candidate.candidate_id not in {"d", "e"}
+                else "price_out_of_range"
+            ),
+        )
+        for candidate in candidates
+    }
+    occupied = frozenset(f"OLD{index}" for index in range(18))
+
+    resolved = resolve_ranked_entry_date(
+        candidates,
+        eligibility=eligibility,
+        occupied_symbols=occupied,
+        occupied_slots=18,
+        next_enrollment_sequence=7,
+        completed_at_utc=cutoff,
+    )
+
+    assert [item.enrollment_state for item in resolved] == [
+        "enrolled",
+        "overlap_suppressed",
+        "overlap_suppressed",
+        "enrolled",
+        "capacity_suppressed",
+        "ineligible",
+        "missed",
+        "missed",
+    ]
+    assert [item.confirmatory_enrollment_sequence for item in resolved] == [
+        7,
+        None,
+        None,
+        8,
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert [item.reason for item in resolved] == [
+        "eligible_E07_F00",
+        "same_symbol_position_active_at_entry_open",
+        "same_symbol_position_active_at_entry_open",
+        "eligible_E07_F00",
+        "challenger_book_at_20_slot_capacity",
+        "price_out_of_range",
+        "evidence_not_recorded_before_entry_cutoff",
+        "candidate_not_imported_before_entry_cutoff",
+    ]
+
+
+@pytest.mark.parametrize(
+    "completed_at",
+    [
+        datetime(2026, 8, 27, 13, 19, 59, 999999, tzinfo=UTC),
+        datetime(2026, 8, 27, 13, 30, tzinfo=UTC),
+    ],
+)
+def test_entry_resolution_rejects_completion_outside_pre_open_window(
+    completed_at: datetime,
+) -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    candidate = _trial_candidate(
+        "a",
+        symbol="TEST",
+        rank="1",
+        evidence_recorded_at=ready,
+        imported_at=ready,
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="pre_open_window"):
+        resolve_ranked_entry_date(
+            [candidate],
+            eligibility={"a": EntryEligibility(True, "eligible_E07_F00")},
+            occupied_symbols=frozenset(),
+            occupied_slots=0,
+            next_enrollment_sequence=1,
+            completed_at_utc=completed_at,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source_first_observed_at_utc",
+        "evidence_recorded_at_utc",
+        "imported_at_utc",
+        "entry_opens_at_utc",
+    ],
+)
+def test_entry_resolution_normalizes_naive_candidate_timestamp_failure(field: str) -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    candidate = _trial_candidate(
+        "a",
+        symbol="TEST",
+        rank="1",
+        evidence_recorded_at=ready,
+        imported_at=ready,
+    )
+    candidate = replace(candidate, **{field: ready.replace(tzinfo=None)})
+
+    with pytest.raises(TrialRuntimeInvalid, match="timestamp_naive"):
+        resolve_ranked_entry_date(
+            [candidate],
+            eligibility={"a": EntryEligibility(True, "eligible_E07_F00")},
+            occupied_symbols=frozenset(),
+            occupied_slots=0,
+            next_enrollment_sequence=1,
+            completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
+        )
+
+
+def test_same_date_source_at_cutoff_is_an_invalid_planner_invariant() -> None:
+    ready = datetime(2026, 8, 27, 13, 10, tzinfo=UTC)
+    candidate = _trial_candidate(
+        "a",
+        symbol="TEST",
+        rank="1",
+        evidence_recorded_at=ready,
+        imported_at=ready,
+    )
+    candidate = replace(
+        candidate,
+        source_first_observed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
+    )
+
+    with pytest.raises(TrialRuntimeInvalid, match="source_not_before_cutoff"):
+        resolve_ranked_entry_date(
+            [candidate],
+            eligibility={"a": EntryEligibility(True, "eligible_E07_F00")},
+            occupied_symbols=frozenset(),
+            occupied_slots=0,
+            next_enrollment_sequence=1,
+            completed_at_utc=datetime(2026, 8, 27, 13, 20, tzinfo=UTC),
+        )
 
 
 def test_draft_registry_only_heartbeats_and_creates_no_candidates(tmp_path: Path) -> None:
