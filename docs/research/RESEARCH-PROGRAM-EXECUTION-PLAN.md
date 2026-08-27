@@ -118,7 +118,7 @@ Exit gate: fault-injection tests prove a dead option service, invalid surface, l
 broker outage, and process restart cannot create an order, lose a signal silently, mutate a prior
 snapshot, or stop the existing canary from managing positions.
 
-### M3 — SEC history and point-in-time classifier (current)
+### M3 — SEC history and point-in-time classifier (complete)
 
 - Download SEC quarterly archives from 2006 onward into a raw content-addressed cache, preserving
   retrieval metadata and upstream hashes when supplied. Fix `2006-01-01` as the observable-history
@@ -133,7 +133,7 @@ snapshot, or stop the existing canary from managing positions.
 Exit gate: hand-worked fixtures, boundary dates, amendments, same-month intersections, incomplete
 years, left-censor cases, multi-owner filings, duplicate accessions, and replay-as-of tests all pass.
 
-### M4 — Frozen inference executable
+### M4 — Frozen inference executable (current)
 
 - Implement the exact endpoint, PRNG, circular block sampler, ordering and tie rules, sample freeze,
   18-month deadline, economic gates, decision states, and machine-readable report while the registry
