@@ -1899,6 +1899,31 @@ def test_transient_read_only_evidence_open_failure_is_degraded_not_invalid(
     assert TrialStore(config.trial_db).fault_count() == 0
 
 
+def test_runtime_candidate_import_clock_regression_is_degraded_without_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_schedule(config)
+    _install_evidence(config)
+    monkeypatch.setattr(runtime, "_validated_trial_window", lambda _config: _active_window())
+    monkeypatch.setattr(
+        TrialStore,
+        "append_candidate",
+        lambda _store, _candidate: (_ for _ in ()).throw(
+            TrialRuntimeRetryable("candidate_import_time_moved_behind_entry_date_cursor")
+        ),
+    )
+
+    result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
+
+    assert result.status == "degraded"
+    status = TrialStore(config.trial_db).status()
+    assert status["faults"] == 0
+    assert status["health"]["last_result"] == "degraded"
+    assert "candidate_import_time_moved_behind" in str(status["health"]["last_error"])
+
+
 def test_duplicate_evidence_snapshot_identity_fails_before_any_import(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

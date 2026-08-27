@@ -2276,7 +2276,7 @@ def run_trial_once(
             unresolved_evidence=unresolved,
         )
         return result
-    except (sqlite3.OperationalError, OSError) as exc:
+    except (TrialRuntimeRetryable, sqlite3.OperationalError, OSError) as exc:
         error = f"{type(exc).__name__}: {exc}"[:2000]
         store.write_health(
             now=now,
