@@ -285,9 +285,17 @@ def _active_registry_path(tmp_path: Path) -> Path:
     registry["activation"]["activation_receipt_sha256"] = activation_module.activation_receipt(
         registry
     )["receipt_sha256"]
-    activation_module.ActivationStore(tmp_path / "activation.db").put(registry)
+    activation_db = tmp_path / "activation.db"
+    activation_module.ActivationStore(activation_db).put(registry)
     path = tmp_path / "active-registry.json"
-    path.write_text(json.dumps(registry), encoding="utf-8")
+    registry_bytes = rfc8785.dumps(registry)
+    path.write_bytes(registry_bytes)
+    activation_module.validate_deployed_registry_state(
+        registry,
+        activation_db,
+        registry_bytes=registry_bytes,
+        now=ACTIVATED_AT - timedelta(microseconds=1),
+    )
     return path
 
 
