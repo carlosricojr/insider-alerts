@@ -20,6 +20,9 @@ from insider_alerts.execution.errors import (
 
 __all__ = ["IbkrBroker", "IbkrExecutionError"]
 
+_CONNECT_TIMEOUT_SECONDS = 10.0
+_OPEN_ORDERS_TIMEOUT_SECONDS = 10.0
+
 
 class IbkrBroker:
     def __init__(
@@ -49,13 +52,29 @@ class IbkrBroker:
         self.ib.errorEvent += self._on_error
         self._errors.clear()
         try:
-            await self.ib.connectAsync(
-                self.host,
-                self.port,
-                clientId=self.client_id,
-                readonly=readonly,
-                timeout=10,
-            )
+            if readonly:
+                # IB.connectAsync always requests positions, even when readonly=True and
+                # fetchFields=0. Shadow-only operation needs only the API handshake plus
+                # market/reference data, so do not create futures for account callbacks.
+                self.ib.wrapper.clientId = self.client_id
+                await self.ib.client.connectAsync(
+                    self.host,
+                    self.port,
+                    self.client_id,
+                    _CONNECT_TIMEOUT_SECONDS,
+                )
+                if not self.ib.client.isReady():
+                    raise ConnectionError("socket is not API-ready after handshake")
+                self.ib.connectedEvent.emit()
+            else:
+                await self.ib.connectAsync(
+                    self.host,
+                    self.port,
+                    clientId=self.client_id,
+                    readonly=False,
+                    timeout=_CONNECT_TIMEOUT_SECONDS,
+                    raiseSyncErrors=True,
+                )
             self.ib.reqMarketDataType(1)
         except Exception as exc:  # noqa: BLE001
             try:
@@ -64,8 +83,14 @@ class IbkrBroker:
             except Exception:  # noqa: BLE001 - preserve the original connection failure
                 pass
             self.ib = None
+            reason = (
+                "IBKR_GATEWAY_HANDSHAKE_TIMEOUT"
+                if isinstance(exc, TimeoutError)
+                else "IBKR_GATEWAY_STARTUP_SYNC_FAILED"
+            )
+            detail = str(exc).strip() or type(exc).__name__
             raise IbkrExecutionError(
-                f"IB Gateway unavailable at {self.host}:{self.port}: {exc}"
+                f"{reason}: IB Gateway unavailable at {self.host}:{self.port}: {detail}"
             ) from exc
 
     def disconnect(self) -> None:
@@ -175,7 +200,26 @@ class IbkrBroker:
         account = self._account()
         monotonic_now = asyncio.get_running_loop().time()
         if monotonic_now - self._all_orders_checked_at >= 15.0:
-            self._all_open_trades = list(await self.ib.reqAllOpenOrdersAsync())
+            try:
+                open_trades = await asyncio.wait_for(
+                    self.ib.reqAllOpenOrdersAsync(),
+                    timeout=_OPEN_ORDERS_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                self.disconnect()
+                raise IbkrExecutionError(
+                    "IBKR_ALL_OPEN_ORDERS_TIMEOUT: all-open-orders reconciliation "
+                    f"did not complete within {_OPEN_ORDERS_TIMEOUT_SECONDS:.0f}s; "
+                    "broker order state is unknown"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001
+                self.disconnect()
+                detail = str(exc).strip() or type(exc).__name__
+                raise IbkrExecutionError(
+                    "IBKR_ALL_OPEN_ORDERS_FAILED: all-open-orders reconciliation "
+                    f"failed; broker order state is unknown: {detail}"
+                ) from exc
+            self._all_open_trades = list(open_trades)
             self._all_orders_checked_at = monotonic_now
         values = {
             value.tag: value.value
