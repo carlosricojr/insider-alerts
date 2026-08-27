@@ -208,6 +208,10 @@ def test_worker_keeps_historical_feed_available_when_session_store_is_missing(
 
     assert asyncio.run(bar_worker._run(args))["requests"] == 0
     assert not missing.exists()
+    status = BarFeedStore(args.feed_db).status()
+    assert status["failure_count"] == 1
+    assert status["health"]["last_result"] == "idle"
+    assert "session feed ledger is missing" in args.error_log.read_text(encoding="utf-8")
 
 
 def test_worker_degrades_corrupt_session_proof_without_stopping_historical_feed(
@@ -404,6 +408,28 @@ def test_ibkr_empty_response_fails_closed() -> None:
 
     with pytest.raises(RuntimeError, match="historical bars unavailable"):
         asyncio.run(source.daily_bars("TEST", start_date=date(2026, 8, 1)))
+
+
+def test_ibkr_schedule_request_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import insider_alerts.research.ibkr_bar_source as source_module
+
+    class HungScheduleIb:
+        async def reqHistoricalScheduleAsync(self, *_args: object) -> object:
+            await asyncio.sleep(60)
+            return object()
+
+    monkeypatch.setattr(source_module, "_HISTORICAL_TIMEOUT_SECONDS", 0.001)
+    source = IbkrHistoricalBarSource(host="127.0.0.1", port=4001, client_id=176)
+    source._IbkrHistoricalBarSource__ib = HungScheduleIb()  # type: ignore[attr-defined]
+    source._IbkrHistoricalBarSource__contracts["SPY"] = object()  # type: ignore[attr-defined]
+
+    with pytest.raises(TimeoutError, match="historical schedule request timed out for SPY"):
+        asyncio.run(
+            source.exchange_sessions(
+                end=datetime(2026, 8, 27, 12, 0, tzinfo=UTC),
+                calendar_days=30,
+            )
+        )
 
 
 def test_ibkr_source_has_no_account_execution_or_order_api() -> None:

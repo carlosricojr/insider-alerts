@@ -52,6 +52,17 @@ async def _run(args: argparse.Namespace) -> dict[str, int]:
                 category="session_completion_proof_unavailable",
                 detail=f"{type(exc).__name__}: {exc}",
             )
+    else:
+        missing_error = FileNotFoundError(
+            f"session feed ledger is missing or not a regular file: {args.session_feed_db}"
+        )
+        _append_error(args.error_log, missing_error)
+        store.record_failure(
+            now=now,
+            symbol="SESSION-FEED",
+            category="session_completion_proof_unavailable",
+            detail=f"{type(missing_error).__name__}: {missing_error}",
+        )
     source = IbkrHistoricalBarSource(host=args.host, port=args.port, client_id=args.client_id)
     result = await collect_once(
         store,

@@ -152,12 +152,18 @@ class IbkrHistoricalBarSource:
         calendar_days: int,
     ) -> SourceSessionBatch:
         contract = await self.__contract("SPY")
-        schedule = await self.__ib.reqHistoricalScheduleAsync(
-            contract,
-            calendar_days,
-            end.astimezone(UTC) + timedelta(days=45),
-            True,
-        )
+        try:
+            schedule = await asyncio.wait_for(
+                self.__ib.reqHistoricalScheduleAsync(
+                    contract,
+                    calendar_days,
+                    end.astimezone(UTC) + timedelta(days=45),
+                    True,
+                ),
+                timeout=_HISTORICAL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError("IBKR historical schedule request timed out for SPY") from exc
         try:
             schedule_zone = ZoneInfo(str(schedule.timeZone))
         except (KeyError, ValueError, ZoneInfoNotFoundError) as exc:
