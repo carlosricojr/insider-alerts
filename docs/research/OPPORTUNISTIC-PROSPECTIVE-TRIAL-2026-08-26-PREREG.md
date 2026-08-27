@@ -17,6 +17,9 @@ and outcome-independent prior-book occupancy to each entry-date seal<br>
 Draft correction: 2026-08-27, before activation and with zero challenger snapshots, to bind the
 terminal outcome materialization time, exact stock/SPY bar and schedule provenance, and terminal
 missing-session behavior<br>
+Draft correction: 2026-08-27, before activation and with zero evidence snapshots or challenger
+candidates, to freeze prospective full-control and routine diagnostic membership, provenance,
+outcome authority, failure isolation, and reconciliation semantics<br>
 Supersedes: nothing; the existing E07/F00 canary and its preregistration remain unchanged
 
 ## Decision and scope
@@ -130,10 +133,29 @@ completion transaction may return from its durable SQLite commit after the open 
 system latency, but it cannot incorporate any input or decision sampled after the sealed pre-open
 decision clock.
 
-The control ledger records every otherwise eligible E07/F00 signal and its opened, overlap-, or
-capacity-suppressed outcome; at most 20 control positions are open. The challenger independently
-applies the same 20-slot, same-symbol, and ascending deterministic-rank policy within the
-opportunistic eligible set. Neither book changes live slot selection or orders.
+The existing live-canary ledger is the sole selection authority for the full E07/F00 diagnostic
+control; the research runtime does not create or replay a second control selection engine. Its
+prospective membership begins only when both the packet's immutable source-first-observed time and
+the canary candidate's approval-time `signal_at` are at or after activation, preserves every canary
+state, and ends after every candidate whose frozen canary entry session is on or before the
+challenger cohort-freeze boundary is final. The source-first-observed time must be no later than the
+canary approval time; equality is not required because packet creation and approval are distinct
+events. Each binding content-addresses the canary candidate row and its activation metadata. A
+later canary row change or ledger replacement creates a typed diagnostic reconciliation record; it
+does not silently rewrite membership.
+
+At most 20 control positions are open. The challenger independently applies the same 20-slot,
+same-symbol, and ascending deterministic-rank policy within the opportunistic eligible set.
+Neither book changes live slot selection or orders. The terminal `shadow_book_reconciliation`
+integrity check and economic gate apply only to the confirmatory challenger book. Control-ledger
+reconciliation is descriptive diagnostic evidence and cannot veto or rescue the primary decision.
+
+The routine subgroup is the subset of prospectively bound control positions whose first valid
+evidence snapshot was recorded strictly before the position's registered 09:20 ET entry cutoff and
+froze `routine` classification, exact transaction-owner mapping, one reporting-owner CIK, and
+complete required history. It is not a second selected book. Evidence unavailable or late for a
+control record creates typed diagnostic missingness; it does not remove the record from control or
+invalidate the challenger.
 
 Because the frozen execution policy deliberately evaluates stop/target barriers from completed
 daily bars, it does not infer an unobserved intraday barrier-hit minute. Gross trade return uses the
@@ -154,6 +176,18 @@ a stock bar needed to establish the exit or either SPY endpoint remains absent, 
 `INVALID`; the position is never silently discarded. Bars strictly after an established stock exit
 are irrelevant. Routine status exposes only counts and health, never individual returns or an
 aggregate.
+
+Control and routine outcomes are descriptive and are recomputed after the frozen tenth session
+from the same first-observed research bars, point-in-time session records, healthy-poll proof, and
+pure E07 outcome kernel used for the challenger. Canary shadow rows are agreement evidence, not the
+diagnostic outcome authority. Their exact row digests, research-input watermarks, and outcome
+provenance remain in a separate append-only diagnostic SQLite store. A missing join, timestamp
+mismatch, unavailable bar, ledger replacement, canary/research disagreement, or corruption is
+reported per trade or per group as typed `unavailable`; it never mutates the confirmatory store,
+changes a challenger integrity check, or delays the single terminal primary decision. The terminal
+dataset uses deterministic diagnostic trade IDs and strips confirmatory sequence, evidence-record,
+and capacity-rank fields as required by the frozen inference schema; the diagnostic-store receipt
+retains the complete provenance.
 
 ## Point-in-time owner classification
 
@@ -283,8 +317,8 @@ terminal receipt exists, its digest cannot be replaced; a material invalidity re
    50% of total net P&L;
 7. the chronological 20-slot equal-notional replay, with no overlapping same-symbol positions, has
    positive net return at 50 bps; and
-8. timestamp ordering, snapshot hashes, SEC archive coverage, classification provenance, outcome
-   completeness, and shadow-book reconciliation all pass.
+8. timestamp ordering, snapshot hashes, SEC archive coverage, classification provenance,
+   challenger outcome completeness, and challenger shadow-book reconciliation all pass.
 
 For exact gate arithmetic, gross trade return and matched SPY return are decimal fractions. Net
 absolute return subtracts 0.002 (primary) or 0.005 (stress); alpha additionally subtracts matched
