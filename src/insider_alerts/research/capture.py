@@ -547,8 +547,11 @@ def _capture_options(
     if result.returncode != 0:
         output.unlink(missing_ok=True)
         message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        normalized_message = message.casefold()
+        if "venue session is not open" in normalized_message:
+            return None, None, None, "OPTION_CAPTURE_VENUE_CLOSED", message, True
         retryable = any(
-            token in message.lower()
+            token in normalized_message
             for token in ("connect", "timeout", "gateway", "temporar", "market data")
         )
         return None, None, None, "OPTION_CAPTURE_PROCESS_FAILED", message, retryable

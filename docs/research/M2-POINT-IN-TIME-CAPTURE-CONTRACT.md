@@ -17,7 +17,8 @@ alpha-core's reviewed research-only option-surface executable on dedicated IBKR 
   canary context can settle; the original timestamp, not a retry time, anchors the ten-minute limit.
 - A process timeout kills the complete child tree with no visible window. Retryable boundary errors
   receive at most three attempts before the original deadline. Unknown and invalid-artifact errors
-  fail terminally.
+  fail terminally. A closed-venue rejection has its own error kind and remains bounded-retryable in
+  case the venue opens inside the original ten-minute window; exhaustion records typed missingness.
 - A terminal option failure produces explicit missing/error evidence; it never discards the signal.
   Evidence/database failures never execute in the canary process and cannot stop position handling.
 - Claims use expiring leases. A restart after evidence append verifies and reuses the exact stored
