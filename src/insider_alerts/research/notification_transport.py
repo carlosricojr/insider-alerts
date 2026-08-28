@@ -22,7 +22,7 @@ from insider_alerts.notify.ntfy import NtfyTransportEvent
 JOURNAL_VERSION = "ntfy-transport-journal-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_PACKET_ID = re.compile(r"^[A-Za-z0-9|_.:-]{1,256}$")
+_PACKET_ID = re.compile(r"^[A-Za-z0-9|_.:/-]{1,256}$")
 _EXCEPTION_CLASS = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _PHASES = {"request_started", "response_received", "transport_failed"}
 _EXPECTED_POLICY: dict[str, Any] = {
