@@ -16,6 +16,40 @@ SQLITE_LOCK_RETRY_ATTEMPTS = 6
 SQLITE_LOCK_RETRY_BASE_SLEEP_SECONDS = 0.25
 
 
+def form4_source_boundary_sql(table_alias: str = "") -> str:
+    """Return the legacy eligibility predicate for a trusted Form 4 source row.
+
+    Older SEC RSS rows did not persist a separately validated feed form type. Preserve all rows,
+    but exclude an RSS row when its available title explicitly identifies a different form.
+    Non-RSS and title-missing legacy rows remain eligible for backward compatibility.
+    """
+    if table_alias and not table_alias.replace("_", "").isalnum():
+        raise ValueError("table_alias must be an SQL identifier")
+    prefix = f"{table_alias}." if table_alias else ""
+    source = f"{prefix}source"
+    raw = f"{prefix}raw_rss_entry"
+    title = (
+        f"CASE WHEN json_valid({raw}) "
+        f"THEN trim(json_extract({raw}, '$.title')) ELSE NULL END"
+    )
+    feed_form_type = (
+        f"CASE WHEN json_valid({raw}) "
+        f"THEN upper(trim(json_extract({raw}, '$.feed_form_type'))) ELSE NULL END"
+    )
+    return f"""(
+        json_valid({raw})
+        AND (
+            {source} <> 'sec_rss'
+            OR nullif({title}, '') IS NULL
+            OR (
+                instr({title}, '-') > 0
+                AND upper(trim(substr({title}, 1, instr({title}, '-') - 1))) IN ('4', '4/A')
+            )
+            OR {feed_form_type} IN ('4', '4/A')
+        )
+    )"""
+
+
 @dataclass(slots=True)
 class StoreResult:
     inserted: int
@@ -129,14 +163,17 @@ def upsert_filing_refs(db_path: str, refs: list[FilingRef]) -> StoreResult:
 
 def list_filings_missing_xml(db_path: str, *, limit: int) -> list[FilingRef]:
     init_db(db_path)
+    source_boundary = form4_source_boundary_sql()
     with _connect_sqlite(db_path, write=False) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """
+            f"""
             SELECT source, cik, accession_number, form_type, filed_at,
                    filing_detail_url, primary_doc_url, raw_rss_entry
             FROM filings
             WHERE form4_xml_url IS NULL
+              AND form_type IN ('4', '4/A')
+              AND {source_boundary}
             ORDER BY filed_at DESC
             LIMIT ?
             """,

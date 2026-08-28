@@ -44,6 +44,22 @@ def _seed_ref(
     assert updated == 1
 
 
+def test_sec_poll_reports_source_boundary_diagnostics(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+) -> None:
+    rss = Path("tests/fixtures_form4_rss.xml").read_text(encoding="utf-8")
+    httpx_mock.add_response(status_code=200, text=rss)
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+
+    result = run_sec_poll_once(settings, max_items=10, dry_run=True)
+
+    assert result.fetched == 2
+    assert result.source_items_seen == 3
+    assert result.source_boundary_rejected == 0
+    assert result.source_invalid_items == 1
+
+
 def test_enrich_filings_updates_missing_xml(httpx_mock: HTTPXMock, tmp_path) -> None:
     rss = Path("tests/fixtures_form4_rss.xml").read_text(encoding="utf-8")
     httpx_mock.add_response(status_code=200, text=rss)
@@ -305,3 +321,45 @@ def test_enqueue_review_packets_adds_market_context_fields(
             """
         ).fetchone()[0]
     assert trade_turnover is not None
+
+
+def test_enqueue_review_packets_excludes_legacy_false_rss_before_limit(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    valid_xml_url = "https://www.sec.gov/valid-form4.xml"
+    false_xml_url = "https://www.sec.gov/taxonomy.xml"
+    form4 = Path("tests/fixtures_form4.xml").read_text(encoding="utf-8")
+
+    _seed_ref(
+        settings.database_path,
+        accession_number="0000320193-24-000123",
+        filed_at=datetime(2026, 2, 11, 1, 0, tzinfo=UTC),
+        xml_url=valid_xml_url,
+    )
+    false = FilingRef(
+        source="sec_rss",
+        cik="0001000001",
+        accession_number="0001000001-26-000124",
+        form_type="4",
+        filed_at=datetime(2026, 8, 28, 20, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/false-index.htm",
+        primary_doc_url=None,
+        raw_rss_entry={"title": "497 - Example Fund"},
+    )
+    upsert_filing_refs(settings.database_path, [false])
+    assert update_form4_xml_url(
+        settings.database_path,
+        accession_number=false.accession_number,
+        cik=false.cik,
+        form_type=false.form_type,
+        xml_url=false_xml_url,
+    ) == 1
+    httpx_mock.add_response(status_code=200, text=form4, url=valid_xml_url)
+
+    result = enqueue_review_packets(settings, limit=1)
+
+    assert result.processed == 1
+    assert result.enqueued == 1
+    assert [str(request.url) for request in httpx_mock.get_requests()] == [valid_xml_url]

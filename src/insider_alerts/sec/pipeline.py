@@ -23,9 +23,10 @@ from insider_alerts.sec.backfill import iter_quarter_range, master_index_url, pa
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
 from insider_alerts.sec.form4 import Form4ParseError, parse_form4_xml
 from insider_alerts.sec.index import locate_form4_xml_url
-from insider_alerts.sec.rss import parse_form4_rss
+from insider_alerts.sec.rss import parse_form4_rss_with_diagnostics
 from insider_alerts.sec.store import (
     StoreResult,
+    form4_source_boundary_sql,
     list_filings_missing_xml,
     update_form4_xml_urls,
     upsert_filing_refs,
@@ -41,6 +42,9 @@ class PollResult:
     fetched: int
     inserted: int
     skipped_existing: int
+    source_items_seen: int = 0
+    source_boundary_rejected: int = 0
+    source_invalid_items: int = 0
 
 
 @dataclass(slots=True)
@@ -77,16 +81,27 @@ def _normalize_form4_xml_url(url: str) -> str:
 def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> PollResult:
     client = SecHttpClient(settings)
     rss_text = client.get_text(settings.sec_rss_url)
-    refs = parse_form4_rss(rss_text, max_items=max_items)
+    parsed = parse_form4_rss_with_diagnostics(rss_text, max_items=max_items)
+    refs = parsed.refs
 
     if dry_run:
-        return PollResult(fetched=len(refs), inserted=0, skipped_existing=0)
+        return PollResult(
+            fetched=len(refs),
+            inserted=0,
+            skipped_existing=0,
+            source_items_seen=parsed.items_seen,
+            source_boundary_rejected=parsed.source_boundary_rejected,
+            source_invalid_items=parsed.invalid_items,
+        )
 
     result: StoreResult = upsert_filing_refs(settings.database_path, refs)
     return PollResult(
         fetched=len(refs),
         inserted=result.inserted,
         skipped_existing=result.skipped_existing,
+        source_items_seen=parsed.items_seen,
+        source_boundary_rejected=parsed.source_boundary_rejected,
+        source_invalid_items=parsed.invalid_items,
     )
 
 
@@ -119,7 +134,7 @@ def enrich_filings_with_xml_url(
                     exc,
                 )
                 continue
-            maybe = locate_form4_xml_url(html)
+            maybe = locate_form4_xml_url(html, filing_detail_url=ref.filing_detail_url)
             if maybe is None:
                 xml_not_found += 1
                 continue
@@ -157,7 +172,12 @@ def enqueue_review_packets(
     from sqlite3 import connect
 
     ensure_review_tables(settings.database_path)
-    where_parts = ["f.form4_xml_url IS NOT NULL", "f.form4_xml_url <> ''"]
+    where_parts = [
+        "f.form4_xml_url IS NOT NULL",
+        "f.form4_xml_url <> ''",
+        "f.form_type IN ('4', '4/A')",
+        form4_source_boundary_sql("f"),
+    ]
     params: list[object] = []
     if start_date is not None:
         where_parts.append("date(f.filed_at) >= ?")

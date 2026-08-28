@@ -30,7 +30,7 @@ def _ref(
         filed_at=datetime(2026, 2, 11, 1, 0, tzinfo=UTC),
         filing_detail_url=detail_url,
         primary_doc_url=None,
-        raw_rss_entry={"title": "x"},
+        raw_rss_entry={"title": "4 - Example Issuer"},
     )
 
 
@@ -208,5 +208,93 @@ def test_update_form4_xml_urls_raises_non_lock_operational_error(monkeypatch) ->
                     )
                 ],
             )
+    finally:
+        rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_list_missing_xml_excludes_legacy_false_rss_before_limit() -> None:
+    tmp_dir = Path(".tmp_testdata") / f"sec_store_{uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        db = str(tmp_dir / "db.sqlite3")
+        valid = _ref(
+            "https://www.sec.gov/valid-index.htm",
+            accession_number="0000320193-24-000123",
+        )
+        false = FilingRef(
+            source="sec_rss",
+            cik="0001000001",
+            accession_number="0001000001-26-000124",
+            form_type="4",
+            filed_at=datetime(2026, 8, 28, 20, 0, tzinfo=UTC),
+            filing_detail_url="https://www.sec.gov/false-index.htm",
+            primary_doc_url=None,
+            raw_rss_entry={"title": "485BPOS - Example Fund"},
+        )
+        upsert_filing_refs(db, [valid, false])
+
+        rows = list_filings_missing_xml(db, limit=1)
+
+        assert [row.accession_number for row in rows] == [valid.accession_number]
+    finally:
+        rmtree(tmp_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("source", "raw_rss_entry"),
+    [("sec_rss", {}), ("sec_master_idx", {"title": "485BPOS - not authoritative here"})],
+)
+def test_list_missing_xml_keeps_legacy_rows_without_rss_title(
+    source: str,
+    raw_rss_entry: dict[str, str],
+) -> None:
+    tmp_dir = Path(".tmp_testdata") / f"sec_store_{uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        db = str(tmp_dir / "db.sqlite3")
+        ref = _ref("https://www.sec.gov/legacy-index.htm")
+        ref.source = source
+        ref.raw_rss_entry = raw_rss_entry
+        upsert_filing_refs(db, [ref])
+
+        rows = list_filings_missing_xml(db, limit=1)
+
+        assert [row.accession_number for row in rows] == [ref.accession_number]
+    finally:
+        rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_list_missing_xml_keeps_category_validated_rss_row() -> None:
+    tmp_dir = Path(".tmp_testdata") / f"sec_store_{uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        db = str(tmp_dir / "db.sqlite3")
+        ref = _ref("https://www.sec.gov/category-index.htm")
+        ref.raw_rss_entry = {
+            "title": "Accepted Issuer - filing notice",
+            "category": "4",
+            "feed_form_type": "4",
+        }
+        upsert_filing_refs(db, [ref])
+
+        rows = list_filings_missing_xml(db, limit=1)
+
+        assert [row.accession_number for row in rows] == [ref.accession_number]
+    finally:
+        rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_list_missing_xml_fails_closed_on_malformed_raw_json() -> None:
+    tmp_dir = Path(".tmp_testdata") / f"sec_store_{uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        db = str(tmp_dir / "db.sqlite3")
+        ref = _ref("https://www.sec.gov/malformed-index.htm")
+        upsert_filing_refs(db, [ref])
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE filings SET raw_rss_entry = 'not-json'")
+            conn.commit()
+
+        assert list_filings_missing_xml(db, limit=1) == []
     finally:
         rmtree(tmp_dir, ignore_errors=True)
