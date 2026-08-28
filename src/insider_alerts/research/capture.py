@@ -5,8 +5,10 @@ import json
 import os
 import platform
 import sqlite3
+import stat
 import subprocess
 import uuid
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -32,6 +34,8 @@ from insider_alerts.research.sec_history import (
 CAPTURE_CONTRACT_VERSION = "insider-evidence-capture-v2"
 HYPOTHESIS_ID = "OPP-E07-V1"
 MAX_ERROR_LENGTH = 2_000
+HISTORICAL_OPTION_SCHEMA_VERSION = "insider-evidence-option-history-v2"
+HISTORICAL_OPTION_SOURCE_ID = "ib_gateway:US_OPTIONS:SMART:type1:historical_bid_ask_15m"
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,8 +43,12 @@ class CaptureConfig:
     source_db: Path
     evidence_db: Path
     artifact_root: Path
+    research_root: Path
     alpha_python: Path
     alpha_script: Path
+    alpha_historical_script: Path
+    option_chain_store_db: Path
+    historical_pacing_db: Path
     canary_ledger: Path
     history_db: Path
     history_snapshot_sha256: str
@@ -51,6 +59,7 @@ class CaptureConfig:
     capture_delay_seconds: int = 20
     capture_deadline_seconds: int = 600
     option_timeout_seconds: int = 90
+    historical_option_timeout_seconds: int = 120
     max_attempts: int = 3
     lease_seconds: int = 180
 
@@ -67,6 +76,7 @@ class CaptureConfig:
             "capture_delay_seconds",
             "capture_deadline_seconds",
             "option_timeout_seconds",
+            "historical_option_timeout_seconds",
             "max_attempts",
             "lease_seconds",
         ):
@@ -74,12 +84,29 @@ class CaptureConfig:
                 raise ValueError(f"{name} must be positive")
         if self.capture_delay_seconds >= self.capture_deadline_seconds:
             raise ValueError("capture delay must be shorter than capture deadline")
-        if self.lease_seconds <= self.option_timeout_seconds + 30:
-            raise ValueError("lease must outlive the option timeout by more than 30 seconds")
+        if (
+            self.lease_seconds
+            <= max(self.option_timeout_seconds, self.historical_option_timeout_seconds) + 30
+        ):
+            raise ValueError("lease must outlive every option timeout by more than 30 seconds")
         if self.capture_deadline_seconds <= (
             self.capture_delay_seconds + self.max_attempts * self.option_timeout_seconds
         ):
             raise ValueError("capture deadline cannot accommodate every bounded option attempt")
+
+
+class OptionRuntimeValidationError(RuntimeError):
+    """The configured alpha runtime or research database path is not confined."""
+
+
+@dataclass(slots=True, frozen=True)
+class _ValidatedOptionRuntime:
+    alpha_python: Path
+    alpha_script: Path
+    alpha_historical_script: Path
+    alpha_runtime_root: Path
+    option_chain_store_db: Path
+    historical_pacing_db: Path
 
 
 @dataclass(slots=True, frozen=True)
@@ -131,6 +158,96 @@ def parse_utc(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError(f"naive persisted timestamp: {value}")
     return parsed.astimezone(UTC)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return path.is_symlink() or bool(reparse_flag and attributes & reparse_flag)
+
+
+def _confined_research_db(path: Path, *, research_root: Path) -> Path:
+    lexical_root = Path(os.path.abspath(research_root))
+    lexical_path = Path(os.path.abspath(path))
+    if not lexical_path.is_relative_to(lexical_root) or lexical_path == lexical_root:
+        raise OptionRuntimeValidationError("option database escaped data/research")
+    cursor = lexical_root
+    if not cursor.is_dir() or _is_reparse_point(cursor):
+        raise OptionRuntimeValidationError("data/research is unavailable or a reparse point")
+    for part in lexical_path.parent.relative_to(lexical_root).parts:
+        cursor /= part
+        if not cursor.is_dir() or _is_reparse_point(cursor):
+            raise OptionRuntimeValidationError(
+                "option database parent is unavailable or a reparse point"
+            )
+    resolved_root = lexical_root.resolve(strict=True)
+    resolved_parent = lexical_path.parent.resolve(strict=True)
+    if not resolved_parent.is_relative_to(resolved_root):
+        raise OptionRuntimeValidationError("option database parent escaped data/research")
+    candidate = resolved_parent / lexical_path.name
+    if candidate.exists():
+        if _is_reparse_point(candidate):
+            raise OptionRuntimeValidationError("option database cannot be a reparse point")
+        candidate = candidate.resolve(strict=True)
+        if not candidate.is_file() or not candidate.is_relative_to(resolved_root):
+            raise OptionRuntimeValidationError("existing option database escaped data/research")
+    return candidate
+
+
+def _validated_option_runtime(config: CaptureConfig) -> _ValidatedOptionRuntime:
+    try:
+        if _is_reparse_point(config.source_db):
+            raise OptionRuntimeValidationError("source database cannot be a reparse point")
+        source_db = config.source_db.resolve(strict=True)
+        for path in (
+            config.alpha_python,
+            config.alpha_script,
+            config.alpha_historical_script,
+        ):
+            if _is_reparse_point(path):
+                raise OptionRuntimeValidationError("alpha runtime files cannot be reparse points")
+        alpha_python = config.alpha_python.resolve(strict=True)
+        alpha_script = config.alpha_script.resolve(strict=True)
+        alpha_historical_script = config.alpha_historical_script.resolve(strict=True)
+    except OSError as exc:
+        raise OptionRuntimeValidationError("configured option runtime is unavailable") from exc
+    if not source_db.is_file() or not all(
+        path.is_file() for path in (alpha_python, alpha_script, alpha_historical_script)
+    ):
+        raise OptionRuntimeValidationError("option runtime paths must be regular files")
+    runtime_root = alpha_script.parent.parent
+    scripts_root = runtime_root / "scripts"
+    if alpha_script.parent != scripts_root or alpha_historical_script.parent != scripts_root:
+        raise OptionRuntimeValidationError("alpha entrypoints must share the runtime scripts root")
+    try:
+        expected_python = (runtime_root / ".venv" / "Scripts" / "python.exe").resolve(strict=True)
+    except OSError as exc:
+        raise OptionRuntimeValidationError("alpha runtime interpreter is unavailable") from exc
+    if alpha_python != expected_python:
+        raise OptionRuntimeValidationError("alpha interpreter does not belong to the scripts")
+    research_root = Path(os.path.abspath(config.research_root))
+    try:
+        research_parent = research_root.parent.resolve(strict=True)
+    except OSError as exc:
+        raise OptionRuntimeValidationError("research root parent is unavailable") from exc
+    if research_parent != source_db.parent:
+        raise OptionRuntimeValidationError("research root is not bound to the source data root")
+    return _ValidatedOptionRuntime(
+        alpha_python=alpha_python,
+        alpha_script=alpha_script,
+        alpha_historical_script=alpha_historical_script,
+        alpha_runtime_root=runtime_root,
+        option_chain_store_db=_confined_research_db(
+            config.option_chain_store_db, research_root=research_root
+        ),
+        historical_pacing_db=_confined_research_db(
+            config.historical_pacing_db, research_root=research_root
+        ),
+    )
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -518,6 +635,10 @@ def _capture_options(
     config: CaptureConfig,
     job: CaptureJob,
 ) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
+    try:
+        runtime = _validated_option_runtime(config)
+    except OptionRuntimeValidationError as exc:
+        return None, None, None, "OPTION_RUNTIME_INVALID", str(exc), False
     staging_dir = config.artifact_root / ".staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.{job.attempt_count}.json"
@@ -526,8 +647,8 @@ def _capture_options(
     try:
         result = run_hidden_process(
             [
-                str(config.alpha_python),
-                str(config.alpha_script),
+                str(runtime.alpha_python),
+                str(runtime.alpha_script),
                 "--symbol",
                 symbol,
                 "--request-id",
@@ -535,7 +656,7 @@ def _capture_options(
                 "--output",
                 str(output),
             ],
-            cwd=config.alpha_script.parent.parent,
+            cwd=runtime.alpha_runtime_root,
             timeout_seconds=config.option_timeout_seconds,
         )
     except OSError as exc:
@@ -549,7 +670,7 @@ def _capture_options(
         message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
         normalized_message = message.casefold()
         if "venue session is not open" in normalized_message:
-            return None, None, None, "OPTION_CAPTURE_VENUE_CLOSED", message, True
+            return _capture_historical_options(config, job, symbol=symbol)
         retryable = any(
             token in normalized_message
             for token in ("connect", "timeout", "gateway", "temporar", "market data")
@@ -590,6 +711,216 @@ def _capture_options(
         return artifact, destination, digest, None, None, False
     except (KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         return None, None, None, "OPTION_ARTIFACT_INVALID", str(exc), False
+    finally:
+        output.unlink(missing_ok=True)
+
+
+def _history_target_id(value: Any) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("historical option target is not an object")
+    target_id = value.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        raise ValueError("historical option target identity is missing")
+    return target_id
+
+
+def _validate_historical_option_artifact(
+    artifact: dict[str, Any],
+    *,
+    job: CaptureJob,
+    symbol: str,
+    chain_store_db: Path,
+) -> None:
+    expected_identity = {
+        "schema_version": HISTORICAL_OPTION_SCHEMA_VERSION,
+        "artifact_status": "RESEARCH_ONLY",
+        "source_id": HISTORICAL_OPTION_SOURCE_ID,
+        "capture_mode": "FORWARD_CLOSED_VENUE_FALLBACK",
+        "trade_selection_authority": False,
+        "backfill_authority": False,
+        "request_id": job.job_id,
+        "symbol": symbol,
+        "client_id": 49,
+        "market_data_type": 1,
+    }
+    for field, expected in expected_identity.items():
+        if artifact.get(field) != expected:
+            raise ValueError(f"historical option artifact {field} mismatch")
+    cutoff = parse_utc(str(artifact["information_cutoff_utc"]))
+    requested_at = parse_utc(str(artifact["requested_at_utc"]))
+    captured_at = parse_utc(str(artifact["captured_at_utc"]))
+    if cutoff != job.decision_at:
+        raise ValueError("historical option artifact cutoff does not equal the decision time")
+    if not cutoff <= requested_at <= captured_at:
+        raise ValueError("historical option artifact timestamps are out of order")
+    chain = artifact.get("option_chain_snapshot")
+    if not isinstance(chain, dict):
+        raise ValueError("historical option chain snapshot is missing")
+    if parse_utc(str(chain["observed_at_utc"])) > cutoff:
+        raise ValueError("historical option chain snapshot is post-cutoff")
+    digest = artifact.get("option_chain_feed_record_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        raise ValueError("historical option chain digest is invalid")
+    underlying = artifact.get("underlying_reference")
+    if not isinstance(underlying, dict) or underlying.get("symbol") != symbol:
+        raise ValueError("historical underlying reference identity mismatch")
+    if parse_utc(str(underlying["bar_end_utc"])) > cutoff:
+        raise ValueError("historical underlying reference is post-cutoff")
+    targets = artifact.get("targets")
+    bars = artifact.get("bars")
+    errors = artifact.get("capture_errors")
+    if not isinstance(targets, list) or len(targets) != 4:
+        raise ValueError("historical artifact must contain the fixed four targets")
+    if not isinstance(bars, list) or not isinstance(errors, list):
+        raise ValueError("historical artifact results must be arrays")
+    target_ids = [_history_target_id(target) for target in targets]
+    result_ids = [
+        _history_target_id(result.get("target") if isinstance(result, dict) else None)
+        for result in (*bars, *errors)
+    ]
+    if len(set(target_ids)) != 4 or sorted(result_ids) != sorted(target_ids):
+        raise ValueError("historical artifact must have exactly one result per target")
+    for bar in bars:
+        if not isinstance(bar, dict) or parse_utc(str(bar["bar_end_utc"])) > cutoff:
+            raise ValueError("historical option bar is post-cutoff")
+    request_count = artifact.get("historical_request_count")
+    pacing_units = artifact.get("historical_pacing_units")
+    if (
+        isinstance(request_count, bool)
+        or not isinstance(request_count, int)
+        or request_count < 1
+        or isinstance(pacing_units, bool)
+        or not isinstance(pacing_units, int)
+        or not 1 <= pacing_units <= 9
+    ):
+        raise ValueError("historical request accounting is invalid")
+    _validate_historical_chain_custody(
+        artifact,
+        chain_store_db=chain_store_db,
+        symbol=symbol,
+        chain=chain,
+        digest=digest,
+    )
+
+
+def _validate_historical_chain_custody(
+    artifact: dict[str, Any],
+    *,
+    chain_store_db: Path,
+    symbol: str,
+    chain: dict[str, Any],
+    digest: str,
+) -> None:
+    sequence = artifact.get("option_chain_feed_sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise ValueError("historical option chain sequence is invalid")
+    try:
+        with closing(sqlite3.connect(f"{chain_store_db.as_uri()}?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT record_sha256,symbol,observed_at_utc,payload_json "
+                "FROM option_chain_feed_records WHERE sequence=?",
+                (sequence,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValueError("historical option chain custody lookup failed") from exc
+    if row is None or str(row["record_sha256"]) != digest or str(row["symbol"]) != symbol:
+        raise ValueError("historical option chain custody identity mismatch")
+    raw_payload = row["payload_json"]
+    try:
+        if isinstance(raw_payload, bytes):
+            payload = json.loads(raw_payload.decode("utf-8", errors="strict"))
+        elif isinstance(raw_payload, str):
+            payload = json.loads(raw_payload)
+        else:
+            raise ValueError("historical option chain custody payload has invalid storage type")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("historical option chain custody payload is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("historical option chain custody payload is not an object")
+    if (
+        payload.get("record_type") != "snapshot"
+        or payload.get("symbol") != symbol
+        or payload.get("snapshot") != chain
+        or parse_utc(str(payload.get("observed_at_utc"))) != parse_utc(str(row["observed_at_utc"]))
+    ):
+        raise ValueError("historical option chain custody payload mismatch")
+
+
+def _capture_historical_options(
+    config: CaptureConfig,
+    job: CaptureJob,
+    *,
+    symbol: str,
+) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
+    try:
+        runtime = _validated_option_runtime(config)
+    except OptionRuntimeValidationError as exc:
+        return None, None, None, "OPTION_RUNTIME_INVALID", str(exc), False
+    staging_dir = config.artifact_root / ".staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.historical.json"
+    output.unlink(missing_ok=True)
+    try:
+        result = run_hidden_process(
+            [
+                str(runtime.alpha_python),
+                str(runtime.alpha_historical_script),
+                "--chain-store-db",
+                str(runtime.option_chain_store_db),
+                "--pacing-db",
+                str(runtime.historical_pacing_db),
+                "--symbol",
+                symbol,
+                "--request-id",
+                job.job_id,
+                "--information-cutoff",
+                utc_text(job.decision_at),
+                "--output",
+                str(output),
+            ],
+            cwd=runtime.alpha_runtime_root,
+            timeout_seconds=config.historical_option_timeout_seconds,
+        )
+    except OSError as exc:
+        output.unlink(missing_ok=True)
+        return None, None, None, "OPTION_HISTORY_LAUNCH_FAILED", str(exc), False
+    if result.timed_out:
+        output.unlink(missing_ok=True)
+        return (
+            None,
+            None,
+            None,
+            "OPTION_HISTORY_AMBIGUOUS_TIMEOUT",
+            "alpha-core historical request timed out after possible pacing admission",
+            False,
+        )
+    if result.returncode != 0:
+        output.unlink(missing_ok=True)
+        message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        return None, None, None, "OPTION_HISTORY_PROCESS_FAILED", message, False
+    try:
+        raw = output.read_bytes()
+        artifact = json.loads(raw)
+        if not isinstance(artifact, dict):
+            raise ValueError("historical option artifact root is not an object")
+        _validate_historical_option_artifact(
+            artifact,
+            job=job,
+            symbol=symbol,
+            chain_store_db=runtime.option_chain_store_db,
+        )
+        rfc8785.dumps(artifact)
+        destination, digest = _publish_content_addressed(
+            config.artifact_root / "options", raw, suffix=".json"
+        )
+        return artifact, destination, digest, None, None, False
+    except (KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        return None, None, None, "OPTION_HISTORY_ARTIFACT_INVALID", str(exc), False
     finally:
         output.unlink(missing_ok=True)
 
@@ -869,6 +1200,10 @@ def _configuration_sha(config: CaptureConfig) -> str:
     for name in (
         "alpha_python",
         "alpha_script",
+        "alpha_historical_script",
+        "research_root",
+        "option_chain_store_db",
+        "historical_pacing_db",
         "canary_ledger",
         "history_db",
         "policy_path",
@@ -877,6 +1212,101 @@ def _configuration_sha(config: CaptureConfig) -> str:
     ):
         safe[name] = str(getattr(config, name))
     return sha256_bytes(rfc8785.dumps(safe))
+
+
+def _captured_option_observations(
+    artifact: dict[str, Any],
+    *,
+    artifact_path: Path,
+    artifact_sha256: str,
+    observed_at: datetime,
+    candidate: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source = str(artifact["source_id"])
+    if artifact["schema_version"] == HISTORICAL_OPTION_SCHEMA_VERSION:
+        cutoff = parse_utc(str(artifact["information_cutoff_utc"]))
+        options = _captured_observation(
+            source=source,
+            as_of=cutoff,
+            observed_at=observed_at,
+            values={
+                "schema_version": artifact["schema_version"],
+                "status": artifact["artifact_status"],
+                "capture_mode": artifact["capture_mode"],
+                "information_cutoff_utc": artifact["information_cutoff_utc"],
+                "target_count": len(artifact["targets"]),
+                "bar_count": len(artifact["bars"]),
+                "capture_error_count": len(artifact["capture_errors"]),
+                "historical_request_count": artifact["historical_request_count"],
+                "historical_pacing_units": artifact["historical_pacing_units"],
+            },
+            artifact_ref=str(artifact_path),
+            artifact_sha256=artifact_sha256,
+        )
+        market = _captured_observation(
+            source=source,
+            as_of=cutoff,
+            observed_at=observed_at,
+            values={
+                "underlying_reference": artifact["underlying_reference"],
+                "option_chain_snapshot_observed_at_utc": artifact["option_chain_snapshot"][
+                    "observed_at_utc"
+                ],
+                "option_chain_snapshot_staleness_seconds": artifact[
+                    "option_chain_snapshot_staleness_seconds"
+                ],
+                "canary_daily_context": candidate,
+            },
+            artifact_ref=str(artifact_path),
+            artifact_sha256=artifact_sha256,
+        )
+        return options, market
+    completed_at = parse_utc(str(artifact["captured_at_utc"]))
+    surfaces = artifact.get("surfaces", [])
+    underlying_quotes = [
+        {
+            "expiry": surface.get("expiry"),
+            "price": surface.get("underlying_price"),
+            "bid": surface.get("underlying_bid"),
+            "ask": surface.get("underlying_ask"),
+            "source_timestamp_utc": surface.get("underlying_source_timestamp_utc"),
+        }
+        for surface in surfaces
+        if isinstance(surface, dict)
+    ]
+    options = _captured_observation(
+        source=source,
+        as_of=completed_at,
+        observed_at=observed_at,
+        values={
+            "schema_version": artifact["schema_version"],
+            "status": artifact["artifact_status"],
+            "quote_count": sum(
+                len(surface.get("quotes", [])) for surface in surfaces if isinstance(surface, dict)
+            ),
+            "underlying_quotes": underlying_quotes,
+            "bounds": {
+                "min_dte_days": artifact.get("min_dte_days"),
+                "max_dte_days": artifact.get("max_dte_days"),
+                "max_expiries": artifact.get("max_expiries"),
+                "max_contracts_per_expiry": artifact.get("max_contracts_per_expiry"),
+            },
+        },
+        artifact_ref=str(artifact_path),
+        artifact_sha256=artifact_sha256,
+    )
+    market = _captured_observation(
+        source=source,
+        as_of=completed_at,
+        observed_at=observed_at,
+        values={
+            "underlying_quotes": underlying_quotes,
+            "canary_daily_context": candidate,
+        },
+        artifact_ref=str(artifact_path),
+        artifact_sha256=artifact_sha256,
+    )
+    return options, market
 
 
 def _append_snapshot(
@@ -937,52 +1367,12 @@ def _append_snapshot(
     )
     errors = [error for error in (option_error, owner_history.error) if error is not None]
     if option_artifact is not None and option_path is not None and option_sha is not None:
-        completed_at = parse_utc(str(option_artifact["captured_at_utc"]))
-        surfaces = option_artifact.get("surfaces", [])
-        underlying_quotes = [
-            {
-                "expiry": surface.get("expiry"),
-                "price": surface.get("underlying_price"),
-                "bid": surface.get("underlying_bid"),
-                "ask": surface.get("underlying_ask"),
-                "source_timestamp_utc": surface.get("underlying_source_timestamp_utc"),
-            }
-            for surface in surfaces
-            if isinstance(surface, dict)
-        ]
-        options_observation = _captured_observation(
-            source=str(option_artifact["source_id"]),
-            as_of=completed_at,
-            observed_at=capture_finished,
-            values={
-                "schema_version": option_artifact["schema_version"],
-                "status": option_artifact["artifact_status"],
-                "quote_count": sum(
-                    len(surface.get("quotes", []))
-                    for surface in surfaces
-                    if isinstance(surface, dict)
-                ),
-                "underlying_quotes": underlying_quotes,
-                "bounds": {
-                    "min_dte_days": option_artifact.get("min_dte_days"),
-                    "max_dte_days": option_artifact.get("max_dte_days"),
-                    "max_expiries": option_artifact.get("max_expiries"),
-                    "max_contracts_per_expiry": option_artifact.get("max_contracts_per_expiry"),
-                },
-            },
-            artifact_ref=str(option_path),
+        options_observation, market_observation = _captured_option_observations(
+            option_artifact,
+            artifact_path=option_path,
             artifact_sha256=option_sha,
-        )
-        market_observation = _captured_observation(
-            source=str(option_artifact["source_id"]),
-            as_of=completed_at,
             observed_at=capture_finished,
-            values={
-                "underlying_quotes": underlying_quotes,
-                "canary_daily_context": candidate,
-            },
-            artifact_ref=str(option_path),
-            artifact_sha256=option_sha,
+            candidate=candidate,
         )
     else:
         options_observation = _missing_observation(
@@ -1326,7 +1716,14 @@ def _process_claimed_job(
         status="completed",
         job_id=job.job_id,
         snapshot_sha256=record_sha,
-        option_status="captured" if option_artifact else error_kind,
+        option_status=(
+            "captured_historical"
+            if option_artifact
+            and option_artifact.get("schema_version") == HISTORICAL_OPTION_SCHEMA_VERSION
+            else "captured"
+            if option_artifact
+            else error_kind
+        ),
     )
 
 

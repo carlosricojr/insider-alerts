@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import subprocess
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -124,12 +125,26 @@ def _approved_job(
 
 
 def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
+    runtime = tmp_path / "alpha"
+    scripts = runtime / "scripts"
+    python = runtime / ".venv" / "Scripts" / "python.exe"
+    research = source_db.parent / "research"
+    scripts.mkdir(parents=True, exist_ok=True)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    research.mkdir(parents=True, exist_ok=True)
+    python.write_bytes(b"python")
+    (scripts / "capture.py").write_text("# live\n", encoding="utf-8")
+    (scripts / "historical.py").write_text("# historical\n", encoding="utf-8")
     return CaptureConfig(
         source_db=source_db,
         evidence_db=tmp_path / "evidence.db",
         artifact_root=tmp_path / "artifacts",
-        alpha_python=tmp_path / "alpha-python.exe",
-        alpha_script=tmp_path / "alpha" / "scripts" / "capture.py",
+        research_root=research,
+        alpha_python=python,
+        alpha_script=scripts / "capture.py",
+        alpha_historical_script=scripts / "historical.py",
+        option_chain_store_db=research / "option-chain.db",
+        historical_pacing_db=research / "historical-pacing.db",
         canary_ledger=tmp_path / "canary.db",
         history_db=tmp_path / "history.db",
         history_snapshot_sha256="b" * 64,
@@ -139,6 +154,111 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
         activation_db=tmp_path / "activation.db",
         capture_delay_seconds=1,
     )
+
+
+def _historical_artifact(
+    *, request_id: str, decision_at: datetime, chain_observed_at: datetime | None = None
+) -> dict[str, Any]:
+    observed = chain_observed_at or decision_at - timedelta(seconds=1)
+    expiry = "2026-09-18"
+    targets = [
+        {
+            "target_id": f"{expiry}|{option_type}|{moneyness:.4f}",
+            "expiry": expiry,
+            "option_type": option_type,
+            "target_moneyness": moneyness,
+        }
+        for moneyness in (0.9, 1.0)
+        for option_type in ("call", "put")
+    ]
+    return {
+        "schema_version": "insider-evidence-option-history-v2",
+        "artifact_status": "RESEARCH_ONLY",
+        "source_id": "ib_gateway:US_OPTIONS:SMART:type1:historical_bid_ask_15m",
+        "capture_mode": "FORWARD_CLOSED_VENUE_FALLBACK",
+        "trade_selection_authority": False,
+        "backfill_authority": False,
+        "request_id": request_id,
+        "symbol": "TEST",
+        "client_id": 49,
+        "market_data_type": 1,
+        "information_cutoff_utc": decision_at.isoformat(),
+        "requested_at_utc": (decision_at + timedelta(milliseconds=1)).isoformat(),
+        "captured_at_utc": (decision_at + timedelta(milliseconds=2)).isoformat(),
+        "option_chain_feed_sequence": 1,
+        "option_chain_feed_record_sha256": "c" * 64,
+        "option_chain_snapshot": {
+            "observed_at_utc": observed.isoformat(),
+            "expiry_candidates": [expiry],
+            "listed_strikes": [9.0, 10.0],
+        },
+        "option_chain_snapshot_staleness_seconds": (decision_at - observed).total_seconds(),
+        "underlying_reference": {
+            "symbol": "TEST",
+            "what_to_show": "MIDPOINT",
+            "bar_size_seconds": 900,
+            "bar_start_utc": (decision_at - timedelta(minutes=16)).isoformat(),
+            "bar_end_utc": (decision_at - timedelta(minutes=1)).isoformat(),
+            "open": 10.0,
+            "high": 10.1,
+            "low": 9.9,
+            "close": 10.0,
+            "staleness_seconds": 60.0,
+        },
+        "targets": targets,
+        "bars": [],
+        "capture_errors": [
+            {
+                "target": target,
+                "contract": None,
+                "selected_strike": 10.0,
+                "error_code": "OPTION_QUALIFICATION_FAILED",
+                "provider_stage": "option_qualification",
+                "historical_request_issued": False,
+            }
+            for target in targets
+        ],
+        "historical_request_count": 1,
+        "historical_pacing_units": 1,
+    }
+
+
+def _install_chain_custody(
+    path: Path,
+    artifact: dict[str, Any],
+    *,
+    record_sha256: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chain = artifact["option_chain_snapshot"]
+    payload = {
+        "record_type": "snapshot",
+        "symbol": artifact["symbol"],
+        "observed_at_utc": chain["observed_at_utc"],
+        "snapshot": chain,
+    }
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute(
+            """
+            CREATE TABLE option_chain_feed_records(
+              sequence INTEGER PRIMARY KEY,
+              record_sha256 TEXT NOT NULL,
+              symbol TEXT NOT NULL,
+              observed_at_utc TEXT NOT NULL,
+              payload_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO option_chain_feed_records VALUES(?,?,?,?,?)",
+            (
+                artifact["option_chain_feed_sequence"],
+                record_sha256 or artifact["option_chain_feed_record_sha256"],
+                artifact["symbol"],
+                chain["observed_at_utc"],
+                json.dumps(payload),
+            ),
+        )
 
 
 def test_draft_registry_heartbeats_without_claiming_or_writing_evidence(
@@ -357,9 +477,10 @@ def test_active_registry_derives_exact_capture_window(tmp_path: Path) -> None:
     policy_path.write_bytes(rfc8785.dumps(registry))
     config = replace(_config(tmp_path, tmp_path / "source.db"), policy_path=policy_path)
 
-    assert VALIDATE_CAPTURE_WINDOW(
-        config, now=activated_at - timedelta(microseconds=1)
-    ).status == "armed"
+    assert (
+        VALIDATE_CAPTURE_WINDOW(config, now=activated_at - timedelta(microseconds=1)).status
+        == "armed"
+    )
     assert VALIDATE_CAPTURE_WINDOW(config, now=activated_at) == CaptureWindow(
         status="active",
         policy_sha256=_policy_sha(config),
@@ -966,52 +1087,238 @@ def test_retryable_option_failure_keeps_job_durable_without_snapshot(
         assert conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone()[0] == 0
 
 
-def test_closed_venue_option_failure_is_typed_and_bounded(
+def test_closed_venue_uses_one_cutoff_bound_historical_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_db, _, decision_at = _approved_job(tmp_path)
-    config = replace(_config(tmp_path, source_db), max_attempts=2)
-    monkeypatch.setattr(
-        capture_module,
-        "run_hidden_process",
-        lambda *_args, **_kwargs: ProcessResult(
-            returncode=1,
-            stdout="",
-            stderr=(
-                "IB Gateway request failed: bid/ask packet is not actionable because "
-                "the venue session is not open"
-            ),
-            timed_out=False,
-        ),
-    )
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
+    calls: list[tuple[list[str], int]] = []
+
+    def process(command: list[str], **kwargs: Any) -> ProcessResult:
+        calls.append((command, int(kwargs["timeout_seconds"])))
+        if command[1] == str(config.alpha_script):
+            return ProcessResult(
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "IB Gateway request failed: bid/ask packet is not actionable because "
+                    "the venue session is not open"
+                ),
+                timed_out=False,
+            )
+        output = Path(command[command.index("--output") + 1])
+        artifact = _historical_artifact(request_id=job_id, decision_at=decision_at)
+        _install_chain_custody(config.option_chain_store_db, artifact)
+        output.write_text(
+            json.dumps(artifact),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", process)
 
     result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
 
-    assert result.status == "retry_scheduled"
-    assert result.option_status == "OPTION_CAPTURE_VENUE_CLOSED"
+    assert result.status == "completed"
+    assert result.option_status == "captured_historical"
+    assert len(calls) == 2
+    historical_command, historical_timeout = calls[1]
+    assert historical_command == [
+        str(config.alpha_python),
+        str(config.alpha_historical_script),
+        "--chain-store-db",
+        str(config.option_chain_store_db),
+        "--pacing-db",
+        str(config.historical_pacing_db),
+        "--symbol",
+        "TEST",
+        "--request-id",
+        job_id,
+        "--information-cutoff",
+        capture_module.utc_text(decision_at),
+        "--output",
+        historical_command[-1],
+    ]
+    assert historical_timeout == 120
     with sqlite3.connect(source_db) as conn:
         assert conn.execute(
             "SELECT status,attempt_count,last_error_kind FROM research_capture_jobs"
-        ).fetchone() == ("retry", 1, "OPTION_CAPTURE_VENUE_CLOSED")
-        assert conn.execute(
-            "SELECT status,retryable,error_kind FROM research_capture_attempts"
-        ).fetchone() == ("retry", 1, "OPTION_CAPTURE_VENUE_CLOSED")
-    with sqlite3.connect(config.evidence_db) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone()[0] == 0
-
-    terminal = run_capture_once(config, now=decision_at + timedelta(seconds=3))
-
-    assert terminal.status == "completed"
-    assert terminal.option_status == "OPTION_CAPTURE_VENUE_CLOSED"
+        ).fetchone() == ("complete", 1, None)
     with sqlite3.connect(config.evidence_db) as conn:
         row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
     assert row is not None
     record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "captured"
+    assert observation["as_of_utc"] == capture_module.utc_text(decision_at)
+    assert observation["values"]["capture_mode"] == "FORWARD_CLOSED_VENUE_FALLBACK"
+    assert observation["values"]["target_count"] == 4
+
+
+def test_historical_fallback_timeout_is_terminal_and_never_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    calls = 0
+
+    def process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        nonlocal calls
+        calls += 1
+        if command[1] == str(config.alpha_script):
+            return ProcessResult(
+                returncode=1,
+                stdout="",
+                stderr="the venue session is not open",
+                timed_out=False,
+            )
+        return ProcessResult(returncode=1, stdout="", stderr="", timed_out=True)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", process)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_HISTORY_AMBIGUOUS_TIMEOUT"
+    assert calls == 2
+    assert run_capture_once(config, now=decision_at + timedelta(seconds=3)).status == "idle"
+    assert calls == 2
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,attempt_count,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("complete", 1, "OPTION_HISTORY_AMBIGUOUS_TIMEOUT")
+        assert conn.execute(
+            "SELECT status,retryable,error_kind FROM research_capture_attempts"
+        ).fetchone() == ("completed", 0, "OPTION_HISTORY_AMBIGUOUS_TIMEOUT")
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
     assert record["payload"]["observations"]["options_surface"]["status"] == "error"
     assert any(
-        error["kind"] == "OPTION_CAPTURE_VENUE_CLOSED"
-        for error in record["payload"]["errors"]
+        error["kind"] == "OPTION_HISTORY_AMBIGUOUS_TIMEOUT" for error in record["payload"]["errors"]
     )
+
+
+def test_post_cutoff_historical_chain_artifact_is_terminal_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
+
+    def process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        if command[1] == str(config.alpha_script):
+            return ProcessResult(
+                returncode=1,
+                stdout="",
+                stderr="the venue session is not open",
+                timed_out=False,
+            )
+        output = Path(command[command.index("--output") + 1])
+        artifact = _historical_artifact(
+            request_id=job_id,
+            decision_at=decision_at,
+            chain_observed_at=decision_at + timedelta(microseconds=1),
+        )
+        _install_chain_custody(config.option_chain_store_db, artifact)
+        output.write_text(
+            json.dumps(artifact),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", process)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_HISTORY_ARTIFACT_INVALID"
+
+
+def test_option_database_escape_is_rejected_before_any_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        option_chain_store_db=tmp_path / "outside" / "chain.db",
+    )
+    launches = 0
+
+    def process(*_args: Any, **_kwargs: Any) -> ProcessResult:
+        nonlocal launches
+        launches += 1
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", process)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RUNTIME_INVALID"
+    assert launches == 0
+
+
+def test_research_root_cannot_be_rebound_away_from_source_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    outside_research = tmp_path / "outside" / "research"
+    outside_research.mkdir(parents=True)
+    config = replace(
+        _config(tmp_path, source_db),
+        research_root=outside_research,
+        option_chain_store_db=outside_research / "chain.db",
+        historical_pacing_db=outside_research / "pacing.db",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RUNTIME_INVALID"
+
+
+def test_historical_chain_digest_must_match_durable_store_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
+
+    def process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        if command[1] == str(config.alpha_script.resolve()):
+            return ProcessResult(
+                returncode=1,
+                stdout="",
+                stderr="the venue session is not open",
+                timed_out=False,
+            )
+        artifact = _historical_artifact(request_id=job_id, decision_at=decision_at)
+        _install_chain_custody(
+            config.option_chain_store_db,
+            artifact,
+            record_sha256="d" * 64,
+        )
+        Path(command[command.index("--output") + 1]).write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", process)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_HISTORY_ARTIFACT_INVALID"
 
 
 def test_restart_after_snapshot_append_recovers_without_recapture(
@@ -1125,6 +1432,12 @@ def _worker_args(tmp_path: Path) -> list[str]:
         str(tmp_path / "alpha-python.exe"),
         "--alpha-script",
         str(tmp_path / "alpha-capture.py"),
+        "--alpha-historical-script",
+        str(tmp_path / "alpha-history.py"),
+        "--option-chain-store-db",
+        str(tmp_path / "option-chain.db"),
+        "--historical-pacing-db",
+        str(tmp_path / "historical-pacing.db"),
         "--error-log",
         str(tmp_path / "research-capture.err.log"),
     ]
@@ -1145,6 +1458,10 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
 
     assert worker_module.main(_worker_args(tmp_path)) == 0
     assert len(calls) == 1
+    assert calls[0].alpha_historical_script == tmp_path / "alpha-history.py"
+    assert calls[0].option_chain_store_db == tmp_path / "option-chain.db"
+    assert calls[0].historical_pacing_db == tmp_path / "historical-pacing.db"
+    assert calls[0].research_root == ROOT / "data" / "research"
     assert json.loads(capsys.readouterr().out) == {
         "job_id": None,
         "option_status": None,
@@ -1176,5 +1493,8 @@ def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
 
     assert ".venv\\Scripts\\pythonw.exe" in installer
     assert '"--loop"' not in installer
+    assert "capture_insider_historical_option_evidence.py" in installer
+    assert '"--option-chain-store-db' in installer
+    assert '"--historical-pacing-db' in installer
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 15)" in installer
     assert "-MultipleInstances IgnoreNew" in installer
