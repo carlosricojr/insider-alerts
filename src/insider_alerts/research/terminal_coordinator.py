@@ -345,8 +345,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         with contextlib.suppress(Exception):
             _append_record(args.output_log, failure)
+        with contextlib.suppress(Exception):
             _append_error(args.error_log, failure)
-        return 2
+        return 3
     if result.status == "invalid":
         return 3
     if result.status == "failed":

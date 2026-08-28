@@ -58,7 +58,9 @@ receipt and no-outcome report may be committed in the same invocation because no
 calculated. Its append-only operational log emits only
 counts, state, reasons, and content digests. Scientific `KILL` is an operationally successful run;
 retryable degradation returns 2, while persistent operational failure and scientific `INVALID`
-return 3. Transitions are restricted to the daily after-hours window so
+return 3. Task Scheduler does not automatically restart any nonzero result, so a post-transition
+logging failure cannot advance another terminal state before the next daily invocation.
+Transitions are restricted to the daily after-hours window so
 terminal reconciliation locks cannot interfere with live position management.
 
 Manual recovery remains available through the frozen production wrapper (the producer emits only

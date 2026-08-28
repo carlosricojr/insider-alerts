@@ -34,15 +34,13 @@ $arguments = @(
 ) -join " "
 $action = New-ScheduledTaskAction -Execute $pythonExe -Argument $arguments -WorkingDirectory $repoRoot
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At $dailyStart
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
   -ExecutionTimeLimit (New-TimeSpan -Minutes 60) `
   -Hidden `
   -MultipleInstances IgnoreNew `
-  -RestartCount 1 `
-  -RestartInterval (New-TimeSpan -Minutes 5) `
   -StartWhenAvailable
 
 Register-ScheduledTask `

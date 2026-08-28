@@ -123,8 +123,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
   .\ops\windows\install-research-terminal-coordinator-task.ps1 -Start
 ```
 
-The installer fails closed unless the Windows host time zone is `Eastern Standard Time`. The
-coordinator runs once daily at 20:30 Eastern through direct hidden `pythonw.exe`. It is
+The installer fails closed unless the Windows host time zone is `Eastern Standard Time`. Its S4U
+principal runs without an interactive sign-in and stores no password; the coordinator needs only
+local files and does not use S4U-ineligible network resources. It runs once daily at 20:30 Eastern
+through direct hidden `pythonw.exe`. It is
 order-incapable and does not alter the active strategy or registry. The inferential path separates
 cohort sealing and the single look across daily invocations; the no-dataset deadline path may
 atomically bind its universe receipt and outcome-free decision after pending entries drain. A missed trigger may run later through `StartWhenAvailable`,
@@ -132,6 +134,8 @@ but transitions remain deferred unless the invocation is inside the 20:30–23:5
 window. This prevents the terminal seal's multi-store reconciliation locks from competing with
 live position management. Safe state, counts, and content digests are appended to
 `logs\research-terminal-coordinator.log`; returns, p-values, confidence intervals, and economic
-gates are never logged. A terminal `KILL` is a successful scientific completion and does not cause
-Task Scheduler retries. Retryable degradation returns exit code 2 for one five-minute retry;
-persistent operational failure and scientific `INVALID` return 3 and remain visibly failed.
+gates are never logged. A terminal `KILL` is a successful scientific completion. Retryable
+degradation returns exit code 2; persistent operational failure and scientific `INVALID` return 3.
+The task intentionally has no automatic restart: all nonzero results remain visible, and the next
+attempt is the following daily invocation. This prevents a logging failure after a successful seal
+from immediately advancing the inferential decision.

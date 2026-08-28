@@ -235,7 +235,7 @@ def test_main_treats_scientific_kill_as_operational_success(
     assert not error.exists()
 
 
-def test_main_logs_degradation_and_requests_one_scheduler_retry(
+def test_main_logs_degradation_and_returns_retryable_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "coordinator.log"
@@ -255,6 +255,32 @@ def test_main_logs_degradation_and_requests_one_scheduler_retry(
 
     assert exit_code == 2
     assert "database is locked" in error.read_text(encoding="utf-8")
+
+
+def test_main_returns_persistent_failure_when_log_append_fails_after_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = tmp_path / "coordinator.err.log"
+    monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(
+        coordinator,
+        "run_terminal_coordinator_once",
+        lambda _config: coordinator.TerminalCoordinatorResult(
+            "sealed", action="seal", terminal_seal_receipt_sha256="a" * 64
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_append_record",
+        lambda *_args: (_ for _ in ()).throw(OSError("output disk unavailable")),
+    )
+
+    exit_code = coordinator.main(
+        ["--output-log", str(tmp_path / "coordinator.log"), "--error-log", str(error)]
+    )
+
+    assert exit_code == 3
+    assert "unexpected_OSError:output disk unavailable" in error.read_text(encoding="utf-8")
 
 
 def test_activation_bound_artifacts_remain_byte_identical() -> None:
@@ -295,3 +321,6 @@ def test_worker_and_installer_are_order_incapable_hidden_and_singleton() -> None
     assert ".Date.AddHours(20).AddMinutes(30)" in installer
     assert '$localTimeZone.Id -ne "Eastern Standard Time"' in installer
     assert "ExecutionTimeLimit (New-TimeSpan -Minutes 60)" in installer
+    assert "-LogonType S4U" in installer
+    assert "-RestartCount" not in installer
+    assert "-RestartInterval" not in installer
