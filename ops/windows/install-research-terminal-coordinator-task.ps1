@@ -51,6 +51,7 @@ try {
     -Trigger $dailyTrigger `
     -Principal $s4uPrincipal `
     -Settings $settings `
+    -ErrorAction Stop `
     -Force | Out-Null
 } catch {
   if ($_.FullyQualifiedErrorId -ne "HRESULT 0x80070005,Register-ScheduledTask") {
@@ -71,6 +72,7 @@ try {
     -Trigger @($dailyTrigger, $logonTrigger) `
     -Principal $interactivePrincipal `
     -Settings $settings `
+    -ErrorAction Stop `
     -Force | Out-Null
   Write-Warning (
     "S4U registration was denied (HRESULT 0x80070005); registered '$TaskName' " +
