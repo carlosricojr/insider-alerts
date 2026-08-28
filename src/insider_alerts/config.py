@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     ntfy_retry_attempts: int = Field(default=3, alias="NTFY_RETRY_ATTEMPTS", ge=1)
     ntfy_retry_min_seconds: float = Field(default=0.5, alias="NTFY_RETRY_MIN_SECONDS", ge=0)
     ntfy_retry_max_seconds: float = Field(default=3.0, alias="NTFY_RETRY_MAX_SECONDS", ge=0)
+    notification_transport_db: str = Field(
+        default="data/research/notification_transport.db",
+        alias="NOTIFICATION_TRANSPORT_DB",
+    )
+    notification_transport_policy_path: str = Field(
+        default="docs/research/contracts/notification-transport-v1.json",
+        alias="NOTIFICATION_TRANSPORT_POLICY_PATH",
+    )
 
     sec_rss_url: str = Field(
         default="https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&start=-1&count=40&output=rss",
