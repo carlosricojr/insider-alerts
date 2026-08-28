@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -327,19 +328,34 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert "--heartbeat-stale-seconds $StaleHeartbeatSeconds" in installer
     assert "required_stale_seconds" in installer
     assert "Wait-ForFreshWorker" in installer
-    assert "stably running autopilot worker" in installer
+    assert "stably running $WorkerLabel worker" in installer
     assert "ops autopilot-config-validate" in installer
     assert "Push-Location $repoRoot" in installer
-    assert "TaskName and WorkerTaskName must be distinct" in installer
+    assert "All task names must be distinct" in installer
+    assert '"Global\\InsiderAlertsAutopilotTaskInstaller-v1"' in installer
+    mutex_acquire = installer.index("$installMutex.WaitOne(0)")
+    health_snapshot = installer.index("$priorHealth = Get-WorkerHealth")
+    task_snapshot = installer.index("$snapshots = @(")
+    assert mutex_acquire < health_snapshot < task_snapshot
+    assert "$installMutex.ReleaseMutex()" in installer
+    assert "$installMutex.Dispose()" in installer
+    assert "transactional installer requires -Start" in installer
+    assert installer.index("transactional installer requires -Start") < installer.index(
+        "Stop-TaskAndWait -Name $TaskName"
+    )
     assert "prior tasks were restored" in installer
     assert "Phase 1: disable and stop every replacement" in installer
-    assert "Phase 2: restore definitions only" in installer
-    assert "Phase 3: only restart prior instances" in installer
+    assert "Phase 2: restore every prior definition disabled" in installer
+    assert "Phase 3: restore worker state" in installer
+    assert "Phase 4: restore watchdog state last" in installer
     assert "if ($rollbackErrors.Count -eq 0)" in installer
-    phase_two = installer.index("# Phase 2: restore definitions only")
+    phase_two = installer.index("# Phase 2: restore every prior definition disabled")
     restore_gate = installer.index("if ($rollbackErrors.Count -eq 0)", phase_two)
     restore_call = installer.index("Register-ScheduledTask -TaskName $snapshot.Name", phase_two)
     assert restore_gate < restore_call
+    assert "Get-DisabledTaskXml -Xml $snapshot.Xml" in installer
+    assert "Enable-ScheduledTask -TaskName $snapshot.Name" in installer
+    assert "Disable-ScheduledTask -TaskName $snapshot.Name" in installer
     assert "Disable-ScheduledTask -TaskName $Name" in installer
     stop_function = installer[installer.index("function Stop-TaskAndWait") :]
     disable_index = stop_function.index("Disable-ScheduledTask -TaskName $Name")
@@ -349,6 +365,18 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     )
     running_check_index = stop_function.index('if ($task.State -eq "Running")')
     assert disable_index < post_fence_query_index < running_check_index
+    assert '$Snapshot.WasRunning = ($task.State -eq "Running")' in stop_function
+    assert "$Snapshot.WasEnabled = [bool]$task.Settings.Enabled" in stop_function
+    assert "$Snapshot.StateBound = $true" in stop_function
+    assert "$Snapshot.EnabledStateBound = $true" in stop_function
+    assert "-Snapshot $snapshots[2]" in installer
+    assert "-Snapshot $snapshots[0]" in installer
+    watchdog_fence = installer.index("Stop-TaskAndWait -Name $SecTaskName")
+    worker_enabled_refresh = installer.index("-RefreshEnabledState", watchdog_fence)
+    assert watchdog_fence < worker_enabled_refresh
+    assert "foreach ($target in $rollbackTargets)" in installer
+    assert "if (-not $target.Snapshot.StateBound)" in installer
+    assert "prior scheduled-task state could not be bound after fencing" in installer
     assert installer.index("ops autopilot-config-validate") < installer.index(
         "Stop-TaskAndWait -Name $TaskName"
     )
@@ -361,8 +389,100 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert installer.index("Stop-TaskAndWait -Name $TaskName") < installer.index(
         "Register-ScheduledTask `"
     )
-    assert installer.count("Register-ScheduledTask `") == 2
+    assert installer.count("Register-ScheduledTask `") == 4
     assert 'New-ScheduledTaskAction `\n  -Execute $pythonExe' in installer
+    assert '"Insider Alerts SEC Ingestion Worker"' in installer
+    assert '"Insider Alerts SEC Ingestion Watchdog"' in installer
+    assert "ops sec-ingestion --loop --interval 60" in installer
+    assert "ops sec-ingestion-watchdog" in installer
+    assert "ops sec-ingestion-config-validate" in installer
+    assert "--no-sec-ingestion" in installer
+    assert "data\\sec_ingestion_health.db" in installer
+    assert "logs/sec-ingestion.out.log" in installer
+    assert "logs/sec-ingestion.err.log" in installer
+    assert "--heartbeat-stale-seconds $SecStaleHeartbeatSeconds" in installer
+    assert "-PreviousRuntimeId $previousSecRuntimeId" in installer
+    assert "-RequireCycleSuccess $true" in installer
+    assert "last_cycle_success_utc" in installer
+    assert "-DeadlineSeconds ($SecStaleHeartbeatSeconds + 120)" in installer
+    assert "$observedProgressStages.ContainsKey($progressStage)" in installer
+    assert "$deadline = (Get-Date).AddSeconds($DeadlineSeconds)" in installer
+    assert "$watchdogSettings.Enabled = $false" in installer
+    assert "function Wait-ForSuccessfulTaskRun" in installer
+    assert "$taskInfo.LastTaskResult -ne 0" in installer
+    sec_watchdog_marker = installer.index(
+        "$previousSecWatchdogRunTime = Get-TaskLastRunTime"
+    )
+    assert installer.index("Start-ScheduledTask -TaskName $SecWorkerTaskName") < installer.index(
+        "Enable-ScheduledTask -TaskName $SecTaskName"
+    )
+    assert sec_watchdog_marker < installer.index(
+        "Enable-ScheduledTask -TaskName $SecTaskName"
+    )
+    assert installer.index("Start-ScheduledTask -TaskName $SecTaskName") < installer.index(
+        "Wait-ForSuccessfulTaskRun `\n    -Name $SecTaskName"
+    )
+    assert installer.index("Enable-ScheduledTask -TaskName $SecTaskName") < installer.index(
+        "Start-ScheduledTask -TaskName $WorkerTaskName"
+    )
+    assert installer.index("Start-ScheduledTask -TaskName $WorkerTaskName") < installer.index(
+        "Enable-ScheduledTask -TaskName $TaskName"
+    )
+    snapshots_start = installer.index("$snapshots = @(")
+    snapshots = installer[
+        snapshots_start : installer.index("\n\ntry {", snapshots_start)
+    ]
+    assert snapshots.index("$WorkerTaskName") < snapshots.index("$TaskName")
+    assert snapshots.index("$SecWorkerTaskName") < snapshots.index("$SecTaskName")
+
+
+@pytest.mark.skipif(not hasattr(subprocess, "CREATE_NO_WINDOW"), reason="Windows-only mutex test")
+def test_autopilot_installer_rejects_a_concurrent_invocation_without_mutation() -> None:
+    root = Path(__file__).resolve().parents[1]
+    mutex_name = "Global\\InsiderAlertsAutopilotTaskInstaller-v1"
+    holder_script = (
+        f"$m=[System.Threading.Mutex]::new($false,'{mutex_name}');"
+        "$null=$m.WaitOne();[Console]::WriteLine('READY');"
+        "[Console]::Out.Flush();Start-Sleep -Seconds 30"
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    holder = subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", holder_script],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=creationflags,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "READY"
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(root / "ops" / "windows" / "install-autopilot-task.ps1"),
+                "-Start",
+                "-AlphaRoot",
+                str(root / "definitely-missing-alpha-root"),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=creationflags,
+        )
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+    assert result.returncode != 0
+    assert "Another Insider Alerts task installation is already running." in result.stderr
+    assert "Missing alpha runtime interpreter" not in result.stderr
 
 
 def test_process_tree_cleanup_uncertainty_escapes_option_capture_isolation(tmp_path: Path) -> None:

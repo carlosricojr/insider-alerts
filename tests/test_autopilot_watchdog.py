@@ -116,6 +116,33 @@ def test_health_store_preserves_last_error_until_a_cycle_succeeds(tmp_path: Path
     assert health["last_error_message"] is None
 
 
+def test_health_store_records_error_without_advancing_progress(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
+    store = AutopilotHealthStore(tmp_path / "health.db")
+    store.register_runtime(runtime_id="runtime-a", source_fingerprint="a" * 64, now=now)
+    store.progress(
+        runtime_id="runtime-a",
+        stage="cycle_started",
+        now=now + timedelta(seconds=1),
+        cycle_started=True,
+    )
+    before = store.read()
+
+    store.progress(
+        runtime_id="runtime-a",
+        stage="cycle_retryable_failure",
+        now=now + timedelta(seconds=2),
+        error=RuntimeError("upstream unavailable"),
+        advance_progress=False,
+    )
+
+    after = store.read()
+    assert after["last_progress_utc"] == before["last_progress_utc"]
+    assert after["last_progress_stage"] == "cycle_started"
+    assert after["last_error_kind"] == "RuntimeError"
+    assert after["last_error_message"] == "upstream unavailable"
+
+
 def test_progress_write_is_bounded_by_short_database_lock_timeout(tmp_path: Path) -> None:
     now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
     path = tmp_path / "health.db"

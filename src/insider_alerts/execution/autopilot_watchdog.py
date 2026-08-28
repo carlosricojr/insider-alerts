@@ -179,6 +179,7 @@ class AutopilotHealthStore:
         cycle_started: bool = False,
         cycle_succeeded: bool = False,
         error: BaseException | None = None,
+        advance_progress: bool = True,
     ) -> None:
         stage = stage.strip()
         if not stage or len(stage) > MAX_STAGE_LENGTH:
@@ -190,7 +191,8 @@ class AutopilotHealthStore:
             cursor = conn.execute(
                 """
                 UPDATE autopilot_health
-                SET last_progress_utc=?,last_progress_stage=?,
+                SET last_progress_utc=CASE WHEN ? THEN ? ELSE last_progress_utc END,
+                    last_progress_stage=CASE WHEN ? THEN ? ELSE last_progress_stage END,
                     last_cycle_started_utc=CASE WHEN ? THEN ? ELSE last_cycle_started_utc END,
                     last_cycle_success_utc=CASE WHEN ? THEN ? ELSE last_cycle_success_utc END,
                     last_error_kind=CASE
@@ -206,7 +208,9 @@ class AutopilotHealthStore:
                 WHERE singleton=1 AND runtime_id=?
                 """,
                 (
+                    int(advance_progress),
                     stamp,
+                    int(advance_progress),
                     stage,
                     int(cycle_started),
                     stamp,
@@ -624,6 +628,51 @@ def autopilot_runtime_budget(
         "maximum_stage_seconds": round(maximum_stage, 3),
         "required_stale_seconds": required_stale,
     }
+
+
+def sec_ingestion_runtime_budget(*, settings: Settings) -> dict[str, float | int]:
+    """Return the largest legitimate blocking stage for the isolated SEC worker."""
+
+    sec_window = settings.sec_retry_attempts * (
+        HTTPX_TIMEOUT_PHASES * settings.sec_timeout_seconds
+        + 1 / settings.sec_rate_limit_per_second
+    ) + (settings.sec_retry_attempts - 1) * settings.sec_retry_max_seconds
+    ib_window = settings.market_data_retry_attempts * (
+        3 * AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
+        + 1 / settings.market_data_rate_limit_per_second
+    ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
+    yahoo_window = settings.market_data_retry_attempts * (
+        URLLIB_TIMEOUT_PHASES * settings.market_data_timeout_seconds
+        + 1 / settings.market_data_rate_limit_per_second
+    ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
+    review_item_window = (
+        sec_window + ib_window + yahoo_window + SQLITE_REVIEW_ITEM_BUDGET_SECONDS
+    )
+    maximum_stage = max(sec_window, review_item_window, SQLITE_STAGE_BUDGET_SECONDS)
+    required_stale = max(
+        MIN_STALE_SECONDS,
+        math.ceil(maximum_stage + STALE_SAFETY_MARGIN_SECONDS),
+    )
+    return {
+        "sec_window_seconds": round(sec_window, 3),
+        "review_item_window_seconds": round(review_item_window, 3),
+        "sqlite_window_seconds": SQLITE_STAGE_BUDGET_SECONDS,
+        "maximum_stage_seconds": round(maximum_stage, 3),
+        "required_stale_seconds": required_stale,
+    }
+
+
+def validate_sec_ingestion_stale_threshold(
+    *,
+    stale_seconds: int,
+    settings: Settings,
+) -> None:
+    minimum = int(sec_ingestion_runtime_budget(settings=settings)["required_stale_seconds"])
+    if stale_seconds < minimum:
+        raise ValueError(
+            f"SEC ingestion heartbeat stale threshold must be at least {minimum} seconds "
+            "for bounded external calls"
+        )
 
 
 def validate_stale_threshold(
