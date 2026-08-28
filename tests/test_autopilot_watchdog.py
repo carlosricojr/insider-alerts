@@ -49,6 +49,42 @@ def test_health_store_fences_superseded_runtime(tmp_path: Path) -> None:
     assert health["last_progress_stage"] == "runtime_started"
 
 
+def test_health_store_preserves_last_error_until_a_cycle_succeeds(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
+    store = AutopilotHealthStore(tmp_path / "health.db")
+    store.register_runtime(runtime_id="runtime-a", source_fingerprint="a" * 64, now=now)
+    store.progress(
+        runtime_id="runtime-a",
+        stage="cycle_retryable_failure",
+        now=now + timedelta(seconds=1),
+        error=RuntimeError("upstream unavailable"),
+    )
+    store.progress(
+        runtime_id="runtime-a",
+        stage="cycle_wait",
+        now=now + timedelta(seconds=2),
+    )
+    store.register_runtime(
+        runtime_id="runtime-b",
+        source_fingerprint="b" * 64,
+        now=now + timedelta(seconds=3),
+    )
+
+    health = store.read()
+    assert health["last_error_kind"] == "RuntimeError"
+    assert health["last_error_message"] == "upstream unavailable"
+
+    store.progress(
+        runtime_id="runtime-b",
+        stage="cycle_succeeded",
+        now=now + timedelta(seconds=4),
+        cycle_succeeded=True,
+    )
+    health = store.read()
+    assert health["last_error_kind"] is None
+    assert health["last_error_message"] is None
+
+
 def test_progress_write_is_bounded_by_short_database_lock_timeout(tmp_path: Path) -> None:
     now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
     path = tmp_path / "health.db"
@@ -205,6 +241,74 @@ def test_watchdog_never_starts_replacement_after_stop_failure(tmp_path: Path) ->
     assert [call[0] for call in calls] == ["/Query", "/End"]
 
 
+def test_watchdog_propagates_query_failure_without_starting(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(arguments):  # type: ignore[no-untyped-def]
+        calls.append(list(arguments))
+        return subprocess.CompletedProcess([], 1, "", "query denied")
+
+    with pytest.raises(RuntimeError, match="failed to query"):
+        run_autopilot_watchdog(
+            heartbeat_db=tmp_path / "missing.db",
+            worker_task_name="Autopilot Worker",
+            stale_seconds=300,
+            now=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+            task_runner=runner,
+        )
+
+    assert [call[0] for call in calls] == ["/Query"]
+
+
+def test_watchdog_propagates_start_failure(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(arguments):  # type: ignore[no-untyped-def]
+        calls.append(list(arguments))
+        if arguments[0] == "/Query":
+            return _task_result("Ready")
+        return subprocess.CompletedProcess([], 1, "", "start denied")
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        run_autopilot_watchdog(
+            heartbeat_db=tmp_path / "missing.db",
+            worker_task_name="Autopilot Worker",
+            stale_seconds=300,
+            now=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+            task_runner=runner,
+        )
+
+    assert [call[0] for call in calls] == ["/Query", "/Run"]
+
+
+def test_watchdog_propagates_quarantine_failure_without_starting(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "health.db"
+    path.write_bytes(b"not sqlite")
+    calls: list[list[str]] = []
+
+    def runner(arguments):  # type: ignore[no-untyped-def]
+        calls.append(list(arguments))
+        return _task_result("Ready")
+
+    def fail_replace(_source, _destination) -> None:  # type: ignore[no-untyped-def]
+        raise OSError("quarantine denied")
+
+    monkeypatch.setattr("insider_alerts.execution.autopilot_watchdog.os.replace", fail_replace)
+    with pytest.raises(OSError, match="quarantine denied"):
+        run_autopilot_watchdog(
+            heartbeat_db=path,
+            worker_task_name="Autopilot Worker",
+            stale_seconds=300,
+            now=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+            task_runner=runner,
+        )
+
+    assert [call[0] for call in calls] == ["/Query"]
+
+
 def test_watchdog_quarantines_corrupt_store_only_when_worker_is_stopped(
     tmp_path: Path,
 ) -> None:
@@ -258,6 +362,21 @@ def test_heartbeat_state_classifies_empty_and_malformed_stores_as_corrupt(
     assert corrupt is True
     assert autopilot_health_status(malformed)["valid"] is False
 
+    incomplete_v1 = tmp_path / "incomplete-v1.db"
+    with sqlite3.connect(incomplete_v1) as conn:
+        conn.execute(
+            "CREATE TABLE autopilot_health(singleton INTEGER, schema_version INTEGER)"
+        )
+        conn.execute("INSERT INTO autopilot_health VALUES(1,1)")
+    stale, reason, corrupt = heartbeat_state(
+        incomplete_v1,
+        now=now,
+        stale_seconds=300,
+    )
+    assert stale is True
+    assert reason == "heartbeat_store_corrupt_DatabaseError"
+    assert corrupt is True
+
 
 def test_heartbeat_state_does_not_restart_for_transient_locked_store(
     monkeypatch,
@@ -281,6 +400,6 @@ def test_heartbeat_state_does_not_restart_for_transient_locked_store(
 def test_status_and_stale_threshold_are_fail_closed(tmp_path: Path) -> None:
     path = tmp_path / "health.db"
     assert autopilot_health_status(path)["valid"] is False
-    with pytest.raises(ValueError, match="at least 190"):
-        validate_stale_threshold(quant_timeout_seconds=120, stale_seconds=189)
+    with pytest.raises(ValueError, match="at least 300"):
+        validate_stale_threshold(quant_timeout_seconds=120, stale_seconds=299)
     validate_stale_threshold(quant_timeout_seconds=120, stale_seconds=300)

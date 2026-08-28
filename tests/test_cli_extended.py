@@ -1205,11 +1205,44 @@ def test_cli_ops_autopilot_requires_timeout_coupled_heartbeat_configuration(
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--heartbeat-stale-seconds",
-            "189",
+            "299",
         ],
     )
     assert unsafe.exit_code == 2
-    assert "at least 190 seconds" in unsafe.stderr
+    assert "at least 300 seconds" in unsafe.stderr
+
+
+def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    def fail(**_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("scheduled task query denied")
+
+    monkeypatch.setattr(cli, "run_autopilot_watchdog", fail)
+    output_log = tmp_path / "autopilot-watchdog.log"
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-watchdog",
+            "--worker-task-name",
+            "Autopilot Worker",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--stale-seconds",
+            "300",
+            "--output-log",
+            str(output_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(output_log.read_text(encoding="utf-8"))
+    assert payload["action"] == "error"
+    assert payload["error_kind"] == "RuntimeError"
+    assert payload["error_message"] == "scheduled task query denied"
+    assert payload["worker_task_name"] == "Autopilot Worker"
 
 
 def test_cli_ops_autopilot_exits_after_persistent_heartbeat_write_failure(

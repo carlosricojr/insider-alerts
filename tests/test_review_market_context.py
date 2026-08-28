@@ -2,7 +2,7 @@ import gzip
 import json
 from datetime import UTC, date, datetime
 from http.client import InvalidURL
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from urllib.error import HTTPError
 
 import pytest
@@ -15,6 +15,8 @@ from insider_alerts.review.market_context import (
     get_market_snapshot,
     upsert_market_snapshot,
 )
+
+_ORIGINAL_IB_FETCH = market_context_module._IBBarSource.fetch.__func__
 
 
 def test_market_snapshot_round_trip(tmp_path) -> None:
@@ -112,6 +114,67 @@ def test_daily_market_data_client_configures_ib_endpoint() -> None:
     assert market_context_module._IBBarSource._host == "custom-gateway"
     assert market_context_module._IBBarSource._port == 4999
     assert market_context_module._IBBarSource._client_id == 222
+
+
+def test_ib_connection_sets_a_bounded_synchronous_request_timeout(monkeypatch) -> None:
+    import ib_async
+
+    class FakeIB:
+        def __init__(self) -> None:
+            self.RequestTimeout = 0.0
+
+        def connect(self, *_args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            assert kwargs["timeout"] == 10
+
+        def reqMarketDataType(self, market_data_type: int) -> None:
+            assert market_data_type == 1
+
+        def isConnected(self) -> bool:
+            return True
+
+    monkeypatch.setattr(ib_async, "IB", FakeIB)
+    monkeypatch.setattr(market_context_module._IBBarSource, "_ib", None)
+
+    ib = market_context_module._IBBarSource._connect()
+
+    assert ib is not None
+    assert ib.RequestTimeout == 10.0
+
+
+def test_ib_market_requests_are_bounded_for_watchdog_budget(monkeypatch) -> None:
+    historical_timeouts: list[float] = []
+
+    class FakeIB:
+        RequestTimeout = 0.0
+
+        def isConnected(self) -> bool:
+            return True
+
+        def qualifyContracts(self, contract):  # type: ignore[no-untyped-def]
+            contract.conId = 123
+            return [contract]
+
+        def reqHistoricalData(self, *_args, **kwargs):  # type: ignore[no-untyped-def]
+            historical_timeouts.append(float(kwargs["timeout"]))
+            return [
+                SimpleNamespace(
+                    date=date(2026, 2, 11),
+                    close=41.0,
+                    volume=200.0,
+                )
+            ]
+
+    fake_ib = FakeIB()
+    monkeypatch.setattr(
+        market_context_module._IBBarSource,
+        "_connect",
+        classmethod(lambda cls: fake_ib),
+    )
+
+    bars = _ORIGINAL_IB_FETCH(market_context_module._IBBarSource, "SPGI")
+
+    assert bars[date(2026, 2, 11)] == (41.0, 200.0)
+    assert historical_timeouts == [10.0]
 
 
 def test_daily_market_data_client_url_encodes_symbol_with_spaces(monkeypatch) -> None:

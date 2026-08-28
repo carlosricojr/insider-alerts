@@ -17,7 +17,7 @@ if ($RecoveryIntervalMinutes -lt 1) {
 if ($QuantTimeoutSeconds -lt 10 -or $QuantTimeoutSeconds -gt 900) {
   throw "QuantTimeoutSeconds must be between 10 and 900."
 }
-$minimumStaleHeartbeatSeconds = [Math]::Max(190, $QuantTimeoutSeconds + 70)
+$minimumStaleHeartbeatSeconds = [Math]::Max(300, $QuantTimeoutSeconds + 70)
 if ($StaleHeartbeatSeconds -lt $minimumStaleHeartbeatSeconds) {
   throw "StaleHeartbeatSeconds must be at least $minimumStaleHeartbeatSeconds."
 }

@@ -54,43 +54,66 @@ class Settings(BaseSettings):
         default="insider-alerts/0.2 (contact: sec-access@example.com)",
         alias="SEC_USER_AGENT",
     )
-    sec_timeout_seconds: float = Field(default=15.0, alias="SEC_TIMEOUT_SECONDS", gt=0)
+    sec_timeout_seconds: float = Field(
+        default=15.0,
+        alias="SEC_TIMEOUT_SECONDS",
+        gt=0,
+        le=20,
+    )
     sec_rate_limit_per_second: float = Field(
         default=5.0,
         alias="SEC_RATE_LIMIT_PER_SECOND",
-        gt=0,
+        ge=1,
         le=10,
     )
-    sec_retry_attempts: int = Field(default=4, alias="SEC_RETRY_ATTEMPTS", ge=1)
-    sec_retry_min_seconds: float = Field(default=0.25, alias="SEC_RETRY_MIN_SECONDS", ge=0)
-    sec_retry_max_seconds: float = Field(default=3.0, alias="SEC_RETRY_MAX_SECONDS", ge=0)
+    sec_retry_attempts: int = Field(
+        default=4,
+        alias="SEC_RETRY_ATTEMPTS",
+        ge=1,
+        le=4,
+    )
+    sec_retry_min_seconds: float = Field(
+        default=0.25,
+        alias="SEC_RETRY_MIN_SECONDS",
+        ge=0,
+        le=3,
+    )
+    sec_retry_max_seconds: float = Field(
+        default=3.0,
+        alias="SEC_RETRY_MAX_SECONDS",
+        ge=0,
+        le=3,
+    )
     market_context_enabled: bool = Field(default=False, alias="MARKET_CONTEXT_ENABLED")
     market_data_timeout_seconds: float = Field(
         default=10.0,
         alias="MARKET_DATA_TIMEOUT_SECONDS",
         gt=0,
+        le=10,
     )
     market_data_rate_limit_per_second: float = Field(
         default=1.0,
         alias="MARKET_DATA_RATE_LIMIT_PER_SECOND",
-        gt=0,
+        ge=1,
         le=5,
     )
     market_data_retry_attempts: int = Field(
         default=3,
         alias="MARKET_DATA_RETRY_ATTEMPTS",
         ge=1,
-        le=10,
+        le=3,
     )
     market_data_retry_min_seconds: float = Field(
         default=0.5,
         alias="MARKET_DATA_RETRY_MIN_SECONDS",
         ge=0,
+        le=3,
     )
     market_data_retry_max_seconds: float = Field(
         default=3.0,
         alias="MARKET_DATA_RETRY_MAX_SECONDS",
         ge=0,
+        le=3,
     )
     market_earnings_shock_drop_threshold: float = Field(
         default=0.08,
@@ -108,6 +131,8 @@ class Settings(BaseSettings):
     def validate_retry_bounds(self) -> "Settings":
         if self.ntfy_retry_min_seconds > self.ntfy_retry_max_seconds:
             raise ValueError("NTFY_RETRY_MIN_SECONDS cannot exceed NTFY_RETRY_MAX_SECONDS")
+        if self.sec_retry_min_seconds > self.sec_retry_max_seconds:
+            raise ValueError("SEC_RETRY_MIN_SECONDS cannot exceed SEC_RETRY_MAX_SECONDS")
         if self.market_data_retry_min_seconds > self.market_data_retry_max_seconds:
             raise ValueError(
                 "MARKET_DATA_RETRY_MIN_SECONDS cannot exceed MARKET_DATA_RETRY_MAX_SECONDS"

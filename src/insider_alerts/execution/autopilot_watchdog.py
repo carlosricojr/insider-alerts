@@ -12,8 +12,38 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 AUTOPILOT_HEALTH_SCHEMA_VERSION = 1
+MIN_STALE_SECONDS = 300
 MAX_STAGE_LENGTH = 80
 MAX_ERROR_LENGTH = 1000
+
+_HEALTH_COLUMNS = frozenset(
+    {
+        "singleton",
+        "schema_version",
+        "runtime_id",
+        "runtime_started_utc",
+        "source_fingerprint",
+        "last_progress_utc",
+        "last_progress_stage",
+        "last_cycle_started_utc",
+        "last_cycle_success_utc",
+        "last_error_kind",
+        "last_error_message",
+    }
+)
+_REQUIRED_TEXT_COLUMNS = (
+    "runtime_id",
+    "runtime_started_utc",
+    "source_fingerprint",
+    "last_progress_utc",
+    "last_progress_stage",
+)
+_OPTIONAL_TEXT_COLUMNS = (
+    "last_cycle_started_utc",
+    "last_cycle_success_utc",
+    "last_error_kind",
+    "last_error_message",
+)
 
 TaskRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -111,9 +141,7 @@ class AutopilotHealthStore:
                     last_progress_utc=excluded.last_progress_utc,
                     last_progress_stage=excluded.last_progress_stage,
                     last_cycle_started_utc=NULL,
-                    last_cycle_success_utc=NULL,
-                    last_error_kind=NULL,
-                    last_error_message=NULL
+                    last_cycle_success_utc=NULL
                 """,
                 (
                     AUTOPILOT_HEALTH_SCHEMA_VERSION,
@@ -148,7 +176,16 @@ class AutopilotHealthStore:
                 SET last_progress_utc=?,last_progress_stage=?,
                     last_cycle_started_utc=CASE WHEN ? THEN ? ELSE last_cycle_started_utc END,
                     last_cycle_success_utc=CASE WHEN ? THEN ? ELSE last_cycle_success_utc END,
-                    last_error_kind=?,last_error_message=?
+                    last_error_kind=CASE
+                        WHEN ? THEN NULL
+                        WHEN ? IS NOT NULL THEN ?
+                        ELSE last_error_kind
+                    END,
+                    last_error_message=CASE
+                        WHEN ? THEN NULL
+                        WHEN ? IS NOT NULL THEN ?
+                        ELSE last_error_message
+                    END
                 WHERE singleton=1 AND runtime_id=?
                 """,
                 (
@@ -158,7 +195,11 @@ class AutopilotHealthStore:
                     stamp,
                     int(cycle_succeeded),
                     stamp,
+                    int(cycle_succeeded),
                     error_kind,
+                    error_kind,
+                    int(cycle_succeeded),
+                    error_message,
                     error_message,
                     runtime_id,
                 ),
@@ -173,12 +214,29 @@ class AutopilotHealthStore:
         if row is None:
             raise sqlite3.DatabaseError("autopilot health row is missing")
         result = dict(row)
+        missing_columns = sorted(_HEALTH_COLUMNS.difference(result))
+        if missing_columns:
+            raise sqlite3.DatabaseError(
+                f"autopilot health schema is missing columns: {','.join(missing_columns)}"
+            )
         try:
             schema_version = int(result.get("schema_version", -1))
         except (TypeError, ValueError) as exc:
             raise sqlite3.DatabaseError("autopilot health schema version is malformed") from exc
         if schema_version != AUTOPILOT_HEALTH_SCHEMA_VERSION:
             raise sqlite3.DatabaseError("autopilot health schema version is unsupported")
+        for column in _REQUIRED_TEXT_COLUMNS:
+            value = result[column]
+            if not isinstance(value, str) or not value:
+                raise sqlite3.DatabaseError(
+                    f"autopilot health column {column} must be non-empty text"
+                )
+        for column in _OPTIONAL_TEXT_COLUMNS:
+            value = result[column]
+            if value is not None and not isinstance(value, str):
+                raise sqlite3.DatabaseError(
+                    f"autopilot health column {column} must be text or null"
+                )
         return result
 
 
@@ -341,9 +399,9 @@ def autopilot_health_status(path: Path | str) -> dict[str, object]:
 
 
 def validate_stale_threshold(*, quant_timeout_seconds: int, stale_seconds: int) -> None:
-    minimum = quant_timeout_seconds + 70
+    minimum = max(MIN_STALE_SECONDS, quant_timeout_seconds + 70)
     if stale_seconds < minimum:
         raise ValueError(
             f"heartbeat stale threshold must be at least {minimum} seconds "
-            "for the configured quant timeout"
+            "for bounded external calls and the configured quant timeout"
         )

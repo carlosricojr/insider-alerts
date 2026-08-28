@@ -4381,7 +4381,7 @@ def ops_autopilot_watchdog(
         Path("data/autopilot_health.db"),
         "--heartbeat-db",
     ),
-    stale_seconds: int = typer.Option(300, "--stale-seconds", min=190),
+    stale_seconds: int = typer.Option(300, "--stale-seconds", min=300),
     output_log_path: Path = typer.Option(  # noqa: B008
         Path("logs/autopilot-watchdog.log"),
         "--output-log",
@@ -4389,11 +4389,23 @@ def ops_autopilot_watchdog(
 ) -> None:
     """Restart the hidden autopilot worker when its durable progress is stale."""
 
-    result = run_autopilot_watchdog(
-        heartbeat_db=heartbeat_db,
-        worker_task_name=worker_task_name,
-        stale_seconds=stale_seconds,
-    )
+    try:
+        result = run_autopilot_watchdog(
+            heartbeat_db=heartbeat_db,
+            worker_task_name=worker_task_name,
+            stale_seconds=stale_seconds,
+        )
+    except Exception as exc:
+        failure: dict[str, object] = {
+            "checked_at_utc": datetime.now(UTC).isoformat(),
+            "worker_task_name": worker_task_name,
+            "action": "error",
+            "error_kind": type(exc).__name__,
+            "error_message": str(exc)[:1000],
+        }
+        with contextlib.suppress(OSError):
+            append_watchdog_log(output_log_path, failure)
+        raise
     append_watchdog_log(output_log_path, result)
 
 
