@@ -341,6 +341,14 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     restore_call = installer.index("Register-ScheduledTask -TaskName $snapshot.Name", phase_two)
     assert restore_gate < restore_call
     assert "Disable-ScheduledTask -TaskName $Name" in installer
+    stop_function = installer[installer.index("function Stop-TaskAndWait") :]
+    disable_index = stop_function.index("Disable-ScheduledTask -TaskName $Name")
+    post_fence_query_index = stop_function.index(
+        "$task = Get-ScheduledTask -TaskName $Name",
+        disable_index,
+    )
+    running_check_index = stop_function.index('if ($task.State -eq "Running")')
+    assert disable_index < post_fence_query_index < running_check_index
     assert installer.index("ops autopilot-config-validate") < installer.index(
         "Stop-TaskAndWait -Name $TaskName"
     )

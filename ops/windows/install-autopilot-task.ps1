@@ -139,6 +139,9 @@ function Stop-TaskAndWait([string]$Name) {
   }
   # Fence triggers and RestartOnFailure before observing or changing the running process.
   Disable-ScheduledTask -TaskName $Name | Out-Null
+  # The task may have started between the first query and the fence. Only this post-fence state is
+  # safe to use when deciding whether a running process must be stopped.
+  $task = Get-ScheduledTask -TaskName $Name
   if ($task.State -eq "Running") {
     Stop-ScheduledTask -TaskName $Name
     $deadline = (Get-Date).AddSeconds(15)
