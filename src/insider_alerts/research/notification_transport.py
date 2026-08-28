@@ -94,6 +94,7 @@ class NotificationJournalConfig:
     database: Path
     research_root: Path
     policy_path: Path
+    policy_root: Path
     runtime_git_commit: str
     write_timeout_ms: int = 100
 
@@ -152,6 +153,21 @@ def _confined_database(config: NotificationJournalConfig) -> Path:
     if database.exists() and _is_reparse_point(database):
         raise NotificationJournalError("notification journal is a reparse point")
     return database
+
+
+def _confined_policy(config: NotificationJournalConfig) -> Path:
+    root = Path(os.path.abspath(config.policy_root))
+    policy = Path(os.path.abspath(config.policy_path))
+    if policy == root or not policy.is_relative_to(root):
+        raise NotificationJournalError("notification policy escaped the contract directory")
+    if not root.is_dir() or _is_reparse_point(root):
+        raise NotificationJournalError("notification contract directory is unavailable or unsafe")
+    cursor = root
+    for part in policy.relative_to(root).parts:
+        cursor /= part
+        if cursor.exists() and _is_reparse_point(cursor):
+            raise NotificationJournalError("notification policy traverses a reparse point")
+    return policy
 
 
 def _load_policy(path: Path) -> tuple[dict[str, Any], bytes, str]:
@@ -301,9 +317,10 @@ def activate_notification_journal(
     """Seal the one-time capture boundary without sending a notification."""
 
     database = _confined_database(config)
-    _ensure_schema(config)
-    _, policy_bytes, policy_sha = _load_policy(config.policy_path)
+    policy_path = _confined_policy(config)
+    _, policy_bytes, policy_sha = _load_policy(policy_path)
     activation = _utc_text(activated_at_utc)
+    _ensure_schema(config)
     record = {
         "contract_version": JOURNAL_VERSION,
         "activated_at_utc": activation,
@@ -352,6 +369,7 @@ class NotificationTransportJournal:
     def __init__(self, config: NotificationJournalConfig) -> None:
         self.config = config
         _confined_database(config)
+        _confined_policy(config)
 
     def append(
         self,
@@ -361,7 +379,7 @@ class NotificationTransportJournal:
         event: NtfyTransportEvent,
     ) -> bool:
         _validate_event(packet_id=packet_id, transport_id=transport_id, event=event)
-        _, policy_bytes, policy_sha = _load_policy(self.config.policy_path)
+        _, policy_bytes, policy_sha = _load_policy(_confined_policy(self.config))
         database = _confined_database(self.config)
         if not database.is_file():
             raise NotificationJournalNotActive("notification journal is not activated")
@@ -605,7 +623,7 @@ def notification_journal_status(
                 except ValueError:
                     integrity_errors.append("activation_timestamp_invalid")
     try:
-        _, current_policy_bytes, current_policy_sha = _load_policy(config.policy_path)
+        _, current_policy_bytes, current_policy_sha = _load_policy(_confined_policy(config))
     except (OSError, NotificationJournalError):
         integrity_errors.append("policy_unavailable_or_invalid")
         current_policy_sha = None
@@ -727,6 +745,22 @@ def notification_journal_status(
         elif occurred < starts[key]:
             integrity_errors.append(f"terminal_before_start:{key[0]}:{key[1]}")
     unmatched = len(set(starts) - set(terminals))
+    if not rows:
+        if health is not None:
+            integrity_errors.append("health_without_events")
+    elif health is None:
+        integrity_errors.append("health_missing")
+    else:
+        last_row = rows[-1]
+        expected_health = {
+            "singleton": 1,
+            "last_event_at_utc": str(last_row["occurred_at_utc"]),
+            "last_packet_id": str(last_row["packet_id"]),
+            "last_phase": str(last_row["phase"]),
+            "last_error": None,
+        }
+        if dict(health) != expected_health:
+            integrity_errors.append("health_event_mismatch")
     return {
         "valid": not integrity_errors,
         "activation_at_utc": activation,

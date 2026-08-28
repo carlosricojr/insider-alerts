@@ -12,6 +12,8 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("NTFY_RETRY_ATTEMPTS", raising=False)
     monkeypatch.delenv("NTFY_RETRY_MIN_SECONDS", raising=False)
     monkeypatch.delenv("NTFY_RETRY_MAX_SECONDS", raising=False)
+    monkeypatch.delenv("NOTIFICATION_TRANSPORT_DB", raising=False)
+    monkeypatch.delenv("NOTIFICATION_TRANSPORT_POLICY_PATH", raising=False)
     monkeypatch.delenv("SEC_RSS_URL", raising=False)
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     monkeypatch.delenv("SEC_TIMEOUT_SECONDS", raising=False)

@@ -35,6 +35,7 @@ def _config(tmp_path: Path, *, timeout_ms: int = 100) -> NotificationJournalConf
         database=research / "notification_transport.db",
         research_root=research,
         policy_path=POLICY,
+        policy_root=POLICY.parent,
         runtime_git_commit="a" * 40,
         write_timeout_ms=timeout_ms,
     )
@@ -256,10 +257,27 @@ def test_journal_path_must_remain_under_research_root(tmp_path: Path) -> None:
         database=tmp_path / "escaped.db",
         research_root=config.research_root,
         policy_path=config.policy_path,
+        policy_root=config.policy_root,
         runtime_git_commit=config.runtime_git_commit,
     )
 
     with pytest.raises(NotificationJournalError, match="escaped"):
+        NotificationTransportJournal(escaped)
+
+
+def test_policy_path_must_remain_under_reviewed_contract_root(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    outside_policy = tmp_path / "outside-policy.json"
+    outside_policy.write_bytes(POLICY.read_bytes())
+    escaped = NotificationJournalConfig(
+        database=config.database,
+        research_root=config.research_root,
+        policy_path=outside_policy,
+        policy_root=config.policy_root,
+        runtime_git_commit=config.runtime_git_commit,
+    )
+
+    with pytest.raises(NotificationJournalError, match="escaped the contract"):
         NotificationTransportJournal(escaped)
 
 
@@ -287,6 +305,31 @@ def test_status_fails_closed_when_an_immutability_trigger_is_missing(
     ]
 
 
+def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    sqlite3.connect(config.database).close()
+    partial = notification_journal_status(config)
+    assert partial["valid"] is False
+    assert partial["reason"] == "notification_journal_schema_incomplete"
+
+    config.database.unlink()
+    activate_notification_journal(config, activated_at_utc=ACTIVATION)
+    journal = NotificationTransportJournal(config)
+    journal.append(
+        packet_id=PACKET_ID,
+        transport_id=notification_transport_id(PACKET_ID, "dispatch-1"),
+        event=_event("request_started"),
+    )
+    with sqlite3.connect(config.database) as conn:
+        conn.execute(
+            "UPDATE notification_journal_health SET last_phase='response_received'"
+        )
+
+    stale = notification_journal_status(config)
+    assert stale["valid"] is False
+    assert stale["integrity_errors"] == ["health_event_mismatch"]
+
+
 def test_activation_rejects_a_semantically_weakened_policy(tmp_path: Path) -> None:
     config = _config(tmp_path)
     altered_policy = json.loads(POLICY.read_text(encoding="utf-8"))
@@ -297,11 +340,13 @@ def test_activation_rejects_a_semantically_weakened_policy(tmp_path: Path) -> No
         database=config.database,
         research_root=config.research_root,
         policy_path=policy_path,
+        policy_root=tmp_path,
         runtime_git_commit=config.runtime_git_commit,
     )
 
     with pytest.raises(NotificationJournalError, match="reviewed contract"):
         activate_notification_journal(weakened, activated_at_utc=ACTIVATION)
+    assert not config.database.exists()
 
 
 def test_transport_module_is_order_and_trial_incapable() -> None:

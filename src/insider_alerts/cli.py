@@ -1919,6 +1919,7 @@ def _notification_transport_config(settings: Settings) -> NotificationJournalCon
         database=database,
         research_root=repo_root / "data" / "research",
         policy_path=policy,
+        policy_root=repo_root / "docs" / "research" / "contracts",
         runtime_git_commit=_notification_runtime_git_commit(repo_root),
     )
 

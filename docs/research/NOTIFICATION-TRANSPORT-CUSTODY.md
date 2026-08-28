@@ -28,7 +28,9 @@ The first deployment seals a one-time activation timestamp plus the exact review
 `data/research/notification_transport.db`. Pre-activation callbacks are ignored and never backfilled.
 Events are RFC 8785 canonical, SHA-256 bound, gap-free, and protected by update/delete triggers.
 Status validation checks activation and policy custody, row/envelope binding, sequence integrity,
-attempt ordering, orphan terminals, and unmatched starts.
+attempt ordering, orphan terminals, unmatched starts, and health metadata against the latest event.
+The configured policy is confined beneath the reviewed `docs/research/contracts` directory;
+absolute/traversal escapes and symlink or Windows reparse-point paths are rejected before reading.
 
 The journal never stores the URL, topic, Authorization header, token, message, title, tags, raw
 response, or exception text. It stores only packet/attempt identity, phase and timestamp, status,
