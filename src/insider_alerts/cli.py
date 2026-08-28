@@ -1906,7 +1906,7 @@ def _notification_transport_database(settings: Settings) -> Path:
 def _notification_runtime_git_commit(repo_root: Path) -> str:
     """Bind events to the source loaded by this process without per-alert subprocesses."""
 
-    return resolve_git_commit(repo_root)
+    return resolve_git_commit(repo_root, timeout_seconds=1)
 
 
 def _notification_transport_config(settings: Settings) -> NotificationJournalConfig:

@@ -1832,8 +1832,14 @@ def capture_status(source_db: Path, evidence_db: Path) -> dict[str, Any]:
     return result
 
 
-def resolve_git_commit(repo_root: Path) -> str:
-    result = run_hidden_process(["git", "rev-parse", "HEAD"], cwd=repo_root, timeout_seconds=10)
+def resolve_git_commit(repo_root: Path, *, timeout_seconds: int = 10) -> str:
+    if timeout_seconds < 1:
+        raise ValueError("git resolution timeout must be at least one second")
+    result = run_hidden_process(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        timeout_seconds=timeout_seconds,
+    )
     commit = result.stdout.strip().lower()
     if result.timed_out or result.returncode != 0 or len(commit) != 40:
         raise RuntimeError("unable to resolve insider-alerts deployment commit")

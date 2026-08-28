@@ -406,7 +406,7 @@ def test_inactive_journal_does_not_resolve_git_on_notification_path(
         NOTIFICATION_TRANSPORT_DB=str(tmp_path / "missing.db"),
     )
 
-    def forbidden_git_resolution(repo_root: Path) -> str:
+    def forbidden_git_resolution(repo_root: Path, *, timeout_seconds: int = 10) -> str:
         raise AssertionError("git must not run before journal activation")
 
     monkeypatch.setattr(cli, "resolve_git_commit", forbidden_git_resolution)
@@ -425,10 +425,12 @@ def test_runtime_git_commit_is_resolved_once_per_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
+    observed_timeout = None
 
-    def resolve_once(repo_root: Path) -> str:
-        nonlocal calls
+    def resolve_once(repo_root: Path, *, timeout_seconds: int = 10) -> str:
+        nonlocal calls, observed_timeout
         calls += 1
+        observed_timeout = timeout_seconds
         return "a" * 40
 
     monkeypatch.setattr(cli, "resolve_git_commit", resolve_once)
@@ -438,4 +440,5 @@ def test_runtime_git_commit_is_resolved_once_per_process(
     assert cli._notification_runtime_git_commit(repo_root) == "a" * 40
     assert cli._notification_runtime_git_commit(repo_root) == "a" * 40
     assert calls == 1
+    assert observed_timeout == 1
     cli._notification_runtime_git_commit.cache_clear()

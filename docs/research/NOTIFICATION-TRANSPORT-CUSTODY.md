@@ -40,8 +40,9 @@ trade-off protects the operational alert path. Missing journal data remains miss
 retrospectively represented as observed.
 
 Before activation, the notifier checks only for the journal file and does not resolve source
-provenance. After activation, the loaded Git revision is resolved once per process and reused; it
-does not spawn a subprocess for every alert.
+provenance. After activation, the loaded Git revision is resolved at most once per process with a
+one-second hidden-process timeout and reused. A one-shot manual notification can therefore pay one
+bounded lookup; a long-running worker does not spawn a subprocess for every alert.
 
 ## Deployment and operation
 
