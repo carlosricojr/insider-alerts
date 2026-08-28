@@ -147,10 +147,9 @@ merged, deployed, and hashable before any confirmatory enrollment.
 ### M5 — Activate challenger, collect, and decide (current)
 
 The order-incapable challenger runtime, point-in-time session/bar feeds, outcome materializer, and
-prospective control-diagnostic capture are deployed. Deployment of the diagnostic outcome
-materializer and terminal dataset/seal tooling remains an activation prerequisite; the terminal
-dataset itself can exist only after the prospective sample freezes. The registry is still draft,
-so no confirmatory enrollment has begun.
+prospective control-diagnostic capture are deployed. The registry activated at the sealed
+`2026-08-28T04:00:00Z` boundary and the confirmatory stream is collecting without interim outcome
+looks. The terminal dataset itself can exist only after the prospective sample freezes.
 
 - Activate `OPP-E07-V1` only after M2, M3, and M4 are deployed from known merged commits and every
   required artifact digest is sealed.
@@ -168,6 +167,9 @@ so no confirmatory enrollment has begun.
 - Continuously run only blinded counts, timestamp/hash integrity, coverage, missingness, and
   reconciliation diagnostics. Compute concentration, cost, split-period, best-trade, best-month,
   symbol, capacity-return, and inferential outputs only after terminal sealing.
+- Preserve raw point-in-time SEC Companyfacts responses in a separately activated capture-only
+  stream for future fresh-sample market-cap research. This stream cannot delay enrollment, alter
+  the active evidence snapshot/configuration hash, read outcomes, or enter the current decision.
 - Produce a machine-readable decision artifact plus an operator-readable report at the single look,
   or a no-outcome `KILL/insufficient_enrollment` artifact at the frozen deadline.
 

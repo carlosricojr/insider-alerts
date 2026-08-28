@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "contract_id": "prospective-companyfacts-capture-v1",
+  "purpose": "capture_only_future_research",
+  "current_trial_decision_use": "prohibited",
+  "source": {
+    "provider": "SEC",
+    "endpoint_template": "https://data.sec.gov/api/xbrl/companyfacts/CIK{issuer_cik_10}.json"
+  },
+  "activation_boundary": "decision_at_utc_gte_feature_capture_activation",
+  "maximum_request_lag_seconds": 900,
+  "retry": {
+    "maximum_attempts": 3,
+    "terminal_after_request_window": true
+  },
+  "selection": {
+    "as_of_field": "decision_at_utc",
+    "filing_date_rule": "filed_date_strictly_before_as_of_utc_calendar_date",
+    "period_end_rule": "period_end_lte_as_of_utc_calendar_date",
+    "namespace_priority": [
+      "dei:EntityCommonStockSharesOutstanding",
+      "us-gaap:CommonStockSharesOutstanding"
+    ],
+    "unit": "shares",
+    "value_rule": "finite_positive",
+    "within_namespace_order": [
+      "filed_desc",
+      "period_end_desc",
+      "accession_number_desc",
+      "source_index_desc"
+    ]
+  },
+  "missingness": [
+    "clock_before_decision",
+    "request_window_expired",
+    "request_failed",
+    "artifact_publish_failed",
+    "invalid_utf8",
+    "invalid_json",
+    "invalid_payload",
+    "issuer_identity_mismatch",
+    "no_eligible_fact"
+  ],
+  "isolation": {
+    "modifies_active_evidence_snapshot": false,
+    "reads_trial_outcomes": false,
+    "affects_enrollment": false,
+    "affects_live_orders": false
+  }
+}
