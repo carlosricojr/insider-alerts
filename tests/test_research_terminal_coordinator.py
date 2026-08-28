@@ -329,6 +329,7 @@ def test_worker_and_installer_are_order_incapable_hidden_and_singleton() -> None
     )
     assert "-Trigger @($dailyTrigger, $logonTrigger)" in installer
     assert 'RegistrationMode -NotePropertyValue $registrationMode' in installer
+    assert installer.count("-ErrorAction Stop") == 2
     assert "-RestartCount" not in installer
     assert "-RestartInterval" not in installer
 
