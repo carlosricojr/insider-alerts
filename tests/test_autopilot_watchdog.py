@@ -235,6 +235,49 @@ def test_watchdog_quarantines_corrupt_store_only_when_worker_is_stopped(
     assert not path.exists()
 
 
+def test_heartbeat_state_classifies_empty_and_malformed_stores_as_corrupt(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
+    empty = tmp_path / "empty.db"
+    empty.touch()
+    stale, reason, corrupt = heartbeat_state(empty, now=now, stale_seconds=300)
+    assert stale is True
+    assert reason == "heartbeat_store_corrupt_OperationalError"
+    assert corrupt is True
+
+    malformed = tmp_path / "malformed.db"
+    with sqlite3.connect(malformed) as conn:
+        conn.execute(
+            "CREATE TABLE autopilot_health(singleton INTEGER, schema_version TEXT)"
+        )
+        conn.execute("INSERT INTO autopilot_health VALUES(1,NULL)")
+    stale, reason, corrupt = heartbeat_state(malformed, now=now, stale_seconds=300)
+    assert stale is True
+    assert reason == "heartbeat_store_corrupt_DatabaseError"
+    assert corrupt is True
+    assert autopilot_health_status(malformed)["valid"] is False
+
+
+def test_heartbeat_state_does_not_restart_for_transient_locked_store(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "health.db"
+    path.touch()
+
+    def locked(_self) -> dict[str, object]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(AutopilotHealthStore, "read", locked)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        heartbeat_state(
+            path,
+            now=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+            stale_seconds=300,
+        )
+
+
 def test_status_and_stale_threshold_are_fail_closed(tmp_path: Path) -> None:
     path = tmp_path / "health.db"
     assert autopilot_health_status(path)["valid"] is False

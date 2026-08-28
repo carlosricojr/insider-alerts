@@ -13,10 +13,30 @@ class Settings(BaseSettings):
     ntfy_topic: str = Field(default="insider-alerts", alias="NTFY_TOPIC")
     ntfy_token: str | None = Field(default=None, alias="NTFY_TOKEN")
 
-    ntfy_timeout_seconds: float = Field(default=10.0, alias="NTFY_TIMEOUT_SECONDS", gt=0)
-    ntfy_retry_attempts: int = Field(default=3, alias="NTFY_RETRY_ATTEMPTS", ge=1)
-    ntfy_retry_min_seconds: float = Field(default=0.5, alias="NTFY_RETRY_MIN_SECONDS", ge=0)
-    ntfy_retry_max_seconds: float = Field(default=3.0, alias="NTFY_RETRY_MAX_SECONDS", ge=0)
+    ntfy_timeout_seconds: float = Field(
+        default=10.0,
+        alias="NTFY_TIMEOUT_SECONDS",
+        gt=0,
+        le=20,
+    )
+    ntfy_retry_attempts: int = Field(
+        default=3,
+        alias="NTFY_RETRY_ATTEMPTS",
+        ge=1,
+        le=5,
+    )
+    ntfy_retry_min_seconds: float = Field(
+        default=0.5,
+        alias="NTFY_RETRY_MIN_SECONDS",
+        ge=0,
+        le=5,
+    )
+    ntfy_retry_max_seconds: float = Field(
+        default=3.0,
+        alias="NTFY_RETRY_MAX_SECONDS",
+        ge=0,
+        le=5,
+    )
     notification_transport_db: str = Field(
         default="data/research/notification_transport.db",
         alias="NOTIFICATION_TRANSPORT_DB",
@@ -86,6 +106,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_retry_bounds(self) -> "Settings":
+        if self.ntfy_retry_min_seconds > self.ntfy_retry_max_seconds:
+            raise ValueError("NTFY_RETRY_MIN_SECONDS cannot exceed NTFY_RETRY_MAX_SECONDS")
         if self.market_data_retry_min_seconds > self.market_data_retry_max_seconds:
             raise ValueError(
                 "MARKET_DATA_RETRY_MIN_SECONDS cannot exceed MARKET_DATA_RETRY_MAX_SECONDS"

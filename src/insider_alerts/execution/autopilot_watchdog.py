@@ -173,7 +173,11 @@ class AutopilotHealthStore:
         if row is None:
             raise sqlite3.DatabaseError("autopilot health row is missing")
         result = dict(row)
-        if int(result.get("schema_version", -1)) != AUTOPILOT_HEALTH_SCHEMA_VERSION:
+        try:
+            schema_version = int(result.get("schema_version", -1))
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.DatabaseError("autopilot health schema version is malformed") from exc
+        if schema_version != AUTOPILOT_HEALTH_SCHEMA_VERSION:
             raise sqlite3.DatabaseError("autopilot health schema version is unsupported")
         return result
 
@@ -193,8 +197,11 @@ def heartbeat_state(
         return True, "heartbeat_store_missing", False
     try:
         health = AutopilotHealthStore(store_path).read()
-    except sqlite3.OperationalError:
-        raise
+    except sqlite3.OperationalError as exc:
+        message = str(exc).casefold()
+        if "locked" in message or "busy" in message:
+            raise
+        return True, f"heartbeat_store_corrupt_{type(exc).__name__}", True
     except sqlite3.DatabaseError as exc:
         return True, f"heartbeat_store_corrupt_{type(exc).__name__}", True
     raw = health.get("last_progress_utc")

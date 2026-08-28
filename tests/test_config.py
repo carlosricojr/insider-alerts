@@ -83,3 +83,18 @@ def test_config_rejects_inverted_market_data_retry_bounds() -> None:
             MARKET_DATA_RETRY_MIN_SECONDS=2.0,
             MARKET_DATA_RETRY_MAX_SECONDS=1.0,
         )
+
+
+def test_config_bounds_notification_duration_below_minimum_watchdog_staleness() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, NTFY_TIMEOUT_SECONDS=21)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, NTFY_RETRY_ATTEMPTS=6)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, NTFY_RETRY_MAX_SECONDS=6)
+    with pytest.raises(ValidationError, match="cannot exceed"):
+        Settings(
+            _env_file=None,
+            NTFY_RETRY_MIN_SECONDS=4,
+            NTFY_RETRY_MAX_SECONDS=3,
+        )
