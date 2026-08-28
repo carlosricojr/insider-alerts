@@ -25,6 +25,7 @@ from insider_alerts.research.bar_feed import BarFeedStore, BarRequest
 from insider_alerts.research.inference import (
     CAPACITY_RANK_SALT,
     HYPOTHESIS_ID,
+    TrialSealStore,
     _validate_registry,
     cohort_freeze_boundary,
     enrollment_deadline,
@@ -690,12 +691,17 @@ class TrialStore:
             ).fetchone()
         return None if row is None else self._verify_candidate_row(row)
 
-    def append_candidate(self, candidate: TrialCandidate) -> bool:
+    def append_candidate(self, candidate: TrialCandidate, *, seal_db: Path | None = None) -> bool:
         record = self._candidate_record(candidate)
         encoded = _canonical(record)
         digest = _sha256(encoded)
         with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            if (
+                seal_db is not None
+                and TrialSealStore(seal_db).receipt("deadline_miss") is not None
+            ):
+                raise EvidenceExcluded("enrollment_deadline_already_sealed")
             if conn.execute(
                 """
                 SELECT 1 FROM trial_evidence_dispositions
@@ -2449,6 +2455,8 @@ def _candidate_from_evidence(
     deadline = window.enrollment_deadline_utc
     if deadline is None or not window.activated_at_utc <= observed_at < deadline:
         raise EvidenceExcluded("evidence_outside_activation_window")
+    if now >= deadline:
+        raise EvidenceExcluded("candidate_not_imported_before_enrollment_deadline")
     if versions.get("policy_sha256") != window.registry_sha256:
         raise TrialRuntimeInvalid("evidence_registry_digest_mismatch")
     recorded_at = _parse_utc(str(record.get("recorded_at_utc", "")))
@@ -2573,7 +2581,12 @@ def run_trial_once(
                     window=window,
                     session_store=session_store,
                 )
-                candidates_added += int(store.append_candidate(candidate))
+                candidates_added += int(
+                    store.append_candidate(
+                        candidate,
+                        seal_db=config.trial_db.with_name("trial_seals.db"),
+                    )
+                )
                 persisted_candidate = store.candidate_for_evidence(record_sha)
                 if persisted_candidate is None:
                     continue

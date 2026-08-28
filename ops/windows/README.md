@@ -129,7 +129,9 @@ local files and does not use S4U-ineligible network resources. It runs once dail
 through direct hidden `pythonw.exe`. It is
 order-incapable and does not alter the active strategy or registry. The inferential path separates
 cohort sealing and the single look across daily invocations; the no-dataset deadline path may
-atomically bind its universe receipt and outcome-free decision after pending entries drain. A missed trigger may run later through `StartWhenAvailable`,
+bind its universe receipt and produce its outcome-free decision in the same invocation after
+pending entries drain, with idempotent recovery if interrupted between writes. A missed trigger may
+run later through `StartWhenAvailable`,
 but transitions remain deferred unless the invocation is inside the 20:30–23:59:59 Eastern safety
 window. This prevents the terminal seal's multi-store reconciliation locks from competing with
 live position management. Safe state, counts, and content digests are appended to

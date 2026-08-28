@@ -18,6 +18,12 @@ freeze includes every enrolled trade on the first complete date reaching 100 tra
 Before freeze or outcome maturity, the report contains no return aggregate. At the 18-month
 deadline, an append-only receipt binds the immutable candidate universe; pre-deadline pending
 entries then drain before an outcome-free `KILL/insufficient_enrollment` result.
+The candidate importer enforces the registered decision-readiness cutoff: evidence must have been
+recorded and imported strictly before the enrollment deadline. Evidence first encountered by the
+trial worker at or after that instant receives an append-only exclusion disposition even when its
+source observation predates the deadline, so it cannot mutate a universe already bound by the
+deadline receipt. Candidate insertion and deadline sealing serialize on the trial-store write lock;
+an insert that acquires the lock after the deadline receipt exists is also permanently excluded.
 
 Trade timestamps are the official exchange RTH open and close boundaries. Under the frozen
 daily-bar policy, SPY is measured from entry-session open through exit-session close; a stop or

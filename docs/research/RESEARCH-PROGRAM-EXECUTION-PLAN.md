@@ -192,8 +192,9 @@ exactly one of `COLLECTING`, `PROMOTE_RECOMMENDED`, `KILL`, or `INVALID` with re
   worker that still owns ingestion.
 - Run one order-incapable hidden terminal coordinator daily after hours. The inferential path
   separates deterministic cohort sealing and decision across invocations. The no-dataset deadline
-  path may atomically seal its candidate-universe receipt and outcome-free insufficient-enrollment
-  decision after the pending-entry drain. Retryable database contention is operational
+  path may seal its candidate-universe receipt and produce the outcome-free insufficient-enrollment
+  decision in the same invocation after the pending-entry drain; interrupted writes replay
+  idempotently on a later invocation. Retryable database contention is operational
   degradation, not scientific `INVALID`; logs remain blinded to returns and inferential aggregates.
 - At each release, verify `main == origin/main`, no untracked worktree artifacts, and all related
   repositories clean.
