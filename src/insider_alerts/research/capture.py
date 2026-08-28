@@ -36,6 +36,21 @@ HYPOTHESIS_ID = "OPP-E07-V1"
 MAX_ERROR_LENGTH = 2_000
 HISTORICAL_OPTION_SCHEMA_VERSION = "insider-evidence-option-history-v2"
 HISTORICAL_OPTION_SOURCE_ID = "ib_gateway:US_OPTIONS:SMART:type1:historical_bid_ask_15m"
+OPTION_SURFACE_RESULT_SCHEMA_VERSION = "insider-evidence-option-surface-result-v1"
+OPTION_SURFACE_SOURCE_ID = "ib_gateway:US_OPTIONS:SMART:type1"
+OPTION_SURFACE_NOT_APPLICABLE_EXIT_CODE = 4
+_OPTION_SURFACE_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "reason_code",
+        "source_id",
+        "request_id",
+        "symbol",
+        "client_id",
+        "observed_at_utc",
+    }
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -602,6 +617,56 @@ def _optional_sha256(value: Any) -> str | None:
     return candidate if all(char in "0123456789abcdef" for char in candidate) else None
 
 
+def _validated_option_not_applicable_result(
+    result: ProcessResult,
+    *,
+    output: Path,
+    expected_request_id: str,
+    expected_symbol: str,
+    observed_not_before: datetime | None = None,
+    observed_not_after: datetime | None = None,
+) -> dict[str, Any]:
+    if result.timed_out or result.returncode != OPTION_SURFACE_NOT_APPLICABLE_EXIT_CODE:
+        raise ValueError("option not-applicable result used an unexpected process outcome")
+    if output.exists():
+        raise ValueError("option not-applicable result published a forbidden artifact")
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("option not-applicable stdout is not one JSON object") from exc
+    if not isinstance(payload, dict) or set(payload) != _OPTION_SURFACE_RESULT_FIELDS:
+        raise ValueError("option not-applicable result field set is invalid")
+    expected_identity = {
+        "schema_version": OPTION_SURFACE_RESULT_SCHEMA_VERSION,
+        "status": "not_applicable",
+        "reason_code": "OPTION_CHAIN_NOT_LISTED",
+        "source_id": OPTION_SURFACE_SOURCE_ID,
+        "request_id": expected_request_id,
+        "symbol": expected_symbol,
+        "client_id": 48,
+    }
+    for field, expected in expected_identity.items():
+        if payload.get(field) != expected:
+            raise ValueError(f"option not-applicable {field} mismatch")
+    observed_text = payload.get("observed_at_utc")
+    if not isinstance(observed_text, str):
+        raise ValueError("option not-applicable observation timestamp is missing")
+    try:
+        raw_observed = datetime.fromisoformat(observed_text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("option not-applicable observation timestamp is invalid") from exc
+    if raw_observed.tzinfo is None or raw_observed.utcoffset() != timedelta(0):
+        raise ValueError("option not-applicable observation timestamp must be UTC")
+    observed = raw_observed.astimezone(UTC)
+    if observed_not_before is not None and observed < observed_not_before.astimezone(UTC):
+        raise ValueError("option not-applicable observation predates the capture request")
+    if observed_not_after is not None and observed > observed_not_after.astimezone(UTC):
+        raise ValueError("option not-applicable observation is in the future")
+    payload["observed_at_utc"] = utc_text(observed)
+    rfc8785.dumps(payload)
+    return payload
+
+
 def _validate_snapshot(
     config: CaptureConfig,
     snapshot: dict[str, Any],
@@ -670,6 +735,7 @@ def _capture_options(
     output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.{job.attempt_count}.json"
     output.unlink(missing_ok=True)
     symbol = str(json.loads(job.payload_json).get("issuer_symbol", "")).upper()
+    provider_requested_at = datetime.now(UTC)
     try:
         result = run_hidden_process(
             [
@@ -691,6 +757,20 @@ def _capture_options(
     if result.timed_out:
         output.unlink(missing_ok=True)
         return None, None, None, "OPTION_CAPTURE_TIMEOUT", "alpha-core timed out", True
+    if result.returncode == OPTION_SURFACE_NOT_APPLICABLE_EXIT_CODE:
+        try:
+            unavailable = _validated_option_not_applicable_result(
+                result,
+                output=output,
+                expected_request_id=job.job_id,
+                expected_symbol=symbol,
+                observed_not_before=provider_requested_at,
+                observed_not_after=datetime.now(UTC),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            output.unlink(missing_ok=True)
+            return None, None, None, "OPTION_RESULT_INVALID", str(exc), False
+        return unavailable, None, None, None, None, False
     if result.returncode != 0:
         output.unlink(missing_ok=True)
         message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
@@ -1036,7 +1116,9 @@ def _captured_observation(
     }
 
 
-def _not_applicable_observation(*, source: str, observed_at: datetime) -> dict[str, Any]:
+def _not_applicable_observation(
+    *, source: str, observed_at: datetime, values: dict[str, Any] | None = None
+) -> dict[str, Any]:
     return {
         "status": "not_applicable",
         "as_of_utc": None,
@@ -1044,7 +1126,7 @@ def _not_applicable_observation(*, source: str, observed_at: datetime) -> dict[s
         "source": source,
         "artifact_ref": None,
         "artifact_sha256": None,
-        "values": None,
+        "values": values,
         "error": None,
     }
 
@@ -1392,6 +1474,11 @@ def _append_snapshot(
         else None
     )
     errors = [error for error in (option_error, owner_history.error) if error is not None]
+    option_not_applicable = (
+        option_artifact is not None
+        and option_artifact.get("schema_version") == OPTION_SURFACE_RESULT_SCHEMA_VERSION
+        and option_artifact.get("status") == "not_applicable"
+    )
     if option_artifact is not None and option_path is not None and option_sha is not None:
         options_observation, market_observation = _captured_option_observations(
             option_artifact,
@@ -1401,8 +1488,22 @@ def _append_snapshot(
             candidate=candidate,
         )
     else:
-        options_observation = _missing_observation(
-            source="alpha-core", observed_at=capture_finished, error=option_error
+        options_observation = (
+            _not_applicable_observation(
+                source=str(option_artifact["source_id"]),
+                observed_at=parse_utc(str(option_artifact["observed_at_utc"])),
+                values={
+                    "schema_version": option_artifact["schema_version"],
+                    "reason_code": option_artifact["reason_code"],
+                    "request_id": option_artifact["request_id"],
+                    "symbol": option_artifact["symbol"],
+                    "client_id": option_artifact["client_id"],
+                },
+            )
+            if option_not_applicable and option_artifact is not None
+            else _missing_observation(
+                source="alpha-core", observed_at=capture_finished, error=option_error
+            )
         )
         market_observation = (
             _missing_observation(source="live-canary", observed_at=capture_finished)
@@ -1746,6 +1847,10 @@ def _process_claimed_job(
             "captured_historical"
             if option_artifact
             and option_artifact.get("schema_version") == HISTORICAL_OPTION_SCHEMA_VERSION
+            else "not_applicable"
+            if option_artifact
+            and option_artifact.get("schema_version") == OPTION_SURFACE_RESULT_SCHEMA_VERSION
+            and option_artifact.get("status") == "not_applicable"
             else "captured"
             if option_artifact
             else error_kind
