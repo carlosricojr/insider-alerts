@@ -501,9 +501,13 @@ def capture_predecision_option_chain(
             stderr=f"{type(exc).__name__}:{exc}",
         )
     status: Literal["succeeded", "failed", "timed_out"]
-    if _file_sha256(validated.alpha_script) != validated.alpha_script_sha256:
+    try:
+        script_changed = _file_sha256(validated.alpha_script) != validated.alpha_script_sha256
+    except OSError:
+        script_changed = True
+    if script_changed:
         status = "failed"
-        error_kind = "SCRIPT_CHANGED_DURING_CAPTURE"
+        error_kind = "SCRIPT_UNAVAILABLE_OR_CHANGED_DURING_CAPTURE"
         exit_code = completed.returncode or -1
     elif completed.timed_out:
         status = "timed_out"

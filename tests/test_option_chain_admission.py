@@ -176,6 +176,42 @@ def test_timeout_is_terminal_and_never_retried(tmp_path: Path) -> None:
     assert first.error_kind == "CHILD_TIMEOUT"
 
 
+def test_script_disappearing_after_child_return_is_terminal_and_never_retried(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    launches = 0
+
+    def remove_script(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal launches
+        launches += 1
+        config.alpha_script.unlink()
+        return ProcessResult(0, "captured", "", False)
+
+    first = capture_predecision_option_chain(
+        config,
+        packet_id="packet-1",
+        symbol="ABC",
+        clock=lambda: NOW,
+        process_runner=remove_script,
+    )
+
+    assert first.status == "failed"
+    assert first.error_kind == "SCRIPT_UNAVAILABLE_OR_CHANGED_DURING_CAPTURE"
+    assert option_chain_admission_rows(config.source_db)[0]["status"] == "failed"
+    config.alpha_script.write_text("# capture boundary\n", encoding="utf-8")
+    replay = capture_predecision_option_chain(
+        config,
+        packet_id="packet-1",
+        symbol="ABC",
+        clock=lambda: NOW + timedelta(seconds=1),
+        process_runner=remove_script,
+    )
+    assert replay.status == "failed"
+    assert replay.launch_required is False
+    assert launches == 1
+
+
 def test_terminal_rows_and_identity_are_immutable(tmp_path: Path) -> None:
     config = _config(tmp_path)
     capture_predecision_option_chain(
