@@ -46,15 +46,30 @@ Every report is RFC 8785 content-addressed after removing only `report_sha256`. 
 `COLLECTING` or `PROMOTE_RECOMMENDED`, 2 for `KILL`, and 3 for `INVALID`. A promotion recommendation
 is inert and cannot alter the canary, orders, or capital.
 
-Example production protocol after activation (the producer emits only counts, digests, and state;
-it never displays aggregate outcomes):
+The deployed operational protocol uses
+`python -m insider_alerts.research.terminal_coordinator`. It is an unbound wrapper around the
+frozen builder and inference modules; it does not change their bytes, registry, hypothesis, or
+decision rule. On the inferential path, one hidden daily invocation may make at most one state
+transition: a ready cohort is sealed without aggregation, and only a later invocation can run the single look. At the frozen
+18-month deadline, the same wrapper constructs the registered no-dataset payload, seals the
+immutable candidate universe, waits for pre-deadline pending entries to drain, and records the
+outcome-free `KILL/insufficient_enrollment` report. Once no entries remain pending, that deadline
+receipt and no-outcome report may be committed in the same invocation because no aggregate is
+calculated. Its append-only operational log emits only
+counts, state, reasons, and content digests. Scientific `KILL` is an operationally successful run;
+retryable degradation returns 2, while persistent operational failure and scientific `INVALID`
+return 3. Transitions are restricted to the daily after-hours window so
+terminal reconciliation locks cannot interfere with live position management.
+
+Manual recovery remains available through the frozen production wrapper (the producer emits only
+counts, digests, and state; it never displays aggregate outcomes):
 
 ```powershell
 .venv\Scripts\python.exe -m insider_alerts.research.terminal_builder seal `
-  --seal-db data\research\OPP-E07-V1-seals.db
+  --seal-db data\research\trial_seals.db
 
 .venv\Scripts\python.exe -m insider_alerts.research.terminal_builder decide `
-  --seal-db data\research\OPP-E07-V1-seals.db
+  --seal-db data\research\trial_seals.db
 ```
 
 The output path is created exclusively and is never overwritten. `activation_git_commit` identifies

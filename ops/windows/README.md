@@ -115,3 +115,23 @@ candidates, seals or lapses eligible entry dates, and then materializes mature i
 in the same sequential cycle. While the registry remains `draft`, it only records an idle heartbeat
 and cannot enroll candidates. Inspect blinded counts and integrity without connecting to IBKR via
 `ops research-trial-status`; that command never exposes return values.
+
+Install the separate terminal coordinator after the active registry and trial worker are deployed:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\ops\windows\install-research-terminal-coordinator-task.ps1 -Start
+```
+
+The installer fails closed unless the Windows host time zone is `Eastern Standard Time`. The
+coordinator runs once daily at 20:30 Eastern through direct hidden `pythonw.exe`. It is
+order-incapable and does not alter the active strategy or registry. The inferential path separates
+cohort sealing and the single look across daily invocations; the no-dataset deadline path may
+atomically bind its universe receipt and outcome-free decision after pending entries drain. A missed trigger may run later through `StartWhenAvailable`,
+but transitions remain deferred unless the invocation is inside the 20:30–23:59:59 Eastern safety
+window. This prevents the terminal seal's multi-store reconciliation locks from competing with
+live position management. Safe state, counts, and content digests are appended to
+`logs\research-terminal-coordinator.log`; returns, p-values, confidence intervals, and economic
+gates are never logged. A terminal `KILL` is a successful scientific completion and does not cause
+Task Scheduler retries. Retryable degradation returns exit code 2 for one five-minute retry;
+persistent operational failure and scientific `INVALID` return 3 and remain visibly failed.
