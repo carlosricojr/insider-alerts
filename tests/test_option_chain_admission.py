@@ -222,6 +222,23 @@ def test_runtime_paths_are_confined_before_admission(tmp_path: Path, field: str)
     assert table is None
 
 
+def test_missing_expected_runtime_interpreter_is_a_domain_error(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.alpha_python.unlink()
+    outside_python = tmp_path / "outside" / "python.exe"
+    outside_python.parent.mkdir()
+    outside_python.write_bytes(b"outside")
+
+    with pytest.raises(OptionChainAdmissionError, match="interpreter is unavailable"):
+        capture_predecision_option_chain(
+            replace(config, alpha_python=outside_python),
+            packet_id="packet-1",
+            symbol="ABC",
+            clock=lambda: NOW,
+            process_runner=lambda *_args, **_kwargs: pytest.fail("must not launch"),
+        )
+
+
 def test_clock_regression_fails_without_second_launch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     capture_predecision_option_chain(

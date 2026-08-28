@@ -6,6 +6,7 @@ import hashlib
 import re
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -158,9 +159,10 @@ def _validate_config(config: OptionChainAdmissionConfig) -> _ValidatedConfig:
     runtime_root = alpha_script.parent.parent
     if alpha_script.parent != runtime_root / "scripts":
         raise OptionChainAdmissionError("alpha chain script must be directly under runtime scripts")
-    expected_python = (runtime_root / ".venv" / "Scripts" / "python.exe").resolve(
-        strict=True
-    )
+    try:
+        expected_python = (runtime_root / ".venv" / "Scripts" / "python.exe").resolve(strict=True)
+    except OSError as exc:
+        raise OptionChainAdmissionError("alpha runtime interpreter is unavailable") from exc
     if alpha_python != expected_python:
         raise OptionChainAdmissionError("alpha interpreter does not belong to the script runtime")
     return _ValidatedConfig(
@@ -186,7 +188,7 @@ def _ensure_store(path: Path) -> None:
     # SQLite cannot transition journal mode while another connection is making the
     # same transition. Production is already WAL, but serialize first-use setup so
     # concurrent in-process approvals cannot race before the admission transaction.
-    with _STORE_INIT_LOCK, _connect(path) as connection:
+    with _STORE_INIT_LOCK, closing(_connect(path)) as connection, connection:
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
         if journal_mode.casefold() != "wal":
             connection.execute("PRAGMA journal_mode=WAL")
@@ -316,7 +318,7 @@ def _admit(
 ) -> OptionChainAdmissionResult:
     _ensure_store(config.source_db)
     identity = _identity(config, packet_id=packet_id, symbol=symbol)
-    with _connect(config.source_db) as connection:
+    with closing(_connect(config.source_db)) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
             "SELECT * FROM research_option_chain_admissions WHERE packet_id=?",
@@ -409,7 +411,7 @@ def _finalize(
     stdout: str,
     stderr: str,
 ) -> OptionChainAdmissionResult:
-    with _connect(config.source_db) as connection:
+    with closing(_connect(config.source_db)) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         admitted = connection.execute(
             "SELECT admitted_at_utc FROM research_option_chain_admissions "
@@ -530,7 +532,7 @@ def capture_predecision_option_chain(
 def option_chain_admission_rows(path: Path) -> list[dict[str, object]]:
     """Return ordered operational rows without creating or changing the store."""
 
-    with _connect(path.resolve(strict=True)) as connection:
+    with closing(_connect(path.resolve(strict=True))) as connection, connection:
         rows = connection.execute(
             "SELECT * FROM research_option_chain_admissions ORDER BY admitted_at_utc,packet_id"
         ).fetchall()
