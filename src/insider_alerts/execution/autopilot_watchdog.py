@@ -21,7 +21,11 @@ MIN_STALE_SECONDS = 300
 STALE_SAFETY_MARGIN_SECONDS = 70
 SQLITE_STAGE_BUDGET_SECONDS = 200.0
 SQLITE_REVIEW_ITEM_BUDGET_SECONDS = 10.0
-NOTIFICATION_OBSERVER_BUDGET_SECONDS = 10.0
+OPTION_CHAIN_SQLITE_BUDGET_SECONDS = 90.0
+OPTION_CHAIN_CLEANUP_BUDGET_SECONDS = 10.0
+REVIEW_DECISION_SQLITE_BUDGET_SECONDS = 40.0
+NOTIFICATION_ACK_SQLITE_BUDGET_SECONDS = 40.0
+NOTIFICATION_OBSERVER_BUDGET_SECONDS = 15.0
 HTTPX_TIMEOUT_PHASES = 4
 URLLIB_TIMEOUT_PHASES = 2
 SCHEDULER_CONTROL_TIMEOUT_SECONDS = 5.0
@@ -561,18 +565,25 @@ def autopilot_runtime_budget(
     review_item_window = (
         sec_window + ib_window + yahoo_window + SQLITE_REVIEW_ITEM_BUDGET_SECONDS
     )
+    option_chain_window = (
+        OPTION_CHAIN_SQLITE_BUDGET_SECONDS
+        + OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
+        + OPTION_CHAIN_CLEANUP_BUDGET_SECONDS
+    )
     notification_window = (
         settings.ntfy_retry_attempts
         * HTTPX_TIMEOUT_PHASES
         * settings.ntfy_timeout_seconds
         + (settings.ntfy_retry_attempts - 1) * settings.ntfy_retry_max_seconds
-        + OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
         + NOTIFICATION_OBSERVER_BUDGET_SECONDS
+        + NOTIFICATION_ACK_SQLITE_BUDGET_SECONDS
     )
     quant_window = quant_timeout_seconds + 20
     maximum_stage = max(
         sec_window,
         review_item_window,
+        option_chain_window,
+        REVIEW_DECISION_SQLITE_BUDGET_SECONDS,
         notification_window,
         quant_window,
         SQLITE_STAGE_BUDGET_SECONDS,
@@ -584,6 +595,8 @@ def autopilot_runtime_budget(
     return {
         "sec_window_seconds": round(sec_window, 3),
         "review_item_window_seconds": round(review_item_window, 3),
+        "option_chain_window_seconds": round(option_chain_window, 3),
+        "decision_write_window_seconds": REVIEW_DECISION_SQLITE_BUDGET_SECONDS,
         "notification_window_seconds": round(notification_window, 3),
         "quant_window_seconds": quant_window,
         "sqlite_window_seconds": SQLITE_STAGE_BUDGET_SECONDS,

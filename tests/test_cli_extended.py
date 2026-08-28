@@ -132,7 +132,9 @@ def test_cli_ops_deadletter(monkeypatch) -> None:
 def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
-    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -248,7 +250,9 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
 def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
-    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -522,7 +526,9 @@ def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -
 def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
-    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -975,7 +981,9 @@ def test_cli_ops_autopilot_blocks_main_quant_agent_in_isolated_mode() -> None:
 def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
-    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -1250,6 +1258,33 @@ def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
     assert payload["worker_task_name"] == "Autopilot Worker"
 
 
+def test_cli_autopilot_watchdog_derives_safe_default(monkeypatch, tmp_path: Path) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(cli, "get_settings", lambda: cli.Settings(_env_file=None))
+
+    def capture(**kwargs):  # type: ignore[no-untyped-def]
+        observed.update(kwargs)
+        return {"action": "already_running"}
+
+    monkeypatch.setattr(cli, "run_autopilot_watchdog", capture)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-watchdog",
+            "--worker-task-name",
+            "Autopilot Worker",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--output-log",
+            str(tmp_path / "watchdog.log"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception
+    assert observed["stale_seconds"] == 498
+
+
 def test_cli_autopilot_watchdog_rejects_unsafe_config_before_task_control(
     monkeypatch,
     tmp_path: Path,
@@ -1306,14 +1341,13 @@ def test_cli_autopilot_preflight_validates_budget_and_process_tree(monkeypatch) 
             "autopilot-config-validate",
             "--quant-timeout-seconds",
             "120",
-            "--heartbeat-stale-seconds",
-            "498",
         ],
     )
 
     assert result.exit_code == 0, result.exception
     assert calls == ["job"]
     assert json.loads(result.stdout)["required_stale_seconds"] == 498
+    assert json.loads(result.stdout)["effective_stale_seconds"] == 498
 
 
 def test_cli_autopilot_preflight_fails_before_process_tree_for_unsafe_budget(
@@ -1618,8 +1652,14 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
 def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch, tmp_path: Path
 ) -> None:
-    calls: dict[str, object] = {"poll": 0, "sleeps": [], "delivered": [], "sent": []}
-    fingerprints = iter(("a" * 64, "a" * 64, "a" * 64, "a" * 64, "b" * 64))
+    calls: dict[str, object] = {
+        "poll": 0,
+        "sleeps": [],
+        "delivered": [],
+        "suppressed": [],
+        "sent": [],
+    }
+    fingerprints = iter(("a" * 64,) * 5 + ("b" * 64,))
 
     def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
         calls["poll"] = int(calls["poll"]) + 1
@@ -1678,12 +1718,23 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
 
     def record_send(_settings, payload, **_kwargs):  # type: ignore[no-untyped-def]
         calls["sent"].append(payload["packet_id"])  # type: ignore[union-attr]
+        if len(calls["sent"]) == 1:  # type: ignore[arg-type]
+            raise cli.NtfyNotificationError("first representative attempt failed")
 
     monkeypatch.setattr(cli, "_send_review_notification", record_send)
     monkeypatch.setattr(
         cli,
         "mark_notification_delivered",
-        lambda db_path, packet_id: calls["delivered"].append(packet_id),  # type: ignore[union-attr]
+        lambda db_path, packet_id, decision: (
+            calls["delivered"].append(packet_id) or 1  # type: ignore[union-attr]
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "mark_notification_suppressed",
+        lambda db_path, packet_id, decision: (
+            calls["suppressed"].append(packet_id) or 1  # type: ignore[union-attr]
+        ),
     )
     monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: next(fingerprints))
     monkeypatch.setattr(cli, "ensure_kill_on_close_process_tree", lambda: None)
@@ -1719,19 +1770,21 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
 
     assert result.exit_code == 0
     assert calls == {
-        "poll": 1,
+        "poll": 2,
         "sleeps": [15.0, 15.0, 1.0],
-        "delivered": [
+        "delivered": ["0000320193-24-000123|0000320193|4"],
+        "suppressed": ["0000320193-24-000124|0000320193|4"],
+        "sent": [
             "0000320193-24-000123|0000320193|4",
-            "0000320193-24-000124|0000320193|4",
+            "0000320193-24-000123|0000320193|4",
         ],
-        "sent": ["0000320193-24-000123|0000320193|4"],
     }
     message = "autopilot source changed; exiting so the hidden watchdog can start"
     assert message in result.stderr
     output = output_log.read_text(encoding="utf-8")
     assert message in output
     assert "autopilot notification outbox suppressed duplicate" in output
+    assert "deferred duplicate behind pending representative" in output
     assert "notify_suppressed_duplicate=1" in output
     errors = error_log.read_text(encoding="utf-8")
     assert "autopilot SEC enrichment degraded (http_failed=1" in errors

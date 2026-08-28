@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from insider_alerts.execution import windows_job
-from insider_alerts.research.capture import run_hidden_process
+from insider_alerts.research import capture as capture_module
+from insider_alerts.research.capture import ProcessTreeCleanupError, run_hidden_process
 
 
 class FakeJobApi:
@@ -69,6 +70,32 @@ def test_failed_assignment_closes_job_and_allows_retry() -> None:
     retry_api = FakeJobApi()
     windows_job.ensure_kill_on_close_process_tree(platform="nt", api=retry_api)
     assert retry_api.events[-1] == ("assign", 42)
+
+
+def test_taskkill_launch_failure_is_fatal_cleanup_uncertainty(monkeypatch) -> None:
+    class FakeProcess:
+        pid = 123
+
+        @staticmethod
+        def poll():  # type: ignore[no-untyped-def]
+            return None
+
+    def fail_taskkill(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("taskkill unavailable")
+
+    monkeypatch.setattr(capture_module.subprocess, "run", fail_taskkill)
+    with pytest.raises(ProcessTreeCleanupError, match="taskkill unavailable"):
+        capture_module._kill_process_tree(FakeProcess(), platform="nt")  # type: ignore[arg-type]
+
+
+def test_exited_parent_with_unknown_descendants_is_fatal_cleanup_uncertainty() -> None:
+    class ExitedProcess:
+        @staticmethod
+        def poll():  # type: ignore[no-untyped-def]
+            return 0
+
+    with pytest.raises(ProcessTreeCleanupError, match="descendant tree"):
+        capture_module._kill_process_tree(ExitedProcess())  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process-tree contract")

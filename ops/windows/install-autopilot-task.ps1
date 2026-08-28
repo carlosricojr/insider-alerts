@@ -257,14 +257,19 @@ try {
 } catch {
   $installError = $_
   $rollbackErrors = @()
+  # Phase 1: stop every replacement before restoring or starting either prior definition.
   foreach ($snapshot in $snapshots) {
     try {
       Stop-TaskAndWait -Name $snapshot.Name
+    } catch {
+      $rollbackErrors += "$($snapshot.Name) stop: $($_.Exception.Message)"
+    }
+  }
+  # Phase 2: restore both definitions while all successfully stopped tasks remain stopped.
+  foreach ($snapshot in $snapshots) {
+    try {
       if ($snapshot.Exists) {
         Register-ScheduledTask -TaskName $snapshot.Name -Xml $snapshot.Xml -Force | Out-Null
-        if ($snapshot.WasRunning) {
-          Start-ScheduledTask -TaskName $snapshot.Name
-        }
       } else {
         $created = Get-ScheduledTask -TaskName $snapshot.Name -ErrorAction SilentlyContinue
         if ($null -ne $created) {
@@ -272,7 +277,20 @@ try {
         }
       }
     } catch {
-      $rollbackErrors += "$($snapshot.Name): $($_.Exception.Message)"
+      $rollbackErrors += "$($snapshot.Name) restore: $($_.Exception.Message)"
+    }
+  }
+  # Phase 3: only restart prior instances when every stop and restore succeeded. This prevents a
+  # prior watchdog or worker from overlapping a replacement whose stop could not be proven.
+  if ($rollbackErrors.Count -eq 0) {
+    foreach ($snapshot in $snapshots) {
+      if ($snapshot.Exists -and $snapshot.WasRunning) {
+        try {
+          Start-ScheduledTask -TaskName $snapshot.Name
+        } catch {
+          $rollbackErrors += "$($snapshot.Name) start: $($_.Exception.Message)"
+        }
+      }
     }
   }
   if ($rollbackErrors.Count -gt 0) {

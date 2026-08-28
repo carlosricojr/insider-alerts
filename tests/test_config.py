@@ -119,6 +119,8 @@ def test_default_network_windows_derive_phase_complete_watchdog_threshold() -> N
     budget = autopilot_runtime_budget(settings=settings, quant_timeout_seconds=120)
 
     assert float(budget["maximum_stage_seconds"]) == pytest.approx(427.8)
+    assert budget["option_chain_window_seconds"] == 115
+    assert budget["decision_write_window_seconds"] == 40
     assert budget["required_stale_seconds"] == 498
     validate_stale_threshold(
         settings=settings,

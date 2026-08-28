@@ -124,6 +124,7 @@ from insider_alerts.review.queue import (
     list_notification_outbox,
     list_pending_review_packets,
     mark_notification_delivered,
+    mark_notification_suppressed,
     replay_deadletter,
 )
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
@@ -2212,7 +2213,7 @@ def review_decide(
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items()}
         _send_review_notification(settings, notify_payload, packet=packet)
-        mark_notification_delivered(settings.database_path, packet_id)
+        mark_notification_delivered(settings.database_path, packet_id, payload)
 
 
 @review_app.command("apply")
@@ -2263,7 +2264,7 @@ def review_apply(
         notify_payload = {k: str(v) for k, v in payload.items() if isinstance(k, str)}
         _send_review_notification(settings, notify_payload, packet=packet)
         if isinstance(packet_id_obj, str):
-            mark_notification_delivered(settings.database_path, packet_id_obj)
+            mark_notification_delivered(settings.database_path, packet_id_obj, payload)
 
 
 @ops_app.command("deadletter-list")
@@ -3401,7 +3402,7 @@ def ops_autopilot(
         notify_suppressed_duplicate = 0
         alerted_event_keys = _recent_alerted_event_keys(settings.database_path)
         if notify and health_store is not None and not once:
-            outbox_event_keys_seen = set(alerted_event_keys)
+            outbox_event_keys_attempted: set[str] = set()
             for outbox_index, outbox_packet in enumerate(
                 list_notification_outbox(settings.database_path, limit=decision_limit)
             ):
@@ -3417,20 +3418,35 @@ def ops_autopilot(
                 outbox_event_key = _economic_event_key(outbox_packet)
                 if (
                     outbox_event_key is not None
-                    and outbox_event_key in outbox_event_keys_seen
+                    and outbox_event_key in alerted_event_keys
                 ):
-                    mark_notification_delivered(settings.database_path, packet_id)
-                    notify_suppressed_duplicate += 1
+                    suppressed = mark_notification_suppressed(
+                        settings.database_path,
+                        packet_id,
+                        decision_payload,
+                    )
+                    notify_suppressed_duplicate += suppressed
+                    log_path = output_log_path if suppressed == 1 else error_log_path
+                    outcome = "suppressed duplicate" if suppressed == 1 else "stale suppression"
                     append_process_log(
-                        output_log_path,
-                        "autopilot notification outbox suppressed duplicate "
+                        log_path,
+                        f"autopilot notification outbox {outcome} "
                         f"packet={packet_id} event={outbox_event_key}",
                     )
                     continue
+                if (
+                    outbox_event_key is not None
+                    and outbox_event_key in outbox_event_keys_attempted
+                ):
+                    notify_suppressed_duplicate += 1
+                    append_process_log(
+                        output_log_path,
+                        "autopilot notification outbox deferred duplicate behind pending "
+                        f"representative packet={packet_id} event={outbox_event_key}",
+                    )
+                    continue
                 if outbox_event_key is not None:
-                    # Claim one representative before transport. Failed delivery leaves that row
-                    # queued; co-filings are acknowledged and only the representative is retried.
-                    outbox_event_keys_seen.add(outbox_event_key)
+                    outbox_event_keys_attempted.add(outbox_event_key)
                 try:
                     _send_review_notification(
                         settings,
@@ -3438,13 +3454,19 @@ def ops_autopilot(
                         packet=outbox_packet,
                         dry_message=str(decision_payload.get("reason", "decision alert")),
                     )
-                    mark_notification_delivered(settings.database_path, packet_id)
-                    if outbox_event_key is not None:
+                    acknowledged = mark_notification_delivered(
+                        settings.database_path,
+                        packet_id,
+                        decision_payload,
+                    )
+                    if acknowledged == 1 and outbox_event_key is not None:
                         alerted_event_keys.add(outbox_event_key)
-                    outbox_notified += 1
+                    outbox_notified += acknowledged
+                    log_path = output_log_path if acknowledged == 1 else error_log_path
+                    outcome = "delivered" if acknowledged == 1 else "stale acknowledgement"
                     append_process_log(
-                        output_log_path,
-                        f"autopilot notification outbox delivered packet={packet_id}",
+                        log_path,
+                        f"autopilot notification outbox {outcome} packet={packet_id}",
                     )
                 except NtfyNotificationError as exc:
                     append_process_log(
@@ -3747,6 +3769,7 @@ def ops_autopilot(
                         f"packet={packet_id_obj} status=internal_failure "
                         f"error={type(exc).__name__}: {exc}",
                     )
+                _heartbeat(f"decision_{packet_index}_option_chain_completed")
 
             should_notify = notify and (not notify_approve_only or rule.decision == "approve")
             event_key: str | None = None
@@ -3782,6 +3805,8 @@ def ops_autopilot(
                 append_process_log(error_log_path, failure_message)
                 continue
 
+            _heartbeat(f"decision_{packet_index}_applied")
+
             if updated != 1:
                 continue
 
@@ -3816,10 +3841,14 @@ def ops_autopilot(
                         packet=packet,
                         dry_message=rule.reason,
                     )
-                    mark_notification_delivered(settings.database_path, packet_id_obj)
-                    if event_key is not None:
+                    acknowledged = mark_notification_delivered(
+                        settings.database_path,
+                        packet_id_obj,
+                        payload,
+                    )
+                    if event_key is not None and acknowledged == 1:
                         alerted_event_keys.add(event_key)
-                    notified += 1
+                    notified += acknowledged
                 except NtfyNotificationError as exc:
                     failure_message = (
                         f"autopilot notification failed for packet={packet_id_obj}: {exc}"
@@ -4502,7 +4531,7 @@ def ops_autopilot_watchdog(
         Path("data/autopilot_health.db"),
         "--heartbeat-db",
     ),
-    stale_seconds: int = typer.Option(300, "--stale-seconds", min=300),
+    stale_seconds: int | None = typer.Option(None, "--stale-seconds", min=300),
     quant_timeout_seconds: int = typer.Option(
         120,
         "--quant-timeout-seconds",
@@ -4517,15 +4546,25 @@ def ops_autopilot_watchdog(
     """Restart the hidden autopilot worker when its durable progress is stale."""
 
     try:
+        settings = get_settings()
+        budget = autopilot_runtime_budget(
+            settings=settings,
+            quant_timeout_seconds=quant_timeout_seconds,
+        )
+        effective_stale_seconds = (
+            stale_seconds
+            if stale_seconds is not None
+            else int(budget["required_stale_seconds"])
+        )
         validate_stale_threshold(
             quant_timeout_seconds=quant_timeout_seconds,
-            stale_seconds=stale_seconds,
-            settings=get_settings(),
+            stale_seconds=effective_stale_seconds,
+            settings=settings,
         )
         result = run_autopilot_watchdog(
             heartbeat_db=heartbeat_db,
             worker_task_name=worker_task_name,
-            stale_seconds=stale_seconds,
+            stale_seconds=effective_stale_seconds,
         )
     except Exception as exc:
         failure: dict[str, object] = {
@@ -4544,8 +4583,8 @@ def ops_autopilot_watchdog(
 @ops_app.command("autopilot-config-validate")
 def ops_autopilot_config_validate(
     quant_timeout_seconds: int = typer.Option(120, "--quant-timeout-seconds", min=10, max=900),
-    heartbeat_stale_seconds: int = typer.Option(
-        300,
+    heartbeat_stale_seconds: int | None = typer.Option(
+        None,
         "--heartbeat-stale-seconds",
         min=300,
     ),
@@ -4554,9 +4593,18 @@ def ops_autopilot_config_validate(
 
     settings = get_settings()
     try:
+        budget = autopilot_runtime_budget(
+            settings=settings,
+            quant_timeout_seconds=quant_timeout_seconds,
+        )
+        effective_stale_seconds = (
+            heartbeat_stale_seconds
+            if heartbeat_stale_seconds is not None
+            else int(budget["required_stale_seconds"])
+        )
         validate_stale_threshold(
             quant_timeout_seconds=quant_timeout_seconds,
-            stale_seconds=heartbeat_stale_seconds,
+            stale_seconds=effective_stale_seconds,
             settings=settings,
         )
         ensure_kill_on_close_process_tree()
@@ -4565,10 +4613,7 @@ def ops_autopilot_config_validate(
         raise typer.Exit(code=2) from exc
     typer.echo(
         json.dumps(
-            autopilot_runtime_budget(
-                settings=settings,
-                quant_timeout_seconds=quant_timeout_seconds,
-            ),
+            {**budget, "effective_stale_seconds": effective_stale_seconds},
             sort_keys=True,
         )
     )

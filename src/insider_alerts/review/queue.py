@@ -54,6 +54,14 @@ def ensure_review_tables(db_path: str) -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
+        if "notification_suppressed_at" not in columns:
+            try:
+                conn.execute(
+                    "ALTER TABLE review_packets ADD COLUMN notification_suppressed_at TEXT"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS deadletter_events (
@@ -286,7 +294,7 @@ def apply_decision(
             """
             UPDATE review_packets
             SET status = ?, decision_json = ?, updated_at = ?, notification_required = ?,
-                notification_sent_at = NULL
+                notification_sent_at = NULL, notification_suppressed_at = NULL
             WHERE packet_id = ? AND status = 'pending'
             """,
             (decision, encoded, now, int(notification_required), packet_id),
@@ -305,18 +313,53 @@ def apply_decision(
     return int(cursor.rowcount)
 
 
-def mark_notification_delivered(db_path: str, packet_id: str) -> int:
-    """Record delivery only after the notification provider returns successfully."""
+def mark_notification_delivered(
+    db_path: str,
+    packet_id: str,
+    decision: Mapping[str, object],
+) -> int:
+    """CAS-acknowledge the exact decision only after provider success."""
+
     ensure_review_tables(db_path)
     delivered_at = datetime.now(tz=UTC).isoformat()
+    encoded = json.dumps(decision, separators=(",", ":"), sort_keys=True)
     with sqlite3.connect(db_path) as conn:
         cursor = conn.execute(
             """
             UPDATE review_packets
             SET notification_sent_at = ?
-            WHERE packet_id = ?
+            WHERE packet_id = ? AND decision_json = ?
+              AND notification_required = 1
+              AND notification_sent_at IS NULL
+              AND notification_suppressed_at IS NULL
             """,
-            (delivered_at, packet_id),
+            (delivered_at, packet_id, encoded),
+        )
+        conn.commit()
+    return int(cursor.rowcount)
+
+
+def mark_notification_suppressed(
+    db_path: str,
+    packet_id: str,
+    decision: Mapping[str, object],
+) -> int:
+    """CAS-acknowledge a co-filing only after its economic event was delivered elsewhere."""
+
+    ensure_review_tables(db_path)
+    suppressed_at = datetime.now(tz=UTC).isoformat()
+    encoded = json.dumps(decision, separators=(",", ":"), sort_keys=True)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE review_packets
+            SET notification_suppressed_at = ?
+            WHERE packet_id = ? AND decision_json = ?
+              AND notification_required = 1
+              AND notification_sent_at IS NULL
+              AND notification_suppressed_at IS NULL
+            """,
+            (suppressed_at, packet_id, encoded),
         )
         conn.commit()
     return int(cursor.rowcount)
@@ -335,6 +378,7 @@ def list_notification_outbox(db_path: str, *, limit: int) -> list[dict[str, obje
             FROM review_packets
             WHERE notification_required = 1
               AND notification_sent_at IS NULL
+              AND notification_suppressed_at IS NULL
               AND decision_json IS NOT NULL
             ORDER BY updated_at ASC, packet_id ASC
             LIMIT ?
@@ -446,7 +490,8 @@ def replay_deadletter(db_path: str, packet_id: str) -> int:
             """
             UPDATE review_packets
             SET status = 'pending', decision_json = NULL, updated_at = ?,
-                notification_required = 0, notification_sent_at = NULL
+                notification_required = 0, notification_sent_at = NULL,
+                notification_suppressed_at = NULL
             WHERE packet_id = ? AND status = 'deadletter'
             """,
             (now, packet_id),

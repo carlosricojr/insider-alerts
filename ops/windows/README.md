@@ -29,9 +29,11 @@ default. The watchdog writes only bounded operational metadata to
 heartbeat store without reading signal or outcome payloads. Passing `-Start` stops the legacy
 same-named worker before registering both new definitions, then starts the watchdog. If cutover
 fails, or a new worker does not produce a fresh stable runtime heartbeat within 90 seconds, the
-installer restores the prior task definitions and running state. Approved notifications
-carry an atomic delivery intent and are retried by the next managed cycle after an interrupted
-send (at-least-once delivery). The looping
+installer stops both replacements, restores both prior definitions, and only then restarts their
+prior running state. Approved notifications carry an atomic delivery intent and are retried by the
+next managed cycle after an interrupted send (at-least-once delivery). Delivery acknowledgement is
+compare-and-set against the exact decision version; co-filing suppression is recorded separately
+and occurs only after the event has a confirmed representative delivery. The looping
 worker also fingerprints the loaded Python source between
 completed cycles. If source changes later, it exits cleanly within one 15-second wait slice so no
 cycle is interrupted. The watchdog's next one-minute run starts the fresh worker. A stale restart

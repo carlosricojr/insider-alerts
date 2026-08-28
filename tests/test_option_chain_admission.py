@@ -332,6 +332,10 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert "Push-Location $repoRoot" in installer
     assert "TaskName and WorkerTaskName must be distinct" in installer
     assert "prior tasks were restored" in installer
+    assert "Phase 1: stop every replacement" in installer
+    assert "Phase 2: restore both definitions" in installer
+    assert "Phase 3: only restart prior instances" in installer
+    assert "if ($rollbackErrors.Count -eq 0)" in installer
     assert installer.index("ops autopilot-config-validate") < installer.index(
         "Stop-TaskAndWait -Name $TaskName"
     )
