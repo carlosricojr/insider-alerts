@@ -25,6 +25,7 @@ from insider_alerts.research.bar_feed import BarFeedStore, BarRequest
 from insider_alerts.research.inference import (
     CAPACITY_RANK_SALT,
     HYPOTHESIS_ID,
+    TrialSealStore,
     _validate_registry,
     cohort_freeze_boundary,
     enrollment_deadline,
@@ -146,6 +147,11 @@ class TrialRuntimeConfig:
     session_feed_db: Path
     registry_path: Path
     activation_db: Path
+    seal_db: Path | None = None
+
+    @property
+    def effective_seal_db(self) -> Path:
+        return self.seal_db or self.trial_db.with_name("trial_seals.db")
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,12 +696,19 @@ class TrialStore:
             ).fetchone()
         return None if row is None else self._verify_candidate_row(row)
 
-    def append_candidate(self, candidate: TrialCandidate) -> bool:
+    def append_candidate(
+        self,
+        candidate: TrialCandidate,
+        *,
+        seal_store: TrialSealStore | None = None,
+    ) -> bool:
         record = self._candidate_record(candidate)
         encoded = _canonical(record)
         digest = _sha256(encoded)
         with contextlib.closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            if seal_store is not None and seal_store.receipt("deadline_miss") is not None:
+                raise EvidenceExcluded("enrollment_deadline_already_sealed")
             if conn.execute(
                 """
                 SELECT 1 FROM trial_evidence_dispositions
@@ -2483,6 +2496,8 @@ def _candidate_from_evidence(
         raise EvidenceExcluded(f"transaction_owner_mapping_excluded:{owner_mapping}")
     if history_complete is not True:
         raise EvidenceExcluded("classification_history_coverage_incomplete")
+    if now >= deadline:
+        raise EvidenceExcluded("candidate_not_imported_before_enrollment_deadline")
     schedule = session_store.schedule_as_known_at(observed_at)
     entry, final_date = planned_entry_session(observed_at, schedule)
     return TrialCandidate(
@@ -2554,6 +2569,7 @@ def run_trial_once(
         session_store = SessionFeedStore(config.session_feed_db, initialize=False)
         session_store.validate_integrity()
         bar_store = BarFeedStore(config.bar_feed_db)
+        seal_store: TrialSealStore | None = None
         candidates_added = requests_ensured = 0
         for record in evidence:
             record_sha = str(record.get("record_sha256", ""))
@@ -2573,7 +2589,14 @@ def run_trial_once(
                     window=window,
                     session_store=session_store,
                 )
-                candidates_added += int(store.append_candidate(candidate))
+                if seal_store is None:
+                    seal_store = TrialSealStore(config.effective_seal_db)
+                candidates_added += int(
+                    store.append_candidate(
+                        candidate,
+                        seal_store=seal_store,
+                    )
+                )
                 persisted_candidate = store.candidate_for_evidence(record_sha)
                 if persisted_candidate is None:
                     continue

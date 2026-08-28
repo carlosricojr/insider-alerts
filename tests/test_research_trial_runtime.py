@@ -2445,6 +2445,106 @@ def test_active_runtime_rejects_both_outside_window_boundaries(
     assert status["evidence_dispositions"] == 1
 
 
+def test_active_runtime_never_imports_predeadline_evidence_at_or_after_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    deadline = runtime.enrollment_deadline(ACTIVATED_AT)
+    _install_schedule(config)
+    _install_evidence(
+        config,
+        observed_at=ACTIVATED_AT + timedelta(minutes=30),
+        recorded_at=deadline - timedelta(minutes=1),
+    )
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+
+    result = run_trial_once(config, now=deadline)
+
+    assert result.status == "collecting"
+    assert result.error is None
+    store = TrialStore(config.trial_db)
+    assert store.candidates() == []
+    assert store.disposition_counts() == {"excluded": 1}
+    assert _disposition_reasons(config) == [
+        "candidate_not_imported_before_enrollment_deadline"
+    ]
+
+
+def test_candidate_insert_cannot_cross_an_existing_deadline_receipt(tmp_path: Path) -> None:
+    store = TrialStore(tmp_path / "trial.db")
+    seal_db = tmp_path / "trial_seals.db"
+    deadline = runtime.enrollment_deadline(ACTIVATED_AT)
+    runtime.TrialSealStore(seal_db).seal_deadline_miss(
+        {
+            "activated_at_utc": _utc_text(ACTIVATED_AT),
+            "candidates": [],
+        },
+        recorded_at=deadline,
+    )
+    candidate = _trial_candidate(
+        "candidate-a",
+        symbol="TEST",
+        rank="a",
+        evidence_recorded_at=ACTIVATED_AT + timedelta(minutes=1),
+        imported_at=deadline - timedelta(microseconds=1),
+    )
+
+    with pytest.raises(runtime.EvidenceExcluded, match="enrollment_deadline_already_sealed"):
+        store.append_candidate(candidate, seal_store=runtime.TrialSealStore(seal_db))
+
+    assert store.candidates() == []
+
+
+def test_runtime_wires_explicit_seal_store_into_candidate_insert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_config(tmp_path), seal_db=tmp_path / "custom" / "seals.db")
+    deadline = runtime.enrollment_deadline(ACTIVATED_AT)
+    _install_schedule(config)
+    _install_evidence(config)
+    runtime.TrialSealStore(config.effective_seal_db).seal_deadline_miss(
+        {
+            "activated_at_utc": _utc_text(ACTIVATED_AT),
+            "candidates": [],
+        },
+        recorded_at=deadline,
+    )
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+
+    result = run_trial_once(config, now=deadline - timedelta(microseconds=1))
+
+    assert result.status == "collecting"
+    store = TrialStore(config.trial_db)
+    assert store.candidates() == []
+    assert store.disposition_counts() == {"excluded": 1}
+    assert _disposition_reasons(config) == ["enrollment_deadline_already_sealed"]
+    assert not config.trial_db.with_name("trial_seals.db").exists()
+
+
+def test_postdeadline_registry_mismatch_remains_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_schedule(config)
+    _install_evidence(config, policy_sha256="b" * 64)
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+
+    result = run_trial_once(config, now=runtime.enrollment_deadline(ACTIVATED_AT))
+
+    assert result.status == "invalid"
+    assert TrialStore(config.trial_db).disposition_counts() == {"invalid": 1}
+    assert "registry_digest_mismatch" in _disposition_reasons(config)[0]
+
+
 def test_active_runtime_rejects_evidence_bound_to_another_registry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2716,7 +2816,7 @@ def test_runtime_candidate_import_clock_regression_is_degraded_without_fault(
     monkeypatch.setattr(
         TrialStore,
         "append_candidate",
-        lambda _store, _candidate: (_ for _ in ()).throw(
+        lambda _store, _candidate, **_kwargs: (_ for _ in ()).throw(
             TrialRuntimeRetryable("candidate_import_time_moved_behind_entry_date_cursor")
         ),
     )

@@ -18,6 +18,12 @@ freeze includes every enrolled trade on the first complete date reaching 100 tra
 Before freeze or outcome maturity, the report contains no return aggregate. At the 18-month
 deadline, an append-only receipt binds the immutable candidate universe; pre-deadline pending
 entries then drain before an outcome-free `KILL/insufficient_enrollment` result.
+The candidate importer enforces the registered decision-readiness cutoff: evidence must have been
+recorded and imported strictly before the enrollment deadline. Evidence first encountered by the
+trial worker at or after that instant receives an append-only exclusion disposition even when its
+source observation predates the deadline, so it cannot mutate a universe already bound by the
+deadline receipt. Candidate insertion and deadline sealing serialize on the trial-store write lock;
+an insert that acquires the lock after the deadline receipt exists is also permanently excluded.
 
 Trade timestamps are the official exchange RTH open and close boundaries. Under the frozen
 daily-bar policy, SPY is measured from entry-session open through exit-session close; a stop or
@@ -46,15 +52,32 @@ Every report is RFC 8785 content-addressed after removing only `report_sha256`. 
 `COLLECTING` or `PROMOTE_RECOMMENDED`, 2 for `KILL`, and 3 for `INVALID`. A promotion recommendation
 is inert and cannot alter the canary, orders, or capital.
 
-Example production protocol after activation (the producer emits only counts, digests, and state;
-it never displays aggregate outcomes):
+The deployed operational protocol uses
+`python -m insider_alerts.research.terminal_coordinator`. It is an unbound wrapper around the
+frozen builder and inference modules; it does not change their bytes, registry, hypothesis, or
+decision rule. On the inferential path, one hidden daily invocation may make at most one state
+transition: a ready cohort is sealed without aggregation, and only a later invocation can run the single look. At the frozen
+18-month deadline, the same wrapper constructs the registered no-dataset payload, seals the
+immutable candidate universe, waits for pre-deadline pending entries to drain, and records the
+outcome-free `KILL/insufficient_enrollment` report. Once no entries remain pending, that deadline
+receipt and no-outcome report may be committed in the same invocation because no aggregate is
+calculated. Its append-only operational log emits only
+counts, state, reasons, and content digests. Scientific `KILL` is an operationally successful run;
+retryable degradation returns 2, while persistent operational failure and scientific `INVALID`
+return 3. Task Scheduler does not automatically restart any nonzero result, so a post-transition
+logging failure cannot advance another terminal state before the next daily invocation.
+Transitions are restricted to the daily after-hours window so
+terminal reconciliation locks cannot interfere with live position management.
+
+Manual recovery remains available through the frozen production wrapper (the producer emits only
+counts, digests, and state; it never displays aggregate outcomes):
 
 ```powershell
 .venv\Scripts\python.exe -m insider_alerts.research.terminal_builder seal `
-  --seal-db data\research\OPP-E07-V1-seals.db
+  --seal-db data\research\trial_seals.db
 
 .venv\Scripts\python.exe -m insider_alerts.research.terminal_builder decide `
-  --seal-db data\research\OPP-E07-V1-seals.db
+  --seal-db data\research\trial_seals.db
 ```
 
 The output path is created exclusively and is never overwritten. `activation_git_commit` identifies

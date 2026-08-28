@@ -1,12 +1,15 @@
 param(
-  [string]$TaskName = "Insider Alerts Research Trial",
-  [int]$IntervalMinutes = 1,
+  [string]$TaskName = "Insider Alerts Research Terminal Coordinator",
   [switch]$Start
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($IntervalMinutes -lt 1) { throw "IntervalMinutes must be at least 1." }
+$localTimeZone = [System.TimeZoneInfo]::Local
+if ($localTimeZone.Id -ne "Eastern Standard Time") {
+  throw "Terminal coordinator requires Windows time zone 'Eastern Standard Time'; found '$($localTimeZone.Id)'."
+}
+$dailyStart = (Get-Date).Date.AddHours(20).AddMinutes(30)
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
@@ -17,40 +20,33 @@ if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments = @(
-  "-m insider_alerts.research.trial_worker",
+  "-m insider_alerts.research.terminal_coordinator",
   "--trial-db `"$repoRoot\data\research\trial.db`"",
   "--diagnostics-db `"$repoRoot\data\research\diagnostics.db`"",
   "--canary-ledger-db `"$repoRoot\data\live_canary.db`"",
   "--source-db `"$repoRoot\data\insider_alerts.db`"",
-  "--evidence-db `"$repoRoot\data\research\evidence.db`"",
-  "--bar-feed-db `"$repoRoot\data\research\bar_feed.db`"",
-  "--session-feed-db `"$repoRoot\data\research\session_feed.db`"",
   "--registry-path `"$repoRoot\docs\research\registry\OPP-E07-V1.json`"",
   "--seal-db `"$repoRoot\data\research\trial_seals.db`"",
-  "--error-log `"$repoRoot\logs\research-trial-worker.err.log`""
+  "--artifact-root `"$repoRoot\data\research\artifacts`"",
+  "--activation-db `"$repoRoot\data\research\activation.db`"",
+  "--output-log `"$repoRoot\logs\research-terminal-coordinator.log`"",
+  "--error-log `"$repoRoot\logs\research-terminal-coordinator.err.log`""
 ) -join " "
 $action = New-ScheduledTaskAction -Execute $pythonExe -Argument $arguments -WorkingDirectory $repoRoot
-$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$intervalTrigger = New-ScheduledTaskTrigger `
-  -Once `
-  -At (Get-Date).AddMinutes(1) `
-  -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
-  -RepetitionDuration (New-TimeSpan -Days 3650)
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$dailyTrigger = New-ScheduledTaskTrigger -Daily -At $dailyStart
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
-  -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+  -ExecutionTimeLimit (New-TimeSpan -Minutes 60) `
   -Hidden `
   -MultipleInstances IgnoreNew `
-  -RestartCount 2 `
-  -RestartInterval (New-TimeSpan -Minutes 1) `
   -StartWhenAvailable
 
 Register-ScheduledTask `
   -TaskName $TaskName `
   -Action $action `
-  -Trigger @($logonTrigger, $intervalTrigger) `
+  -Trigger $dailyTrigger `
   -Principal $principal `
   -Settings $settings `
   -Force | Out-Null

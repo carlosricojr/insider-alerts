@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--activation-db", type=Path, default=Path("data/research/activation.db")
     )
+    parser.add_argument("--seal-db", type=Path, default=Path("data/research/trial_seals.db"))
     parser.add_argument("--bar-feed-db", type=Path, default=Path("data/research/bar_feed.db"))
     parser.add_argument(
         "--session-feed-db", type=Path, default=Path("data/research/session_feed.db")
@@ -78,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         session_feed_db=args.session_feed_db,
         registry_path=args.registry_path,
         activation_db=args.activation_db,
+        seal_db=args.seal_db,
     )
     diagnostic_config = DiagnosticConfig(
         trial_db=args.trial_db,
