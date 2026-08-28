@@ -317,11 +317,18 @@ def test_worker_and_installer_are_order_incapable_hidden_and_singleton() -> None
     assert "-MultipleInstances IgnoreNew" in installer
     assert "-WindowStyle" not in installer
     assert "New-ScheduledTaskTrigger -Daily" in installer
-    assert "New-ScheduledTaskTrigger -AtLogOn" not in installer
+    assert "New-ScheduledTaskTrigger -AtLogOn -User $user" in installer
     assert ".Date.AddHours(20).AddMinutes(30)" in installer
     assert '$localTimeZone.Id -ne "Eastern Standard Time"' in installer
     assert "ExecutionTimeLimit (New-TimeSpan -Minutes 60)" in installer
     assert "-LogonType S4U" in installer
+    assert "-LogonType Interactive" in installer
+    assert (
+        '$_.FullyQualifiedErrorId -ne "HRESULT 0x80070005,Register-ScheduledTask"'
+        in installer
+    )
+    assert "-Trigger @($dailyTrigger, $logonTrigger)" in installer
+    assert 'RegistrationMode -NotePropertyValue $registrationMode' in installer
     assert "-RestartCount" not in installer
     assert "-RestartInterval" not in installer
 

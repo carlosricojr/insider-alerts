@@ -123,10 +123,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
   .\ops\windows\install-research-terminal-coordinator-task.ps1 -Start
 ```
 
-The installer fails closed unless the Windows host time zone is `Eastern Standard Time`. Its S4U
-principal runs without an interactive sign-in and stores no password; the coordinator needs only
-local files and does not use S4U-ineligible network resources. It runs once daily at 20:30 Eastern
-through direct hidden `pythonw.exe`. It is
+The installer fails closed unless the Windows host time zone is `Eastern Standard Time`. It first
+registers an S4U principal, which runs without an interactive sign-in and stores no password; the
+coordinator needs only local files and does not use S4U-ineligible network resources. If and only
+if Windows denies S4U registration with `HRESULT 0x80070005`, the installer falls back to a limited
+interactive principal with daily and logon triggers and reports that mode. The fallback requires
+the user to remain signed in, while the logon trigger catches up after a missed daily invocation.
+Both modes run at 20:30 Eastern through direct hidden `pythonw.exe`. The coordinator is
 order-incapable and does not alter the active strategy or registry. The inferential path separates
 cohort sealing and the single look across daily invocations; the no-dataset deadline path may
 bind its universe receipt and produce its outcome-free decision in the same invocation after
@@ -134,7 +137,10 @@ pending entries drain, with idempotent recovery if interrupted between writes. A
 run later through `StartWhenAvailable`,
 but transitions remain deferred unless the invocation is inside the 20:30–23:59:59 Eastern safety
 window. This prevents the terminal seal's multi-store reconciliation locks from competing with
-live position management. Safe state, counts, and content digests are appended to
+live position management. If the interactive fallback is logged off across a deadline, the
+deadline cutoff and transactional receipt fence prevent later candidates from entering the frozen
+universe; the next signed-in after-hours invocation closes the trial idempotently. Safe state,
+counts, and content digests are appended to
 `logs\research-terminal-coordinator.log`; returns, p-values, confidence intervals, and economic
 gates are never logged. A terminal `KILL` is a successful scientific completion. Retryable
 degradation returns exit code 2; persistent operational failure and scientific `INVALID` return 3.

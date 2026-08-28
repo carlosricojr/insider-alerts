@@ -196,6 +196,8 @@ exactly one of `COLLECTING`, `PROMOTE_RECOMMENDED`, `KILL`, or `INVALID` with re
   decision in the same invocation after the pending-entry drain; interrupted writes replay
   idempotently on a later invocation. Retryable database contention is operational
   degradation, not scientific `INVALID`; logs remain blinded to returns and inferential aggregates.
+  Prefer unattended S4U registration; where Windows explicitly denies it, use a hidden limited-user
+  daily-plus-logon fallback and rely on the deadline cutoff and receipt fence for delayed catch-up.
 - At each release, verify `main == origin/main`, no untracked worktree artifacts, and all related
   repositories clean.
 

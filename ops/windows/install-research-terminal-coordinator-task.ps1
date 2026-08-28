@@ -34,7 +34,7 @@ $arguments = @(
 ) -join " "
 $action = New-ScheduledTaskAction -Execute $pythonExe -Argument $arguments -WorkingDirectory $repoRoot
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At $dailyStart
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
+$s4uPrincipal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
@@ -43,13 +43,40 @@ $settings = New-ScheduledTaskSettingsSet `
   -MultipleInstances IgnoreNew `
   -StartWhenAvailable
 
-Register-ScheduledTask `
-  -TaskName $TaskName `
-  -Action $action `
-  -Trigger $dailyTrigger `
-  -Principal $principal `
-  -Settings $settings `
-  -Force | Out-Null
+$registrationMode = "S4U"
+try {
+  Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $action `
+    -Trigger $dailyTrigger `
+    -Principal $s4uPrincipal `
+    -Settings $settings `
+    -Force | Out-Null
+} catch {
+  if ($_.FullyQualifiedErrorId -ne "HRESULT 0x80070005,Register-ScheduledTask") {
+    throw
+  }
+
+  # Some non-elevated Windows installations deny S4U task registration. Preserve the daily
+  # trigger and add a logon catch-up trigger when falling back to an interactive principal.
+  $registrationMode = "InteractiveFallback"
+  $interactivePrincipal = New-ScheduledTaskPrincipal `
+    -UserId $user `
+    -LogonType Interactive `
+    -RunLevel Limited
+  $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $action `
+    -Trigger @($dailyTrigger, $logonTrigger) `
+    -Principal $interactivePrincipal `
+    -Settings $settings `
+    -Force | Out-Null
+  Write-Warning (
+    "S4U registration was denied (HRESULT 0x80070005); registered '$TaskName' " +
+    "for the current interactive session with daily and logon triggers."
+  )
+}
 
 if ($Start) {
   $task = Get-ScheduledTask -TaskName $TaskName
@@ -57,4 +84,6 @@ if ($Start) {
   Start-ScheduledTask -TaskName $TaskName
 }
 
-Get-ScheduledTask -TaskName $TaskName
+$registeredTask = Get-ScheduledTask -TaskName $TaskName
+$registeredTask | Add-Member -NotePropertyName RegistrationMode -NotePropertyValue $registrationMode
+$registeredTask
