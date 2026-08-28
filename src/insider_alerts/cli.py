@@ -82,6 +82,10 @@ from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
 from insider_alerts.research.bar_feed import bar_feed_status
 from insider_alerts.research.capture import capture_status
 from insider_alerts.research.diagnostics import diagnostic_status
+from insider_alerts.research.option_chain_admission import (
+    OptionChainAdmissionConfig,
+    capture_predecision_option_chain,
+)
 from insider_alerts.research.session_feed import session_feed_status
 from insider_alerts.research.trial_runtime import trial_runtime_status
 from insider_alerts.review.queue import (
@@ -151,6 +155,11 @@ class AutoPilotCycleResult:
     escalated_schema_invalid: int
     quant_deferred: int
     notify_suppressed_duplicate: int = 0
+    option_chain_succeeded: int = 0
+    option_chain_skipped_cadence: int = 0
+    option_chain_failed: int = 0
+    option_chain_timed_out: int = 0
+    option_chain_ambiguous: int = 0
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -3073,11 +3082,21 @@ def ops_autopilot(
     error_log_path: Path | None = typer.Option(  # noqa: B008
         None, "--error-log", hidden=True
     ),
+    alpha_chain_python: Path | None = typer.Option(  # noqa: B008
+        None, "--alpha-chain-python", hidden=True
+    ),
+    alpha_chain_script: Path | None = typer.Option(  # noqa: B008
+        None, "--alpha-chain-script", hidden=True
+    ),
+    option_chain_store_db: Path | None = typer.Option(  # noqa: B008
+        None, "--option-chain-store-db", hidden=True
+    ),
 ) -> None:
     """
     Run SEC ingestion + auto-decision loop and notify for approved signals by default.
     """
     settings = get_settings()
+    repo_root = Path(__file__).resolve().parents[2]
 
     def append_process_log(path: Path | None, message: str) -> None:
         if path is None:
@@ -3163,6 +3182,32 @@ def ops_autopilot(
             err=True,
         )
         raise typer.Exit(code=2)
+    option_chain_values = (
+        alpha_chain_python,
+        alpha_chain_script,
+        option_chain_store_db,
+    )
+    if any(value is not None for value in option_chain_values) and not all(
+        value is not None for value in option_chain_values
+    ):
+        typer.secho(
+            "--alpha-chain-python, --alpha-chain-script, and --option-chain-store-db "
+            "must be provided together",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    option_chain_config = (
+        OptionChainAdmissionConfig(
+            source_db=Path(settings.database_path),
+            repo_root=repo_root,
+            chain_store_db=cast(Path, option_chain_store_db),
+            alpha_python=cast(Path, alpha_chain_python),
+            alpha_script=cast(Path, alpha_chain_script),
+        )
+        if all(value is not None for value in option_chain_values)
+        else None
+    )
 
     def _run_cycle() -> AutoPilotCycleResult:
         poll_result = run_sec_poll_once(settings, max_items=poll_max_items, dry_run=False)
@@ -3265,6 +3310,11 @@ def ops_autopilot(
         escalated_schema_invalid = 0
         quant_deferred = 0
         seen_decision_keys: set[str] = set()
+        option_chain_succeeded = 0
+        option_chain_skipped_cadence = 0
+        option_chain_failed = 0
+        option_chain_timed_out = 0
+        option_chain_ambiguous = 0
 
         for packet in pending:
             packet_id_obj = packet.get("packet_id")
@@ -3366,6 +3416,48 @@ def ops_autopilot(
                     2,
                 )
 
+            if rule.decision == "approve" and option_chain_config is not None:
+                try:
+                    packet_payload = packet.get("payload")
+                    if not isinstance(packet_payload, dict):
+                        raise ValueError("approved packet payload is not an object")
+                    symbol_value = packet_payload.get("issuer_symbol")
+                    if not isinstance(symbol_value, str):
+                        raise ValueError("approved packet has no issuer symbol")
+                    chain_result = capture_predecision_option_chain(
+                        option_chain_config,
+                        packet_id=packet_id_obj,
+                        symbol=symbol_value,
+                    )
+                    if chain_result.status == "succeeded":
+                        option_chain_succeeded += 1
+                    elif chain_result.status == "skipped_cadence":
+                        option_chain_skipped_cadence += 1
+                    elif chain_result.status == "timed_out":
+                        option_chain_timed_out += 1
+                    elif chain_result.status == "failed":
+                        option_chain_failed += 1
+                    else:
+                        option_chain_ambiguous += 1
+                    chain_message = (
+                        "predecision option-chain capture "
+                        f"packet={packet_id_obj} status={chain_result.status} "
+                        f"batch={chain_result.batch_id} exit={chain_result.exit_code} "
+                        f"error={chain_result.error_kind}"
+                    )
+                    if chain_result.status in {"succeeded", "skipped_cadence"}:
+                        append_process_log(output_log_path, chain_message)
+                    else:
+                        append_process_log(error_log_path, chain_message)
+                except Exception as exc:
+                    option_chain_failed += 1
+                    append_process_log(
+                        error_log_path,
+                        "predecision option-chain capture "
+                        f"packet={packet_id_obj} status=internal_failure "
+                        f"error={type(exc).__name__}: {exc}",
+                    )
+
             try:
                 updated = apply_decision(settings.database_path, payload)
             except DecisionValidationError as exc:
@@ -3464,6 +3556,11 @@ def ops_autopilot(
             escalated_schema_invalid=escalated_schema_invalid,
             quant_deferred=quant_deferred,
             notify_suppressed_duplicate=notify_suppressed_duplicate,
+            option_chain_succeeded=option_chain_succeeded,
+            option_chain_skipped_cadence=option_chain_skipped_cadence,
+            option_chain_failed=option_chain_failed,
+            option_chain_timed_out=option_chain_timed_out,
+            option_chain_ambiguous=option_chain_ambiguous,
         )
         cycle_message = (
             "ops autopilot cycle completed "
@@ -3480,7 +3577,12 @@ def ops_autopilot(
             f"escalated_missing_context={cycle.escalated_missing_context}, "
             f"escalated_schema_invalid={cycle.escalated_schema_invalid}, "
             f"quant_deferred={cycle.quant_deferred}, "
-            f"notify_suppressed_duplicate={cycle.notify_suppressed_duplicate})"
+            f"notify_suppressed_duplicate={cycle.notify_suppressed_duplicate}, "
+            f"option_chain_succeeded={cycle.option_chain_succeeded}, "
+            f"option_chain_skipped_cadence={cycle.option_chain_skipped_cadence}, "
+            f"option_chain_failed={cycle.option_chain_failed}, "
+            f"option_chain_timed_out={cycle.option_chain_timed_out}, "
+            f"option_chain_ambiguous={cycle.option_chain_ambiguous})"
         )
         typer.echo(cycle_message)
         append_process_log(output_log_path, cycle_message)
