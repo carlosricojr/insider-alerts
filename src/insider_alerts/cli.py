@@ -77,6 +77,8 @@ from insider_alerts.execution.autopilot_watchdog import (
     autopilot_health_status,
     autopilot_runtime_budget,
     run_autopilot_watchdog,
+    sec_ingestion_runtime_budget,
+    validate_sec_ingestion_stale_threshold,
     validate_stale_threshold,
 )
 from insider_alerts.execution.canary import (
@@ -130,6 +132,9 @@ from insider_alerts.review.queue import (
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
 from insider_alerts.sec.pipeline import (
     BackfillResult,
+    EnrichResult,
+    PollResult,
+    QueueResult,
     backfill_form4_filings,
     enqueue_review_packets,
     enrich_filings_with_xml_url,
@@ -195,6 +200,25 @@ class AutoPilotCycleResult:
     enqueue_parse_failed: int = 0
     enqueue_market_failed: int = 0
     outbox_notified: int = 0
+    source_items_seen: int = 0
+    source_boundary_rejected: int = 0
+    source_invalid_items: int = 0
+
+
+@dataclass(slots=True)
+class SecIngestionCycleResult:
+    fetched: int
+    inserted: int
+    skipped_existing: int
+    enriched_scanned: int
+    enriched_updated: int
+    enqueue_processed: int
+    enqueue_enqueued: int
+    enrichment_http_failed: int = 0
+    enrichment_xml_not_found: int = 0
+    enqueue_http_failed: int = 0
+    enqueue_parse_failed: int = 0
+    enqueue_market_failed: int = 0
     source_items_seen: int = 0
     source_boundary_rejected: int = 0
     source_invalid_items: int = 0
@@ -3142,6 +3166,305 @@ def ops_event_study(
         raise typer.Exit(code=3)
 
 
+@ops_app.command("sec-ingestion")
+def ops_sec_ingestion(
+    once: bool = typer.Option(
+        False,
+        "--once/--loop",
+        help="Run one ingestion cycle or keep running in a background loop.",
+    ),
+    interval: int = typer.Option(60, "--interval", min=10),
+    poll_max_items: int = typer.Option(40, "--poll-max-items", min=1, max=200),
+    enrich_limit: int = typer.Option(100, "--enrich-limit", min=1, max=1000),
+    enqueue_limit: int = typer.Option(100, "--enqueue-limit", min=1, max=2000),
+    output_log_path: Path | None = typer.Option(  # noqa: B008
+        None, "--output-log", hidden=True
+    ),
+    error_log_path: Path | None = typer.Option(  # noqa: B008
+        None, "--error-log", hidden=True
+    ),
+    heartbeat_db: Path | None = typer.Option(None, "--heartbeat-db", hidden=True),  # noqa: B008
+    heartbeat_stale_seconds: int | None = typer.Option(
+        None,
+        "--heartbeat-stale-seconds",
+        min=1,
+        hidden=True,
+    ),
+) -> None:
+    """Continuously acquire and normalize SEC filings without making decisions."""
+
+    settings = get_settings()
+
+    def append_process_log(path: Path | None, message: str) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(message.rstrip() + "\n")
+
+    if (heartbeat_db is None) != (heartbeat_stale_seconds is None):
+        typer.secho(
+            "--heartbeat-db and --heartbeat-stale-seconds must be provided together",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if heartbeat_stale_seconds is not None:
+        try:
+            validate_sec_ingestion_stale_threshold(
+                stale_seconds=heartbeat_stale_seconds,
+                settings=settings,
+            )
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+
+    health_store = AutopilotHealthStore(heartbeat_db) if heartbeat_db is not None else None
+    runtime_id = secrets.token_hex(16)
+    heartbeat_failure_count = 0
+    heartbeat_paused = False
+
+    class HeartbeatOwnershipUnavailableError(sqlite3.OperationalError):
+        """The worker cannot prove that it still owns the runtime heartbeat."""
+
+    def _heartbeat(
+        stage: str,
+        *,
+        cycle_started: bool = False,
+        cycle_succeeded: bool = False,
+        error: BaseException | None = None,
+        advance_progress: bool = True,
+        force: bool = False,
+        require_success: bool = False,
+    ) -> None:
+        nonlocal heartbeat_failure_count
+        if health_store is None or (heartbeat_paused and not force):
+            return
+        try:
+            health_store.progress(
+                runtime_id=runtime_id,
+                stage=stage,
+                now=datetime.now(UTC),
+                cycle_started=cycle_started,
+                cycle_succeeded=cycle_succeeded,
+                error=error,
+                advance_progress=advance_progress,
+            )
+        except RuntimeOwnershipError:
+            raise
+        except sqlite3.OperationalError as exc:
+            normalized = str(exc).casefold()
+            if "locked" not in normalized and "busy" not in normalized:
+                raise
+            if require_success:
+                raise HeartbeatOwnershipUnavailableError(str(exc)) from exc
+            heartbeat_failure_count += 1
+            if heartbeat_failure_count == 1:
+                append_process_log(
+                    error_log_path,
+                    f"SEC ingestion heartbeat degraded ({type(exc).__name__}: {exc})",
+                )
+            if heartbeat_failure_count >= 3:
+                raise RuntimeError(
+                    "SEC ingestion heartbeat unavailable for three consecutive progress writes"
+                ) from exc
+        except (OSError, sqlite3.Error):
+            raise
+        else:
+            heartbeat_failure_count = 0
+
+    def _run_cycle() -> SecIngestionCycleResult:
+        nonlocal heartbeat_paused
+        # Even while forward-progress timestamps are frozen after a retryable failure, prove that
+        # this runtime still owns the heartbeat row before the next mutating SEC poll.
+        _heartbeat(
+            "cycle_started",
+            cycle_started=True,
+            advance_progress=not heartbeat_paused,
+            force=True,
+            require_success=True,
+        )
+        poll_result = run_sec_poll_once(settings, max_items=poll_max_items, dry_run=False)
+        # A successful source poll proves forward progress after a retryable failure. Resume
+        # normal stage heartbeats before the potentially long per-item enrichment work.
+        heartbeat_paused = False
+        _heartbeat("sec_poll_completed")
+        if health_store is None:
+            enrich_result = enrich_filings_with_xml_url(settings, limit=enrich_limit)
+        else:
+            enrich_result = enrich_filings_with_xml_url(
+                settings,
+                limit=enrich_limit,
+                progress_callback=_heartbeat,
+            )
+        _heartbeat("enrichment_completed")
+        if health_store is None:
+            enqueue_result = enqueue_review_packets(settings, limit=enqueue_limit)
+        else:
+            enqueue_result = enqueue_review_packets(
+                settings,
+                limit=enqueue_limit,
+                progress_callback=_heartbeat,
+            )
+        _heartbeat("review_enqueue_completed")
+
+        if enrich_result.http_failed or enrich_result.xml_not_found:
+            append_process_log(
+                error_log_path,
+                "SEC ingestion enrichment degraded "
+                f"(http_failed={enrich_result.http_failed}, "
+                f"xml_not_found={enrich_result.xml_not_found})",
+            )
+        if (
+            enqueue_result.http_failed
+            or enqueue_result.parse_failed
+            or enqueue_result.market_failed
+        ):
+            append_process_log(
+                error_log_path,
+                "SEC ingestion review enrichment degraded "
+                f"(http_failed={enqueue_result.http_failed}, "
+                f"parse_failed={enqueue_result.parse_failed}, "
+                f"market_failed={enqueue_result.market_failed})",
+            )
+
+        cycle = SecIngestionCycleResult(
+            fetched=poll_result.fetched,
+            inserted=poll_result.inserted,
+            skipped_existing=poll_result.skipped_existing,
+            enriched_scanned=enrich_result.scanned,
+            enriched_updated=enrich_result.updated,
+            enqueue_processed=enqueue_result.processed,
+            enqueue_enqueued=enqueue_result.enqueued,
+            enrichment_http_failed=enrich_result.http_failed,
+            enrichment_xml_not_found=enrich_result.xml_not_found,
+            enqueue_http_failed=enqueue_result.http_failed,
+            enqueue_parse_failed=enqueue_result.parse_failed,
+            enqueue_market_failed=enqueue_result.market_failed,
+            source_items_seen=poll_result.source_items_seen,
+            source_boundary_rejected=poll_result.source_boundary_rejected,
+            source_invalid_items=poll_result.source_invalid_items,
+        )
+        cycle_message = (
+            "ops SEC ingestion cycle completed "
+            f"(fetched={cycle.fetched}, inserted={cycle.inserted}, "
+            f"skipped_existing={cycle.skipped_existing}, "
+            f"source_items_seen={cycle.source_items_seen}, "
+            f"source_boundary_rejected={cycle.source_boundary_rejected}, "
+            f"source_invalid_items={cycle.source_invalid_items}, "
+            f"enrich_scanned={cycle.enriched_scanned}, "
+            f"enrich_updated={cycle.enriched_updated}, "
+            f"enqueue_processed={cycle.enqueue_processed}, "
+            f"enqueue_enqueued={cycle.enqueue_enqueued}, "
+            f"enrichment_http_failed={cycle.enrichment_http_failed}, "
+            f"enrichment_xml_not_found={cycle.enrichment_xml_not_found}, "
+            f"enqueue_http_failed={cycle.enqueue_http_failed}, "
+            f"enqueue_parse_failed={cycle.enqueue_parse_failed}, "
+            f"enqueue_market_failed={cycle.enqueue_market_failed})"
+        )
+        typer.echo(cycle_message)
+        append_process_log(output_log_path, cycle_message)
+        _heartbeat("cycle_succeeded", cycle_succeeded=True)
+        return cycle
+
+    def _record_retryable_cycle_failure(
+        exc: BaseException,
+        *,
+        loop_mode: bool,
+    ) -> None:
+        nonlocal heartbeat_paused
+        heartbeat_paused = True
+        # Preserve the diagnostic without making a permanently failing loop look healthy. Wait
+        # and retry-stage heartbeats remain paused until a later SEC poll actually succeeds.
+        _heartbeat(
+            "cycle_retryable_failure",
+            error=exc,
+            advance_progress=False,
+            force=True,
+        )
+        failure_message = (
+            "ops SEC ingestion cycle failed "
+            f"(retryable, {type(exc).__name__}: {exc})"
+        )
+        typer.secho(failure_message, fg=typer.colors.RED, err=True)
+        append_process_log(error_log_path, failure_message)
+        if not loop_mode:
+            raise typer.Exit(code=1) from exc
+
+    def _run_cycle_with_recovery(*, loop_mode: bool) -> SecIngestionCycleResult | None:
+        try:
+            return _run_cycle()
+        except (SecHttpError, SecRssParseError) as exc:
+            _record_retryable_cycle_failure(exc, loop_mode=loop_mode)
+            return None
+        except HeartbeatOwnershipUnavailableError:
+            raise
+        except sqlite3.OperationalError as exc:
+            normalized = str(exc).casefold()
+            if "locked" not in normalized and "busy" not in normalized:
+                raise
+            _record_retryable_cycle_failure(exc, loop_mode=loop_mode)
+            return None
+
+    def _source_changed_during_wait(startup_fingerprint: str) -> bool:
+        remaining = float(interval)
+        while remaining > 0:
+            _heartbeat("cycle_wait")
+            if runtime_source_fingerprint() != startup_fingerprint:
+                return True
+            sleep_seconds = min(SOURCE_REVISION_CHECK_INTERVAL_SECONDS, remaining)
+            time.sleep(sleep_seconds)
+            remaining -= sleep_seconds
+        return runtime_source_fingerprint() != startup_fingerprint
+
+    try:
+        startup_fingerprint: str | None = None
+        if health_store is not None:
+            if not once:
+                ensure_kill_on_close_process_tree()
+            startup_fingerprint = runtime_source_fingerprint()
+            health_store.register_runtime(
+                runtime_id=runtime_id,
+                source_fingerprint=startup_fingerprint,
+                now=datetime.now(UTC),
+            )
+        if once:
+            _run_cycle_with_recovery(loop_mode=False)
+            return
+        if startup_fingerprint is None:
+            startup_fingerprint = runtime_source_fingerprint()
+        _run_cycle_with_recovery(loop_mode=True)
+        while True:
+            if _source_changed_during_wait(startup_fingerprint):
+                _heartbeat("source_changed")
+                source_message = (
+                    "SEC ingestion source changed; exiting so the hidden watchdog "
+                    "can start a fresh worker"
+                )
+                typer.secho(source_message, fg=typer.colors.YELLOW, err=True)
+                append_process_log(output_log_path, source_message)
+                return
+            _run_cycle_with_recovery(loop_mode=True)
+    except typer.Exit:
+        raise
+    except RuntimeOwnershipError as exc:
+        failure_message = f"SEC ingestion process stopped ({type(exc).__name__}: {exc})"
+        append_process_log(error_log_path, failure_message)
+        raise
+    except Exception as exc:
+        try:
+            _heartbeat("process_failure", error=exc)
+        except Exception as heartbeat_exc:
+            append_process_log(
+                error_log_path,
+                "SEC ingestion terminal heartbeat failed "
+                f"({type(heartbeat_exc).__name__}: {heartbeat_exc})",
+            )
+        failure_message = f"SEC ingestion process failed ({type(exc).__name__}: {exc})"
+        append_process_log(error_log_path, failure_message)
+        raise
+
+
 @ops_app.command("autopilot")
 def ops_autopilot(
     once: bool = typer.Option(
@@ -3158,6 +3481,11 @@ def ops_autopilot(
     poll_max_items: int = typer.Option(40, "--poll-max-items", min=1, max=200),
     enrich_limit: int = typer.Option(100, "--enrich-limit", min=1, max=1000),
     enqueue_limit: int = typer.Option(100, "--enqueue-limit", min=1, max=2000),
+    sec_ingestion_enabled: bool = typer.Option(
+        True,
+        "--sec-ingestion/--no-sec-ingestion",
+        help="Run legacy in-process SEC ingestion before decisions.",
+    ),
     decision_limit: int = typer.Option(200, "--decision-limit", min=1, max=5000),
     decision_engine: str = typer.Option("quant", "--decision-engine", help="quant|rules"),
     approve_score_min: float = typer.Option(90.0, "--approve-score-min"),
@@ -3231,7 +3559,7 @@ def ops_autopilot(
     ),
 ) -> None:
     """
-    Run SEC ingestion + auto-decision loop and notify for approved signals by default.
+    Run the auto-decision loop and, by default, legacy in-process SEC ingestion.
     """
     settings = get_settings()
     repo_root = Path(__file__).resolve().parents[2]
@@ -3479,26 +3807,32 @@ def ops_autopilot(
                         error_log_path,
                         f"autopilot notification outbox failed for packet={packet_id}: {exc}",
                     )
-        poll_result = run_sec_poll_once(settings, max_items=poll_max_items, dry_run=False)
-        _heartbeat("sec_poll_completed")
-        if health_store is None:
-            enrich_result = enrich_filings_with_xml_url(settings, limit=enrich_limit)
+        if sec_ingestion_enabled:
+            poll_result = run_sec_poll_once(settings, max_items=poll_max_items, dry_run=False)
+            _heartbeat("sec_poll_completed")
+            if health_store is None:
+                enrich_result = enrich_filings_with_xml_url(settings, limit=enrich_limit)
+            else:
+                enrich_result = enrich_filings_with_xml_url(
+                    settings,
+                    limit=enrich_limit,
+                    progress_callback=_heartbeat,
+                )
+            _heartbeat("enrichment_completed")
+            if health_store is None:
+                enqueue_result = enqueue_review_packets(settings, limit=enqueue_limit)
+            else:
+                enqueue_result = enqueue_review_packets(
+                    settings,
+                    limit=enqueue_limit,
+                    progress_callback=_heartbeat,
+                )
+            _heartbeat("review_enqueue_completed")
         else:
-            enrich_result = enrich_filings_with_xml_url(
-                settings,
-                limit=enrich_limit,
-                progress_callback=_heartbeat,
-            )
-        _heartbeat("enrichment_completed")
-        if health_store is None:
-            enqueue_result = enqueue_review_packets(settings, limit=enqueue_limit)
-        else:
-            enqueue_result = enqueue_review_packets(
-                settings,
-                limit=enqueue_limit,
-                progress_callback=_heartbeat,
-            )
-        _heartbeat("review_enqueue_completed")
+            poll_result = PollResult(fetched=0, inserted=0, skipped_existing=0)
+            enrich_result = EnrichResult(scanned=0, updated=0)
+            enqueue_result = QueueResult(processed=0, enqueued=0)
+            _heartbeat("external_sec_ingestion")
         if enrich_result.http_failed or enrich_result.xml_not_found:
             append_process_log(
                 error_log_path,
@@ -4595,6 +4929,101 @@ def ops_autopilot_watchdog(
     append_watchdog_log(output_log_path, result)
 
 
+@ops_app.command("sec-ingestion-watchdog")
+def ops_sec_ingestion_watchdog(
+    worker_task_name: str = typer.Option(..., "--worker-task-name"),
+    heartbeat_db: Path = typer.Option(  # noqa: B008
+        Path("data/sec_ingestion_health.db"),
+        "--heartbeat-db",
+    ),
+    stale_seconds: int | None = typer.Option(None, "--stale-seconds", min=300),
+    output_log_path: Path = typer.Option(  # noqa: B008
+        Path("logs/sec-ingestion-watchdog.log"),
+        "--output-log",
+    ),
+) -> None:
+    """Restart the hidden SEC ingestion worker when durable progress is stale."""
+
+    try:
+        settings = get_settings()
+        budget = sec_ingestion_runtime_budget(settings=settings)
+        effective_stale_seconds = (
+            stale_seconds
+            if stale_seconds is not None
+            else int(budget["required_stale_seconds"])
+        )
+        validate_sec_ingestion_stale_threshold(
+            stale_seconds=effective_stale_seconds,
+            settings=settings,
+        )
+        result = run_autopilot_watchdog(
+            heartbeat_db=heartbeat_db,
+            worker_task_name=worker_task_name,
+            stale_seconds=effective_stale_seconds,
+        )
+    except Exception as exc:
+        failure: dict[str, object] = {
+            "checked_at_utc": datetime.now(UTC).isoformat(),
+            "worker_task_name": worker_task_name,
+            "action": "error",
+            "error_kind": type(exc).__name__,
+            "error_message": str(exc)[:1000],
+        }
+        with contextlib.suppress(OSError):
+            append_watchdog_log(output_log_path, failure)
+        raise
+    append_watchdog_log(output_log_path, result)
+
+
+@ops_app.command("sec-ingestion-config-validate")
+def ops_sec_ingestion_config_validate(
+    heartbeat_stale_seconds: int | None = typer.Option(
+        None,
+        "--heartbeat-stale-seconds",
+        min=300,
+    ),
+) -> None:
+    """Preflight SEC ingestion watchdog budgets and process-tree ownership."""
+
+    settings = get_settings()
+    try:
+        budget = sec_ingestion_runtime_budget(settings=settings)
+        effective_stale_seconds = (
+            heartbeat_stale_seconds
+            if heartbeat_stale_seconds is not None
+            else int(budget["required_stale_seconds"])
+        )
+        validate_sec_ingestion_stale_threshold(
+            stale_seconds=effective_stale_seconds,
+            settings=settings,
+        )
+        ensure_kill_on_close_process_tree()
+    except (RuntimeError, ValueError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(
+        json.dumps(
+            {**budget, "effective_stale_seconds": effective_stale_seconds},
+            sort_keys=True,
+        )
+    )
+
+
+@ops_app.command("sec-ingestion-health-status")
+def ops_sec_ingestion_health_status(
+    heartbeat_db: Path = typer.Option(  # noqa: B008
+        Path("data/sec_ingestion_health.db"),
+        "--heartbeat-db",
+    ),
+) -> None:
+    """Show bounded SEC ingestion liveness metadata without filing payloads."""
+
+    report = autopilot_health_status(heartbeat_db)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if not bool(report.get("valid", False)):
+        raise typer.Exit(code=3)
+
+
 @ops_app.command("autopilot-config-validate")
 def ops_autopilot_config_validate(
     quant_timeout_seconds: int = typer.Option(120, "--quant-timeout-seconds", min=10, max=900),
@@ -4656,14 +5085,17 @@ if __name__ == "__main__":
         # Typer enters the command only after settings and argument conversion succeed. The
         # scheduled worker uses pythonw, so preserve failures that occur before its inner logging
         # scope as well as unexpected top-level failures.
-        if len(sys.argv) >= 3 and sys.argv[1:3] == ["ops", "autopilot"]:
+        if len(sys.argv) >= 3 and sys.argv[1:3] in (
+            ["ops", "autopilot"],
+            ["ops", "sec-ingestion"],
+        ):
             try:
                 error_index = sys.argv.index("--error-log") + 1
                 error_path = Path(sys.argv[error_index])
                 error_path.parent.mkdir(parents=True, exist_ok=True)
                 with error_path.open("a", encoding="utf-8") as handle:
                     handle.write(
-                        "autopilot unhandled process failure "
+                        f"{sys.argv[2]} unhandled process failure "
                         f"({type(exc).__name__}: {exc})\n"
                     )
             except (OSError, ValueError, IndexError):

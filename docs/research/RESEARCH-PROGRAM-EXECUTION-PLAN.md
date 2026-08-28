@@ -187,7 +187,9 @@ exactly one of `COLLECTING`, `PROMOTE_RECOMMENDED`, `KILL`, or `INVALID` with re
   invisible tasks.
 - Run SEC ingestion under separate hidden worker and bounded watchdog tasks. Durable stage
   progress must recover both clean source-revision exits and a live-but-stuck worker without
-  allowing overlapping instances.
+  allowing overlapping instances. Cut over both worker/watchdog pairs in one rollback-capable
+  transaction: verify acquisition first, then decisions; on failure restore the prior all-in-one
+  worker that still owns ingestion.
 - At each release, verify `main == origin/main`, no untracked worktree artifacts, and all related
   repositories clean.
 

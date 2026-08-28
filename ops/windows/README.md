@@ -6,10 +6,11 @@ Install or refresh the background autopilot task:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-autopilot-task.ps1 -Start
 ```
 
-The installer creates separate non-elevated per-user tasks named `Insider Alerts Autopilot
-Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent trigger, preventing
-startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
-restarts a worker only when its durable progress heartbeat exceeds the configured stale threshold.
+The installer creates two non-elevated worker/watchdog pairs: `Insider Alerts Autopilot` handles
+decisions and notifications, while `Insider Alerts SEC Ingestion` independently polls, enriches,
+and enqueues filings every minute. Worker tasks have no independent trigger, preventing startup
+races. Each bounded watchdog starts at logon and every minute, starts a stopped worker, and
+restarts a worker only when its own durable progress heartbeat exceeds the configured stale threshold.
 That threshold is at least five minutes and may be longer when configured network or quant windows
 require it. When no threshold is passed, the installer derives the minimum safe value from the
 effective settings. The installer, worker, and watchdog validate it against every configured
@@ -19,18 +20,23 @@ slow-drip or otherwise hung external call.
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
 highest-privilege execution.
 
-Both tasks launch the virtualenv's `pythonw.exe` directly, so they never create a console window.
-The worker owns its complete descendant tree in a kill-on-close Windows Job Object, so ending a
-hung worker also ends quant and option-capture children before replacement. The worker reads `.env`,
-writes to `logs\autopilot.out.log` and
-`logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
-default. The watchdog writes only bounded operational metadata to
-`logs\autopilot-watchdog.log`; `ops autopilot-health-status` exposes the separate operational
-heartbeat store without reading signal or outcome payloads. Passing `-Start` stops the legacy
-same-named worker before registering both new definitions, then starts the watchdog. If cutover
-fails, or a new worker does not produce a fresh stable runtime heartbeat within 90 seconds, the
-installer stops both replacements, restores both prior definitions, and only then restarts their
-prior running state. Approved notifications carry an atomic delivery intent and are retried by the
+All four tasks launch the virtualenv's `pythonw.exe` directly, so they never create a console
+window. Each worker owns its complete descendant tree in a kill-on-close Windows Job Object, so ending a
+hung worker also ends quant and option-capture children before replacement. Both workers read
+`.env`; acquisition writes to `logs\sec-ingestion.out.log` and `logs\sec-ingestion.err.log`, while
+decisions write to `logs\autopilot.out.log` and `logs\autopilot.err.log` and send NTFY notifications for approved decisions by
+default. The watchdogs write only bounded operational metadata to
+`logs\autopilot-watchdog.log` and `logs\sec-ingestion-watchdog.log`; the corresponding health
+status commands expose separate operational stores without reading filing, signal, or outcome
+payloads. `-Start` is required: it fences both watchdogs and workers before registering all four
+definitions. A machine-wide mutex rejects overlapping installer runs across Windows logon sessions.
+It requires a completed
+acquisition cycle before starting and verifying decisions, then requires a new successful run from
+each watchdog before committing the cutover.
+If either runtime misses its validated startup deadline, the installer stops every replacement,
+restores every prior definition, and only then restarts prior running state. The restored legacy
+autopilot continues ingestion, so a failed cutover does not create a durable acquisition gap.
+Approved notifications carry an atomic delivery intent and are retried by the
 next managed cycle after an interrupted send (at-least-once delivery). Delivery acknowledgement is
 compare-and-set against the exact decision version; co-filing suppression is recorded separately
 and occurs only after the event has a confirmed representative delivery. The looping

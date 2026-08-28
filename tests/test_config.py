@@ -4,6 +4,8 @@ from pydantic import ValidationError
 from insider_alerts.config import Settings
 from insider_alerts.execution.autopilot_watchdog import (
     autopilot_runtime_budget,
+    sec_ingestion_runtime_budget,
+    validate_sec_ingestion_stale_threshold,
     validate_stale_threshold,
 )
 from insider_alerts.research.history_worker import _parser as history_worker_parser
@@ -140,6 +142,17 @@ def test_long_network_settings_require_a_larger_autopilot_stale_threshold() -> N
             quant_timeout_seconds=120,
             stale_seconds=300,
         )
+
+
+def test_sec_ingestion_watchdog_budget_covers_each_external_review_item() -> None:
+    settings = Settings(_env_file=None)
+    budget = sec_ingestion_runtime_budget(settings=settings)
+
+    assert float(budget["maximum_stage_seconds"]) == pytest.approx(427.8)
+    assert budget["required_stale_seconds"] == 498
+    validate_sec_ingestion_stale_threshold(stale_seconds=498, settings=settings)
+    with pytest.raises(ValueError, match="SEC ingestion heartbeat stale threshold"):
+        validate_sec_ingestion_stale_threshold(stale_seconds=497, settings=settings)
 
 
 def test_config_rejects_inverted_sec_retry_bounds() -> None:
