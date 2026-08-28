@@ -19,7 +19,11 @@ console window and Task Scheduler retains ownership of the complete worker proce
 chain. The worker reads `.env`, writes to `logs\autopilot.out.log` and
 `logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
 default. Passing `-Start` performs a controlled restart so deployed source changes
-are loaded immediately. The optional manual hidden launcher also invokes
+are loaded immediately. The looping worker also fingerprints the loaded Python source between
+completed cycles. If source changes later, it exits cleanly within one 15-second wait slice so no
+cycle is interrupted. The next one-minute repetition trigger starts the fresh worker; Task
+Scheduler's `RestartCount` applies only to failure exits and is not the recovery mechanism for
+this clean source-change exit. The optional manual hidden launcher also invokes
 `pythonw.exe` directly and never routes through `cmd.exe`.
 
 Install the separate IBKR canary watchdog with:

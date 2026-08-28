@@ -73,9 +73,11 @@ from insider_alerts.backtest.signal_study import (
 from insider_alerts.config import Settings, get_settings
 from insider_alerts.execution.canary import (
     ARM_PHRASE,
+    SOURCE_REVISION_CHECK_INTERVAL_SECONDS,
     CanaryConfig,
     CanaryRunner,
     poll_delay_seconds,
+    runtime_source_fingerprint,
 )
 from insider_alerts.execution.canary import (
     status_report as live_canary_status_report,
@@ -3685,12 +3687,32 @@ def ops_autopilot(
                 return None
             raise typer.Exit(code=1) from exc
 
+    def _source_changed_during_wait(startup_fingerprint: str) -> bool:
+        remaining = float(interval)
+        while remaining > 0:
+            if runtime_source_fingerprint() != startup_fingerprint:
+                return True
+            sleep_seconds = min(SOURCE_REVISION_CHECK_INTERVAL_SECONDS, remaining)
+            time.sleep(sleep_seconds)
+            remaining -= sleep_seconds
+        return runtime_source_fingerprint() != startup_fingerprint
+
     try:
-        _run_cycle_with_recovery(loop_mode=not once)
-        if not once:
-            while True:
-                time.sleep(interval)
-                _run_cycle_with_recovery(loop_mode=True)
+        if once:
+            _run_cycle_with_recovery(loop_mode=False)
+            return
+        startup_fingerprint = runtime_source_fingerprint()
+        _run_cycle_with_recovery(loop_mode=True)
+        while True:
+            if _source_changed_during_wait(startup_fingerprint):
+                source_message = (
+                    "autopilot source changed; exiting so the hidden repeating task "
+                    "can start a fresh worker"
+                )
+                typer.secho(source_message, fg=typer.colors.YELLOW, err=True)
+                append_process_log(output_log_path, source_message)
+                return
+            _run_cycle_with_recovery(loop_mode=True)
     except typer.Exit:
         raise
     except Exception as exc:

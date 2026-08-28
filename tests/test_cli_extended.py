@@ -1141,12 +1141,12 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
         calls["poll"] += 1
         if calls["poll"] == 1:
             raise SecHttpError("transient dns failure")
+        if calls["poll"] >= 3:
+            raise RuntimeError("stop-loop")
         return PollResult(fetched=0, inserted=0, skipped_existing=0)
 
     def fake_sleep(seconds: int) -> None:
         calls["sleep"] += 1
-        if calls["sleep"] >= 2:
-            raise RuntimeError("stop-loop")
 
     monkeypatch.setattr(cli, "run_sec_poll_once", fake_poll)
     monkeypatch.setattr(
@@ -1161,6 +1161,7 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
     )
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
     monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: "a" * 64)
 
     result = runner.invoke(
         cli.app,
@@ -1180,13 +1181,136 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
     assert result.exit_code == 1
     assert isinstance(result.exception, RuntimeError)
     assert "stop-loop" in str(result.exception)
-    assert calls["poll"] == 2
+    assert calls == {"poll": 3, "sleep": 2}
     assert "ops autopilot cycle failed" in result.stderr
     assert "transient dns failure" in result.stderr
     assert "ops autopilot cycle completed" in result.stdout
     error_log = (tmp_path / "autopilot.err.log").read_text(encoding="utf-8")
     assert "transient dns failure" in error_log
     assert "autopilot process failed (RuntimeError: stop-loop)" in error_log
+
+
+def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: dict[str, object] = {"poll": 0, "sleeps": []}
+    fingerprints = iter(("a" * 64, "a" * 64, "a" * 64, "a" * 64, "b" * 64))
+
+    def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
+        calls["poll"] = int(calls["poll"]) + 1
+        return PollResult(fetched=0, inserted=0, skipped_existing=0)
+
+    monkeypatch.setattr(cli, "run_sec_poll_once", fake_poll)
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit: EnrichResult(scanned=0, updated=0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enqueue_review_packets",
+        lambda settings, *, limit: QueueResult(processed=0, enqueued=0),
+    )
+    monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: next(fingerprints))
+    monkeypatch.setattr(
+        cli.time,
+        "sleep",
+        lambda seconds: calls["sleeps"].append(seconds),  # type: ignore[union-attr]
+    )
+    output_log = tmp_path / "autopilot.out.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--loop",
+            "--interval",
+            "31",
+            "--decision-engine",
+            "rules",
+            "--output-log",
+            str(output_log),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == {"poll": 1, "sleeps": [15.0, 15.0, 1.0]}
+    message = "autopilot source changed; exiting so the hidden repeating task can start"
+    assert message in result.stderr
+    assert message in output_log.read_text(encoding="utf-8")
+
+
+def test_cli_ops_autopilot_once_does_not_fingerprint_source(monkeypatch) -> None:
+    def forbidden_fingerprint() -> str:
+        raise AssertionError("once mode must not fingerprint source")
+
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", forbidden_fingerprint)
+    monkeypatch.setattr(
+        cli,
+        "run_sec_poll_once",
+        lambda settings, *, max_items, dry_run: PollResult(
+            fetched=0, inserted=0, skipped_existing=0
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit: EnrichResult(scanned=0, updated=0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enqueue_review_packets",
+        lambda settings, *, limit: QueueResult(processed=0, enqueued=0),
+    )
+    monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["ops", "autopilot", "--once", "--decision-engine", "rules"],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_cli_ops_autopilot_logs_startup_fingerprint_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    poll_called = False
+
+    def fail_fingerprint() -> str:
+        raise OSError("source temporarily unreadable")
+
+    def forbidden_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
+        nonlocal poll_called
+        poll_called = True
+        raise AssertionError("cycle must not start without source provenance")
+
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", fail_fingerprint)
+    monkeypatch.setattr(cli, "run_sec_poll_once", forbidden_poll)
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--loop",
+            "--interval",
+            "10",
+            "--decision-engine",
+            "rules",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert poll_called is False
+    assert "autopilot process failed (OSError: source temporarily unreadable)" in (
+        error_log.read_text(encoding="utf-8")
+    )
 
 
 def test_trade_signal_notification_includes_ticker_and_why() -> None:
