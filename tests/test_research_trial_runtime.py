@@ -1183,6 +1183,8 @@ def test_trial_worker_runs_import_then_finalizer_and_draft_is_inert(
             str(tmp_path / "sessions.db"),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
@@ -1248,6 +1250,8 @@ def test_trial_worker_runs_time_sensitive_confirmatory_phases_before_diagnostics
             str(tmp_path / "diagnostics.db"),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
         ]
     )
 
@@ -1287,6 +1291,8 @@ def test_diagnostic_logger_failure_cannot_block_confirmatory_execution(
             str(tmp_path / "diagnostics.db"),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
         ]
     )
 
@@ -1323,6 +1329,8 @@ def test_trial_worker_isolates_diagnostic_failure_from_confirmatory_phase(
             str(tmp_path / "sessions.db"),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
@@ -1367,6 +1375,8 @@ def test_trial_worker_isolates_diagnostic_outcome_failure_from_confirmatory_phas
             str(tmp_path / "sessions.db"),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
@@ -1402,6 +1412,8 @@ def test_trial_worker_records_finalizer_failure_in_durable_health(
             str(trial_db),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
@@ -1435,6 +1447,8 @@ def test_trial_worker_retryable_finalizer_failure_is_degraded_not_poisoned(
             str(trial_db),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
@@ -1466,6 +1480,8 @@ def test_trial_worker_clock_regression_is_degraded_not_poisoned(
             str(trial_db),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(tmp_path / "worker.err.log"),
         ]
@@ -1488,6 +1504,8 @@ def test_trial_worker_logs_when_trial_database_cannot_be_opened(tmp_path: Path) 
             str(trial_db),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
@@ -1519,6 +1537,8 @@ def test_trial_worker_logs_original_error_when_fault_persistence_also_fails(
             str(tmp_path / "trial.db"),
             "--registry-path",
             str(write_draft_registry(ROOT, tmp_path)),
+            "--activation-db",
+            str(tmp_path / "activation.db"),
             "--error-log",
             str(error_log),
         ]
