@@ -334,6 +334,7 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
         "Stop-TaskAndWait -Name $TaskName"
     )
     assert "ops autopilot-watchdog" in installer
+    assert "--quant-timeout-seconds $QuantTimeoutSeconds" in installer
     assert "--worker-task-name `\"$WorkerTaskName`\"" in installer
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 1)" in installer
     assert installer.count("New-ScheduledTaskTrigger -AtLogOn") == 1

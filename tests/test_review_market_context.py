@@ -119,12 +119,14 @@ def test_daily_market_data_client_configures_ib_endpoint() -> None:
 def test_ib_connection_sets_a_bounded_synchronous_request_timeout(monkeypatch) -> None:
     import ib_async
 
+    connect_kwargs: dict[str, object] = {}
+
     class FakeIB:
         def __init__(self) -> None:
             self.RequestTimeout = 0.0
 
         def connect(self, *_args, **kwargs) -> None:  # type: ignore[no-untyped-def]
-            assert kwargs["timeout"] == 10
+            connect_kwargs.update(kwargs)
 
         def reqMarketDataType(self, market_data_type: int) -> None:
             assert market_data_type == 1
@@ -139,6 +141,7 @@ def test_ib_connection_sets_a_bounded_synchronous_request_timeout(monkeypatch) -
 
     assert ib is not None
     assert ib.RequestTimeout == 10.0
+    assert connect_kwargs["timeout"] == 10
 
 
 def test_ib_market_requests_are_bounded_for_watchdog_budget(monkeypatch) -> None:

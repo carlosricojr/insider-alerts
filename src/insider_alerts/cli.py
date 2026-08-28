@@ -4474,6 +4474,12 @@ def ops_autopilot_watchdog(
         "--heartbeat-db",
     ),
     stale_seconds: int = typer.Option(300, "--stale-seconds", min=300),
+    quant_timeout_seconds: int = typer.Option(
+        120,
+        "--quant-timeout-seconds",
+        min=10,
+        max=900,
+    ),
     output_log_path: Path = typer.Option(  # noqa: B008
         Path("logs/autopilot-watchdog.log"),
         "--output-log",
@@ -4482,6 +4488,11 @@ def ops_autopilot_watchdog(
     """Restart the hidden autopilot worker when its durable progress is stale."""
 
     try:
+        validate_stale_threshold(
+            quant_timeout_seconds=quant_timeout_seconds,
+            stale_seconds=stale_seconds,
+            settings=get_settings(),
+        )
         result = run_autopilot_watchdog(
             heartbeat_db=heartbeat_db,
             worker_task_name=worker_task_name,

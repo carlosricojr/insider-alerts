@@ -83,7 +83,7 @@ $workerAction = New-ScheduledTaskAction `
   -WorkingDirectory $repoRoot
 $watchdogAction = New-ScheduledTaskAction `
   -Execute $pythonExe `
-  -Argument "-m insider_alerts.cli ops autopilot-watchdog --worker-task-name `"$WorkerTaskName`" --heartbeat-db `"$heartbeatDb`" --stale-seconds $StaleHeartbeatSeconds --output-log logs/autopilot-watchdog.log" `
+  -Argument "-m insider_alerts.cli ops autopilot-watchdog --worker-task-name `"$WorkerTaskName`" --heartbeat-db `"$heartbeatDb`" --stale-seconds $StaleHeartbeatSeconds --quant-timeout-seconds $QuantTimeoutSeconds --output-log logs/autopilot-watchdog.log" `
   -WorkingDirectory $repoRoot
 
 $watchdogLogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user

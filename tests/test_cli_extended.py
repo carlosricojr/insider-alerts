@@ -1250,6 +1250,46 @@ def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
     assert payload["worker_task_name"] == "Autopilot Worker"
 
 
+def test_cli_autopilot_watchdog_rejects_unsafe_config_before_task_control(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: cli.Settings(_env_file=None, SEC_TIMEOUT_SECONDS=120),
+    )
+
+    def forbidden(**_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("unsafe watchdog must not query or stop the worker")
+
+    monkeypatch.setattr(cli, "run_autopilot_watchdog", forbidden)
+    output_log = tmp_path / "autopilot-watchdog.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-watchdog",
+            "--worker-task-name",
+            "Autopilot Worker",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--stale-seconds",
+            "300",
+            "--quant-timeout-seconds",
+            "120",
+            "--output-log",
+            str(output_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(output_log.read_text(encoding="utf-8"))
+    assert payload["error_kind"] == "ValueError"
+    assert "heartbeat stale threshold" in payload["error_message"]
+
+
 def test_cli_autopilot_preflight_validates_budget_and_process_tree(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(cli, "get_settings", lambda: cli.Settings(_env_file=None))

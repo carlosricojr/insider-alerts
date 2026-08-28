@@ -9,9 +9,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-au
 The installer creates separate non-elevated per-user tasks named `Insider Alerts Autopilot
 Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent trigger, preventing
 startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
-restarts a worker only when its durable progress heartbeat is more than five minutes old. The
-installer and worker validate that this threshold exceeds every configured nominal timeout/retry
-stage plus database and cleanup margins. The heartbeat threshold is also the hard wall for a
+restarts a worker only when its durable progress heartbeat exceeds the configured stale threshold.
+That threshold is at least five minutes and may be longer when configured network or quant windows
+require it. The installer, worker, and watchdog validate the threshold against every configured
+nominal timeout/retry stage plus database and cleanup margins. It is also the hard wall for a
 slow-drip or otherwise hung external call.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs

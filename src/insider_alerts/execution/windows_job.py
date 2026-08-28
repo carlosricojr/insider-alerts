@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import os
-from typing import Protocol
+from typing import Any, Protocol
+
+_ctypes_windows: Any = ctypes
 
 
 class WindowsJobError(RuntimeError):
@@ -59,7 +61,7 @@ class _CtypesWindowsJobApi:
                 ("PeakJobMemoryUsed", ctypes.c_size_t),
             ]
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _ctypes_windows.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
         kernel32.CreateJobObjectW.restype = wintypes.HANDLE
         kernel32.SetInformationJobObject.argtypes = (
@@ -79,7 +81,7 @@ class _CtypesWindowsJobApi:
 
     @staticmethod
     def _raise_last_error(operation: str) -> None:
-        error_code = ctypes.get_last_error()
+        error_code = int(_ctypes_windows.get_last_error())
         raise WindowsJobError(f"{operation} failed with Windows error {error_code}")
 
     def create_job(self) -> int:
