@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from shutil import rmtree
+from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
 from typer.testing import CliRunner
 
 from insider_alerts import cli
@@ -969,6 +971,132 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
     assert decisions == ["approve", "deadletter"]
     assert notifications == ["approve"]
     assert "deadlettered=1" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("chain_status", "counter"),
+    [
+        ("succeeded", "option_chain_succeeded=1"),
+        ("skipped_cadence", "option_chain_skipped_cadence=1"),
+        ("failed", "option_chain_failed=1"),
+        ("timed_out", "option_chain_timed_out=1"),
+        ("admitted", "option_chain_ambiguous=1"),
+        ("exception", "option_chain_failed=1"),
+    ],
+)
+def test_cli_ops_autopilot_capture_is_causal_and_fail_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    chain_status: str,
+    counter: str,
+) -> None:
+    runner = CliRunner()
+    monkeypatch.setattr(
+        cli,
+        "_load_conviction_history",
+        lambda *args, **kwargs: cli._empty_conviction_history(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_poll_once",
+        lambda settings, *, max_items, dry_run: PollResult(1, 1, 0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit: EnrichResult(scanned=1, updated=1),
+    )
+    monkeypatch.setattr(
+        cli,
+        "enqueue_review_packets",
+        lambda settings, *, limit: QueueResult(processed=1, enqueued=1),
+    )
+    packet_id = "0000905148-26-000640|0001824653|4"
+    monkeypatch.setattr(
+        cli,
+        "list_pending_review_packets",
+        lambda db_path, limit: [
+            {
+                "packet_id": packet_id,
+                "payload": {
+                    "issuer_symbol": "ABC",
+                    "score": 100.0,
+                    "rationale": {
+                        "net_buy_shares": 5000.0,
+                        "open_market_buy_shares": 5000.0,
+                        "open_market_gross_value": 1_000_000.0,
+                        "holding_change_ratio": 0.5,
+                        "trade_pct_daily_turnover": 0.5,
+                    },
+                },
+            }
+        ],
+    )
+    events: list[str] = []
+
+    def fake_capture(config, *, packet_id: str, symbol: str):  # type: ignore[no-untyped-def]
+        events.append("capture")
+        assert symbol == "ABC"
+        assert config.chain_store_db == tmp_path / "chain.db"
+        if chain_status == "exception":
+            raise RuntimeError("research-only failure")
+        return SimpleNamespace(
+            status=chain_status,
+            batch_id="insider-batch",
+            exit_code=0 if chain_status == "succeeded" else 2,
+            error_kind=None if chain_status == "succeeded" else "TEST_FAILURE",
+        )
+
+    monkeypatch.setattr(cli, "capture_predecision_option_chain", fake_capture)
+    applied: list[dict[str, object]] = []
+
+    def fake_apply(db_path: str, payload: dict[str, object]) -> int:
+        events.append("apply")
+        applied.append(dict(payload))
+        return 1
+
+    monkeypatch.setattr(cli, "apply_decision", fake_apply)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+            "--no-notify",
+            "--alpha-chain-python",
+            str(tmp_path / "python.exe"),
+            "--alpha-chain-script",
+            str(tmp_path / "capture.py"),
+            "--option-chain-store-db",
+            str(tmp_path / "chain.db"),
+            "--error-log",
+            str(tmp_path / "errors.log"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception
+    assert events == ["capture", "apply"]
+    assert [payload["decision"] for payload in applied] == ["approve"]
+    assert counter in result.stdout
+
+
+def test_cli_ops_autopilot_requires_complete_chain_configuration(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--alpha-chain-python",
+            str(tmp_path / "python.exe"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "must be provided together" in result.stderr
 
 
 def test_cli_ops_autopilot_once_exits_on_sec_http_error(
