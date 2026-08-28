@@ -17,7 +17,7 @@ if ($RecoveryIntervalMinutes -lt 1) {
 if ($QuantTimeoutSeconds -lt 10 -or $QuantTimeoutSeconds -gt 900) {
   throw "QuantTimeoutSeconds must be between 10 and 900."
 }
-$minimumStaleHeartbeatSeconds = [Math]::Max(300, $QuantTimeoutSeconds + 70)
+$minimumStaleHeartbeatSeconds = [Math]::Max(300, $QuantTimeoutSeconds + 80)
 if ($StaleHeartbeatSeconds -lt $minimumStaleHeartbeatSeconds) {
   throw "StaleHeartbeatSeconds must be at least $minimumStaleHeartbeatSeconds."
 }
@@ -25,6 +25,7 @@ if ($StaleHeartbeatSeconds -lt $minimumStaleHeartbeatSeconds) {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
 $pythonExe = Join-Path $repoRoot ".venv\Scripts\pythonw.exe"
+$pythonConsoleExe = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $researchRoot = Join-Path $repoRoot "data\research"
 New-Item -ItemType Directory -Path $researchRoot -Force | Out-Null
 $chainStoreDb = Join-Path $researchRoot "option_chain_feed.db"
@@ -41,6 +42,9 @@ $alphaChainScript = Join-Path $alphaRootResolved "scripts\capture_insider_option
 if (-not (Test-Path $pythonExe)) {
   throw "Missing windowless virtualenv Python at $pythonExe"
 }
+if (-not (Test-Path $pythonConsoleExe)) {
+  throw "Missing virtualenv Python at $pythonConsoleExe"
+}
 
 if (-not (Test-Path -LiteralPath $alphaPython -PathType Leaf)) {
   throw "Missing alpha runtime interpreter at $alphaPython"
@@ -52,6 +56,13 @@ if (-not (Test-Path -LiteralPath $alphaChainScript -PathType Leaf)) {
 
 if (-not (Test-Path (Join-Path $repoRoot ".env"))) {
   throw "Missing .env at $repoRoot\.env"
+}
+
+& $pythonConsoleExe -m insider_alerts.cli ops autopilot-config-validate `
+  --quant-timeout-seconds $QuantTimeoutSeconds `
+  --heartbeat-stale-seconds $StaleHeartbeatSeconds
+if ($LASTEXITCODE -ne 0) {
+  throw "Autopilot watchdog preflight failed."
 }
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name

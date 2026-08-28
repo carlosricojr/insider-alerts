@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS = 10.0
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -54,66 +56,43 @@ class Settings(BaseSettings):
         default="insider-alerts/0.2 (contact: sec-access@example.com)",
         alias="SEC_USER_AGENT",
     )
-    sec_timeout_seconds: float = Field(
-        default=15.0,
-        alias="SEC_TIMEOUT_SECONDS",
-        gt=0,
-        le=20,
-    )
+    sec_timeout_seconds: float = Field(default=15.0, alias="SEC_TIMEOUT_SECONDS", gt=0)
     sec_rate_limit_per_second: float = Field(
         default=5.0,
         alias="SEC_RATE_LIMIT_PER_SECOND",
-        ge=1,
+        gt=0,
         le=10,
     )
-    sec_retry_attempts: int = Field(
-        default=4,
-        alias="SEC_RETRY_ATTEMPTS",
-        ge=1,
-        le=4,
-    )
-    sec_retry_min_seconds: float = Field(
-        default=0.25,
-        alias="SEC_RETRY_MIN_SECONDS",
-        ge=0,
-        le=3,
-    )
-    sec_retry_max_seconds: float = Field(
-        default=3.0,
-        alias="SEC_RETRY_MAX_SECONDS",
-        ge=0,
-        le=3,
-    )
+    sec_retry_attempts: int = Field(default=4, alias="SEC_RETRY_ATTEMPTS", ge=1)
+    sec_retry_min_seconds: float = Field(default=0.25, alias="SEC_RETRY_MIN_SECONDS", ge=0)
+    sec_retry_max_seconds: float = Field(default=3.0, alias="SEC_RETRY_MAX_SECONDS", ge=0)
     market_context_enabled: bool = Field(default=False, alias="MARKET_CONTEXT_ENABLED")
     market_data_timeout_seconds: float = Field(
         default=10.0,
         alias="MARKET_DATA_TIMEOUT_SECONDS",
         gt=0,
-        le=10,
     )
     market_data_rate_limit_per_second: float = Field(
         default=1.0,
         alias="MARKET_DATA_RATE_LIMIT_PER_SECOND",
-        ge=1,
+        gt=0,
         le=5,
     )
     market_data_retry_attempts: int = Field(
         default=3,
         alias="MARKET_DATA_RETRY_ATTEMPTS",
         ge=1,
-        le=3,
+        le=10,
     )
     market_data_retry_min_seconds: float = Field(
         default=0.5,
         alias="MARKET_DATA_RETRY_MIN_SECONDS",
         ge=0,
-        le=3,
     )
     market_data_retry_max_seconds: float = Field(
         default=3.0,
         alias="MARKET_DATA_RETRY_MAX_SECONDS",
         ge=0,
-        le=3,
     )
     market_earnings_shock_drop_threshold: float = Field(
         default=0.08,

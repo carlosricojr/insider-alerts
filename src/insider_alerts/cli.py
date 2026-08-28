@@ -75,6 +75,7 @@ from insider_alerts.execution.autopilot_watchdog import (
     AutopilotHealthStore,
     RuntimeOwnershipError,
     autopilot_health_status,
+    autopilot_runtime_budget,
     run_autopilot_watchdog,
     validate_stale_threshold,
 )
@@ -91,6 +92,7 @@ from insider_alerts.execution.canary import (
 )
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
+from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier, NtfyTransportEvent
 from insider_alerts.research.bar_feed import bar_feed_status
 from insider_alerts.research.capture import capture_status, resolve_git_commit
@@ -3313,6 +3315,7 @@ def ops_autopilot(
             validate_stale_threshold(
                 quant_timeout_seconds=quant_timeout_seconds,
                 stale_seconds=heartbeat_stale_seconds,
+                settings=settings,
             )
         except ValueError as exc:
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
@@ -3808,6 +3811,8 @@ def ops_autopilot(
     try:
         startup_fingerprint: str | None = None
         if health_store is not None:
+            if not once:
+                ensure_kill_on_close_process_tree()
             startup_fingerprint = runtime_source_fingerprint()
             health_store.register_runtime(
                 runtime_id=runtime_id,
@@ -4407,6 +4412,39 @@ def ops_autopilot_watchdog(
             append_watchdog_log(output_log_path, failure)
         raise
     append_watchdog_log(output_log_path, result)
+
+
+@ops_app.command("autopilot-config-validate")
+def ops_autopilot_config_validate(
+    quant_timeout_seconds: int = typer.Option(120, "--quant-timeout-seconds", min=10, max=900),
+    heartbeat_stale_seconds: int = typer.Option(
+        300,
+        "--heartbeat-stale-seconds",
+        min=300,
+    ),
+) -> None:
+    """Preflight watchdog budgets and Windows descendant-tree ownership."""
+
+    settings = get_settings()
+    try:
+        validate_stale_threshold(
+            quant_timeout_seconds=quant_timeout_seconds,
+            stale_seconds=heartbeat_stale_seconds,
+            settings=settings,
+        )
+        ensure_kill_on_close_process_tree()
+    except (RuntimeError, ValueError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(
+        json.dumps(
+            autopilot_runtime_budget(
+                settings=settings,
+                quant_timeout_seconds=quant_timeout_seconds,
+            ),
+            sort_keys=True,
+        )
+    )
 
 
 @ops_app.command("autopilot-health-status")

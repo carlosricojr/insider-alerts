@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import os
 import sqlite3
 import subprocess
@@ -11,8 +12,15 @@ from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
+from insider_alerts.config import AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS, Settings
+from insider_alerts.research.option_chain_admission import OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
+
 AUTOPILOT_HEALTH_SCHEMA_VERSION = 1
 MIN_STALE_SECONDS = 300
+STALE_SAFETY_MARGIN_SECONDS = 70
+SQLITE_STAGE_BUDGET_SECONDS = 200.0
+NOTIFICATION_OBSERVER_BUDGET_SECONDS = 10.0
+SCHEDULER_CONTROL_TIMEOUT_SECONDS = 10.0
 MAX_STAGE_LENGTH = 80
 MAX_ERROR_LENGTH = 1000
 
@@ -287,20 +295,30 @@ def _task_is_running(result: subprocess.CompletedProcess[str]) -> bool:
 
 
 def _run_schtasks(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["schtasks.exe", *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        return subprocess.run(
+            ["schtasks.exe", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SCHEDULER_CONTROL_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        operation = arguments[0] if arguments else "unknown"
+        raise RuntimeError(
+            f"scheduled task control {operation} timed out after "
+            f"{SCHEDULER_CONTROL_TIMEOUT_SECONDS:g} seconds"
+        ) from exc
 
 
 def quarantine_corrupt_health_store(path: Path | str, *, now: datetime) -> list[str]:
     store_path = Path(path).resolve()
     token = _stamp(now).replace(":", "").replace("-", "").replace(".", "")
     moved: list[str] = []
-    for suffix in ("", "-wal", "-shm"):
+    # Preserve the corrupt main file until every sidecar is safely out of the way. If any move
+    # fails, the next watchdog still sees a corrupt main store and retries quarantine.
+    for suffix in ("-wal", "-shm", ""):
         source = Path(f"{store_path}{suffix}")
         if not source.exists():
             continue
@@ -398,8 +416,70 @@ def autopilot_health_status(path: Path | str) -> dict[str, object]:
     return {"exists": True, "valid": True, "health": health}
 
 
-def validate_stale_threshold(*, quant_timeout_seconds: int, stale_seconds: int) -> None:
-    minimum = max(MIN_STALE_SECONDS, quant_timeout_seconds + 70)
+def autopilot_runtime_budget(
+    *,
+    settings: Settings,
+    quant_timeout_seconds: int,
+) -> dict[str, float | int]:
+    """Return conservative single-stage blocking budgets used by watchdog validation."""
+
+    sec_window = settings.sec_retry_attempts * (
+        settings.sec_timeout_seconds + 1 / settings.sec_rate_limit_per_second
+    ) + (settings.sec_retry_attempts - 1) * settings.sec_retry_max_seconds
+    ib_window = settings.market_data_retry_attempts * (
+        3 * AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
+        + 1 / settings.market_data_rate_limit_per_second
+    ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
+    yahoo_window = settings.market_data_retry_attempts * (
+        settings.market_data_timeout_seconds
+        + 1 / settings.market_data_rate_limit_per_second
+    ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
+    review_item_window = sec_window + ib_window + yahoo_window
+    notification_window = (
+        settings.ntfy_retry_attempts * settings.ntfy_timeout_seconds
+        + (settings.ntfy_retry_attempts - 1) * settings.ntfy_retry_max_seconds
+        + OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
+        + NOTIFICATION_OBSERVER_BUDGET_SECONDS
+    )
+    quant_window = quant_timeout_seconds + 10
+    maximum_stage = max(
+        sec_window,
+        review_item_window,
+        notification_window,
+        quant_window,
+        SQLITE_STAGE_BUDGET_SECONDS,
+    )
+    required_stale = max(
+        MIN_STALE_SECONDS,
+        math.ceil(maximum_stage + STALE_SAFETY_MARGIN_SECONDS),
+    )
+    return {
+        "sec_window_seconds": round(sec_window, 3),
+        "review_item_window_seconds": round(review_item_window, 3),
+        "notification_window_seconds": round(notification_window, 3),
+        "quant_window_seconds": quant_window,
+        "sqlite_window_seconds": SQLITE_STAGE_BUDGET_SECONDS,
+        "maximum_stage_seconds": round(maximum_stage, 3),
+        "required_stale_seconds": required_stale,
+    }
+
+
+def validate_stale_threshold(
+    *,
+    quant_timeout_seconds: int,
+    stale_seconds: int,
+    settings: Settings | None = None,
+) -> None:
+    minimum = (
+        int(
+            autopilot_runtime_budget(
+                settings=settings,
+                quant_timeout_seconds=quant_timeout_seconds,
+            )["required_stale_seconds"]
+        )
+        if settings is not None
+        else max(MIN_STALE_SECONDS, quant_timeout_seconds + 80)
+    )
     if stale_seconds < minimum:
         raise ValueError(
             f"heartbeat stale threshold must be at least {minimum} seconds "

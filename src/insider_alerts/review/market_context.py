@@ -19,11 +19,12 @@ from urllib.parse import quote as url_quote
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from insider_alerts.config import AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
+
 logger = logging.getLogger(__name__)
 
 # Fallback-only HTTP source. Primary is IB Gateway (see _IBBarSource).
 _YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
-_IB_REQUEST_TIMEOUT_SECONDS = 10.0
 
 # IB Gateway is the authoritative feed on this host: it is authenticated, always-on, and the
 # same source the rest of the stack trades against. Verified 2026-08-11 to cover the full
@@ -78,12 +79,12 @@ class _IBBarSource:
             ib = IB()
             # ib_async otherwise lets synchronous requests wait forever. Keep both contract
             # qualification and historical bars inside the autopilot watchdog budget.
-            ib.RequestTimeout = _IB_REQUEST_TIMEOUT_SECONDS
+            ib.RequestTimeout = AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
             ib.connect(
                 cls._host,
                 cls._port,
                 clientId=cls._client_id,
-                timeout=10,
+                timeout=AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS,
                 readonly=True,
             )
             ib.reqMarketDataType(1)
@@ -123,7 +124,7 @@ class _IBBarSource:
                     "TRADES",
                     useRTH=True,
                     formatDate=2,
-                    timeout=_IB_REQUEST_TIMEOUT_SECONDS,
+                    timeout=AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("IB bar fetch failed for %s: %s", symbol, exc)

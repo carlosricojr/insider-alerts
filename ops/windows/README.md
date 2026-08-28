@@ -10,14 +10,15 @@ The installer creates separate non-elevated per-user tasks named `Insider Alerts
 Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent trigger, preventing
 startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
 restarts a worker only when its durable progress heartbeat is more than five minutes old. The
-worker validates that this threshold exceeds the configured quant-process timeout with a safety
-margin.
+installer and worker validate that this threshold exceeds every configured blocking/retry stage
+with a safety margin.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
 highest-privilege execution.
 
-Both tasks launch the virtualenv's `pythonw.exe` directly, so they never create a console window
-and Task Scheduler retains ownership of each complete process chain. The worker reads `.env`,
+Both tasks launch the virtualenv's `pythonw.exe` directly, so they never create a console window.
+The worker owns its complete descendant tree in a kill-on-close Windows Job Object, so ending a
+hung worker also ends quant and option-capture children before replacement. The worker reads `.env`,
 writes to `logs\autopilot.out.log` and
 `logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
 default. The watchdog writes only bounded operational metadata to

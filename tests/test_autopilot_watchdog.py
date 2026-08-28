@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from insider_alerts.execution import autopilot_watchdog
 from insider_alerts.execution.autopilot_watchdog import (
     AutopilotHealthStore,
     RuntimeOwnershipError,
     autopilot_health_status,
     heartbeat_state,
+    quarantine_corrupt_health_store,
     run_autopilot_watchdog,
     validate_stale_threshold,
 )
@@ -260,6 +262,16 @@ def test_watchdog_propagates_query_failure_without_starting(tmp_path: Path) -> N
     assert [call[0] for call in calls] == ["/Query"]
 
 
+def test_scheduled_task_control_timeout_is_bounded_and_actionable(monkeypatch) -> None:
+    def timeout(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise subprocess.TimeoutExpired("schtasks.exe", 10)
+
+    monkeypatch.setattr(autopilot_watchdog.subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match=r"control /Query timed out after 10 seconds"):
+        autopilot_watchdog._run_schtasks(["/Query", "/TN", "Autopilot Worker"])
+
+
 def test_watchdog_propagates_start_failure(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 
@@ -337,6 +349,36 @@ def test_watchdog_quarantines_corrupt_store_only_when_worker_is_stopped(
     assert isinstance(quarantined, list) and len(quarantined) == 1
     assert Path(quarantined[0]).read_bytes() == b"not sqlite"
     assert not path.exists()
+
+
+def test_quarantine_preserves_main_store_until_sidecars_are_moved(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
+    path = tmp_path / "health.db"
+    path.write_bytes(b"corrupt main")
+    Path(f"{path}-wal").write_bytes(b"wal")
+    Path(f"{path}-shm").write_bytes(b"shm")
+    real_replace = autopilot_watchdog.os.replace
+    moves: list[str] = []
+
+    def fail_on_main(source, destination) -> None:  # type: ignore[no-untyped-def]
+        source_path = Path(source)
+        moves.append(source_path.name)
+        if source_path == path:
+            raise OSError("main quarantine denied")
+        real_replace(source_path, destination)
+
+    monkeypatch.setattr(autopilot_watchdog.os, "replace", fail_on_main)
+
+    with pytest.raises(OSError, match="main quarantine denied"):
+        quarantine_corrupt_health_store(path, now=now)
+
+    assert moves == ["health.db-wal", "health.db-shm", "health.db"]
+    assert path.read_bytes() == b"corrupt main"
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
 
 
 def test_heartbeat_state_classifies_empty_and_malformed_stores_as_corrupt(

@@ -325,7 +325,11 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert '"Insider Alerts Autopilot Worker"' in installer
     assert "--heartbeat-db" in installer
     assert "--heartbeat-stale-seconds $StaleHeartbeatSeconds" in installer
-    assert "[Math]::Max(300, $QuantTimeoutSeconds + 70)" in installer
+    assert "[Math]::Max(300, $QuantTimeoutSeconds + 80)" in installer
+    assert "ops autopilot-config-validate" in installer
+    assert installer.index("ops autopilot-config-validate") < installer.index(
+        "Stop-TaskAndWait -Name $TaskName"
+    )
     assert "ops autopilot-watchdog" in installer
     assert "--worker-task-name `\"$WorkerTaskName`\"" in installer
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 1)" in installer

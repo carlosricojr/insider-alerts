@@ -1245,6 +1245,106 @@ def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
     assert payload["worker_task_name"] == "Autopilot Worker"
 
 
+def test_cli_autopilot_preflight_validates_budget_and_process_tree(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "get_settings", lambda: cli.Settings(_env_file=None))
+    monkeypatch.setattr(
+        cli,
+        "ensure_kill_on_close_process_tree",
+        lambda: calls.append("job"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-config-validate",
+            "--quant-timeout-seconds",
+            "120",
+            "--heartbeat-stale-seconds",
+            "300",
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception
+    assert calls == ["job"]
+    assert json.loads(result.stdout)["required_stale_seconds"] == 300
+
+
+def test_cli_autopilot_preflight_fails_before_process_tree_for_unsafe_budget(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: cli.Settings(_env_file=None, SEC_TIMEOUT_SECONDS=120),
+    )
+    monkeypatch.setattr(
+        cli,
+        "ensure_kill_on_close_process_tree",
+        lambda: calls.append("job"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-config-validate",
+            "--quant-timeout-seconds",
+            "120",
+            "--heartbeat-stale-seconds",
+            "300",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "heartbeat stale threshold" in result.stderr
+    assert calls == []
+
+
+def test_cli_autopilot_loop_logs_process_tree_ownership_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    poll_called = False
+
+    def fail_job() -> None:
+        raise RuntimeError("job ownership denied")
+
+    def forbidden_poll(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal poll_called
+        poll_called = True
+        raise AssertionError("worker must stop before polling")
+
+    monkeypatch.setattr(cli, "ensure_kill_on_close_process_tree", fail_job)
+    monkeypatch.setattr(cli, "run_sec_poll_once", forbidden_poll)
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--loop",
+            "--decision-engine",
+            "rules",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "300",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert poll_called is False
+    assert "autopilot process failed (RuntimeError: job ownership denied)" in (
+        error_log.read_text(encoding="utf-8")
+    )
+
+
 def test_cli_ops_autopilot_exits_after_persistent_heartbeat_write_failure(
     monkeypatch,
     tmp_path: Path,
@@ -1459,6 +1559,7 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     )
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
     monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: next(fingerprints))
+    monkeypatch.setattr(cli, "ensure_kill_on_close_process_tree", lambda: None)
     monkeypatch.setattr(
         cli.time,
         "sleep",

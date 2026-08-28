@@ -2,6 +2,11 @@ import pytest
 from pydantic import ValidationError
 
 from insider_alerts.config import Settings
+from insider_alerts.execution.autopilot_watchdog import (
+    autopilot_runtime_budget,
+    validate_stale_threshold,
+)
+from insider_alerts.research.history_worker import _parser as history_worker_parser
 
 
 def test_config_defaults(monkeypatch) -> None:
@@ -100,53 +105,36 @@ def test_config_bounds_notification_duration_below_minimum_watchdog_staleness() 
         )
 
 
-@pytest.mark.parametrize(
-    ("override", "value"),
-    [
-        ("SEC_TIMEOUT_SECONDS", 21),
-        ("SEC_RATE_LIMIT_PER_SECOND", 0.9),
-        ("SEC_RETRY_ATTEMPTS", 5),
-        ("SEC_RETRY_MAX_SECONDS", 4),
-        ("MARKET_DATA_TIMEOUT_SECONDS", 11),
-        ("MARKET_DATA_RATE_LIMIT_PER_SECOND", 0.9),
-        ("MARKET_DATA_RETRY_ATTEMPTS", 4),
-        ("MARKET_DATA_RETRY_MAX_SECONDS", 4),
-    ],
-)
-def test_config_rejects_network_windows_outside_watchdog_budget(
-    override: str,
-    value: float,
-) -> None:
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, **{override: value})
+def test_history_worker_timeout_remains_valid_outside_watchdog_runtime() -> None:
+    timeout = history_worker_parser().parse_args([]).timeout
+    assert timeout == 120
+    assert Settings(_env_file=None, SEC_TIMEOUT_SECONDS=timeout).sec_timeout_seconds == 120
 
 
-def test_maximum_network_windows_fit_below_five_minute_watchdog_floor() -> None:
-    settings = Settings(
-        _env_file=None,
-        SEC_TIMEOUT_SECONDS=20,
-        SEC_RATE_LIMIT_PER_SECOND=1,
-        SEC_RETRY_ATTEMPTS=4,
-        SEC_RETRY_MIN_SECONDS=3,
-        SEC_RETRY_MAX_SECONDS=3,
-        MARKET_DATA_TIMEOUT_SECONDS=10,
-        MARKET_DATA_RATE_LIMIT_PER_SECOND=1,
-        MARKET_DATA_RETRY_ATTEMPTS=3,
-        MARKET_DATA_RETRY_MIN_SECONDS=3,
-        MARKET_DATA_RETRY_MAX_SECONDS=3,
+def test_default_network_windows_fit_five_minute_watchdog_floor() -> None:
+    settings = Settings(_env_file=None)
+    budget = autopilot_runtime_budget(settings=settings, quant_timeout_seconds=120)
+
+    assert float(budget["maximum_stage_seconds"]) <= 230
+    assert budget["required_stale_seconds"] == 300
+    validate_stale_threshold(
+        settings=settings,
+        quant_timeout_seconds=120,
+        stale_seconds=300,
     )
-    sec_window = settings.sec_retry_attempts * (
-        settings.sec_timeout_seconds + 1 / settings.sec_rate_limit_per_second
-    ) + (settings.sec_retry_attempts - 1) * settings.sec_retry_max_seconds
-    ib_window = settings.market_data_retry_attempts * (
-        20 + 1 / settings.market_data_rate_limit_per_second
-    ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
-    yahoo_window = settings.market_data_retry_attempts * (
-        settings.market_data_timeout_seconds
-        + 1 / settings.market_data_rate_limit_per_second
-    ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
 
-    assert sec_window + ib_window + yahoo_window <= 230
+
+def test_long_network_settings_require_a_larger_autopilot_stale_threshold() -> None:
+    settings = Settings(_env_file=None, SEC_TIMEOUT_SECONDS=120)
+    budget = autopilot_runtime_budget(settings=settings, quant_timeout_seconds=120)
+
+    assert int(budget["required_stale_seconds"]) > 300
+    with pytest.raises(ValueError, match="heartbeat stale threshold"):
+        validate_stale_threshold(
+            settings=settings,
+            quant_timeout_seconds=120,
+            stale_seconds=300,
+        )
 
 
 def test_config_rejects_inverted_sec_retry_bounds() -> None:
