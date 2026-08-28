@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
 import time
 from bisect import bisect_right
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal, cast
 
@@ -78,10 +82,17 @@ from insider_alerts.execution.canary import (
 )
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
-from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier
+from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier, NtfyTransportEvent
 from insider_alerts.research.bar_feed import bar_feed_status
-from insider_alerts.research.capture import capture_status
+from insider_alerts.research.capture import capture_status, resolve_git_commit
 from insider_alerts.research.diagnostics import diagnostic_status
+from insider_alerts.research.notification_transport import (
+    NotificationJournalConfig,
+    NotificationTransportJournal,
+    activate_notification_journal,
+    notification_journal_status,
+    notification_transport_id,
+)
 from insider_alerts.research.option_chain_admission import (
     OptionChainAdmissionConfig,
     capture_predecision_option_chain,
@@ -1854,6 +1865,7 @@ def _send_review_notification(
     dry_message: str | None = None,
 ) -> None:
     notifier = NtfyNotifier(settings)
+    observer, observer_error_handler = _notification_transport_observer(settings, payload)
     decision = payload.get("decision", "")
     if decision == "approve" and packet is not None:
         title, message, tags, priority = _build_trade_signal_notification(packet, payload)
@@ -1863,6 +1875,8 @@ def _send_review_notification(
             tags=tags,
             priority=priority,
             markdown=True,
+            observer=observer,
+            observer_error_handler=observer_error_handler,
         )
         return
 
@@ -1875,7 +1889,75 @@ def _send_review_notification(
         tags=["insider-alerts", "review"],
         priority=3,
         markdown=False,
+        observer=observer,
+        observer_error_handler=observer_error_handler,
     )
+
+
+def _notification_transport_database(settings: Settings) -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    database = Path(settings.notification_transport_db)
+    if not database.is_absolute():
+        database = repo_root / database
+    return database
+
+
+@lru_cache(maxsize=8)
+def _notification_runtime_git_commit(repo_root: Path) -> str:
+    """Bind events to the source loaded by this process without per-alert subprocesses."""
+
+    return resolve_git_commit(repo_root, timeout_seconds=1)
+
+
+def _notification_transport_config(settings: Settings) -> NotificationJournalConfig:
+    repo_root = Path(__file__).resolve().parents[2]
+    database = _notification_transport_database(settings)
+    policy = Path(settings.notification_transport_policy_path)
+    if not policy.is_absolute():
+        policy = repo_root / policy
+    return NotificationJournalConfig(
+        database=database,
+        research_root=repo_root / "data" / "research",
+        policy_path=policy,
+        policy_root=repo_root / "docs" / "research" / "contracts",
+        runtime_git_commit=_notification_runtime_git_commit(repo_root),
+    )
+
+
+def _notification_transport_observer(
+    settings: Settings, payload: dict[str, str]
+) -> tuple[
+    Callable[[NtfyTransportEvent], None] | None,
+    Callable[[Exception], None] | None,
+]:
+    error_log = Path(__file__).resolve().parents[2] / "logs" / "notification-transport.err.log"
+
+    def capture_error(exc: Exception) -> None:
+        with contextlib.suppress(OSError):
+            error_log.parent.mkdir(parents=True, exist_ok=True)
+            with error_log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{datetime.now(UTC).isoformat()} notification transport capture "
+                    f"isolated: {type(exc).__name__}\n"
+                )
+
+    packet_id = payload.get("packet_id", "").strip()
+    if not packet_id:
+        return None, None
+    try:
+        if not _notification_transport_database(settings).is_file():
+            return None, None
+        config = _notification_transport_config(settings)
+        journal = NotificationTransportJournal(config)
+        transport_id = notification_transport_id(packet_id, secrets.token_hex(32))
+    except Exception as exc:
+        capture_error(exc)
+        return None, capture_error
+
+    def observe(event: NtfyTransportEvent) -> None:
+        journal.append(packet_id=packet_id, transport_id=transport_id, event=event)
+
+    return observe, capture_error
 
 
 @notify_app.command("test")
@@ -4011,6 +4093,40 @@ def ops_live_canary_status(
     """Show canary state without connecting to IBKR or changing broker state."""
 
     typer.echo(json.dumps(live_canary_status_report(str(ledger_path)), indent=2, sort_keys=True))
+
+
+@ops_app.command("notification-journal-activate")
+def ops_notification_journal_activate(
+    activation_at_utc: str = typer.Option(..., "--activation-at-utc"),
+) -> None:
+    """Seal the capture-only ntfy transport boundary without sending a message."""
+
+    try:
+        activated_at = datetime.fromisoformat(activation_at_utc.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise typer.BadParameter("activation timestamp must be ISO-8601") from exc
+    if activated_at.tzinfo is None:
+        raise typer.BadParameter("activation timestamp must include a UTC offset")
+    settings = get_settings()
+    result = activate_notification_journal(
+        _notification_transport_config(settings),
+        activated_at_utc=activated_at.astimezone(UTC),
+    )
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
+@ops_app.command("notification-journal-status")
+def ops_notification_journal_status() -> None:
+    """Validate capture-only ntfy transport custody without sending a message."""
+
+    settings = get_settings()
+    typer.echo(
+        json.dumps(
+            notification_journal_status(_notification_transport_config(settings)),
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 @ops_app.command("research-capture-status")

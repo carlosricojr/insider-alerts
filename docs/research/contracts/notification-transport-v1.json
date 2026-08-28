@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "contract_id": "ntfy-transport-journal-v1",
+  "purpose": "capture_only_future_research",
+  "current_trial_decision_use": "prohibited",
+  "activation_boundary": "request_started_at_utc_gte_journal_activation",
+  "semantics": {
+    "request_started": "local_http_attempt_start",
+    "response_received": "ntfy_server_http_response_not_device_delivery",
+    "transport_failed": "local_transport_exception_without_message",
+    "client_received": "unavailable_without_subscriber_instrumentation",
+    "unmatched_start": "outcome_unknown_after_crash_or_observer_failure"
+  },
+  "delivery_behavior": {
+    "adds_retries": false,
+    "changes_headers": false,
+    "changes_payload": false,
+    "changes_provider_idempotency": false
+  },
+  "stored_fields": [
+    "packet_id",
+    "transport_id",
+    "attempt_number",
+    "phase",
+    "occurred_at_utc",
+    "request_body_sha256",
+    "route_sha256",
+    "http_status",
+    "response_body_sha256",
+    "provider_message_id",
+    "provider_message_time",
+    "exception_class",
+    "runtime_git_commit",
+    "policy_sha256"
+  ],
+  "prohibited_plaintext": [
+    "url",
+    "topic",
+    "authorization",
+    "token",
+    "message_body",
+    "title",
+    "tags",
+    "exception_message",
+    "raw_response"
+  ],
+  "isolation": {
+    "modifies_active_evidence_snapshot": false,
+    "reads_trial_outcomes": false,
+    "affects_enrollment": false,
+    "affects_live_orders": false,
+    "blocks_notification_on_capture_failure": false
+  }
+}

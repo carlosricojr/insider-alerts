@@ -12,6 +12,8 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("NTFY_RETRY_ATTEMPTS", raising=False)
     monkeypatch.delenv("NTFY_RETRY_MIN_SECONDS", raising=False)
     monkeypatch.delenv("NTFY_RETRY_MAX_SECONDS", raising=False)
+    monkeypatch.delenv("NOTIFICATION_TRANSPORT_DB", raising=False)
+    monkeypatch.delenv("NOTIFICATION_TRANSPORT_POLICY_PATH", raising=False)
     monkeypatch.delenv("SEC_RSS_URL", raising=False)
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     monkeypatch.delenv("SEC_TIMEOUT_SECONDS", raising=False)
@@ -37,6 +39,10 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.ntfy_retry_attempts == 3
     assert settings.ntfy_retry_min_seconds == 0.5
     assert settings.ntfy_retry_max_seconds == 3.0
+    assert settings.notification_transport_db == "data/research/notification_transport.db"
+    assert settings.notification_transport_policy_path == (
+        "docs/research/contracts/notification-transport-v1.json"
+    )
     assert settings.sec_rate_limit_per_second == 5.0
     assert settings.market_context_enabled is False
     assert settings.market_data_timeout_seconds == 10.0
