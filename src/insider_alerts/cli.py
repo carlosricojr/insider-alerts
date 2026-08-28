@@ -71,6 +71,13 @@ from insider_alerts.backtest.signal_study import (
     matched_random_date_control,
 )
 from insider_alerts.config import Settings, get_settings
+from insider_alerts.execution.autopilot_watchdog import (
+    AutopilotHealthStore,
+    RuntimeOwnershipError,
+    autopilot_health_status,
+    run_autopilot_watchdog,
+    validate_stale_threshold,
+)
 from insider_alerts.execution.canary import (
     ARM_PHRASE,
     SOURCE_REVISION_CHECK_INTERVAL_SECONDS,
@@ -1414,6 +1421,7 @@ def _decide_packets_with_quant(
     quant_timeout_seconds: int,
     quant_thinking: str,
     quant_batch_size: int,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, AutoDecisionRuleResult], str | None]:
     backends = _resolve_quant_cmds()
     if not backends:
@@ -1467,6 +1475,8 @@ def _decide_packets_with_quant(
                 quant_thinking=quant_thinking,
             )
             backend_label = f"{quant_flavor}:{Path(quant_cmd).name}"
+            if progress_callback is not None:
+                progress_callback(f"quant_backend_{start}_started")
             try:
                 completed = subprocess.run(
                     args,
@@ -1481,6 +1491,9 @@ def _decide_packets_with_quant(
                     f"chunk[{start}:{start + len(chunk)}] {backend_label} failed: {exc}"
                 )
                 continue
+            finally:
+                if progress_callback is not None:
+                    progress_callback(f"quant_backend_{start}_finished")
 
             stdout = completed.stdout if isinstance(completed.stdout, str) else ""
             stderr = completed.stderr if isinstance(completed.stderr, str) else ""
@@ -3175,6 +3188,13 @@ def ops_autopilot(
     option_chain_store_db: Path | None = typer.Option(  # noqa: B008
         None, "--option-chain-store-db", hidden=True
     ),
+    heartbeat_db: Path | None = typer.Option(None, "--heartbeat-db", hidden=True),  # noqa: B008
+    heartbeat_stale_seconds: int | None = typer.Option(
+        None,
+        "--heartbeat-stale-seconds",
+        min=1,
+        hidden=True,
+    ),
 ) -> None:
     """
     Run SEC ingestion + auto-decision loop and notify for approved signals by default.
@@ -3281,6 +3301,22 @@ def ops_autopilot(
             err=True,
         )
         raise typer.Exit(code=2)
+    if (heartbeat_db is None) != (heartbeat_stale_seconds is None):
+        typer.secho(
+            "--heartbeat-db and --heartbeat-stale-seconds must be provided together",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if heartbeat_stale_seconds is not None:
+        try:
+            validate_stale_threshold(
+                quant_timeout_seconds=quant_timeout_seconds,
+                stale_seconds=heartbeat_stale_seconds,
+            )
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
     option_chain_config = (
         OptionChainAdmissionConfig(
             source_db=Path(settings.database_path),
@@ -3292,17 +3328,74 @@ def ops_autopilot(
         if all(value is not None for value in option_chain_values)
         else None
     )
+    health_store = AutopilotHealthStore(heartbeat_db) if heartbeat_db is not None else None
+    runtime_id = secrets.token_hex(16)
+    heartbeat_failure_count = 0
+
+    def _heartbeat(
+        stage: str,
+        *,
+        cycle_started: bool = False,
+        cycle_succeeded: bool = False,
+        error: BaseException | None = None,
+    ) -> None:
+        nonlocal heartbeat_failure_count
+        if health_store is None:
+            return
+        try:
+            health_store.progress(
+                runtime_id=runtime_id,
+                stage=stage,
+                now=datetime.now(UTC),
+                cycle_started=cycle_started,
+                cycle_succeeded=cycle_succeeded,
+                error=error,
+            )
+        except RuntimeOwnershipError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            heartbeat_failure_count += 1
+            if heartbeat_failure_count == 1:
+                append_process_log(
+                    error_log_path,
+                    f"autopilot heartbeat degraded ({type(exc).__name__}: {exc})",
+                )
+            if heartbeat_failure_count >= 3:
+                raise RuntimeError(
+                    "autopilot heartbeat unavailable for three consecutive progress writes"
+                ) from exc
+        else:
+            heartbeat_failure_count = 0
 
     def _run_cycle() -> AutoPilotCycleResult:
+        _heartbeat("cycle_started", cycle_started=True)
         poll_result = run_sec_poll_once(settings, max_items=poll_max_items, dry_run=False)
-        enrich_result = enrich_filings_with_xml_url(settings, limit=enrich_limit)
-        enqueue_result = enqueue_review_packets(settings, limit=enqueue_limit)
+        _heartbeat("sec_poll_completed")
+        if health_store is None:
+            enrich_result = enrich_filings_with_xml_url(settings, limit=enrich_limit)
+        else:
+            enrich_result = enrich_filings_with_xml_url(
+                settings,
+                limit=enrich_limit,
+                progress_callback=_heartbeat,
+            )
+        _heartbeat("enrichment_completed")
+        if health_store is None:
+            enqueue_result = enqueue_review_packets(settings, limit=enqueue_limit)
+        else:
+            enqueue_result = enqueue_review_packets(
+                settings,
+                limit=enqueue_limit,
+                progress_callback=_heartbeat,
+            )
+        _heartbeat("review_enqueue_completed")
         pending = list_pending_review_packets(settings.database_path, limit=decision_limit)
         conviction_history = _load_conviction_history(
             settings.database_path,
             as_of_date=date.today(),
             lookback_days=conviction_lookback_days,
         )
+        _heartbeat("history_loaded")
         baseline_rules: dict[str, AutoDecisionRuleResult] = {}
         for packet in pending:
             packet_id_obj = packet.get("packet_id")
@@ -3328,6 +3421,7 @@ def ops_autopilot(
                 director_turnover_min=director_turnover_min,
                 shock_turnover_min=shock_turnover_min,
             )
+        _heartbeat("baseline_completed")
         quant_decisions: dict[str, AutoDecisionRuleResult] = {}
         quant_error: str | None = None
         if decision_engine == "quant" and pending:
@@ -3345,13 +3439,23 @@ def ops_autopilot(
                 # still never reach the judge, which keeps the LLM cost on the ambiguous minority.
                 and baseline_rules[str(packet.get("packet_id"))].decision in ("approve", "escalate")
             ]
-            quant_decisions, quant_error = _decide_packets_with_quant(
-                quant_candidates,
-                quant_agent_id=quant_agent_id,
-                quant_timeout_seconds=quant_timeout_seconds,
-                quant_thinking=quant_thinking,
-                quant_batch_size=quant_batch_size,
-            )
+            if health_store is None:
+                quant_decisions, quant_error = _decide_packets_with_quant(
+                    quant_candidates,
+                    quant_agent_id=quant_agent_id,
+                    quant_timeout_seconds=quant_timeout_seconds,
+                    quant_thinking=quant_thinking,
+                    quant_batch_size=quant_batch_size,
+                )
+            else:
+                quant_decisions, quant_error = _decide_packets_with_quant(
+                    quant_candidates,
+                    quant_agent_id=quant_agent_id,
+                    quant_timeout_seconds=quant_timeout_seconds,
+                    quant_thinking=quant_thinking,
+                    quant_batch_size=quant_batch_size,
+                    progress_callback=_heartbeat,
+                )
             # OBSERVABILITY (2026-08-10): quant_error used to be consumed silently by the
             # fallback-to-baseline branch, so a dead decision engine looked identical to a quiet
             # market. That is how the judge stayed broken from ~May to Aug 2026 with a clean
@@ -3400,7 +3504,8 @@ def ops_autopilot(
         option_chain_timed_out = 0
         option_chain_ambiguous = 0
 
-        for packet in pending:
+        for packet_index, packet in enumerate(pending):
+            _heartbeat(f"decision_{packet_index}_started")
             packet_id_obj = packet.get("packet_id")
             if not isinstance(packet_id_obj, str):
                 continue
@@ -3670,12 +3775,14 @@ def ops_autopilot(
         )
         typer.echo(cycle_message)
         append_process_log(output_log_path, cycle_message)
+        _heartbeat("cycle_succeeded", cycle_succeeded=True)
         return cycle
 
     def _run_cycle_with_recovery(*, loop_mode: bool) -> AutoPilotCycleResult | None:
         try:
             return _run_cycle()
         except (SecHttpError, SecRssParseError) as exc:
+            _heartbeat("cycle_retryable_failure", error=exc)
             failure_message = f"ops autopilot cycle failed (retryable, {type(exc).__name__}: {exc})"
             typer.secho(
                 failure_message,
@@ -3690,6 +3797,7 @@ def ops_autopilot(
     def _source_changed_during_wait(startup_fingerprint: str) -> bool:
         remaining = float(interval)
         while remaining > 0:
+            _heartbeat("cycle_wait")
             if runtime_source_fingerprint() != startup_fingerprint:
                 return True
             sleep_seconds = min(SOURCE_REVISION_CHECK_INTERVAL_SECONDS, remaining)
@@ -3698,15 +3806,25 @@ def ops_autopilot(
         return runtime_source_fingerprint() != startup_fingerprint
 
     try:
+        startup_fingerprint: str | None = None
+        if health_store is not None:
+            startup_fingerprint = runtime_source_fingerprint()
+            health_store.register_runtime(
+                runtime_id=runtime_id,
+                source_fingerprint=startup_fingerprint,
+                now=datetime.now(UTC),
+            )
         if once:
             _run_cycle_with_recovery(loop_mode=False)
             return
-        startup_fingerprint = runtime_source_fingerprint()
+        if startup_fingerprint is None:
+            startup_fingerprint = runtime_source_fingerprint()
         _run_cycle_with_recovery(loop_mode=True)
         while True:
             if _source_changed_during_wait(startup_fingerprint):
+                _heartbeat("source_changed")
                 source_message = (
-                    "autopilot source changed; exiting so the hidden repeating task "
+                    "autopilot source changed; exiting so the hidden watchdog "
                     "can start a fresh worker"
                 )
                 typer.secho(source_message, fg=typer.colors.YELLOW, err=True)
@@ -3715,7 +3833,19 @@ def ops_autopilot(
             _run_cycle_with_recovery(loop_mode=True)
     except typer.Exit:
         raise
+    except RuntimeOwnershipError as exc:
+        failure_message = f"autopilot process stopped ({type(exc).__name__}: {exc})"
+        append_process_log(error_log_path, failure_message)
+        raise
     except Exception as exc:
+        try:
+            _heartbeat("process_failure", error=exc)
+        except Exception as heartbeat_exc:
+            append_process_log(
+                error_log_path,
+                "autopilot terminal heartbeat failed "
+                f"({type(heartbeat_exc).__name__}: {heartbeat_exc})",
+            )
         failure_message = f"autopilot process failed ({type(exc).__name__}: {exc})"
         append_process_log(error_log_path, failure_message)
         raise
@@ -4242,6 +4372,44 @@ def ops_live_canary_watchdog(
         stale_seconds=stale_seconds,
     )
     append_watchdog_log(output_log_path, result)
+
+
+@ops_app.command("autopilot-watchdog")
+def ops_autopilot_watchdog(
+    worker_task_name: str = typer.Option(..., "--worker-task-name"),
+    heartbeat_db: Path = typer.Option(  # noqa: B008
+        Path("data/autopilot_health.db"),
+        "--heartbeat-db",
+    ),
+    stale_seconds: int = typer.Option(300, "--stale-seconds", min=190),
+    output_log_path: Path = typer.Option(  # noqa: B008
+        Path("logs/autopilot-watchdog.log"),
+        "--output-log",
+    ),
+) -> None:
+    """Restart the hidden autopilot worker when its durable progress is stale."""
+
+    result = run_autopilot_watchdog(
+        heartbeat_db=heartbeat_db,
+        worker_task_name=worker_task_name,
+        stale_seconds=stale_seconds,
+    )
+    append_watchdog_log(output_log_path, result)
+
+
+@ops_app.command("autopilot-health-status")
+def ops_autopilot_health_status(
+    heartbeat_db: Path = typer.Option(  # noqa: B008
+        Path("data/autopilot_health.db"),
+        "--heartbeat-db",
+    ),
+) -> None:
+    """Show bounded autopilot liveness metadata without signal payloads."""
+
+    report = autopilot_health_status(heartbeat_db)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if not bool(report.get("valid", False)):
+        raise typer.Exit(code=3)
 
 
 if __name__ == "__main__":

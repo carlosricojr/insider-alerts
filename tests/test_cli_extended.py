@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -127,6 +128,8 @@ def test_cli_ops_deadletter(monkeypatch) -> None:
 
 def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -241,6 +244,8 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
 
 def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -343,6 +348,84 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
     assert notified[0]["reason"] == "Quant thesis: large insider open-market buy with unusual size."
 
 
+def test_quant_backend_publishes_progress_on_both_sides_of_bounded_call(
+    monkeypatch,
+) -> None:
+    packet_id = "0000905148-26-000640|0001824653|4"
+    packet = {
+        "packet_id": packet_id,
+        "payload": {"score": 50.0, "rationale": {}},
+    }
+    response = json.dumps(
+        {
+            "decisions": [
+                {
+                    "packet_id": "P00000",
+                    "decision": "reject",
+                    "why": "No measured edge.",
+                    "edge_hypothesis": "None.",
+                    "risk_flags": [],
+                    "evidence": {
+                        "role_tier": "unknown",
+                        "open_market_buy_shares": 0,
+                        "trade_pct_daily_turnover": 0,
+                        "novelty_penalty": 0,
+                        "regime_earnings_shock_flag": False,
+                    },
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("codex.exe", "codex")])
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, response, ""),
+    )
+    progress: list[str] = []
+
+    decisions, error = cli._decide_packets_with_quant(
+        [packet],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=120,
+        quant_thinking="low",
+        quant_batch_size=8,
+        progress_callback=progress.append,
+    )
+
+    assert error is None
+    assert decisions[packet_id].decision == "reject"
+    assert progress == ["quant_backend_0_started", "quant_backend_0_finished"]
+
+
+def test_quant_backend_publishes_finished_progress_after_timeout(monkeypatch) -> None:
+    packet = {
+        "packet_id": "0000905148-26-000640|0001824653|4",
+        "payload": {"score": 50.0, "rationale": {}},
+    }
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("codex.exe", "codex")])
+
+    def timeout(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise subprocess.TimeoutExpired("codex.exe", 130)
+
+    monkeypatch.setattr(cli.subprocess, "run", timeout)
+    progress: list[str] = []
+
+    decisions, error = cli._decide_packets_with_quant(
+        [packet],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=120,
+        quant_thinking="low",
+        quant_batch_size=8,
+        progress_callback=progress.append,
+    )
+
+    assert decisions == {}
+    assert error is not None and "failed" in error
+    assert progress == ["quant_backend_0_started", "quant_backend_0_finished"]
+
+
 def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -> None:
     runner = CliRunner()
     monkeypatch.setattr(
@@ -435,6 +518,8 @@ def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -
 
 def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -884,6 +969,8 @@ def test_cli_ops_autopilot_blocks_main_quant_agent_in_isolated_mode() -> None:
 
 def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(cli, "mark_notification_delivered", lambda db_path, packet_id: 1)
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -1099,6 +1186,132 @@ def test_cli_ops_autopilot_requires_complete_chain_configuration(tmp_path: Path)
     assert "must be provided together" in result.stderr
 
 
+def test_cli_ops_autopilot_requires_timeout_coupled_heartbeat_configuration(
+    tmp_path: Path,
+) -> None:
+    incomplete = CliRunner().invoke(
+        cli.app,
+        ["ops", "autopilot", "--once", "--heartbeat-db", str(tmp_path / "health.db")],
+    )
+    assert incomplete.exit_code == 2
+    assert "must be provided together" in incomplete.stderr
+
+    unsafe = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "189",
+        ],
+    )
+    assert unsafe.exit_code == 2
+    assert "at least 190 seconds" in unsafe.stderr
+
+
+def test_cli_ops_autopilot_exits_after_persistent_heartbeat_write_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FailingStore:
+        def register_runtime(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def progress(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise sqlite3.OperationalError("health store locked")
+
+    polls = 0
+
+    def fake_poll(settings, *, max_items, dry_run):  # type: ignore[no-untyped-def]
+        nonlocal polls
+        polls += 1
+        return PollResult(0, 0, 0)
+
+    monkeypatch.setattr(cli, "AutopilotHealthStore", lambda path: FailingStore())
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: "a" * 64)
+    monkeypatch.setattr(cli, "run_sec_poll_once", fake_poll)
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit, progress_callback: EnrichResult(0, 0),
+    )
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "300",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert polls == 1
+    log = error_log.read_text(encoding="utf-8")
+    assert log.count("autopilot heartbeat degraded") == 1
+    assert "unavailable for three consecutive progress writes" in log
+    assert "autopilot process failed" in log
+
+
+def test_cli_ops_autopilot_exits_when_runtime_ownership_is_superseded(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class SupersededStore:
+        def register_runtime(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def progress(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise cli.RuntimeOwnershipError("superseded")
+
+    poll_called = False
+
+    def forbidden_poll(settings, *, max_items, dry_run):  # type: ignore[no-untyped-def]
+        nonlocal poll_called
+        poll_called = True
+        raise AssertionError("superseded runtime must stop before polling")
+
+    monkeypatch.setattr(cli, "AutopilotHealthStore", lambda path: SupersededStore())
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: "a" * 64)
+    monkeypatch.setattr(cli, "run_sec_poll_once", forbidden_poll)
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "300",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert poll_called is False
+    assert "autopilot process stopped (RuntimeOwnershipError: superseded)" in (
+        error_log.read_text(encoding="utf-8")
+    )
+
+
 def test_cli_ops_autopilot_once_exits_on_sec_http_error(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1204,12 +1417,12 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch.setattr(
         cli,
         "enrich_filings_with_xml_url",
-        lambda settings, *, limit: EnrichResult(scanned=0, updated=0),
+        lambda settings, *, limit, progress_callback=None: EnrichResult(scanned=0, updated=0),
     )
     monkeypatch.setattr(
         cli,
         "enqueue_review_packets",
-        lambda settings, *, limit: QueueResult(processed=0, enqueued=0),
+        lambda settings, *, limit, progress_callback=None: QueueResult(processed=0, enqueued=0),
     )
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
     monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: next(fingerprints))
@@ -1219,6 +1432,7 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
         lambda seconds: calls["sleeps"].append(seconds),  # type: ignore[union-attr]
     )
     output_log = tmp_path / "autopilot.out.log"
+    heartbeat_db = tmp_path / "autopilot-health.db"
 
     result = CliRunner().invoke(
         cli.app,
@@ -1230,6 +1444,10 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
             "31",
             "--decision-engine",
             "rules",
+            "--heartbeat-db",
+            str(heartbeat_db),
+            "--heartbeat-stale-seconds",
+            "300",
             "--output-log",
             str(output_log),
         ],
@@ -1237,9 +1455,12 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
 
     assert result.exit_code == 0
     assert calls == {"poll": 1, "sleeps": [15.0, 15.0, 1.0]}
-    message = "autopilot source changed; exiting so the hidden repeating task can start"
+    message = "autopilot source changed; exiting so the hidden watchdog can start"
     assert message in result.stderr
     assert message in output_log.read_text(encoding="utf-8")
+    health = cli.AutopilotHealthStore(heartbeat_db).read()
+    assert health["last_progress_stage"] == "source_changed"
+    assert health["last_cycle_success_utc"] is not None
 
 
 def test_cli_ops_autopilot_once_does_not_fingerprint_source(monkeypatch) -> None:

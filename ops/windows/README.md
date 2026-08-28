@@ -6,25 +6,30 @@ Install or refresh the background autopilot task:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-autopilot-task.ps1 -Start
 ```
 
-The default task is a non-elevated per-user watchdog named `Insider Alerts
-Autopilot Watchdog`. It starts at user logon and has a one-minute recovery
-trigger. Multiple instances are ignored, so recovery triggers do not start a
-second worker while the long-running loop is already alive.
+The installer creates separate non-elevated per-user tasks named `Insider Alerts Autopilot
+Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent trigger, preventing
+startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
+restarts a worker only when its durable progress heartbeat is more than five minutes old. The
+worker validates that this threshold exceeds the configured quant-process timeout with a safety
+margin.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
 highest-privilege execution.
 
-The task launches the virtualenv's `pythonw.exe` directly, so it never creates a
-console window and Task Scheduler retains ownership of the complete worker process
-chain. The worker reads `.env`, writes to `logs\autopilot.out.log` and
+Both tasks launch the virtualenv's `pythonw.exe` directly, so they never create a console window
+and Task Scheduler retains ownership of each complete process chain. The worker reads `.env`,
+writes to `logs\autopilot.out.log` and
 `logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
-default. Passing `-Start` performs a controlled restart so deployed source changes
-are loaded immediately. The looping worker also fingerprints the loaded Python source between
+default. The watchdog writes only bounded operational metadata to
+`logs\autopilot-watchdog.log`; `ops autopilot-health-status` exposes the separate operational
+heartbeat store without reading signal or outcome payloads. Passing `-Start` stops the legacy
+same-named worker before registering both new definitions, then starts the watchdog. The looping
+worker also fingerprints the loaded Python source between
 completed cycles. If source changes later, it exits cleanly within one 15-second wait slice so no
-cycle is interrupted. The next one-minute repetition trigger starts the fresh worker; Task
-Scheduler's `RestartCount` applies only to failure exits and is not the recovery mechanism for
-this clean source-change exit. The optional manual hidden launcher also invokes
-`pythonw.exe` directly and never routes through `cmd.exe`.
+cycle is interrupted. The watchdog's next one-minute run starts the fresh worker. A stale restart
+is conservative after system suspend/resume and fully stops the old scheduled task before starting
+another; it never starts a replacement after a failed stop. The optional manual hidden launcher
+also invokes `pythonw.exe` directly and never routes through `cmd.exe`.
 
 Install the separate IBKR canary watchdog with:
 

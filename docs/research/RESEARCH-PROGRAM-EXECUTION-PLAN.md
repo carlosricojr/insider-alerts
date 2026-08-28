@@ -185,6 +185,9 @@ exactly one of `COLLECTING`, `PROMOTE_RECOMMENDED`, `KILL`, or `INVALID` with re
 - Monitor through enough fresh observations for the terminal decision.
 - Confirm heartbeats, source revision, evidence lag, history coverage, shadow reconciliation, and
   invisible tasks.
+- Run SEC ingestion under separate hidden worker and bounded watchdog tasks. Durable stage
+  progress must recover both clean source-revision exits and a live-but-stuck worker without
+  allowing overlapping instances.
 - At each release, verify `main == origin/main`, no untracked worktree artifacts, and all related
   repositories clean.
 

@@ -51,9 +51,15 @@ def test_enrich_filings_updates_missing_xml(httpx_mock: HTTPXMock, tmp_path) -> 
     settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
     run_sec_poll_once(settings, max_items=1, dry_run=False)
 
-    result = enrich_filings_with_xml_url(settings, limit=10)
+    progress: list[str] = []
+    result = enrich_filings_with_xml_url(
+        settings,
+        limit=10,
+        progress_callback=progress.append,
+    )
     assert result.scanned == 1
     assert result.updated == 1
+    assert progress == ["enrichment_item_0_started", "enrichment_items_completed"]
 
 
 def test_enrich_filings_preserves_successes_when_later_detail_fetch_fails(
@@ -110,9 +116,15 @@ def test_enqueue_review_packets_from_xml_urls(httpx_mock: HTTPXMock, tmp_path) -
     enrich_filings_with_xml_url(settings, limit=5)
 
     httpx_mock.add_response(status_code=200, text=form4)
-    result = enqueue_review_packets(settings, limit=5)
+    progress: list[str] = []
+    result = enqueue_review_packets(
+        settings,
+        limit=5,
+        progress_callback=progress.append,
+    )
     assert result.processed == 1
     assert result.enqueued == 1
+    assert progress == ["review_item_0_started", "review_items_completed"]
 
 
 def test_enqueue_review_packets_skips_existing_packets(httpx_mock: HTTPXMock, tmp_path) -> None:

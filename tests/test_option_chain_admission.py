@@ -322,4 +322,16 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert "--alpha-chain-script" in installer
     assert "capture_insider_option_chain.py" in installer
     assert "--option-chain-store-db" in installer
+    assert '"Insider Alerts Autopilot Worker"' in installer
+    assert "--heartbeat-db" in installer
+    assert "--heartbeat-stale-seconds $StaleHeartbeatSeconds" in installer
+    assert "ops autopilot-watchdog" in installer
+    assert "--worker-task-name `\"$WorkerTaskName`\"" in installer
+    assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 1)" in installer
+    assert installer.count("New-ScheduledTaskTrigger -AtLogOn") == 1
+    assert "$workerLogonTrigger" not in installer
+    assert installer.index("Stop-TaskAndWait -Name $TaskName") < installer.index(
+        "Register-ScheduledTask `"
+    )
+    assert installer.count("Register-ScheduledTask `") == 2
     assert 'New-ScheduledTaskAction `\n  -Execute $pythonExe' in installer
