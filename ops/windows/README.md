@@ -11,8 +11,9 @@ Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent t
 startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
 restarts a worker only when its durable progress heartbeat exceeds the configured stale threshold.
 That threshold is at least five minutes and may be longer when configured network or quant windows
-require it. The installer, worker, and watchdog validate the threshold against every configured
-nominal timeout/retry stage plus database and cleanup margins. It is also the hard wall for a
+require it. When no threshold is passed, the installer derives the minimum safe value from the
+effective settings. The installer, worker, and watchdog validate it against every configured
+network phase, retry stage, database window, and cleanup margin. It is also the hard wall for a
 slow-drip or otherwise hung external call.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
@@ -27,7 +28,8 @@ default. The watchdog writes only bounded operational metadata to
 `logs\autopilot-watchdog.log`; `ops autopilot-health-status` exposes the separate operational
 heartbeat store without reading signal or outcome payloads. Passing `-Start` stops the legacy
 same-named worker before registering both new definitions, then starts the watchdog. If cutover
-fails, the installer restores the prior task definitions and running state. Approved notifications
+fails, or a new worker does not produce a fresh stable runtime heartbeat within 90 seconds, the
+installer restores the prior task definitions and running state. Approved notifications
 carry an atomic delivery intent and are retried by the next managed cycle after an interrupted
 send (at-least-once delivery). The looping
 worker also fingerprints the loaded Python source between

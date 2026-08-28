@@ -139,6 +139,10 @@ class ProcessResult:
     timed_out: bool
 
 
+class ProcessTreeCleanupError(RuntimeError):
+    """A timed-out hidden process may still have live descendants or open pipes."""
+
+
 @dataclass(slots=True, frozen=True)
 class CaptureWindow:
     status: Literal["draft", "armed", "active"]
@@ -519,16 +523,20 @@ def _kill_process_tree(process: subprocess.Popen[str]) -> None:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("timed out terminating hidden child process tree") from exc
+            raise ProcessTreeCleanupError(
+                "timed out terminating hidden child process tree"
+            ) from exc
         if killed.returncode != 0 and process.poll() is None:
             detail = (killed.stderr or killed.stdout or "unknown taskkill failure").strip()
-            raise RuntimeError(f"failed to terminate hidden child process tree: {detail}")
+            raise ProcessTreeCleanupError(
+                f"failed to terminate hidden child process tree: {detail}"
+            )
     if process.poll() is None:
         process.kill()
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("hidden child did not terminate after tree kill") from exc
+        raise ProcessTreeCleanupError("hidden child did not terminate after tree kill") from exc
 
 
 def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -> ProcessResult:
@@ -551,7 +559,9 @@ def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("hidden child pipes remained open after tree kill") from exc
+            raise ProcessTreeCleanupError(
+                "hidden child pipes remained open after tree kill"
+            ) from exc
         return ProcessResult(process.returncode or -1, stdout, stderr, True)
 
 
@@ -1759,6 +1769,8 @@ def run_capture_once(
         return CaptureResult(status="idle")
     try:
         return _process_claimed_job(config, job, capture_window=window)
+    except ProcessTreeCleanupError:
+        raise
     except Exception as exc:
         finished = datetime.now(UTC)
         message = f"{type(exc).__name__}: {exc}"

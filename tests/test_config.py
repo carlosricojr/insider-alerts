@@ -114,16 +114,16 @@ def test_history_worker_timeout_remains_valid_outside_watchdog_runtime() -> None
     assert Settings(_env_file=None, SEC_TIMEOUT_SECONDS=timeout).sec_timeout_seconds == 120
 
 
-def test_default_network_windows_fit_five_minute_watchdog_floor() -> None:
+def test_default_network_windows_derive_phase_complete_watchdog_threshold() -> None:
     settings = Settings(_env_file=None)
     budget = autopilot_runtime_budget(settings=settings, quant_timeout_seconds=120)
 
-    assert float(budget["maximum_stage_seconds"]) <= 230
-    assert budget["required_stale_seconds"] == 300
+    assert float(budget["maximum_stage_seconds"]) == pytest.approx(427.8)
+    assert budget["required_stale_seconds"] == 498
     validate_stale_threshold(
         settings=settings,
         quant_timeout_seconds=120,
-        stale_seconds=300,
+        stale_seconds=498,
     )
 
 

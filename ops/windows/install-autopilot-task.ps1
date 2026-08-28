@@ -3,13 +3,14 @@ param(
   [string]$WorkerTaskName = "Insider Alerts Autopilot Worker",
   [int]$RecoveryIntervalMinutes = 1,
   [int]$QuantTimeoutSeconds = 120,
-  [int]$StaleHeartbeatSeconds = 300,
+  [int]$StaleHeartbeatSeconds = 0,
   [string]$AlphaRoot = "",
   [switch]$RunElevated,
   [switch]$Start
 )
 
 $ErrorActionPreference = "Stop"
+$staleHeartbeatExplicit = $PSBoundParameters.ContainsKey("StaleHeartbeatSeconds")
 
 if ([string]::IsNullOrWhiteSpace($TaskName) -or [string]::IsNullOrWhiteSpace($WorkerTaskName)) {
   throw "TaskName and WorkerTaskName must be nonempty."
@@ -23,9 +24,8 @@ if ($RecoveryIntervalMinutes -lt 1) {
 if ($QuantTimeoutSeconds -lt 10 -or $QuantTimeoutSeconds -gt 900) {
   throw "QuantTimeoutSeconds must be between 10 and 900."
 }
-$minimumStaleHeartbeatSeconds = [Math]::Max(300, $QuantTimeoutSeconds + 90)
-if ($StaleHeartbeatSeconds -lt $minimumStaleHeartbeatSeconds) {
-  throw "StaleHeartbeatSeconds must be at least $minimumStaleHeartbeatSeconds."
+if ($StaleHeartbeatSeconds -lt 0) {
+  throw "StaleHeartbeatSeconds cannot be negative."
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -66,11 +66,25 @@ if (-not (Test-Path (Join-Path $repoRoot ".env"))) {
 
 Push-Location $repoRoot
 try {
-  & $pythonConsoleExe -m insider_alerts.cli ops autopilot-config-validate `
+  $budgetOutput = @(& $pythonConsoleExe -m insider_alerts.cli ops autopilot-config-validate `
     --quant-timeout-seconds $QuantTimeoutSeconds `
-    --heartbeat-stale-seconds $StaleHeartbeatSeconds
+    --heartbeat-stale-seconds 2147483647)
   if ($LASTEXITCODE -ne 0) {
     throw "Autopilot watchdog preflight failed."
+  }
+  try {
+    $runtimeBudget = ($budgetOutput -join "`n") | ConvertFrom-Json
+    $requiredStaleHeartbeatSeconds = [int]$runtimeBudget.required_stale_seconds
+  } catch {
+    throw "Autopilot watchdog preflight returned an invalid runtime budget."
+  }
+  if ($requiredStaleHeartbeatSeconds -lt 300) {
+    throw "Autopilot watchdog preflight returned an unsafe stale threshold."
+  }
+  if (-not $staleHeartbeatExplicit) {
+    $StaleHeartbeatSeconds = $requiredStaleHeartbeatSeconds
+  } elseif ($StaleHeartbeatSeconds -lt $requiredStaleHeartbeatSeconds) {
+    throw "StaleHeartbeatSeconds must be at least $requiredStaleHeartbeatSeconds."
   }
 } finally {
   Pop-Location
@@ -149,6 +163,68 @@ function Get-TaskSnapshot([string]$Name) {
   }
 }
 
+function Get-AutopilotHealth {
+  Push-Location $repoRoot
+  try {
+    $raw = @(& $pythonConsoleExe -m insider_alerts.cli ops autopilot-health-status `
+      --heartbeat-db $heartbeatDb 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+      return $null
+    }
+    return (($raw -join "`n") | ConvertFrom-Json)
+  } catch {
+    return $null
+  } finally {
+    Pop-Location
+  }
+}
+
+function Wait-ForFreshWorker([string]$PreviousRuntimeId) {
+  $deadline = (Get-Date).AddSeconds(90)
+  $stableRuntimeId = $null
+  $stableSamples = 0
+  do {
+    $healthReport = Get-AutopilotHealth
+    $workerTask = Get-ScheduledTask -TaskName $WorkerTaskName -ErrorAction SilentlyContinue
+    if ($null -ne $healthReport -and $healthReport.valid -and $null -ne $healthReport.health) {
+      $runtimeId = [string]$healthReport.health.runtime_id
+      $progressText = [string]$healthReport.health.last_progress_utc
+      $isNewRuntime = -not [string]::IsNullOrWhiteSpace($runtimeId) -and `
+        ([string]::IsNullOrWhiteSpace($PreviousRuntimeId) -or $runtimeId -ne $PreviousRuntimeId)
+      $progressIsFresh = $false
+      try {
+        $progressAge = [DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($progressText)
+        $progressIsFresh = $progressAge.TotalSeconds -ge -5 -and $progressAge.TotalSeconds -le 30
+      } catch {
+        $progressIsFresh = $false
+      }
+      if ($isNewRuntime -and $progressIsFresh -and $null -ne $workerTask -and `
+          $workerTask.State -eq "Running") {
+        if ($stableRuntimeId -eq $runtimeId) {
+          $stableSamples += 1
+        } else {
+          $stableRuntimeId = $runtimeId
+          $stableSamples = 1
+        }
+        if ($stableSamples -ge 3) {
+          return
+        }
+      } else {
+        $stableRuntimeId = $null
+        $stableSamples = 0
+      }
+    }
+    Start-Sleep -Milliseconds 500
+  } while ((Get-Date) -lt $deadline)
+  throw "Timed out waiting for a new, fresh, stably running autopilot worker."
+}
+
+$priorHealth = Get-AutopilotHealth
+$previousRuntimeId = ""
+if ($null -ne $priorHealth -and $priorHealth.valid -and $null -ne $priorHealth.health) {
+  $previousRuntimeId = [string]$priorHealth.health.runtime_id
+}
+
 $snapshots = @(
   (Get-TaskSnapshot -Name $TaskName),
   (Get-TaskSnapshot -Name $WorkerTaskName)
@@ -176,6 +252,7 @@ try {
 
   if ($Start) {
     Start-ScheduledTask -TaskName $TaskName
+    Wait-ForFreshWorker -PreviousRuntimeId $previousRuntimeId
   }
 } catch {
   $installError = $_

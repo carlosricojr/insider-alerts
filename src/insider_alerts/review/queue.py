@@ -285,7 +285,8 @@ def apply_decision(
         cursor = conn.execute(
             """
             UPDATE review_packets
-            SET status = ?, decision_json = ?, updated_at = ?, notification_required = ?
+            SET status = ?, decision_json = ?, updated_at = ?, notification_required = ?,
+                notification_sent_at = NULL
             WHERE packet_id = ? AND status = 'pending'
             """,
             (decision, encoded, now, int(notification_required), packet_id),
@@ -444,7 +445,8 @@ def replay_deadletter(db_path: str, packet_id: str) -> int:
         cursor = conn.execute(
             """
             UPDATE review_packets
-            SET status = 'pending', decision_json = NULL, updated_at = ?
+            SET status = 'pending', decision_json = NULL, updated_at = ?,
+                notification_required = 0, notification_sent_at = NULL
             WHERE packet_id = ? AND status = 'deadletter'
             """,
             (now, packet_id),

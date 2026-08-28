@@ -95,7 +95,12 @@ from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled
 from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier, NtfyTransportEvent
 from insider_alerts.research.bar_feed import bar_feed_status
-from insider_alerts.research.capture import capture_status, resolve_git_commit, run_hidden_process
+from insider_alerts.research.capture import (
+    ProcessTreeCleanupError,
+    capture_status,
+    resolve_git_commit,
+    run_hidden_process,
+)
 from insider_alerts.research.diagnostics import diagnostic_status
 from insider_alerts.research.notification_transport import (
     NotificationJournalConfig,
@@ -1977,6 +1982,8 @@ def _notification_transport_observer(
         config = _notification_transport_config(settings)
         journal = NotificationTransportJournal(config)
         transport_id = notification_transport_id(packet_id, secrets.token_hex(32))
+    except ProcessTreeCleanupError:
+        raise
     except Exception as exc:
         capture_error(exc)
         return None, capture_error
@@ -3391,7 +3398,10 @@ def ops_autopilot(
     def _run_cycle() -> AutoPilotCycleResult:
         _heartbeat("cycle_started", cycle_started=True)
         outbox_notified = 0
+        notify_suppressed_duplicate = 0
+        alerted_event_keys = _recent_alerted_event_keys(settings.database_path)
         if notify and health_store is not None and not once:
+            outbox_event_keys_seen = set(alerted_event_keys)
             for outbox_index, outbox_packet in enumerate(
                 list_notification_outbox(settings.database_path, limit=decision_limit)
             ):
@@ -3404,6 +3414,23 @@ def ops_autopilot(
                         f"autopilot notification outbox malformed for packet={packet_id}",
                     )
                     continue
+                outbox_event_key = _economic_event_key(outbox_packet)
+                if (
+                    outbox_event_key is not None
+                    and outbox_event_key in outbox_event_keys_seen
+                ):
+                    mark_notification_delivered(settings.database_path, packet_id)
+                    notify_suppressed_duplicate += 1
+                    append_process_log(
+                        output_log_path,
+                        "autopilot notification outbox suppressed duplicate "
+                        f"packet={packet_id} event={outbox_event_key}",
+                    )
+                    continue
+                if outbox_event_key is not None:
+                    # Claim one representative before transport. Failed delivery leaves that row
+                    # queued; co-filings are acknowledged and only the representative is retried.
+                    outbox_event_keys_seen.add(outbox_event_key)
                 try:
                     _send_review_notification(
                         settings,
@@ -3412,6 +3439,8 @@ def ops_autopilot(
                         dry_message=str(decision_payload.get("reason", "decision alert")),
                     )
                     mark_notification_delivered(settings.database_path, packet_id)
+                    if outbox_event_key is not None:
+                        alerted_event_keys.add(outbox_event_key)
                     outbox_notified += 1
                     append_process_log(
                         output_log_path,
@@ -3560,10 +3589,8 @@ def ops_autopilot(
         escalated = 0
         deadlettered = 0
         notified = 0
-        notify_suppressed_duplicate = 0
         # Seeded from recent approvals so co-filings landing in LATER cycles are still caught,
         # then extended in-cycle so co-filings inside a single batch collapse too.
-        alerted_event_keys = _recent_alerted_event_keys(settings.database_path)
         approved_high_edge = 0
         rejected_low_edge = 0
         escalated_missing_context = 0
@@ -3710,6 +3737,8 @@ def ops_autopilot(
                         append_process_log(output_log_path, chain_message)
                     else:
                         append_process_log(error_log_path, chain_message)
+                except ProcessTreeCleanupError:
+                    raise
                 except Exception as exc:
                     option_chain_failed += 1
                     append_process_log(

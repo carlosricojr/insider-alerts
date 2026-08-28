@@ -1214,7 +1214,7 @@ def test_cli_ops_autopilot_requires_timeout_coupled_heartbeat_configuration(
         ],
     )
     assert unsafe.exit_code == 2
-    assert "at least 300 seconds" in unsafe.stderr
+    assert "heartbeat stale threshold" in unsafe.stderr
 
 
 def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
@@ -1236,7 +1236,7 @@ def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--stale-seconds",
-            "300",
+            "10000",
             "--output-log",
             str(output_log),
         ],
@@ -1276,7 +1276,7 @@ def test_cli_autopilot_watchdog_rejects_unsafe_config_before_task_control(
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--stale-seconds",
-            "300",
+            "498",
             "--quant-timeout-seconds",
             "120",
             "--output-log",
@@ -1307,13 +1307,13 @@ def test_cli_autopilot_preflight_validates_budget_and_process_tree(monkeypatch) 
             "--quant-timeout-seconds",
             "120",
             "--heartbeat-stale-seconds",
-            "300",
+            "498",
         ],
     )
 
     assert result.exit_code == 0, result.exception
     assert calls == ["job"]
-    assert json.loads(result.stdout)["required_stale_seconds"] == 300
+    assert json.loads(result.stdout)["required_stale_seconds"] == 498
 
 
 def test_cli_autopilot_preflight_fails_before_process_tree_for_unsafe_budget(
@@ -1364,7 +1364,7 @@ def test_pythonw_entrypoint_durably_logs_settings_bootstrap_failure(tmp_path: Pa
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--heartbeat-stale-seconds",
-            "300",
+            "10000",
             "--error-log",
             str(error_log),
         ],
@@ -1411,7 +1411,7 @@ def test_cli_autopilot_loop_logs_process_tree_ownership_failure(
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--heartbeat-stale-seconds",
-            "300",
+            "10000",
             "--error-log",
             str(error_log),
         ],
@@ -1463,7 +1463,7 @@ def test_cli_ops_autopilot_exits_after_persistent_heartbeat_write_failure(
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--heartbeat-stale-seconds",
-            "300",
+            "10000",
             "--error-log",
             str(error_log),
         ],
@@ -1511,7 +1511,7 @@ def test_cli_ops_autopilot_exits_when_runtime_ownership_is_superseded(
             "--heartbeat-db",
             str(tmp_path / "health.db"),
             "--heartbeat-stale-seconds",
-            "300",
+            "10000",
             "--error-log",
             str(error_log),
         ],
@@ -1618,7 +1618,7 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
 def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch, tmp_path: Path
 ) -> None:
-    calls: dict[str, object] = {"poll": 0, "sleeps": [], "delivered": []}
+    calls: dict[str, object] = {"poll": 0, "sleeps": [], "delivered": [], "sent": []}
     fingerprints = iter(("a" * 64, "a" * 64, "a" * 64, "a" * 64, "b" * 64))
 
     def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
@@ -1647,19 +1647,39 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
     outbox_packet = {
         "packet_id": "0000320193-24-000123|0000320193|4",
-        "payload": {"issuer_symbol": "AAPL"},
+        "payload": {
+            "issuer_symbol": "MKZR",
+            "rationale": {
+                "net_buy_shares": 33400.0,
+                "pre_trade_shares_estimate": 66600.0,
+                "post_trade_shares": 100000.0,
+                "gross_value": 53340.0,
+            },
+        },
         "decision": {
             "packet_id": "0000320193-24-000123|0000320193|4",
             "decision": "approve",
             "reason": "retry durable alert",
         },
     }
+    duplicate_outbox_packet = {
+        **outbox_packet,
+        "packet_id": "0000320193-24-000124|0000320193|4",
+        "decision": {
+            **outbox_packet["decision"],  # type: ignore[dict-item]
+            "packet_id": "0000320193-24-000124|0000320193|4",
+        },
+    }
     monkeypatch.setattr(
         cli,
         "list_notification_outbox",
-        lambda db_path, limit: [outbox_packet],
+        lambda db_path, limit: [outbox_packet, duplicate_outbox_packet],
     )
-    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
+
+    def record_send(_settings, payload, **_kwargs):  # type: ignore[no-untyped-def]
+        calls["sent"].append(payload["packet_id"])  # type: ignore[union-attr]
+
+    monkeypatch.setattr(cli, "_send_review_notification", record_send)
     monkeypatch.setattr(
         cli,
         "mark_notification_delivered",
@@ -1689,7 +1709,7 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
             "--heartbeat-db",
             str(heartbeat_db),
             "--heartbeat-stale-seconds",
-            "300",
+            "10000",
             "--output-log",
             str(output_log),
             "--error-log",
@@ -1701,11 +1721,18 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     assert calls == {
         "poll": 1,
         "sleeps": [15.0, 15.0, 1.0],
-        "delivered": ["0000320193-24-000123|0000320193|4"],
+        "delivered": [
+            "0000320193-24-000123|0000320193|4",
+            "0000320193-24-000124|0000320193|4",
+        ],
+        "sent": ["0000320193-24-000123|0000320193|4"],
     }
     message = "autopilot source changed; exiting so the hidden watchdog can start"
     assert message in result.stderr
-    assert message in output_log.read_text(encoding="utf-8")
+    output = output_log.read_text(encoding="utf-8")
+    assert message in output
+    assert "autopilot notification outbox suppressed duplicate" in output
+    assert "notify_suppressed_duplicate=1" in output
     errors = error_log.read_text(encoding="utf-8")
     assert "autopilot SEC enrichment degraded (http_failed=1" in errors
     assert "autopilot review enrichment degraded" in errors

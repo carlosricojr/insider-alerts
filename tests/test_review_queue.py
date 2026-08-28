@@ -132,6 +132,27 @@ def test_notification_intent_is_atomic_and_remains_until_delivery(tmp_path) -> N
     assert list_notification_outbox(db, limit=10) == []
 
 
+def test_replayed_decision_clears_prior_notification_acknowledgement(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    deadletter = {
+        "packet_id": packet_id,
+        "decision": "deadletter",
+        "analyst": "quant",
+        "reason": "retry later",
+    }
+    assert apply_decision(db, deadletter, notification_required=True) == 1
+    assert mark_notification_delivered(db, packet_id) == 1
+
+    assert replay_deadletter(db, packet_id) == 1
+    approval = {**deadletter, "decision": "approve", "reason": "send replay"}
+    assert apply_decision(db, approval, notification_required=True) == 1
+
+    assert [row["packet_id"] for row in list_notification_outbox(db, limit=10)] == [packet_id]
+
+
 def test_list_deadletters_returns_records(tmp_path) -> None:
     db = str(tmp_path / "insider_alerts.db")
     init_db(db)

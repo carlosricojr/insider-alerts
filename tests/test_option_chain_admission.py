@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from insider_alerts.research.capture import ProcessResult
+from insider_alerts.research.capture import ProcessResult, ProcessTreeCleanupError
 from insider_alerts.research.option_chain_admission import (
     OptionChainAdmissionConfig,
     OptionChainAdmissionError,
@@ -325,7 +325,9 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert '"Insider Alerts Autopilot Worker"' in installer
     assert "--heartbeat-db" in installer
     assert "--heartbeat-stale-seconds $StaleHeartbeatSeconds" in installer
-    assert "[Math]::Max(300, $QuantTimeoutSeconds + 90)" in installer
+    assert "required_stale_seconds" in installer
+    assert "Wait-ForFreshWorker" in installer
+    assert "stably running autopilot worker" in installer
     assert "ops autopilot-config-validate" in installer
     assert "Push-Location $repoRoot" in installer
     assert "TaskName and WorkerTaskName must be distinct" in installer
@@ -344,3 +346,18 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     )
     assert installer.count("Register-ScheduledTask `") == 2
     assert 'New-ScheduledTaskAction `\n  -Execute $pythonExe' in installer
+
+
+def test_process_tree_cleanup_uncertainty_escapes_option_capture_isolation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    def uncertain_cleanup(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise ProcessTreeCleanupError("tree state unknown")
+
+    with pytest.raises(ProcessTreeCleanupError, match="tree state unknown"):
+        capture_predecision_option_chain(
+            config,
+            packet_id="packet-1",
+            symbol="ABC",
+            process_runner=uncertain_cleanup,
+        )

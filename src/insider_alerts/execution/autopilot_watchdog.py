@@ -22,6 +22,8 @@ STALE_SAFETY_MARGIN_SECONDS = 70
 SQLITE_STAGE_BUDGET_SECONDS = 200.0
 SQLITE_REVIEW_ITEM_BUDGET_SECONDS = 10.0
 NOTIFICATION_OBSERVER_BUDGET_SECONDS = 10.0
+HTTPX_TIMEOUT_PHASES = 4
+URLLIB_TIMEOUT_PHASES = 2
 SCHEDULER_CONTROL_TIMEOUT_SECONDS = 5.0
 SCHEDULED_TASK_RUNNING_STATE = 4
 MAX_STAGE_LENGTH = 80
@@ -541,22 +543,28 @@ def autopilot_runtime_budget(
 ) -> dict[str, float | int]:
     """Return conservative single-stage blocking budgets used by watchdog validation."""
 
+    # Scalar HTTPX timeouts apply independently to pool/connect/write/read phases, while urllib's
+    # socket timeout can apply once to connect and again to response reads. Budget those legitimate
+    # phases explicitly; the stale watchdog remains the hard wall for slow-drip responses.
     sec_window = settings.sec_retry_attempts * (
-        settings.sec_timeout_seconds + 1 / settings.sec_rate_limit_per_second
+        HTTPX_TIMEOUT_PHASES * settings.sec_timeout_seconds
+        + 1 / settings.sec_rate_limit_per_second
     ) + (settings.sec_retry_attempts - 1) * settings.sec_retry_max_seconds
     ib_window = settings.market_data_retry_attempts * (
         3 * AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
         + 1 / settings.market_data_rate_limit_per_second
     ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
     yahoo_window = settings.market_data_retry_attempts * (
-        settings.market_data_timeout_seconds
+        URLLIB_TIMEOUT_PHASES * settings.market_data_timeout_seconds
         + 1 / settings.market_data_rate_limit_per_second
     ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
     review_item_window = (
         sec_window + ib_window + yahoo_window + SQLITE_REVIEW_ITEM_BUDGET_SECONDS
     )
     notification_window = (
-        settings.ntfy_retry_attempts * settings.ntfy_timeout_seconds
+        settings.ntfy_retry_attempts
+        * HTTPX_TIMEOUT_PHASES
+        * settings.ntfy_timeout_seconds
         + (settings.ntfy_retry_attempts - 1) * settings.ntfy_retry_max_seconds
         + OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
         + NOTIFICATION_OBSERVER_BUDGET_SECONDS
