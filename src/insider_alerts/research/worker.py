@@ -21,23 +21,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Capture at most one prospective evidence job")
     parser.add_argument("--database-path", type=Path, default=Path("data/insider_alerts.db"))
     parser.add_argument("--evidence-db", type=Path, default=Path("data/research/evidence.db"))
-    parser.add_argument(
-        "--activation-db", type=Path, default=Path("data/research/activation.db")
-    )
-    parser.add_argument(
-        "--artifact-root", type=Path, default=Path("data/research/artifacts")
-    )
+    parser.add_argument("--activation-db", type=Path, default=Path("data/research/activation.db"))
+    parser.add_argument("--artifact-root", type=Path, default=Path("data/research/artifacts"))
     parser.add_argument("--canary-ledger", type=Path, default=Path("data/live_canary.db"))
-    parser.add_argument(
-        "--history-db", type=Path, default=Path("data/research/sec_history.db")
-    )
+    parser.add_argument("--history-db", type=Path, default=Path("data/research/sec_history.db"))
     parser.add_argument("--history-snapshot-sha256", required=True)
     parser.add_argument("--alpha-python", type=Path, required=True)
     parser.add_argument("--alpha-script", type=Path, required=True)
+    parser.add_argument("--alpha-historical-script", type=Path, required=True)
+    parser.add_argument("--option-chain-store-db", type=Path, required=True)
+    parser.add_argument("--historical-pacing-db", type=Path, required=True)
     parser.add_argument("--option-timeout", type=int, default=90)
-    parser.add_argument(
-        "--error-log", type=Path, default=Path("logs/research-capture.err.log")
-    )
+    parser.add_argument("--historical-option-timeout", type=int, default=120)
+    parser.add_argument("--error-log", type=Path, default=Path("logs/research-capture.err.log"))
     return parser
 
 
@@ -56,8 +52,12 @@ def main(argv: list[str] | None = None) -> int:
             source_db=args.database_path,
             evidence_db=args.evidence_db,
             artifact_root=args.artifact_root,
+            research_root=repo_root / "data" / "research",
             alpha_python=args.alpha_python,
             alpha_script=args.alpha_script,
+            alpha_historical_script=args.alpha_historical_script,
+            option_chain_store_db=args.option_chain_store_db,
+            historical_pacing_db=args.historical_pacing_db,
             canary_ledger=args.canary_ledger,
             history_db=args.history_db,
             history_snapshot_sha256=args.history_snapshot_sha256,
@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             activation_db=args.activation_db,
             option_timeout_seconds=args.option_timeout,
+            historical_option_timeout_seconds=args.historical_option_timeout,
         )
         result = run_capture_once(config)
     except Exception as exc:
