@@ -90,13 +90,16 @@ def test_config_rejects_inverted_market_data_retry_bounds() -> None:
         )
 
 
-def test_config_bounds_notification_duration_below_minimum_watchdog_staleness() -> None:
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, NTFY_TIMEOUT_SECONDS=21)
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, NTFY_RETRY_ATTEMPTS=6)
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, NTFY_RETRY_MAX_SECONDS=6)
+def test_config_preserves_notification_compatibility_outside_autopilot() -> None:
+    settings = Settings(
+        _env_file=None,
+        NTFY_TIMEOUT_SECONDS=21,
+        NTFY_RETRY_ATTEMPTS=6,
+        NTFY_RETRY_MAX_SECONDS=6,
+    )
+    assert settings.ntfy_timeout_seconds == 21
+    assert settings.ntfy_retry_attempts == 6
+    assert settings.ntfy_retry_max_seconds == 6
     with pytest.raises(ValidationError, match="cannot exceed"):
         Settings(
             _env_file=None,

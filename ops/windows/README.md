@@ -10,8 +10,9 @@ The installer creates separate non-elevated per-user tasks named `Insider Alerts
 Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent trigger, preventing
 startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
 restarts a worker only when its durable progress heartbeat is more than five minutes old. The
-installer and worker validate that this threshold exceeds every configured blocking/retry stage
-with a safety margin.
+installer and worker validate that this threshold exceeds every configured nominal timeout/retry
+stage plus database and cleanup margins. The heartbeat threshold is also the hard wall for a
+slow-drip or otherwise hung external call.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
 highest-privilege execution.
@@ -24,7 +25,10 @@ writes to `logs\autopilot.out.log` and
 default. The watchdog writes only bounded operational metadata to
 `logs\autopilot-watchdog.log`; `ops autopilot-health-status` exposes the separate operational
 heartbeat store without reading signal or outcome payloads. Passing `-Start` stops the legacy
-same-named worker before registering both new definitions, then starts the watchdog. The looping
+same-named worker before registering both new definitions, then starts the watchdog. If cutover
+fails, the installer restores the prior task definitions and running state. Approved notifications
+carry an atomic delivery intent and are retried by the next managed cycle after an interrupted
+send (at-least-once delivery). The looping
 worker also fingerprints the loaded Python source between
 completed cycles. If source changes later, it exits cleanly within one 15-second wait slice so no
 cycle is interrupted. The watchdog's next one-minute run starts the fresh worker. A stale restart

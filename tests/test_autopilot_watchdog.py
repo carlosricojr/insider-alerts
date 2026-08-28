@@ -23,6 +23,35 @@ def _task_result(state: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess([], 0, f'"host","task","next","{state}"\n', "")
 
 
+def test_task_state_api_does_not_depend_on_localized_display_text() -> None:
+    running = subprocess.CompletedProcess([], 0, "__TASK_STATE__=4", "")
+    ready = subprocess.CompletedProcess([], 0, "__TASK_STATE__=3", "")
+
+    assert autopilot_watchdog._task_is_running(running) is True
+    assert autopilot_watchdog._task_is_running(ready) is False
+
+
+def test_task_query_uses_hidden_scheduler_state_api(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def run(command, **kwargs):  # type: ignore[no-untyped-def]
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "__TASK_STATE__=4", "")
+
+    monkeypatch.setattr(autopilot_watchdog.subprocess, "run", run)
+
+    result = autopilot_watchdog._run_schtasks(
+        ["/Query", "/TN", "Arbeitnehmerüberwachung", "/FO", "CSV"]
+    )
+
+    assert result.stdout == "__TASK_STATE__=4"
+    assert captured["command"][0] == "powershell.exe"  # type: ignore[index]
+    assert captured["timeout"] == 5
+    assert captured["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert captured["env"]["INSIDER_ALERTS_TASK_QUERY_NAME"] == "Arbeitnehmerüberwachung"  # type: ignore[index]
+
+
 def test_health_store_fences_superseded_runtime(tmp_path: Path) -> None:
     now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
     store = AutopilotHealthStore(tmp_path / "health.db")
@@ -264,11 +293,11 @@ def test_watchdog_propagates_query_failure_without_starting(tmp_path: Path) -> N
 
 def test_scheduled_task_control_timeout_is_bounded_and_actionable(monkeypatch) -> None:
     def timeout(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        raise subprocess.TimeoutExpired("schtasks.exe", 10)
+        raise subprocess.TimeoutExpired("schtasks.exe", 5)
 
     monkeypatch.setattr(autopilot_watchdog.subprocess, "run", timeout)
 
-    with pytest.raises(RuntimeError, match=r"control /Query timed out after 10 seconds"):
+    with pytest.raises(RuntimeError, match=r"control /Query timed out after 5 seconds"):
         autopilot_watchdog._run_schtasks(["/Query", "/TN", "Autopilot Worker"])
 
 
@@ -351,7 +380,7 @@ def test_watchdog_quarantines_corrupt_store_only_when_worker_is_stopped(
     assert not path.exists()
 
 
-def test_quarantine_preserves_main_store_until_sidecars_are_moved(
+def test_quarantine_manifest_resumes_after_partial_bundle_move(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -363,21 +392,41 @@ def test_quarantine_preserves_main_store_until_sidecars_are_moved(
     real_replace = autopilot_watchdog.os.replace
     moves: list[str] = []
 
-    def fail_on_main(source, destination) -> None:  # type: ignore[no-untyped-def]
+    failed_once = False
+
+    def fail_on_shm_once(source, destination) -> None:  # type: ignore[no-untyped-def]
+        nonlocal failed_once
         source_path = Path(source)
+        if source_path.name.startswith(".health.db.quarantine.json"):
+            real_replace(source_path, destination)
+            return
         moves.append(source_path.name)
-        if source_path == path:
-            raise OSError("main quarantine denied")
+        if source_path == Path(f"{path}-shm") and not failed_once:
+            failed_once = True
+            raise OSError("shm quarantine denied")
         real_replace(source_path, destination)
 
-    monkeypatch.setattr(autopilot_watchdog.os, "replace", fail_on_main)
+    monkeypatch.setattr(autopilot_watchdog.os, "replace", fail_on_shm_once)
 
-    with pytest.raises(OSError, match="main quarantine denied"):
+    with pytest.raises(OSError, match="shm quarantine denied"):
         quarantine_corrupt_health_store(path, now=now)
 
-    assert moves == ["health.db-wal", "health.db-shm", "health.db"]
-    assert path.read_bytes() == b"corrupt main"
+    assert moves == ["health.db", "health.db-wal", "health.db-shm"]
+    manifest = Path(f"{path.resolve()}.quarantine.json")
+    assert manifest.is_file()
+    assert heartbeat_state(path, now=now, stale_seconds=300) == (
+        True,
+        "heartbeat_quarantine_incomplete",
+        True,
+    )
+    assert not path.exists()
     assert not Path(f"{path}-wal").exists()
+    assert Path(f"{path}-shm").exists()
+
+    quarantined = quarantine_corrupt_health_store(path, now=now + timedelta(seconds=1))
+
+    assert len(quarantined) == 3
+    assert not manifest.exists()
     assert not Path(f"{path}-shm").exists()
 
 
@@ -445,3 +494,29 @@ def test_status_and_stale_threshold_are_fail_closed(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="at least 300"):
         validate_stale_threshold(quant_timeout_seconds=120, stale_seconds=299)
     validate_stale_threshold(quant_timeout_seconds=120, stale_seconds=300)
+
+
+def test_worker_runtime_verification_requires_changed_runtime_id(tmp_path: Path) -> None:
+    path = tmp_path / "health.db"
+    now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
+    store = AutopilotHealthStore(path)
+    store.register_runtime(runtime_id="old", source_fingerprint="a" * 64, now=now)
+    sleeps = 0
+
+    def replace_runtime(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            store.register_runtime(
+                runtime_id="new",
+                source_fingerprint="b" * 64,
+                now=now + timedelta(seconds=1),
+            )
+
+    assert autopilot_watchdog._await_worker_runtime(
+        path,
+        previous_runtime_id="old",
+        sleep_fn=replace_runtime,
+        attempts=3,
+    )
+    assert sleeps == 1

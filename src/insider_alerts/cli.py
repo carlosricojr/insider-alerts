@@ -10,7 +10,7 @@ import re
 import secrets
 import shutil
 import sqlite3
-import subprocess
+import sys
 import time
 from bisect import bisect_right
 from collections.abc import Callable
@@ -95,7 +95,7 @@ from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled
 from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier, NtfyTransportEvent
 from insider_alerts.research.bar_feed import bar_feed_status
-from insider_alerts.research.capture import capture_status, resolve_git_commit
+from insider_alerts.research.capture import capture_status, resolve_git_commit, run_hidden_process
 from insider_alerts.research.diagnostics import diagnostic_status
 from insider_alerts.research.notification_transport import (
     NotificationJournalConfig,
@@ -116,6 +116,7 @@ from insider_alerts.review.queue import (
     ensure_review_tables,
     get_review_packet,
     list_deadletters,
+    list_notification_outbox,
     list_pending_review_packets,
     mark_notification_delivered,
     replay_deadletter,
@@ -182,6 +183,12 @@ class AutoPilotCycleResult:
     option_chain_failed: int = 0
     option_chain_timed_out: int = 0
     option_chain_ambiguous: int = 0
+    enrichment_http_failed: int = 0
+    enrichment_xml_not_found: int = 0
+    enqueue_http_failed: int = 0
+    enqueue_parse_failed: int = 0
+    enqueue_market_failed: int = 0
+    outbox_notified: int = 0
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -1480,15 +1487,12 @@ def _decide_packets_with_quant(
             if progress_callback is not None:
                 progress_callback(f"quant_backend_{start}_started")
             try:
-                completed = subprocess.run(
+                completed = run_hidden_process(
                     args,
-                    capture_output=True,
-                    text=True,
-                    timeout=quant_timeout_seconds + 10,
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    cwd=Path.cwd(),
+                    timeout_seconds=quant_timeout_seconds + 10,
                 )
-            except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+            except (OSError, UnicodeError) as exc:
                 errors.append(
                     f"chunk[{start}:{start + len(chunk)}] {backend_label} failed: {exc}"
                 )
@@ -1497,6 +1501,12 @@ def _decide_packets_with_quant(
                 if progress_callback is not None:
                     progress_callback(f"quant_backend_{start}_finished")
 
+            if completed.timed_out:
+                errors.append(
+                    f"chunk[{start}:{start + len(chunk)}] {backend_label} failed: "
+                    f"timed out after {quant_timeout_seconds + 10} seconds"
+                )
+                continue
             stdout = completed.stdout if isinstance(completed.stdout, str) else ""
             stderr = completed.stderr if isinstance(completed.stderr, str) else ""
             if completed.returncode != 0:
@@ -2174,7 +2184,11 @@ def review_decide(
     packet = get_review_packet(settings.database_path, packet_id)
 
     try:
-        updated = apply_decision(settings.database_path, payload)
+        updated = apply_decision(
+            settings.database_path,
+            payload,
+            notification_required=notify,
+        )
     except DecisionValidationError as exc:
         typer.secho(f"decision validation failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -2220,7 +2234,11 @@ def review_apply(
             if isinstance(packet_id_obj, str)
             else None
         )
-        updated = apply_decision(settings.database_path, payload)
+        updated = apply_decision(
+            settings.database_path,
+            payload,
+            notification_required=notify,
+        )
     except DecisionValidationError as exc:
         typer.secho(f"decision validation failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -3372,6 +3390,38 @@ def ops_autopilot(
 
     def _run_cycle() -> AutoPilotCycleResult:
         _heartbeat("cycle_started", cycle_started=True)
+        outbox_notified = 0
+        if notify and health_store is not None and not once:
+            for outbox_index, outbox_packet in enumerate(
+                list_notification_outbox(settings.database_path, limit=decision_limit)
+            ):
+                _heartbeat(f"notification_outbox_{outbox_index}_started")
+                packet_id = str(outbox_packet["packet_id"])
+                decision_payload = outbox_packet.get("decision")
+                if not isinstance(decision_payload, dict):
+                    append_process_log(
+                        error_log_path,
+                        f"autopilot notification outbox malformed for packet={packet_id}",
+                    )
+                    continue
+                try:
+                    _send_review_notification(
+                        settings,
+                        {key: str(value) for key, value in decision_payload.items()},
+                        packet=outbox_packet,
+                        dry_message=str(decision_payload.get("reason", "decision alert")),
+                    )
+                    mark_notification_delivered(settings.database_path, packet_id)
+                    outbox_notified += 1
+                    append_process_log(
+                        output_log_path,
+                        f"autopilot notification outbox delivered packet={packet_id}",
+                    )
+                except NtfyNotificationError as exc:
+                    append_process_log(
+                        error_log_path,
+                        f"autopilot notification outbox failed for packet={packet_id}: {exc}",
+                    )
         poll_result = run_sec_poll_once(settings, max_items=poll_max_items, dry_run=False)
         _heartbeat("sec_poll_completed")
         if health_store is None:
@@ -3392,6 +3442,25 @@ def ops_autopilot(
                 progress_callback=_heartbeat,
             )
         _heartbeat("review_enqueue_completed")
+        if enrich_result.http_failed or enrich_result.xml_not_found:
+            append_process_log(
+                error_log_path,
+                "autopilot SEC enrichment degraded "
+                f"(http_failed={enrich_result.http_failed}, "
+                f"xml_not_found={enrich_result.xml_not_found})",
+            )
+        if (
+            enqueue_result.http_failed
+            or enqueue_result.parse_failed
+            or enqueue_result.market_failed
+        ):
+            append_process_log(
+                error_log_path,
+                "autopilot review enrichment degraded "
+                f"(http_failed={enqueue_result.http_failed}, "
+                f"parse_failed={enqueue_result.parse_failed}, "
+                f"market_failed={enqueue_result.market_failed})",
+            )
         pending = list_pending_review_packets(settings.database_path, limit=decision_limit)
         conviction_history = _load_conviction_history(
             settings.database_path,
@@ -3650,8 +3719,30 @@ def ops_autopilot(
                         f"error={type(exc).__name__}: {exc}",
                     )
 
+            should_notify = notify and (not notify_approve_only or rule.decision == "approve")
+            event_key: str | None = None
+            if should_notify:
+                event_key = _economic_event_key(packet)
+                if event_key is not None and event_key in alerted_event_keys:
+                    notify_suppressed_duplicate += 1
+                    duplicate_message = (
+                        f"suppressing duplicate alert for packet={packet_id_obj}: "
+                        f"same economic event already alerted ({event_key})"
+                    )
+                    typer.secho(
+                        duplicate_message,
+                        fg=typer.colors.YELLOW,
+                        err=True,
+                    )
+                    append_process_log(output_log_path, duplicate_message)
+                    should_notify = False
+
             try:
-                updated = apply_decision(settings.database_path, payload)
+                updated = apply_decision(
+                    settings.database_path,
+                    payload,
+                    notification_required=should_notify,
+                )
             except DecisionValidationError as exc:
                 failure_message = f"autopilot decision failed for packet={packet_id_obj}: {exc}"
                 typer.secho(
@@ -3687,22 +3778,6 @@ def ops_autopilot(
             if rule.decision == "escalate" and rule.reason_code == "quant_schema_invalid":
                 escalated_schema_invalid += 1
 
-            should_notify = notify and (not notify_approve_only or rule.decision == "approve")
-            if should_notify:
-                event_key = _economic_event_key(packet)
-                if event_key is not None and event_key in alerted_event_keys:
-                    notify_suppressed_duplicate += 1
-                    duplicate_message = (
-                        f"suppressing duplicate alert for packet={packet_id_obj}: "
-                        f"same economic event already alerted ({event_key})"
-                    )
-                    typer.secho(
-                        duplicate_message,
-                        fg=typer.colors.YELLOW,
-                        err=True,
-                    )
-                    append_process_log(output_log_path, duplicate_message)
-                    should_notify = False
             if should_notify:
                 try:
                     notify_payload = {k: str(v) for k, v in payload.items()}
@@ -3753,6 +3828,12 @@ def ops_autopilot(
             option_chain_failed=option_chain_failed,
             option_chain_timed_out=option_chain_timed_out,
             option_chain_ambiguous=option_chain_ambiguous,
+            enrichment_http_failed=enrich_result.http_failed,
+            enrichment_xml_not_found=enrich_result.xml_not_found,
+            enqueue_http_failed=enqueue_result.http_failed,
+            enqueue_parse_failed=enqueue_result.parse_failed,
+            enqueue_market_failed=enqueue_result.market_failed,
+            outbox_notified=outbox_notified,
         )
         cycle_message = (
             "ops autopilot cycle completed "
@@ -3774,7 +3855,13 @@ def ops_autopilot(
             f"option_chain_skipped_cadence={cycle.option_chain_skipped_cadence}, "
             f"option_chain_failed={cycle.option_chain_failed}, "
             f"option_chain_timed_out={cycle.option_chain_timed_out}, "
-            f"option_chain_ambiguous={cycle.option_chain_ambiguous})"
+            f"option_chain_ambiguous={cycle.option_chain_ambiguous}, "
+            f"enrichment_http_failed={cycle.enrichment_http_failed}, "
+            f"enrichment_xml_not_found={cycle.enrichment_xml_not_found}, "
+            f"enqueue_http_failed={cycle.enqueue_http_failed}, "
+            f"enqueue_parse_failed={cycle.enqueue_parse_failed}, "
+            f"enqueue_market_failed={cycle.enqueue_market_failed}, "
+            f"outbox_notified={cycle.outbox_notified})"
         )
         typer.echo(cycle_message)
         append_process_log(output_log_path, cycle_message)
@@ -4463,4 +4550,22 @@ def ops_autopilot_health_status(
 
 
 if __name__ == "__main__":
-    app()
+    try:
+        app()
+    except Exception as exc:
+        # Typer enters the command only after settings and argument conversion succeed. The
+        # scheduled worker uses pythonw, so preserve failures that occur before its inner logging
+        # scope as well as unexpected top-level failures.
+        if len(sys.argv) >= 3 and sys.argv[1:3] == ["ops", "autopilot"]:
+            try:
+                error_index = sys.argv.index("--error-log") + 1
+                error_path = Path(sys.argv[error_index])
+                error_path.parent.mkdir(parents=True, exist_ok=True)
+                with error_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        "autopilot unhandled process failure "
+                        f"({type(exc).__name__}: {exc})\n"
+                    )
+            except (OSError, ValueError, IndexError):
+                pass
+        raise

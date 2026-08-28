@@ -45,6 +45,15 @@ def ensure_review_tables(db_path: str) -> None:
                 # A second service can finish this additive migration after our PRAGMA.
                 if "duplicate column name" not in str(exc).lower():
                     raise
+        if "notification_required" not in columns:
+            try:
+                conn.execute(
+                    "ALTER TABLE review_packets ADD COLUMN notification_required "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(notification_required IN (0,1))"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS deadletter_events (
@@ -258,7 +267,12 @@ def _validate_decision_payload(payload: Mapping[str, object]) -> None:
         raise DecisionValidationError("invalid reason")
 
 
-def apply_decision(db_path: str, payload: Mapping[str, object]) -> int:
+def apply_decision(
+    db_path: str,
+    payload: Mapping[str, object],
+    *,
+    notification_required: bool = False,
+) -> int:
     ensure_review_tables(db_path)
     _validate_decision_payload(payload)
 
@@ -271,10 +285,10 @@ def apply_decision(db_path: str, payload: Mapping[str, object]) -> int:
         cursor = conn.execute(
             """
             UPDATE review_packets
-            SET status = ?, decision_json = ?, updated_at = ?
+            SET status = ?, decision_json = ?, updated_at = ?, notification_required = ?
             WHERE packet_id = ? AND status = 'pending'
             """,
-            (decision, encoded, now, packet_id),
+            (decision, encoded, now, int(notification_required), packet_id),
         )
 
         if decision == "deadletter" and cursor.rowcount == 1:
@@ -305,6 +319,41 @@ def mark_notification_delivered(db_path: str, packet_id: str) -> int:
         )
         conn.commit()
     return int(cursor.rowcount)
+
+
+def list_notification_outbox(db_path: str, *, limit: int) -> list[dict[str, object]]:
+    """Return decisions durably marked for delivery but not yet acknowledged locally."""
+
+    ensure_review_tables(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT packet_id, accession_number, cik, form_type, payload_json, status,
+                   decision_json, created_at, updated_at
+            FROM review_packets
+            WHERE notification_required = 1
+              AND notification_sent_at IS NULL
+              AND decision_json IS NOT NULL
+            ORDER BY updated_at ASC, packet_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "packet_id": str(row["packet_id"]),
+            "accession_number": str(row["accession_number"]),
+            "cik": str(row["cik"]),
+            "form_type": str(row["form_type"]),
+            "payload": json.loads(str(row["payload_json"])),
+            "status": str(row["status"]),
+            "decision": json.loads(str(row["decision_json"])),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+        for row in rows
+    ]
 
 
 def list_deadletters(db_path: str) -> list[dict[str, str]]:

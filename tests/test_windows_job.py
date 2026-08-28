@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import ctypes
+import os
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
 from insider_alerts.execution import windows_job
+from insider_alerts.research.capture import run_hidden_process
 
 
 class FakeJobApi:
@@ -62,3 +69,32 @@ def test_failed_assignment_closes_job_and_allows_retry() -> None:
     retry_api = FakeJobApi()
     windows_job.ensure_kill_on_close_process_tree(platform="nt", api=retry_api)
     assert retry_api.events[-1] == ("assign", 42)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-tree contract")
+def test_hidden_timeout_kills_pipe_inheriting_grandchild() -> None:
+    child_code = (
+        "import subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "print(child.pid,flush=True); time.sleep(60)"
+    )
+    started = time.monotonic()
+
+    result = run_hidden_process(
+        [sys.executable, "-c", child_code],
+        cwd=Path.cwd(),
+        timeout_seconds=1,
+    )
+
+    assert result.timed_out is True
+    assert time.monotonic() - started < 12
+    grandchild_pid = int(result.stdout.strip())
+    process_query_limited_information = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
+        process_query_limited_information,
+        False,
+        grandchild_pid,
+    )
+    if handle:
+        ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+    assert not handle

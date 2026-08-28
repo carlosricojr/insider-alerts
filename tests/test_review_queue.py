@@ -7,6 +7,7 @@ from insider_alerts.review.queue import (
     apply_decision,
     enqueue_review_packet,
     list_deadletters,
+    list_notification_outbox,
     list_pending_review_packets,
     mark_notification_delivered,
     replay_deadletter,
@@ -105,6 +106,30 @@ def test_apply_decision_validates_schema(tmp_path) -> None:
         pass
     else:
         raise AssertionError("expected validation error for invalid decision")
+
+
+def test_notification_intent_is_atomic_and_remains_until_delivery(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+
+    assert apply_decision(
+        db,
+        {
+            "packet_id": packet_id,
+            "decision": "approve",
+            "analyst": "quant",
+            "reason": "send this",
+        },
+        notification_required=True,
+    ) == 1
+
+    outbox = list_notification_outbox(db, limit=10)
+    assert [row["packet_id"] for row in outbox] == [packet_id]
+    assert outbox[0]["decision"]["reason"] == "send this"  # type: ignore[index]
+    assert mark_notification_delivered(db, packet_id) == 1
+    assert list_notification_outbox(db, limit=10) == []
 
 
 def test_list_deadletters_returns_records(tmp_path) -> None:

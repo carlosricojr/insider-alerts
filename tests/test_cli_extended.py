@@ -1,6 +1,8 @@
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -28,6 +30,7 @@ from insider_alerts.backtest.event_study import (
 )
 from insider_alerts.backtest.models import DailyBar, SignalEvent
 from insider_alerts.backtest.readiness import EventStudyReadinessReport
+from insider_alerts.research.capture import ProcessResult
 from insider_alerts.sec.client import SecHttpError
 from insider_alerts.sec.pipeline import BackfillResult, EnrichResult, PollResult, QueueResult
 
@@ -197,7 +200,7 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
 
     decisions: list[str] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         decisions.append(str(payload["decision"]))
         return 1
 
@@ -311,7 +314,7 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
 
     applied: list[dict[str, object]] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         applied.append(payload)
         return 1
 
@@ -379,9 +382,9 @@ def test_quant_backend_publishes_progress_on_both_sides_of_bounded_call(
     )
     monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("codex.exe", "codex")])
     monkeypatch.setattr(
-        cli.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, response, ""),
+        cli,
+        "run_hidden_process",
+        lambda *args, **kwargs: ProcessResult(0, response, "", False),
     )
     progress: list[str] = []
 
@@ -407,9 +410,9 @@ def test_quant_backend_publishes_finished_progress_after_timeout(monkeypatch) ->
     monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("codex.exe", "codex")])
 
     def timeout(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise subprocess.TimeoutExpired("codex.exe", 130)
+        return ProcessResult(-1, "", "", True)
 
-    monkeypatch.setattr(cli.subprocess, "run", timeout)
+    monkeypatch.setattr(cli, "run_hidden_process", timeout)
     progress: list[str] = []
 
     decisions, error = cli._decide_packets_with_quant(
@@ -488,7 +491,7 @@ def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -
 
     applied: list[dict[str, object]] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         applied.append(payload)
         return 1
 
@@ -593,7 +596,7 @@ def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch
         )
 
     monkeypatch.setattr(cli, "_decide_packets_with_quant", fake_quant_decide)
-    monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload: 1)
+    monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload, **kwargs: 1)
     monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
 
     result = runner.invoke(
@@ -617,8 +620,9 @@ def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch
 @dataclass
 class _Completed:
     returncode: int
-    stdout: str
-    stderr: str
+    stdout: str | None
+    stderr: str | None
+    timed_out: bool = False
 
 
 def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
@@ -658,7 +662,7 @@ def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
         outer = json.dumps({"type": "result", "is_error": False, "result": inner})
         return _Completed(returncode=0, stdout=outer, stderr="")
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
 
     packets = [
         {
@@ -701,7 +705,7 @@ def test_decide_packets_with_quant_rejects_invalid_schema(monkeypatch) -> None:
         outer = json.dumps({"type": "result", "is_error": False, "result": inner})
         return _Completed(returncode=0, stdout=outer, stderr="")
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
 
     packets = [
         {
@@ -734,7 +738,8 @@ def test_decide_packets_with_quant_fails_over_per_missing_packet_and_surfaces_st
 
     def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
         calls.append(str(args[0]))
-        assert "creationflags" in kwargs
+        assert kwargs["timeout_seconds"] == 40
+        assert kwargs["cwd"] == Path.cwd()
         if args[0] == "claude.exe":
             outer = json.dumps(
                 {
@@ -771,7 +776,7 @@ def test_decide_packets_with_quant_fails_over_per_missing_packet_and_surfaces_st
             stderr="",
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
     packet_id = "0000000000-00-000001|0000000001|4"
     mapped, error = cli._decide_packets_with_quant(
         [
@@ -831,7 +836,7 @@ def test_decide_packets_with_quant_keeps_valid_primary_decision_and_falls_back_o
             stderr="",
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
     packet_ids = [
         "0000000000-00-000001|0000000001|4",
         "0000000000-00-000002|0000000002|4",
@@ -859,8 +864,8 @@ def test_decide_packets_with_quant_keeps_valid_primary_decision_and_falls_back_o
 def test_decide_packets_with_quant_handles_nontext_error_streams(monkeypatch) -> None:
     monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("claude.exe", "claude")])
     monkeypatch.setattr(
-        cli.subprocess,
-        "run",
+        cli,
+        "run_hidden_process",
         lambda *args, **kwargs: _Completed(  # type: ignore[arg-type]
             returncode=1,
             stdout=None,
@@ -934,7 +939,7 @@ def test_cli_ops_autopilot_defers_quant_infrastructure_failure(monkeypatch) -> N
     monkeypatch.setattr(
         cli,
         "apply_decision",
-        lambda db_path, payload: applied.append(dict(payload)) or 1,
+        lambda db_path, payload, **kwargs: applied.append(dict(payload)) or 1,
     )
 
     result = runner.invoke(
@@ -1030,7 +1035,7 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
 
     decisions: list[str] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         decisions.append(str(payload["decision"]))
         return 1
 
@@ -1137,7 +1142,7 @@ def test_cli_ops_autopilot_capture_is_causal_and_fail_isolated(
     monkeypatch.setattr(cli, "capture_predecision_option_chain", fake_capture)
     applied: list[dict[str, object]] = []
 
-    def fake_apply(db_path: str, payload: dict[str, object]) -> int:
+    def fake_apply(db_path: str, payload: dict[str, object], **_kwargs: object) -> int:
         events.append("apply")
         applied.append(dict(payload))
         return 1
@@ -1301,6 +1306,40 @@ def test_cli_autopilot_preflight_fails_before_process_tree_for_unsafe_budget(
     assert result.exit_code == 2
     assert "heartbeat stale threshold" in result.stderr
     assert calls == []
+
+
+def test_pythonw_entrypoint_durably_logs_settings_bootstrap_failure(tmp_path: Path) -> None:
+    error_log = tmp_path / "bootstrap.err.log"
+    environment = dict(os.environ)
+    environment["SEC_TIMEOUT_SECONDS"] = "not-a-number"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "insider_alerts.cli",
+            "ops",
+            "autopilot",
+            "--loop",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "300",
+            "--error-log",
+            str(error_log),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert result.returncode != 0
+    assert "autopilot unhandled process failure (ValidationError:" in error_log.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_cli_autopilot_loop_logs_process_tree_ownership_failure(
@@ -1539,7 +1578,7 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
 def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch, tmp_path: Path
 ) -> None:
-    calls: dict[str, object] = {"poll": 0, "sleeps": []}
+    calls: dict[str, object] = {"poll": 0, "sleeps": [], "delivered": []}
     fingerprints = iter(("a" * 64, "a" * 64, "a" * 64, "a" * 64, "b" * 64))
 
     def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
@@ -1550,14 +1589,42 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch.setattr(
         cli,
         "enrich_filings_with_xml_url",
-        lambda settings, *, limit, progress_callback=None: EnrichResult(scanned=0, updated=0),
+        lambda settings, *, limit, progress_callback=None: EnrichResult(
+            scanned=1,
+            updated=0,
+            http_failed=1,
+        ),
     )
     monkeypatch.setattr(
         cli,
         "enqueue_review_packets",
-        lambda settings, *, limit, progress_callback=None: QueueResult(processed=0, enqueued=0),
+        lambda settings, *, limit, progress_callback=None: QueueResult(
+            processed=1,
+            enqueued=1,
+            market_failed=1,
+        ),
     )
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
+    outbox_packet = {
+        "packet_id": "0000320193-24-000123|0000320193|4",
+        "payload": {"issuer_symbol": "AAPL"},
+        "decision": {
+            "packet_id": "0000320193-24-000123|0000320193|4",
+            "decision": "approve",
+            "reason": "retry durable alert",
+        },
+    }
+    monkeypatch.setattr(
+        cli,
+        "list_notification_outbox",
+        lambda db_path, limit: [outbox_packet],
+    )
+    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "mark_notification_delivered",
+        lambda db_path, packet_id: calls["delivered"].append(packet_id),  # type: ignore[union-attr]
+    )
     monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: next(fingerprints))
     monkeypatch.setattr(cli, "ensure_kill_on_close_process_tree", lambda: None)
     monkeypatch.setattr(
@@ -1566,6 +1633,7 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
         lambda seconds: calls["sleeps"].append(seconds),  # type: ignore[union-attr]
     )
     output_log = tmp_path / "autopilot.out.log"
+    error_log = tmp_path / "autopilot.err.log"
     heartbeat_db = tmp_path / "autopilot-health.db"
 
     result = CliRunner().invoke(
@@ -1584,14 +1652,24 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
             "300",
             "--output-log",
             str(output_log),
+            "--error-log",
+            str(error_log),
         ],
     )
 
     assert result.exit_code == 0
-    assert calls == {"poll": 1, "sleeps": [15.0, 15.0, 1.0]}
+    assert calls == {
+        "poll": 1,
+        "sleeps": [15.0, 15.0, 1.0],
+        "delivered": ["0000320193-24-000123|0000320193|4"],
+    }
     message = "autopilot source changed; exiting so the hidden watchdog can start"
     assert message in result.stderr
     assert message in output_log.read_text(encoding="utf-8")
+    errors = error_log.read_text(encoding="utf-8")
+    assert "autopilot SEC enrichment degraded (http_failed=1" in errors
+    assert "autopilot review enrichment degraded" in errors
+    assert "market_failed=1" in errors
     health = cli.AutopilotHealthStore(heartbeat_db).read()
     assert health["last_progress_stage"] == "source_changed"
     assert health["last_cycle_success_utc"] is not None

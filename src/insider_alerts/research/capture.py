@@ -509,16 +509,26 @@ def _kill_process_tree(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            killed = subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("timed out terminating hidden child process tree") from exc
+        if killed.returncode != 0 and process.poll() is None:
+            detail = (killed.stderr or killed.stdout or "unknown taskkill failure").strip()
+            raise RuntimeError(f"failed to terminate hidden child process tree: {detail}")
     if process.poll() is None:
         process.kill()
-    process.wait(timeout=10)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("hidden child did not terminate after tree kill") from exc
 
 
 def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -> ProcessResult:
@@ -538,7 +548,10 @@ def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -
         return ProcessResult(process.returncode, stdout, stderr, False)
     except subprocess.TimeoutExpired:
         _kill_process_tree(process)
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("hidden child pipes remained open after tree kill") from exc
         return ProcessResult(process.returncode or -1, stdout, stderr, True)
 
 

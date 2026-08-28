@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import math
 import os
 import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Sequence
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,8 +20,10 @@ AUTOPILOT_HEALTH_SCHEMA_VERSION = 1
 MIN_STALE_SECONDS = 300
 STALE_SAFETY_MARGIN_SECONDS = 70
 SQLITE_STAGE_BUDGET_SECONDS = 200.0
+SQLITE_REVIEW_ITEM_BUDGET_SECONDS = 10.0
 NOTIFICATION_OBSERVER_BUDGET_SECONDS = 10.0
-SCHEDULER_CONTROL_TIMEOUT_SECONDS = 10.0
+SCHEDULER_CONTROL_TIMEOUT_SECONDS = 5.0
+SCHEDULED_TASK_RUNNING_STATE = 4
 MAX_STAGE_LENGTH = 80
 MAX_ERROR_LENGTH = 1000
 
@@ -259,6 +262,8 @@ def heartbeat_state(
     if stale_seconds < 1:
         raise ValueError("stale_seconds must be positive")
     store_path = Path(path)
+    if Path(f"{store_path.resolve()}.quarantine.json").is_file():
+        return True, "heartbeat_quarantine_incomplete", True
     if not store_path.is_file():
         return True, "heartbeat_store_missing", False
     try:
@@ -290,19 +295,41 @@ def _task_is_running(result: subprocess.CompletedProcess[str]) -> bool:
     if result.returncode != 0:
         error = (result.stderr or result.stdout or "unknown schtasks failure").strip()
         raise RuntimeError(f"failed to query scheduled autopilot worker: {error}")
+    normalized = result.stdout.strip()
+    if normalized.startswith("__TASK_STATE__="):
+        try:
+            return int(normalized.partition("=")[2]) == SCHEDULED_TASK_RUNNING_STATE
+        except ValueError as exc:
+            raise RuntimeError("scheduled task state API returned malformed output") from exc
     rows = csv.reader(io.StringIO(result.stdout))
     return any(len(row) > 3 and row[3].strip().casefold() == "running" for row in rows)
 
 
 def _run_schtasks(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    command = ["schtasks.exe", *arguments]
+    environment: dict[str, str] | None = None
+    if arguments and arguments[0].casefold() == "/query":
+        try:
+            task_name = arguments[arguments.index("/TN") + 1]
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError("scheduled task query requires an exact task name") from exc
+        environment = dict(os.environ)
+        environment["INSIDER_ALERTS_TASK_QUERY_NAME"] = task_name
+        state_script = (
+            "$task = Get-ScheduledTask "
+            "-TaskPath '\\' -TaskName $env:INSIDER_ALERTS_TASK_QUERY_NAME -ErrorAction Stop; "
+            "[Console]::Out.Write('__TASK_STATE__=' + [int]$task.State)"
+        )
+        command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", state_script]
     try:
         return subprocess.run(
-            ["schtasks.exe", *arguments],
+            command,
             check=False,
             capture_output=True,
             text=True,
             timeout=SCHEDULER_CONTROL_TIMEOUT_SECONDS,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=environment,
         )
     except subprocess.TimeoutExpired as exc:
         operation = arguments[0] if arguments else "unknown"
@@ -314,18 +341,95 @@ def _run_schtasks(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 def quarantine_corrupt_health_store(path: Path | str, *, now: datetime) -> list[str]:
     store_path = Path(path).resolve()
-    token = _stamp(now).replace(":", "").replace("-", "").replace(".", "")
+    manifest_path = Path(f"{store_path}.quarantine.json")
+    suffixes = ("", "-wal", "-shm")
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            members = manifest["members"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("autopilot health quarantine manifest is unreadable") from exc
+        if not isinstance(members, list) or len(members) != len(suffixes):
+            raise RuntimeError("autopilot health quarantine manifest is malformed")
+    else:
+        token = _stamp(now).replace(":", "").replace("-", "").replace(".", "")
+        members = [
+            {
+                "source": str(Path(f"{store_path}{suffix}")),
+                "destination": str(
+                    Path(f"{store_path}{suffix}").with_name(
+                        f"{Path(f'{store_path}{suffix}').name}.corrupt-{token}"
+                    )
+                ),
+                "required": Path(f"{store_path}{suffix}").exists(),
+            }
+            for suffix in suffixes
+        ]
+        staging = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+        encoded = json.dumps({"version": 1, "members": members}, sort_keys=True)
+        with staging.open("x", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(staging, manifest_path)
+        finally:
+            staging.unlink(missing_ok=True)
+
     moved: list[str] = []
-    # Preserve the corrupt main file until every sidecar is safely out of the way. If any move
-    # fails, the next watchdog still sees a corrupt main store and retries quarantine.
-    for suffix in ("-wal", "-shm", ""):
-        source = Path(f"{store_path}{suffix}")
-        if not source.exists():
+    expected_sources = {str(Path(f"{store_path}{suffix}")) for suffix in suffixes}
+    for member in members:
+        if not isinstance(member, dict):
+            raise RuntimeError("autopilot health quarantine manifest is malformed")
+        source_text = member.get("source")
+        destination_text = member.get("destination")
+        required = member.get("required")
+        if (
+            not isinstance(source_text, str)
+            or source_text not in expected_sources
+            or not isinstance(destination_text, str)
+            or not isinstance(required, bool)
+        ):
+            raise RuntimeError("autopilot health quarantine manifest is malformed")
+        source = Path(source_text)
+        destination = Path(destination_text)
+        if destination.parent != store_path.parent or not destination.name.startswith(
+            f"{source.name}.corrupt-"
+        ):
+            raise RuntimeError("autopilot health quarantine manifest escaped its store")
+        if destination.exists():
+            if source.exists():
+                raise RuntimeError("autopilot health quarantine destination collision")
+            moved.append(str(destination))
             continue
-        destination = source.with_name(f"{source.name}.corrupt-{token}")
+        if not source.exists():
+            if required:
+                raise RuntimeError("autopilot health quarantine member disappeared")
+            continue
         os.replace(source, destination)
         moved.append(str(destination))
+    manifest_path.unlink()
     return moved
+
+
+def _await_worker_runtime(
+    heartbeat_db: Path | str,
+    *,
+    previous_runtime_id: str | None,
+    sleep_fn: Callable[[float], None],
+    attempts: int = 10,
+) -> bool:
+    for attempt in range(attempts):
+        try:
+            health = AutopilotHealthStore(heartbeat_db).read()
+            runtime_id = health.get("runtime_id")
+            if isinstance(runtime_id, str) and runtime_id and runtime_id != previous_runtime_id:
+                return True
+        except (OSError, sqlite3.Error):
+            pass
+        if attempt + 1 < attempts:
+            sleep_fn(0.5)
+    return False
 
 
 def run_autopilot_watchdog(
@@ -336,7 +440,7 @@ def run_autopilot_watchdog(
     now: datetime | None = None,
     task_runner: TaskRunner | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
-    stop_poll_attempts: int = 20,
+    stop_poll_attempts: int = 4,
 ) -> dict[str, object]:
     if stop_poll_attempts < 1:
         raise ValueError("stop_poll_attempts must be positive")
@@ -347,6 +451,12 @@ def run_autopilot_watchdog(
         stale_seconds=stale_seconds,
     )
     runner = task_runner or _run_schtasks
+    previous_runtime_id: str | None = None
+    if not corrupt and Path(heartbeat_db).is_file():
+        with suppress(OSError, sqlite3.Error):
+            candidate = AutopilotHealthStore(heartbeat_db).read().get("runtime_id")
+            if isinstance(candidate, str):
+                previous_runtime_id = candidate
     query = ["/Query", "/TN", worker_task_name, "/FO", "CSV", "/NH", "/V"]
     worker_running = _task_is_running(runner(query))
     end_return_code: int | None = None
@@ -383,6 +493,14 @@ def run_autopilot_watchdog(
                 run_result.stderr or run_result.stdout or "unknown schtasks failure"
             ).strip()
             raise RuntimeError(f"failed to start scheduled autopilot worker: {error}")
+        if task_runner is None and not _await_worker_runtime(
+            heartbeat_db,
+            previous_runtime_id=previous_runtime_id,
+            sleep_fn=sleep_fn,
+        ):
+            raise RuntimeError(
+                "scheduled autopilot worker accepted start but did not publish a new runtime"
+            )
     if stale:
         action = "restart"
     elif should_start:
@@ -434,14 +552,16 @@ def autopilot_runtime_budget(
         settings.market_data_timeout_seconds
         + 1 / settings.market_data_rate_limit_per_second
     ) + (settings.market_data_retry_attempts - 1) * settings.market_data_retry_max_seconds
-    review_item_window = sec_window + ib_window + yahoo_window
+    review_item_window = (
+        sec_window + ib_window + yahoo_window + SQLITE_REVIEW_ITEM_BUDGET_SECONDS
+    )
     notification_window = (
         settings.ntfy_retry_attempts * settings.ntfy_timeout_seconds
         + (settings.ntfy_retry_attempts - 1) * settings.ntfy_retry_max_seconds
         + OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
         + NOTIFICATION_OBSERVER_BUDGET_SECONDS
     )
-    quant_window = quant_timeout_seconds + 10
+    quant_window = quant_timeout_seconds + 20
     maximum_stage = max(
         sec_window,
         review_item_window,
@@ -478,7 +598,7 @@ def validate_stale_threshold(
             )["required_stale_seconds"]
         )
         if settings is not None
-        else max(MIN_STALE_SECONDS, quant_timeout_seconds + 80)
+        else max(MIN_STALE_SECONDS, quant_timeout_seconds + 90)
     )
     if stale_seconds < minimum:
         raise ValueError(

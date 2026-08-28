@@ -11,13 +11,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($TaskName) -or [string]::IsNullOrWhiteSpace($WorkerTaskName)) {
+  throw "TaskName and WorkerTaskName must be nonempty."
+}
+if ([string]::Equals($TaskName, $WorkerTaskName, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "TaskName and WorkerTaskName must be distinct."
+}
 if ($RecoveryIntervalMinutes -lt 1) {
   throw "RecoveryIntervalMinutes must be greater than or equal to 1."
 }
 if ($QuantTimeoutSeconds -lt 10 -or $QuantTimeoutSeconds -gt 900) {
   throw "QuantTimeoutSeconds must be between 10 and 900."
 }
-$minimumStaleHeartbeatSeconds = [Math]::Max(300, $QuantTimeoutSeconds + 80)
+$minimumStaleHeartbeatSeconds = [Math]::Max(300, $QuantTimeoutSeconds + 90)
 if ($StaleHeartbeatSeconds -lt $minimumStaleHeartbeatSeconds) {
   throw "StaleHeartbeatSeconds must be at least $minimumStaleHeartbeatSeconds."
 }
@@ -58,11 +64,16 @@ if (-not (Test-Path (Join-Path $repoRoot ".env"))) {
   throw "Missing .env at $repoRoot\.env"
 }
 
-& $pythonConsoleExe -m insider_alerts.cli ops autopilot-config-validate `
-  --quant-timeout-seconds $QuantTimeoutSeconds `
-  --heartbeat-stale-seconds $StaleHeartbeatSeconds
-if ($LASTEXITCODE -ne 0) {
-  throw "Autopilot watchdog preflight failed."
+Push-Location $repoRoot
+try {
+  & $pythonConsoleExe -m insider_alerts.cli ops autopilot-config-validate `
+    --quant-timeout-seconds $QuantTimeoutSeconds `
+    --heartbeat-stale-seconds $StaleHeartbeatSeconds
+  if ($LASTEXITCODE -ne 0) {
+    throw "Autopilot watchdog preflight failed."
+  }
+} finally {
+  Pop-Location
 }
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -125,27 +136,72 @@ function Stop-TaskAndWait([string]$Name) {
   }
 }
 
-# Stop the old same-named long-running definition before either replacement can run.
-Stop-TaskAndWait -Name $TaskName
-Stop-TaskAndWait -Name $WorkerTaskName
+function Get-TaskSnapshot([string]$Name) {
+  $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  if ($null -eq $task) {
+    return [pscustomobject]@{ Name = $Name; Exists = $false; Xml = $null; WasRunning = $false }
+  }
+  return [pscustomobject]@{
+    Name = $Name
+    Exists = $true
+    Xml = Export-ScheduledTask -TaskName $Name
+    WasRunning = ($task.State -eq "Running")
+  }
+}
 
-Register-ScheduledTask `
-  -TaskName $WorkerTaskName `
-  -Action $workerAction `
-  -Principal $principal `
-  -Settings $workerSettings `
-  -Force | Out-Null
+$snapshots = @(
+  (Get-TaskSnapshot -Name $TaskName),
+  (Get-TaskSnapshot -Name $WorkerTaskName)
+)
 
-Register-ScheduledTask `
-  -TaskName $TaskName `
-  -Action $watchdogAction `
-  -Trigger @($watchdogLogonTrigger, $watchdogTrigger) `
-  -Principal $principal `
-  -Settings $watchdogSettings `
-  -Force | Out-Null
+try {
+  # Stop the old same-named long-running definition before either replacement can run.
+  Stop-TaskAndWait -Name $TaskName
+  Stop-TaskAndWait -Name $WorkerTaskName
 
-if ($Start) {
-  Start-ScheduledTask -TaskName $TaskName
+  Register-ScheduledTask `
+    -TaskName $WorkerTaskName `
+    -Action $workerAction `
+    -Principal $principal `
+    -Settings $workerSettings `
+    -Force | Out-Null
+
+  Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $watchdogAction `
+    -Trigger @($watchdogLogonTrigger, $watchdogTrigger) `
+    -Principal $principal `
+    -Settings $watchdogSettings `
+    -Force | Out-Null
+
+  if ($Start) {
+    Start-ScheduledTask -TaskName $TaskName
+  }
+} catch {
+  $installError = $_
+  $rollbackErrors = @()
+  foreach ($snapshot in $snapshots) {
+    try {
+      Stop-TaskAndWait -Name $snapshot.Name
+      if ($snapshot.Exists) {
+        Register-ScheduledTask -TaskName $snapshot.Name -Xml $snapshot.Xml -Force | Out-Null
+        if ($snapshot.WasRunning) {
+          Start-ScheduledTask -TaskName $snapshot.Name
+        }
+      } else {
+        $created = Get-ScheduledTask -TaskName $snapshot.Name -ErrorAction SilentlyContinue
+        if ($null -ne $created) {
+          Unregister-ScheduledTask -TaskName $snapshot.Name -Confirm:$false
+        }
+      }
+    } catch {
+      $rollbackErrors += "$($snapshot.Name): $($_.Exception.Message)"
+    }
+  }
+  if ($rollbackErrors.Count -gt 0) {
+    throw "Autopilot install failed ($($installError.Exception.Message)); rollback also failed: $($rollbackErrors -join '; ')"
+  }
+  throw "Autopilot install failed and prior tasks were restored: $($installError.Exception.Message)"
 }
 
 Get-ScheduledTask -TaskName @($TaskName, $WorkerTaskName)
