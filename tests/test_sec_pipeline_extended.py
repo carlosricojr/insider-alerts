@@ -2,6 +2,7 @@ import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
 from pytest_httpx import HTTPXMock
 
 from insider_alerts.config import Settings
@@ -120,6 +121,87 @@ def test_enrich_filings_preserves_successes_when_later_detail_fetch_fails(
             (good.accession_number,),
         ).fetchone()
     assert value == (good.filing_detail_url,)
+
+
+@pytest.mark.parametrize(
+    "filing_url",
+    [
+        "https://attacker.example/form4.xml",
+        "http://www.sec.gov/form4.xml",
+        "https://www.sec.gov.attacker.example/form4.xml",
+        "https://[invalid/form4.xml",
+        "https://attacker.example/form4-index.htm",
+        "https://www.sec.gov:notaport/form4.xml",
+        "https://www.sec.gov:/form4.xml",
+        "https://www.sec.gov:8443/form4.xml",
+        "https://user:password@www.sec.gov/form4.xml",
+        "https://.sec.gov/form4.xml",
+        "https:///form4.xml",
+        "/form4.xml",
+        "form4.xml",
+    ],
+)
+def test_enrich_filings_rejects_direct_xml_outside_sec_boundary(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+    filing_url: str,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    ref = FilingRef(
+        source="sec_rss",
+        cik="1",
+        accession_number="0000000001-26-000001",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 2, 0, tzinfo=UTC),
+        filing_detail_url=filing_url,
+        primary_doc_url=None,
+        raw_rss_entry={},
+    )
+    upsert_filing_refs(settings.database_path, [ref])
+
+    result = enrich_filings_with_xml_url(settings, limit=10)
+
+    assert result.scanned == 1
+    assert result.updated == 0
+    assert result.xml_not_found == 1
+    assert httpx_mock.get_requests() == []
+    with sqlite3.connect(settings.database_path) as conn:
+        value = conn.execute(
+            "SELECT form4_xml_url FROM filings WHERE accession_number = ?",
+            (ref.accession_number,),
+        ).fetchone()
+    assert value == (None,)
+
+
+@pytest.mark.parametrize(
+    "xml_url",
+    [
+        "https://attacker.example/form4.xml",
+        "https://xsl.attacker.example/www.sec.gov/form4.xml",
+        "https:///form4.xml",
+        "/form4.xml",
+        "form4.xml",
+    ],
+)
+def test_enqueue_review_packets_rejects_stored_xml_outside_sec_boundary(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+    xml_url: str,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    _seed_ref(
+        settings.database_path,
+        accession_number="0000320193-24-000123",
+        filed_at=datetime(2026, 2, 11, 1, 0, tzinfo=UTC),
+        xml_url=xml_url,
+    )
+
+    result = enqueue_review_packets(settings, limit=5)
+
+    assert result.processed == 1
+    assert result.enqueued == 0
+    assert result.http_failed == 1
+    assert httpx_mock.get_requests() == []
 
 
 def test_enqueue_review_packets_from_xml_urls(httpx_mock: HTTPXMock, tmp_path) -> None:

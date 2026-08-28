@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 XML_LINK_RE = re.compile(r"href=[\"'](?P<href>[^\"']+\.xml)[\"']", re.IGNORECASE)
+HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -72,13 +73,40 @@ def _absolute_sec_url(href: str, filing_detail_url: str | None) -> str | None:
         absolute = urljoin(filing_detail_url or "https://www.sec.gov/", href)
         parsed = urlsplit(absolute)
         hostname = (parsed.hostname or "").casefold()
+        port = parsed.port
     except ValueError:
         return None
     if parsed.scheme.casefold() != "https":
         return None
-    if hostname != "sec.gov" and not hostname.endswith(".sec.gov"):
+    if hostname == "sec.gov":
+        valid_hostname = True
+    elif hostname.endswith(".sec.gov"):
+        subdomain = hostname.removesuffix(".sec.gov")
+        valid_hostname = bool(subdomain) and all(
+            HOST_LABEL_RE.fullmatch(label) for label in subdomain.split(".")
+        )
+    else:
+        valid_hostname = False
+    if not valid_hostname:
+        return None
+    if port not in {None, 443} or parsed.username is not None or parsed.password is not None:
+        return None
+    canonical_authority = hostname if port is None else f"{hostname}:{port}"
+    if parsed.netloc.casefold() != canonical_authority:
         return None
     return absolute
+
+
+def validate_sec_url(url: str) -> str | None:
+    """Return a normalized HTTPS SEC URL, or ``None`` when it crosses the boundary."""
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return _absolute_sec_url(url, None)
 
 
 def _is_form4_like(url: str) -> bool:

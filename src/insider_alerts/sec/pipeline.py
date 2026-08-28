@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from urllib.parse import urlsplit, urlunsplit
 
 from insider_alerts.config import Settings
 from insider_alerts.review.market_context import (
@@ -22,7 +23,7 @@ from insider_alerts.review.scoring import score_form4_signal
 from insider_alerts.sec.backfill import iter_quarter_range, master_index_url, parse_form4_master_idx
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
 from insider_alerts.sec.form4 import Form4ParseError, parse_form4_xml
-from insider_alerts.sec.index import locate_form4_xml_url
+from insider_alerts.sec.index import locate_form4_xml_url, validate_sec_url
 from insider_alerts.sec.rss import parse_form4_rss_with_diagnostics
 from insider_alerts.sec.store import (
     StoreResult,
@@ -75,7 +76,11 @@ class BackfillResult:
 
 
 def _normalize_form4_xml_url(url: str) -> str:
-    return XSL_SEGMENT_RE.sub("/", url, count=1)
+    parsed = urlsplit(url)
+    normalized_path = XSL_SEGMENT_RE.sub("/", parsed.path, count=1)
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, normalized_path, parsed.query, parsed.fragment)
+    )
 
 
 def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> PollResult:
@@ -120,11 +125,20 @@ def enrich_filings_with_xml_url(
     for index, ref in enumerate(refs):
         if progress_callback is not None:
             progress_callback(f"enrichment_item_{index}_started")
-        if ref.filing_detail_url.lower().endswith(".xml"):
-            xml_url = _normalize_form4_xml_url(ref.filing_detail_url)
+        validated_detail_url = validate_sec_url(ref.filing_detail_url)
+        if validated_detail_url is None:
+            xml_not_found += 1
+            logger.warning(
+                "SEC filing URL rejected for accession=%s url=%s",
+                ref.accession_number,
+                ref.filing_detail_url,
+            )
+            continue
+        if urlsplit(validated_detail_url).path.lower().endswith(".xml"):
+            xml_url = _normalize_form4_xml_url(validated_detail_url)
         else:
             try:
-                html = client.get_text(ref.filing_detail_url)
+                html = client.get_text(validated_detail_url)
             except SecHttpError as exc:
                 http_failed += 1
                 logger.warning(
@@ -134,7 +148,7 @@ def enrich_filings_with_xml_url(
                     exc,
                 )
                 continue
-            maybe = locate_form4_xml_url(html, filing_detail_url=ref.filing_detail_url)
+            maybe = locate_form4_xml_url(html, filing_detail_url=validated_detail_url)
             if maybe is None:
                 xml_not_found += 1
                 continue
@@ -250,7 +264,21 @@ def enqueue_review_packets(
         form_type = str(row["form_type"])
 
         processed += 1
-        xml_url = _normalize_form4_xml_url(str(row["form4_xml_url"]))
+        stored_xml_url = str(row["form4_xml_url"])
+        validated_stored_xml_url = validate_sec_url(stored_xml_url)
+        xml_url = (
+            validate_sec_url(_normalize_form4_xml_url(validated_stored_xml_url))
+            if validated_stored_xml_url is not None
+            else None
+        )
+        if xml_url is None:
+            http_failed += 1
+            logger.warning(
+                "SEC review XML URL rejected for accession=%s url=%s",
+                accession_number,
+                stored_xml_url,
+            )
+            continue
         try:
             xml_text = client.get_text(xml_url)
             facts = parse_form4_xml(xml_text)
