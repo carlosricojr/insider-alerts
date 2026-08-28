@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "docs" / "research" / "contracts" / "notification-transport-v1.json"
 ACTIVATION = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
 PACKET_ID = "0000320193-26-000001|0000320193|4"
+AMENDED_PACKET_ID = "0001866174-26-000011|0001866174|4/A"
 
 
 def _config(tmp_path: Path, *, timeout_ms: int = 100) -> NotificationJournalConfig:
@@ -386,7 +387,11 @@ def test_review_notification_records_one_complete_dispatch(
 
     cli._send_review_notification(
         settings,
-        {"packet_id": PACKET_ID, "decision": "reject", "analyst": "operator"},
+        {
+            "packet_id": AMENDED_PACKET_ID,
+            "decision": "reject",
+            "analyst": "operator",
+        },
     )
 
     status = notification_journal_status(config)
@@ -403,7 +408,15 @@ def test_review_notification_records_one_complete_dispatch(
             str(row[0])
             for row in conn.execute("SELECT transport_id FROM notification_transport_events")
         }
-    assert transport_ids == {notification_transport_id(PACKET_ID, "dispatch-nonce")}
+    assert transport_ids == {
+        notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")
+    }
+    with sqlite3.connect(config.database) as conn:
+        packet_ids = {
+            str(row[0])
+            for row in conn.execute("SELECT packet_id FROM notification_transport_events")
+        }
+    assert packet_ids == {AMENDED_PACKET_ID}
 
 
 def test_observer_setup_failure_does_not_block_notification(
