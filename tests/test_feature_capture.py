@@ -195,6 +195,49 @@ def test_preactivation_job_is_never_ingested_or_requested(tmp_path: Path) -> Non
     assert feature_capture_status(config.feature_db)["receipts"] == 0
 
 
+def test_naive_source_timestamp_is_rejected_without_blocking_later_job(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _source(config.source_db)
+    with sqlite3.connect(config.source_db) as conn:
+        conn.execute(
+            "UPDATE research_capture_jobs SET decision_at_utc=? WHERE job_id='job-1'",
+            ("2026-08-28T11:59:00",),
+        )
+        conn.execute(
+            """
+            INSERT INTO research_capture_jobs
+            SELECT 'job-2','packet-2',contract_version,'0001-26-000002',issuer_cik,
+                   form_type,payload_json,decision_json,source_first_observed_at_utc,
+                   ?,created_at_utc
+            FROM research_capture_jobs WHERE job_id='job-1'
+            """,
+            (DECISION.isoformat(),),
+        )
+    times = _clock(
+        DECISION + timedelta(seconds=1),
+        DECISION + timedelta(seconds=2),
+        DECISION + timedelta(seconds=3),
+    )
+
+    result = run_feature_capture_once(
+        config,
+        client=_Client(_resource(_payload())),
+        now_fn=lambda: next(times),
+    )
+
+    assert result.status == "completed"
+    assert result.job_id == "job-2"
+    with sqlite3.connect(config.feature_db) as conn:
+        rejection = conn.execute(
+            "SELECT job_id,reason FROM feature_source_rejections"
+        ).fetchone()
+        assert rejection == ("job-1", "invalid_decision_at_utc")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE feature_source_rejections SET reason='changed'")
+
+
 def test_expired_capture_is_terminal_missing_without_sec_request(tmp_path: Path) -> None:
     config = _config(tmp_path)
     _source(config.source_db)

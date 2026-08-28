@@ -278,6 +278,27 @@ def _ensure_store(
             BEFORE DELETE ON feature_capture_jobs
             BEGIN SELECT RAISE(ABORT, 'feature capture jobs cannot be deleted'); END;
 
+            CREATE TABLE IF NOT EXISTS feature_source_rejections (
+                sequence INTEGER PRIMARY KEY,
+                rejection_id TEXT NOT NULL UNIQUE,
+                job_id TEXT NOT NULL UNIQUE,
+                source_job_sha256 TEXT NOT NULL UNIQUE,
+                reason TEXT NOT NULL,
+                recorded_at_utc TEXT NOT NULL,
+                record_sha256 TEXT NOT NULL UNIQUE,
+                record_json BLOB NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS feature_source_rejections_sequence
+            BEFORE INSERT ON feature_source_rejections
+            WHEN NEW.sequence<>(SELECT COALESCE(MAX(sequence),0)+1 FROM feature_source_rejections)
+            BEGIN SELECT RAISE(ABORT, 'feature source rejection sequence must be gap-free'); END;
+            CREATE TRIGGER IF NOT EXISTS feature_source_rejections_no_update
+            BEFORE UPDATE ON feature_source_rejections
+            BEGIN SELECT RAISE(ABORT, 'feature source rejections are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS feature_source_rejections_no_delete
+            BEFORE DELETE ON feature_source_rejections
+            BEGIN SELECT RAISE(ABORT, 'feature source rejections are immutable'); END;
+
             CREATE TABLE IF NOT EXISTS feature_capture_attempts (
                 sequence INTEGER PRIMARY KEY,
                 attempt_id TEXT NOT NULL UNIQUE,
@@ -396,11 +417,9 @@ def _source_job_record(row: sqlite3.Row) -> tuple[dict[str, Any], str]:
         "contract_version": str(row["contract_version"]),
         "payload_json": str(row["payload_json"]),
         "decision_json": str(row["decision_json"]),
-        "source_first_observed_at_utc": _utc_text(
-            _parse_utc(str(row["source_first_observed_at_utc"]))
-        ),
-        "decision_at_utc": _utc_text(_parse_utc(str(row["decision_at_utc"]))),
-        "created_at_utc": _utc_text(_parse_utc(str(row["created_at_utc"]))),
+        "source_first_observed_at_utc": str(row["source_first_observed_at_utc"]),
+        "decision_at_utc": str(row["decision_at_utc"]),
+        "created_at_utc": str(row["created_at_utc"]),
     }
     return record, _sha256(_canonical(record))
 
@@ -423,7 +442,73 @@ def _source_validation_error(record: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _ingest_next_job(config: FeatureCaptureConfig) -> None:
+def _source_timestamp_error(record: Mapping[str, Any]) -> tuple[str | None, datetime | None]:
+    parsed: dict[str, datetime] = {}
+    for field in (
+        "source_first_observed_at_utc",
+        "decision_at_utc",
+        "created_at_utc",
+    ):
+        try:
+            parsed[field] = _parse_utc(str(record[field]))
+        except (KeyError, TypeError, ValueError):
+            return f"invalid_{field}", None
+    if parsed["source_first_observed_at_utc"] > parsed["decision_at_utc"]:
+        return "source_timestamps_out_of_order", parsed["decision_at_utc"]
+    return None, parsed["decision_at_utc"]
+
+
+def _record_source_rejection(
+    conn: sqlite3.Connection,
+    *,
+    record: Mapping[str, Any],
+    source_sha256: str,
+    reason: str,
+    recorded_at: datetime,
+) -> None:
+    job_id = str(record["job_id"])
+    existing = conn.execute(
+        "SELECT source_job_sha256,reason FROM feature_source_rejections WHERE job_id=?",
+        (job_id,),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing["source_job_sha256"]) != source_sha256
+            or str(existing["reason"]) != reason
+        ):
+            raise RuntimeError("rejected source job changed after feature observation")
+        return
+    rejection = {
+        "contract_version": FEATURE_CAPTURE_VERSION,
+        "rejection_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{job_id}|source-rejection")),
+        "job_id": job_id,
+        "source_job_sha256": source_sha256,
+        "reason": reason,
+        "recorded_at_utc": _utc_text(recorded_at),
+    }
+    encoded = _canonical(rejection)
+    digest = _sha256(encoded)
+    sequence = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM feature_source_rejections"
+        ).fetchone()[0]
+    )
+    conn.execute(
+        "INSERT INTO feature_source_rejections VALUES(?,?,?,?,?,?,?,?)",
+        (
+            sequence,
+            rejection["rejection_id"],
+            job_id,
+            source_sha256,
+            reason,
+            rejection["recorded_at_utc"],
+            digest,
+            encoded,
+        ),
+    )
+
+
+def _ingest_next_job(config: FeatureCaptureConfig, *, observed_at: datetime) -> None:
     if not config.source_db.is_file():
         return
     with closing(_connect(config.source_db, write=False)) as source:
@@ -439,6 +524,7 @@ def _ingest_next_job(config: FeatureCaptureConfig) -> None:
                    decision_json,source_first_observed_at_utc,decision_at_utc,created_at_utc
             FROM research_capture_jobs
             WHERE julianday(decision_at_utc)>=julianday(?)
+               OR julianday(decision_at_utc) IS NULL
             ORDER BY decision_at_utc,job_id
             """,
             (_utc_text(config.activation_at_utc),),
@@ -446,7 +532,18 @@ def _ingest_next_job(config: FeatureCaptureConfig) -> None:
     with closing(_connect(config.feature_db, write=True)) as conn, conn:
         for row in rows:
             record, source_sha = _source_job_record(row)
-            if _parse_utc(str(record["decision_at_utc"])) < config.activation_at_utc:
+            timestamp_error, decision_at = _source_timestamp_error(record)
+            if timestamp_error is not None:
+                _record_source_rejection(
+                    conn,
+                    record=record,
+                    source_sha256=source_sha,
+                    reason=timestamp_error,
+                    recorded_at=observed_at,
+                )
+                continue
+            assert decision_at is not None
+            if decision_at < config.activation_at_utc:
                 continue
             existing = conn.execute(
                 "SELECT source_job_sha256 FROM feature_capture_jobs WHERE job_id=?",
@@ -853,7 +950,7 @@ def run_feature_capture_once(
     initialize_feature_capture(config)
     policy, _, policy_sha = _load_policy(config.policy_path)
     now = _now(now_fn)
-    _ingest_next_job(config)
+    _ingest_next_job(config, observed_at=now)
     job = _claim(config, now=now)
     if job is None:
         _write_health(config, now=now, result="idle", job_id=None)
@@ -1140,6 +1237,9 @@ def feature_capture_status(
             ).fetchall()
         }
         receipts = int(conn.execute("SELECT COUNT(*) FROM companyfacts_receipts").fetchone()[0])
+        source_rejections = int(
+            conn.execute("SELECT COUNT(*) FROM feature_source_rejections").fetchone()[0]
+        )
         receipt_rows = conn.execute(
             "SELECT receipt_sha256,record_json FROM companyfacts_receipts ORDER BY sequence"
         ).fetchall()
@@ -1184,5 +1284,6 @@ def feature_capture_status(
         "health": dict(health) if health else None,
         "jobs": jobs,
         "receipts": receipts,
+        "source_rejections": source_rejections,
         "integrity_errors": integrity_errors,
     }

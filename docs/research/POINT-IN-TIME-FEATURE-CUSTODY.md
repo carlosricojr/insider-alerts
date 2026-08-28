@@ -10,7 +10,8 @@ The worker watches the immutable identity fields of approved `research_capture_j
 of the slower option evidence snapshot. Only jobs whose decision timestamp is at or after the
 separately sealed feature-stream activation are admitted. A request must begin no more than 900
 seconds after that decision. An older job becomes typed missingness; it is never backfilled and
-presented as contemporaneous.
+presented as contemporaneous. A source row whose timestamps cannot prove UTC ordering or activation
+membership is written to a separate immutable rejection ledger and cannot block later valid rows.
 
 Every successful SEC response is stored byte-for-byte in a content-addressed `.bin` artifact. Its
 receipt binds the request and response times, endpoint, status, selected HTTP metadata, raw digest,
