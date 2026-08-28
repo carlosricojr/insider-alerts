@@ -324,3 +324,8 @@ def test_worker_and_installer_are_order_incapable_hidden_and_singleton() -> None
     assert "-LogonType S4U" in installer
     assert "-RestartCount" not in installer
     assert "-RestartInterval" not in installer
+
+    trial_installer = (
+        ROOT / "ops/windows/install-research-trial-task.ps1"
+    ).read_text(encoding="utf-8")
+    assert r'--seal-db `"$repoRoot\data\research\trial_seals.db`"' in trial_installer

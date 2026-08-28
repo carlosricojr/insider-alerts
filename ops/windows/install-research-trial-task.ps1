@@ -26,6 +26,7 @@ $arguments = @(
   "--bar-feed-db `"$repoRoot\data\research\bar_feed.db`"",
   "--session-feed-db `"$repoRoot\data\research\session_feed.db`"",
   "--registry-path `"$repoRoot\docs\research\registry\OPP-E07-V1.json`"",
+  "--seal-db `"$repoRoot\data\research\trial_seals.db`"",
   "--error-log `"$repoRoot\logs\research-trial-worker.err.log`""
 ) -join " "
 $action = New-ScheduledTaskAction -Execute $pythonExe -Argument $arguments -WorkingDirectory $repoRoot

@@ -113,6 +113,7 @@ def _trial_config(config: TerminalBuildConfig) -> TrialRuntimeConfig:
         session_feed_db=config.trial_db.with_name("session_feed.db"),
         registry_path=config.registry_path,
         activation_db=config.activation_db,
+        seal_db=config.seal_db,
     )
 
 

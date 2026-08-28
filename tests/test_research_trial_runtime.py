@@ -2493,9 +2493,56 @@ def test_candidate_insert_cannot_cross_an_existing_deadline_receipt(tmp_path: Pa
     )
 
     with pytest.raises(runtime.EvidenceExcluded, match="enrollment_deadline_already_sealed"):
-        store.append_candidate(candidate, seal_db=seal_db)
+        store.append_candidate(candidate, seal_store=runtime.TrialSealStore(seal_db))
 
     assert store.candidates() == []
+
+
+def test_runtime_wires_explicit_seal_store_into_candidate_insert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_config(tmp_path), seal_db=tmp_path / "custom" / "seals.db")
+    deadline = runtime.enrollment_deadline(ACTIVATED_AT)
+    _install_schedule(config)
+    _install_evidence(config)
+    runtime.TrialSealStore(config.effective_seal_db).seal_deadline_miss(
+        {
+            "activated_at_utc": _utc_text(ACTIVATED_AT),
+            "candidates": [],
+        },
+        recorded_at=deadline,
+    )
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+
+    result = run_trial_once(config, now=deadline - timedelta(microseconds=1))
+
+    assert result.status == "collecting"
+    store = TrialStore(config.trial_db)
+    assert store.candidates() == []
+    assert store.disposition_counts() == {"excluded": 1}
+    assert _disposition_reasons(config) == ["enrollment_deadline_already_sealed"]
+    assert not config.trial_db.with_name("trial_seals.db").exists()
+
+
+def test_postdeadline_registry_mismatch_remains_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    _install_schedule(config)
+    _install_evidence(config, policy_sha256="b" * 64)
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+
+    result = run_trial_once(config, now=runtime.enrollment_deadline(ACTIVATED_AT))
+
+    assert result.status == "invalid"
+    assert TrialStore(config.trial_db).disposition_counts() == {"invalid": 1}
+    assert "registry_digest_mismatch" in _disposition_reasons(config)[0]
 
 
 def test_active_runtime_rejects_evidence_bound_to_another_registry(
