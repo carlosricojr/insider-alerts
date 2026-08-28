@@ -39,7 +39,10 @@ the bounded enrichment and review queues, while preserving all historical record
    non-HTTPS URLs, or off-domain URLs.
 4. Apply the same source-provenance predicate to both the missing-XML queue and review queue so
    immutable legacy false positives cannot consume their limits.
-5. Prove the boundary with focused regressions, the complete quality gate, adversarial review,
+5. Record deterministic URL/document rejections in an append-only ledger and exclude the exact
+   rejected input before later queue limits. Only positively identified XBRL instances, linkbases,
+   and schemas are terminal; transport, malformed, error, and unrecognized XML remain retryable.
+6. Prove the boundary with focused regressions, the complete quality gate, adversarial review,
    CodeRabbit exact-head review, and a post-deploy live cycle.
 
 ## Acceptance checks

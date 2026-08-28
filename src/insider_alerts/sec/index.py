@@ -19,6 +19,12 @@ class _Cell:
         return " ".join(" ".join(self.text_parts).split())
 
 
+@dataclass(frozen=True, slots=True)
+class Form4XmlLocation:
+    url: str | None
+    recognized_document_table: bool
+
+
 class _DocumentTableParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -132,8 +138,9 @@ def _prefer_raw(candidates: list[str]) -> str | None:
     return candidates[0] if candidates else None
 
 
-def _table_form4_candidates(parser: _DocumentTableParser) -> list[str]:
+def _table_form4_candidates(parser: _DocumentTableParser) -> tuple[list[str], bool]:
     candidates: list[str] = []
+    recognized_document_table = False
     for table in parser.tables:
         type_index: int | None = None
         header_index: int | None = None
@@ -147,30 +154,37 @@ def _table_form4_candidates(parser: _DocumentTableParser) -> list[str]:
                 break
         if type_index is None or header_index is None:
             continue
+        if len(table) <= header_index + 1:
+            continue
+        recognized_document_table = True
 
         for row in table[header_index + 1 :]:
             if len(row) <= type_index or row[type_index].text.strip().upper() not in {"4", "4/A"}:
                 continue
             candidates.extend(href for cell in row for href in cell.hrefs if _is_xml_link(href))
-    return candidates
+    return candidates, recognized_document_table
 
 
-def locate_form4_xml_url(
+def locate_form4_xml(
     filing_detail_html: str,
     *,
     filing_detail_url: str | None = None,
-) -> str | None:
+) -> Form4XmlLocation:
     parser = _DocumentTableParser()
     parser.feed(filing_detail_html)
 
     if parser.tables:
+        table_candidates, recognized_document_table = _table_form4_candidates(parser)
         candidates = [
             absolute
-            for href in _table_form4_candidates(parser)
+            for href in table_candidates
             for absolute in [_absolute_sec_url(href, filing_detail_url)]
             if absolute is not None
         ]
-        return _prefer_raw(candidates)
+        return Form4XmlLocation(
+            url=_prefer_raw(candidates),
+            recognized_document_table=recognized_document_table,
+        )
 
     candidates = [
         absolute
@@ -189,4 +203,18 @@ def locate_form4_xml_url(
             if absolute is not None
         ]
 
-    return _prefer_raw(candidates)
+    return Form4XmlLocation(
+        url=_prefer_raw(candidates),
+        recognized_document_table=False,
+    )
+
+
+def locate_form4_xml_url(
+    filing_detail_html: str,
+    *,
+    filing_detail_url: str | None = None,
+) -> str | None:
+    return locate_form4_xml(
+        filing_detail_html,
+        filing_detail_url=filing_detail_url,
+    ).url

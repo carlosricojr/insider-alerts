@@ -11,6 +11,7 @@ from insider_alerts.sec.models import FilingRef
 from insider_alerts.sec.store import (
     get_filing_date_bounds,
     list_filings_missing_xml,
+    record_sec_processing_rejections,
     update_form4_xml_url,
     update_form4_xml_urls,
     upsert_filing_refs,
@@ -296,5 +297,41 @@ def test_list_missing_xml_fails_closed_on_malformed_raw_json() -> None:
             conn.commit()
 
         assert list_filings_missing_xml(db, limit=1) == []
+    finally:
+        rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_processing_rejections_are_append_only_idempotent_and_prelimit() -> None:
+    tmp_dir = Path(".tmp_testdata") / f"sec_store_{uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        db = str(tmp_dir / "db.sqlite3")
+        ref = _ref("https://www.sec.gov/rejected-index.htm")
+        upsert_filing_refs(db, [ref])
+        rejection = (
+            ref.accession_number,
+            ref.cik,
+            ref.form_type,
+            ref.filing_detail_url,
+            "xml_not_found",
+        )
+
+        assert record_sec_processing_rejections(
+            db,
+            stage="xml_enrichment",
+            rejections=[rejection],
+        ) == 1
+        assert record_sec_processing_rejections(
+            db,
+            stage="xml_enrichment",
+            rejections=[rejection],
+        ) == 0
+        assert list_filings_missing_xml(db, limit=1) == []
+
+        with sqlite3.connect(db) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                conn.execute("UPDATE sec_processing_rejections SET reason = 'changed'")
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                conn.execute("DELETE FROM sec_processing_rejections")
     finally:
         rmtree(tmp_dir, ignore_errors=True)

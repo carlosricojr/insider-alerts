@@ -204,6 +204,216 @@ def test_enqueue_review_packets_rejects_stored_xml_outside_sec_boundary(
     assert httpx_mock.get_requests() == []
 
 
+def test_enrichment_rejection_cannot_starve_older_valid_row(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    rejected = FilingRef(
+        source="sec_rss",
+        cik="0000000002",
+        accession_number="0000000002-26-000002",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 2, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/no-form4-index.htm",
+        primary_doc_url=None,
+        raw_rss_entry={"title": "4 - Rejected Issuer"},
+    )
+    valid = FilingRef(
+        source="sec_rss",
+        cik="0000000001",
+        accession_number="0000000001-26-000001",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 1, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/valid-form4.xml",
+        primary_doc_url=None,
+        raw_rss_entry={"title": "4 - Valid Issuer"},
+    )
+    upsert_filing_refs(settings.database_path, [rejected, valid])
+    httpx_mock.add_response(
+        url=rejected.filing_detail_url,
+        text="""
+        <table summary="Document Format Files">
+          <tr><th>Document</th><th>Type</th></tr>
+          <tr><td><a href="taxonomy.xml">taxonomy</a></td><td>EX-101</td></tr>
+        </table>
+        """,
+    )
+
+    first = enrich_filings_with_xml_url(settings, limit=1)
+    second = enrich_filings_with_xml_url(settings, limit=1)
+    third = enrich_filings_with_xml_url(settings, limit=1)
+
+    assert (first.scanned, first.updated, first.xml_not_found) == (1, 0, 1)
+    assert (second.scanned, second.updated) == (1, 1)
+    assert third.scanned == 0
+    with sqlite3.connect(settings.database_path) as conn:
+        rejection = conn.execute(
+            "SELECT stage, reason FROM sec_processing_rejections"
+        ).fetchone()
+        selected = conn.execute(
+            "SELECT form4_xml_url FROM filings WHERE accession_number = ?",
+            (valid.accession_number,),
+        ).fetchone()
+    assert rejection == ("xml_enrichment", "xml_not_found")
+    assert selected == (valid.filing_detail_url,)
+
+
+def test_enrichment_unrecognized_page_remains_retryable(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    ref = FilingRef(
+        source="sec_rss",
+        cik="0000000002",
+        accession_number="0000000002-26-000002",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 2, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/transient-index.htm",
+        primary_doc_url=None,
+        raw_rss_entry={"title": "4 - Transient Issuer"},
+    )
+    upsert_filing_refs(settings.database_path, [ref])
+    for _ in range(2):
+        httpx_mock.add_response(url=ref.filing_detail_url, text="<html>try again</html>")
+
+    first = enrich_filings_with_xml_url(settings, limit=1)
+    second = enrich_filings_with_xml_url(settings, limit=1)
+
+    assert (first.scanned, first.updated, first.xml_not_found) == (1, 0, 1)
+    assert (second.scanned, second.updated, second.xml_not_found) == (1, 0, 1)
+    assert len(httpx_mock.get_requests()) == 2
+    with sqlite3.connect(settings.database_path) as conn:
+        rejection_count = conn.execute(
+            "SELECT COUNT(*) FROM sec_processing_rejections"
+        ).fetchone()
+    assert rejection_count == (0,)
+
+
+def test_enrichment_truncated_document_table_remains_retryable(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    ref = FilingRef(
+        source="sec_rss",
+        cik="0000000002",
+        accession_number="0000000002-26-000002",
+        form_type="4",
+        filed_at=datetime(2026, 2, 12, 2, 0, tzinfo=UTC),
+        filing_detail_url="https://www.sec.gov/truncated-index.htm",
+        primary_doc_url=None,
+        raw_rss_entry={"title": "4 - Transient Issuer"},
+    )
+    upsert_filing_refs(settings.database_path, [ref])
+    for _ in range(2):
+        httpx_mock.add_response(
+            url=ref.filing_detail_url,
+            text='<table summary="Document Format Files"><tr><th>Type</th></tr>',
+        )
+
+    first = enrich_filings_with_xml_url(settings, limit=1)
+    second = enrich_filings_with_xml_url(settings, limit=1)
+
+    assert (first.scanned, first.xml_not_found) == (1, 1)
+    assert (second.scanned, second.xml_not_found) == (1, 1)
+    assert len(httpx_mock.get_requests()) == 2
+    with sqlite3.connect(settings.database_path) as conn:
+        rejection_count = conn.execute(
+            "SELECT COUNT(*) FROM sec_processing_rejections"
+        ).fetchone()
+    assert rejection_count == (0,)
+
+
+@pytest.mark.parametrize(
+    "unrelated_xml",
+    [
+        "<xbrl></xbrl>",
+        '<link:linkbase xmlns:link="http://www.xbrl.org/2003/linkbase"></link:linkbase>',
+        '<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"></xsd:schema>',
+    ],
+)
+def test_review_parse_rejection_cannot_starve_older_valid_row(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+    unrelated_xml: str,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    rejected_url = "https://www.sec.gov/rejected-form4.xml"
+    valid_url = "https://www.sec.gov/valid-form4.xml"
+    _seed_ref(
+        settings.database_path,
+        accession_number="0000320193-24-000124",
+        filed_at=datetime(2026, 2, 11, 2, 0, tzinfo=UTC),
+        xml_url=rejected_url,
+    )
+    _seed_ref(
+        settings.database_path,
+        accession_number="0000320193-24-000123",
+        filed_at=datetime(2026, 2, 11, 1, 0, tzinfo=UTC),
+        xml_url=valid_url,
+    )
+    httpx_mock.add_response(url=rejected_url, text=unrelated_xml)
+    httpx_mock.add_response(
+        url=valid_url,
+        text=Path("tests/fixtures_form4.xml").read_text(encoding="utf-8"),
+    )
+
+    first = enqueue_review_packets(settings, limit=1)
+    second = enqueue_review_packets(settings, limit=1)
+
+    assert (first.processed, first.enqueued, first.parse_failed) == (1, 0, 1)
+    assert (second.processed, second.enqueued) == (1, 1)
+    assert [str(request.url) for request in httpx_mock.get_requests()] == [
+        rejected_url,
+        valid_url,
+    ]
+    with sqlite3.connect(settings.database_path) as conn:
+        rejection = conn.execute(
+            "SELECT stage, reason FROM sec_processing_rejections"
+        ).fetchone()
+    assert rejection == ("review_xml", "parse_failed")
+
+
+@pytest.mark.parametrize(
+    "xml_text",
+    [
+        "<ownershipDocument>",
+        "<ownershipDocument></ownershipDocument>",
+        "<Error>rate limited</Error>",
+        "<html>try again</html>",
+    ],
+)
+def test_review_unrecognized_xml_remains_retryable(
+    httpx_mock: HTTPXMock,
+    tmp_path,
+    xml_text: str,
+) -> None:
+    settings = Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3"), SEC_RATE_LIMIT_PER_SECOND=10)
+    xml_url = "https://www.sec.gov/transient-form4.xml"
+    _seed_ref(
+        settings.database_path,
+        accession_number="0000320193-24-000124",
+        filed_at=datetime(2026, 2, 11, 2, 0, tzinfo=UTC),
+        xml_url=xml_url,
+    )
+    for _ in range(2):
+        httpx_mock.add_response(url=xml_url, text=xml_text)
+
+    first = enqueue_review_packets(settings, limit=1)
+    second = enqueue_review_packets(settings, limit=1)
+
+    assert (first.processed, first.enqueued, first.parse_failed) == (1, 0, 1)
+    assert (second.processed, second.enqueued, second.parse_failed) == (1, 0, 1)
+    assert len(httpx_mock.get_requests()) == 2
+    with sqlite3.connect(settings.database_path) as conn:
+        rejection_count = conn.execute(
+            "SELECT COUNT(*) FROM sec_processing_rejections"
+        ).fetchone()
+    assert rejection_count == (0,)
+
+
 def test_enqueue_review_packets_from_xml_urls(httpx_mock: HTTPXMock, tmp_path) -> None:
     rss = Path("tests/fixtures_form4_rss.xml").read_text(encoding="utf-8")
     form4 = Path("tests/fixtures_form4.xml").read_text(encoding="utf-8")
