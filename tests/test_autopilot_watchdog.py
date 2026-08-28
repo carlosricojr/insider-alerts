@@ -223,7 +223,10 @@ def test_watchdog_fully_stops_stale_worker_before_start(tmp_path: Path) -> None:
         [
             _task_result("Running"),
             subprocess.CompletedProcess([], 0, "SUCCESS", ""),
+            _task_result("Running"),
+            subprocess.CompletedProcess([], 0, "SUCCESS", ""),
             _task_result("Ready"),
+            subprocess.CompletedProcess([], 0, "SUCCESS", ""),
             subprocess.CompletedProcess([], 0, "SUCCESS", ""),
         ]
     )
@@ -241,7 +244,17 @@ def test_watchdog_fully_stops_stale_worker_before_start(tmp_path: Path) -> None:
     )
 
     assert result["action"] == "restart"
-    assert [call[0] for call in calls] == ["/Query", "/End", "/Query", "/Run"]
+    assert [call[0] for call in calls] == [
+        "/Query",
+        "/Change",
+        "/Query",
+        "/End",
+        "/Query",
+        "/Change",
+        "/Run",
+    ]
+    assert calls[1][-1] == "/Disable"
+    assert calls[-2][-1] == "/Enable"
 
 
 def test_watchdog_never_starts_replacement_after_stop_failure(tmp_path: Path) -> None:
@@ -258,6 +271,8 @@ def test_watchdog_never_starts_replacement_after_stop_failure(tmp_path: Path) ->
         calls.append(list(arguments))
         if arguments[0] == "/Query":
             return _task_result("Running")
+        if arguments[0] == "/Change":
+            return subprocess.CompletedProcess([], 0, "SUCCESS", "")
         return subprocess.CompletedProcess([], 1, "", "access denied")
 
     with pytest.raises(RuntimeError, match="failed to stop stale"):
@@ -269,7 +284,59 @@ def test_watchdog_never_starts_replacement_after_stop_failure(tmp_path: Path) ->
             task_runner=runner,
         )
 
-    assert [call[0] for call in calls] == ["/Query", "/End"]
+    assert [call[0] for call in calls] == ["/Query", "/Change", "/Query", "/End"]
+
+
+def test_watchdog_never_stops_or_quarantines_without_scheduler_fence(tmp_path: Path) -> None:
+    path = tmp_path / "health.db"
+    path.write_bytes(b"not sqlite")
+    calls: list[list[str]] = []
+
+    def runner(arguments):  # type: ignore[no-untyped-def]
+        calls.append(list(arguments))
+        if arguments[0] == "/Query":
+            return _task_result("Running")
+        return subprocess.CompletedProcess([], 1, "", "disable denied")
+
+    with pytest.raises(RuntimeError, match="failed to fence"):
+        run_autopilot_watchdog(
+            heartbeat_db=path,
+            worker_task_name="Autopilot Worker",
+            stale_seconds=300,
+            now=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+            task_runner=runner,
+        )
+
+    assert [call[0] for call in calls] == ["/Query", "/Change"]
+    assert path.read_bytes() == b"not sqlite"
+
+
+def test_watchdog_never_starts_when_reenable_fails(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    results = iter(
+        [
+            _task_result("Ready"),
+            subprocess.CompletedProcess([], 0, "SUCCESS", ""),
+            _task_result("Ready"),
+            subprocess.CompletedProcess([], 1, "", "enable denied"),
+        ]
+    )
+
+    def runner(arguments):  # type: ignore[no-untyped-def]
+        calls.append(list(arguments))
+        return next(results)
+
+    with pytest.raises(RuntimeError, match="failed to re-enable"):
+        run_autopilot_watchdog(
+            heartbeat_db=tmp_path / "missing.db",
+            worker_task_name="Autopilot Worker",
+            stale_seconds=300,
+            now=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+            task_runner=runner,
+        )
+
+    assert [call[0] for call in calls] == ["/Query", "/Change", "/Query", "/Change"]
+    assert calls[-1][-1] == "/Enable"
 
 
 def test_watchdog_propagates_query_failure_without_starting(tmp_path: Path) -> None:
@@ -308,6 +375,8 @@ def test_watchdog_propagates_start_failure(tmp_path: Path) -> None:
         calls.append(list(arguments))
         if arguments[0] == "/Query":
             return _task_result("Ready")
+        if arguments[0] == "/Change":
+            return subprocess.CompletedProcess([], 0, "SUCCESS", "")
         return subprocess.CompletedProcess([], 1, "", "start denied")
 
     with pytest.raises(RuntimeError, match="failed to start"):
@@ -319,7 +388,13 @@ def test_watchdog_propagates_start_failure(tmp_path: Path) -> None:
             task_runner=runner,
         )
 
-    assert [call[0] for call in calls] == ["/Query", "/Run"]
+    assert [call[0] for call in calls] == [
+        "/Query",
+        "/Change",
+        "/Query",
+        "/Change",
+        "/Run",
+    ]
 
 
 def test_watchdog_propagates_quarantine_failure_without_starting(
@@ -332,7 +407,9 @@ def test_watchdog_propagates_quarantine_failure_without_starting(
 
     def runner(arguments):  # type: ignore[no-untyped-def]
         calls.append(list(arguments))
-        return _task_result("Ready")
+        if arguments[0] == "/Query":
+            return _task_result("Ready")
+        return subprocess.CompletedProcess([], 0, "SUCCESS", "")
 
     def fail_replace(_source, _destination) -> None:  # type: ignore[no-untyped-def]
         raise OSError("quarantine denied")
@@ -347,7 +424,8 @@ def test_watchdog_propagates_quarantine_failure_without_starting(
             task_runner=runner,
         )
 
-    assert [call[0] for call in calls] == ["/Query"]
+    assert [call[0] for call in calls] == ["/Query", "/Change", "/Query"]
+    assert calls[1][-1] == "/Disable"
 
 
 def test_watchdog_quarantines_corrupt_store_only_when_worker_is_stopped(
@@ -373,7 +451,15 @@ def test_watchdog_quarantines_corrupt_store_only_when_worker_is_stopped(
     )
 
     assert result["action"] == "restart"
-    assert [call[0] for call in calls] == ["/Query", "/Run"]
+    assert [call[0] for call in calls] == [
+        "/Query",
+        "/Change",
+        "/Query",
+        "/Change",
+        "/Run",
+    ]
+    assert calls[1][-1] == "/Disable"
+    assert calls[-2][-1] == "/Enable"
     quarantined = result["quarantined"]
     assert isinstance(quarantined, list) and len(quarantined) == 1
     assert Path(quarantined[0]).read_bytes() == b"not sqlite"

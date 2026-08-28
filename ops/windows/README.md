@@ -37,8 +37,9 @@ and occurs only after the event has a confirmed representative delivery. The loo
 worker also fingerprints the loaded Python source between
 completed cycles. If source changes later, it exits cleanly within one 15-second wait slice so no
 cycle is interrupted. The watchdog's next one-minute run starts the fresh worker. A stale restart
-is conservative after system suspend/resume and fully stops the old scheduled task before starting
-another; it never starts a replacement after a failed stop. The optional manual hidden launcher
+is conservative after system suspend/resume, disables scheduler retries while it fully stops the
+old task, quarantines corrupt heartbeat files only behind that fence, then re-enables and starts a
+replacement. It never starts a replacement after a failed stop. The optional manual hidden launcher
 also invokes `pythonw.exe` directly and never routes through `cmd.exe`.
 
 Install the separate IBKR canary watchdog with:

@@ -201,6 +201,39 @@ def test_suppression_is_distinct_from_provider_delivery(tmp_path) -> None:
     assert suppressed_at is not None
 
 
+def test_decision_can_atomically_record_duplicate_suppression(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    decision = {
+        "packet_id": packet_id,
+        "decision": "approve",
+        "analyst": "quant",
+        "reason": "same economic event",
+    }
+
+    assert (
+        apply_decision(
+            db,
+            decision,
+            notification_required=True,
+            notification_suppressed=True,
+        )
+        == 1
+    )
+    assert list_notification_outbox(db, limit=10) == []
+    with sqlite3.connect(db) as conn:
+        required, sent_at, suppressed_at = conn.execute(
+            "SELECT notification_required, notification_sent_at, notification_suppressed_at "
+            "FROM review_packets WHERE packet_id=?",
+            (packet_id,),
+        ).fetchone()
+    assert required == 1
+    assert sent_at is None
+    assert suppressed_at is not None
+
+
 def test_list_deadletters_returns_records(tmp_path) -> None:
     db = str(tmp_path / "insider_alerts.db")
     init_db(db)

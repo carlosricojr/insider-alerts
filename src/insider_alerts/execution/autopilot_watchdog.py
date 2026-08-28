@@ -466,7 +466,21 @@ def run_autopilot_watchdog(
     query = ["/Query", "/TN", worker_task_name, "/FO", "CSV", "/NH", "/V"]
     worker_running = _task_is_running(runner(query))
     end_return_code: int | None = None
-    if stale and worker_running:
+    should_start = stale or not worker_running
+    task_fenced = False
+    if should_start:
+        disable_result = runner(["/Change", "/TN", worker_task_name, "/Disable"])
+        if disable_result.returncode != 0:
+            error = (
+                disable_result.stderr or disable_result.stdout or "unknown schtasks failure"
+            ).strip()
+            raise RuntimeError(f"failed to fence scheduled autopilot worker: {error}")
+        task_fenced = True
+        # Disabling prevents RestartOnFailure from racing the stop/quarantine boundary, but it does
+        # not stop an already-running instance. Re-query after the fence before deciding to end it.
+        worker_running = _task_is_running(runner(query))
+
+    if worker_running and should_start:
         end_result = runner(["/End", "/TN", worker_task_name])
         end_return_code = end_result.returncode
         if end_result.returncode != 0:
@@ -489,9 +503,16 @@ def run_autopilot_watchdog(
             raise RuntimeError("refusing to quarantine health while autopilot worker is running")
         quarantined = quarantine_corrupt_health_store(heartbeat_db, now=checked_at)
 
-    should_start = stale or not worker_running
     run_return_code: int | None = None
     if should_start:
+        if not task_fenced:
+            raise RuntimeError("autopilot worker recovery lost its scheduler fence")
+        enable_result = runner(["/Change", "/TN", worker_task_name, "/Enable"])
+        if enable_result.returncode != 0:
+            error = (
+                enable_result.stderr or enable_result.stdout or "unknown schtasks failure"
+            ).strip()
+            raise RuntimeError(f"failed to re-enable scheduled autopilot worker: {error}")
         run_result = runner(["/Run", "/TN", worker_task_name])
         run_return_code = run_result.returncode
         if run_result.returncode != 0:

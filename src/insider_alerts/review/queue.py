@@ -280,24 +280,35 @@ def apply_decision(
     payload: Mapping[str, object],
     *,
     notification_required: bool = False,
+    notification_suppressed: bool = False,
 ) -> int:
     ensure_review_tables(db_path)
     _validate_decision_payload(payload)
+    if notification_suppressed and not notification_required:
+        raise ValueError("notification suppression requires a delivery intent")
 
     packet_id = str(payload["packet_id"])
     decision = str(payload["decision"])
     now = datetime.now(tz=UTC).isoformat()
     encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    suppressed_at = now if notification_suppressed else None
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.execute(
             """
             UPDATE review_packets
             SET status = ?, decision_json = ?, updated_at = ?, notification_required = ?,
-                notification_sent_at = NULL, notification_suppressed_at = NULL
+                notification_sent_at = NULL, notification_suppressed_at = ?
             WHERE packet_id = ? AND status = 'pending'
             """,
-            (decision, encoded, now, int(notification_required), packet_id),
+            (
+                decision,
+                encoded,
+                now,
+                int(notification_required),
+                suppressed_at,
+                packet_id,
+            ),
         )
 
         if decision == "deadletter" and cursor.rowcount == 1:

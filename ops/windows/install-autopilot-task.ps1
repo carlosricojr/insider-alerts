@@ -137,6 +137,8 @@ function Stop-TaskAndWait([string]$Name) {
   if ($null -eq $task) {
     return
   }
+  # Fence triggers and RestartOnFailure before observing or changing the running process.
+  Disable-ScheduledTask -TaskName $Name | Out-Null
   if ($task.State -eq "Running") {
     Stop-ScheduledTask -TaskName $Name
     $deadline = (Get-Date).AddSeconds(15)
@@ -257,7 +259,7 @@ try {
 } catch {
   $installError = $_
   $rollbackErrors = @()
-  # Phase 1: stop every replacement before restoring or starting either prior definition.
+  # Phase 1: disable and stop every replacement before restoring either prior definition.
   foreach ($snapshot in $snapshots) {
     try {
       Stop-TaskAndWait -Name $snapshot.Name
@@ -265,19 +267,22 @@ try {
       $rollbackErrors += "$($snapshot.Name) stop: $($_.Exception.Message)"
     }
   }
-  # Phase 2: restore both definitions while all successfully stopped tasks remain stopped.
-  foreach ($snapshot in $snapshots) {
-    try {
-      if ($snapshot.Exists) {
-        Register-ScheduledTask -TaskName $snapshot.Name -Xml $snapshot.Xml -Force | Out-Null
-      } else {
-        $created = Get-ScheduledTask -TaskName $snapshot.Name -ErrorAction SilentlyContinue
-        if ($null -ne $created) {
-          Unregister-ScheduledTask -TaskName $snapshot.Name -Confirm:$false
+  # Phase 2: restore definitions only when every replacement is conclusively stopped. Restoring
+  # task XML while a replacement remains alive could let its watchdog start the restored worker.
+  if ($rollbackErrors.Count -eq 0) {
+    foreach ($snapshot in $snapshots) {
+      try {
+        if ($snapshot.Exists) {
+          Register-ScheduledTask -TaskName $snapshot.Name -Xml $snapshot.Xml -Force | Out-Null
+        } else {
+          $created = Get-ScheduledTask -TaskName $snapshot.Name -ErrorAction SilentlyContinue
+          if ($null -ne $created) {
+            Unregister-ScheduledTask -TaskName $snapshot.Name -Confirm:$false
+          }
         }
+      } catch {
+        $rollbackErrors += "$($snapshot.Name) restore: $($_.Exception.Message)"
       }
-    } catch {
-      $rollbackErrors += "$($snapshot.Name) restore: $($_.Exception.Message)"
     }
   }
   # Phase 3: only restart prior instances when every stop and restore succeeded. This prevents a

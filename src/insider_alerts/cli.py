@@ -3772,6 +3772,7 @@ def ops_autopilot(
                 _heartbeat(f"decision_{packet_index}_option_chain_completed")
 
             should_notify = notify and (not notify_approve_only or rule.decision == "approve")
+            suppress_notification = False
             event_key: str | None = None
             if should_notify:
                 event_key = _economic_event_key(packet)
@@ -3788,12 +3789,14 @@ def ops_autopilot(
                     )
                     append_process_log(output_log_path, duplicate_message)
                     should_notify = False
+                    suppress_notification = True
 
             try:
                 updated = apply_decision(
                     settings.database_path,
                     payload,
-                    notification_required=should_notify,
+                    notification_required=should_notify or suppress_notification,
+                    notification_suppressed=suppress_notification,
                 )
             except DecisionValidationError as exc:
                 failure_message = f"autopilot decision failed for packet={packet_id_obj}: {exc}"

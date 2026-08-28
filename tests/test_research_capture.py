@@ -1447,6 +1447,12 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls: list[CaptureConfig] = []
+    job_calls: list[bool] = []
+    monkeypatch.setattr(
+        worker_module,
+        "ensure_kill_on_close_process_tree",
+        lambda: job_calls.append(True),
+    )
     monkeypatch.setattr(worker_module, "ensure_review_tables", lambda _path: None)
     monkeypatch.setattr(worker_module, "resolve_git_commit", lambda _root: "a" * 40)
 
@@ -1457,6 +1463,7 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
     monkeypatch.setattr(worker_module, "run_capture_once", capture_once)
 
     assert worker_module.main(_worker_args(tmp_path)) == 0
+    assert job_calls == [True]
     assert len(calls) == 1
     assert calls[0].alpha_historical_script == tmp_path / "alpha-history.py"
     assert calls[0].option_chain_store_db == tmp_path / "option-chain.db"
@@ -1473,6 +1480,7 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
 def test_worker_main_persists_and_logs_fatal_setup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(worker_module, "ensure_kill_on_close_process_tree", lambda: None)
     def fail_setup(_path: str) -> None:
         raise RuntimeError("setup failed")
 
