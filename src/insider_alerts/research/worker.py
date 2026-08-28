@@ -8,6 +8,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
 from insider_alerts.research.capture import (
     CaptureConfig,
     record_worker_failure,
@@ -47,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[3]
     try:
+        # Own every spawned alpha/git descendant even if its direct parent exits before timeout
+        # cleanup can still address the tree by PID.
+        ensure_kill_on_close_process_tree()
         ensure_review_tables(str(args.database_path))
         config = CaptureConfig(
             source_db=args.database_path,

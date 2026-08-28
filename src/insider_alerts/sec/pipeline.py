@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
@@ -46,6 +47,8 @@ class PollResult:
 class EnrichResult:
     scanned: int
     updated: int
+    http_failed: int = 0
+    xml_not_found: int = 0
 
 
 @dataclass(slots=True)
@@ -55,6 +58,7 @@ class QueueResult:
     skipped_existing: int = 0
     http_failed: int = 0
     parse_failed: int = 0
+    market_failed: int = 0
 
 
 @dataclass(slots=True)
@@ -86,18 +90,28 @@ def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> P
     )
 
 
-def enrich_filings_with_xml_url(settings: Settings, *, limit: int) -> EnrichResult:
+def enrich_filings_with_xml_url(
+    settings: Settings,
+    *,
+    limit: int,
+    progress_callback: Callable[[str], None] | None = None,
+) -> EnrichResult:
     client = SecHttpClient(settings)
     refs = list_filings_missing_xml(settings.database_path, limit=limit)
 
     pending_updates: list[tuple[str, str, str, str]] = []
-    for ref in refs:
+    http_failed = 0
+    xml_not_found = 0
+    for index, ref in enumerate(refs):
+        if progress_callback is not None:
+            progress_callback(f"enrichment_item_{index}_started")
         if ref.filing_detail_url.lower().endswith(".xml"):
             xml_url = _normalize_form4_xml_url(ref.filing_detail_url)
         else:
             try:
                 html = client.get_text(ref.filing_detail_url)
             except SecHttpError as exc:
+                http_failed += 1
                 logger.warning(
                     "SEC detail enrichment failed for accession=%s url=%s: %s",
                     ref.accession_number,
@@ -107,6 +121,7 @@ def enrich_filings_with_xml_url(settings: Settings, *, limit: int) -> EnrichResu
                 continue
             maybe = locate_form4_xml_url(html)
             if maybe is None:
+                xml_not_found += 1
                 continue
             xml_url = _normalize_form4_xml_url(maybe)
         pending_updates.append(
@@ -118,8 +133,16 @@ def enrich_filings_with_xml_url(settings: Settings, *, limit: int) -> EnrichResu
             )
         )
 
+    if progress_callback is not None:
+        progress_callback("enrichment_items_completed")
+
     updated = update_form4_xml_urls(settings.database_path, updates=pending_updates)
-    return EnrichResult(scanned=len(refs), updated=updated)
+    return EnrichResult(
+        scanned=len(refs),
+        updated=updated,
+        http_failed=http_failed,
+        xml_not_found=xml_not_found,
+    )
 
 
 def enqueue_review_packets(
@@ -129,6 +152,7 @@ def enqueue_review_packets(
     oldest_first: bool = False,
     start_date: date | None = None,
     end_date: date | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> QueueResult:
     from sqlite3 import connect
 
@@ -197,8 +221,11 @@ def enqueue_review_packets(
     skipped_existing = 0
     http_failed = 0
     parse_failed = 0
+    market_failed = 0
     packets_to_enqueue: list[tuple[FilingRef, dict[str, object]]] = []
-    for row in rows:
+    for row_index, row in enumerate(rows):
+        if progress_callback is not None:
+            progress_callback(f"review_item_{row_index}_started")
         accession_number = str(row["accession_number"])
         form_type = str(row["form_type"])
 
@@ -237,6 +264,7 @@ def enqueue_review_packets(
                             trade_date=trade_date,
                         )
                     except MarketContextError as exc:
+                        market_failed += 1
                         # Never swallow this silently. A dead price feed zeroes out
                         # trade_pct_daily_turnover, which silently disables every liquidity
                         # guard downstream -- exactly how the stooq outage (2026-02-12 to
@@ -276,6 +304,9 @@ def enqueue_review_packets(
         }
         packets_to_enqueue.append((ref, packet))
 
+    if progress_callback is not None:
+        progress_callback("review_items_completed")
+
     enqueued = enqueue_review_packets_batch(settings.database_path, packets_to_enqueue)
     skipped_existing = len(packets_to_enqueue) - enqueued
 
@@ -285,6 +316,7 @@ def enqueue_review_packets(
         skipped_existing=skipped_existing,
         http_failed=http_failed,
         parse_failed=parse_failed,
+        market_failed=market_failed,
     )
 
 

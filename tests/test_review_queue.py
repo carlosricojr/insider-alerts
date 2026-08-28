@@ -7,8 +7,10 @@ from insider_alerts.review.queue import (
     apply_decision,
     enqueue_review_packet,
     list_deadletters,
+    list_notification_outbox,
     list_pending_review_packets,
     mark_notification_delivered,
+    mark_notification_suppressed,
     replay_deadletter,
 )
 from insider_alerts.sec.models import FilingRef
@@ -80,10 +82,10 @@ def test_apply_decision_validates_schema(tmp_path) -> None:
         "analyst": "carlo",
         "reason": "high confidence",
     }
-    updated = apply_decision(db, good)
+    updated = apply_decision(db, good, notification_required=True)
     assert updated == 1
 
-    assert mark_notification_delivered(db, good["packet_id"]) == 1
+    assert mark_notification_delivered(db, good["packet_id"], good) == 1
     with sqlite3.connect(db) as conn:
         delivered_at = conn.execute(
             "SELECT notification_sent_at FROM review_packets WHERE packet_id = ?",
@@ -105,6 +107,131 @@ def test_apply_decision_validates_schema(tmp_path) -> None:
         pass
     else:
         raise AssertionError("expected validation error for invalid decision")
+
+
+def test_notification_intent_is_atomic_and_remains_until_delivery(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+
+    assert apply_decision(
+        db,
+        {
+            "packet_id": packet_id,
+            "decision": "approve",
+            "analyst": "quant",
+            "reason": "send this",
+        },
+        notification_required=True,
+    ) == 1
+
+    outbox = list_notification_outbox(db, limit=10)
+    assert [row["packet_id"] for row in outbox] == [packet_id]
+    assert outbox[0]["decision"]["reason"] == "send this"  # type: ignore[index]
+    decision = outbox[0]["decision"]
+    assert isinstance(decision, dict)
+    assert mark_notification_delivered(db, packet_id, decision) == 1
+    assert list_notification_outbox(db, limit=10) == []
+
+
+def test_replayed_decision_clears_prior_notification_acknowledgement(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    deadletter = {
+        "packet_id": packet_id,
+        "decision": "deadletter",
+        "analyst": "quant",
+        "reason": "retry later",
+    }
+    assert apply_decision(db, deadletter, notification_required=True) == 1
+    assert mark_notification_delivered(db, packet_id, deadletter) == 1
+
+    assert replay_deadletter(db, packet_id) == 1
+    approval = {**deadletter, "decision": "approve", "reason": "send replay"}
+    assert apply_decision(db, approval, notification_required=True) == 1
+
+    assert [row["packet_id"] for row in list_notification_outbox(db, limit=10)] == [packet_id]
+
+
+def test_stale_notification_ack_cannot_acknowledge_replayed_decision(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    first = {
+        "packet_id": packet_id,
+        "decision": "deadletter",
+        "analyst": "quant",
+        "reason": "first decision",
+    }
+    second = {**first, "decision": "approve", "reason": "replacement decision"}
+    assert apply_decision(db, first, notification_required=True) == 1
+    assert replay_deadletter(db, packet_id) == 1
+    assert apply_decision(db, second, notification_required=True) == 1
+
+    assert mark_notification_delivered(db, packet_id, first) == 0
+    assert [row["decision"] for row in list_notification_outbox(db, limit=10)] == [second]
+    assert mark_notification_delivered(db, packet_id, second) == 1
+
+
+def test_suppression_is_distinct_from_provider_delivery(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    decision = {
+        "packet_id": packet_id,
+        "decision": "approve",
+        "analyst": "quant",
+        "reason": "duplicate co-filing",
+    }
+    assert apply_decision(db, decision, notification_required=True) == 1
+    assert mark_notification_suppressed(db, packet_id, decision) == 1
+    assert list_notification_outbox(db, limit=10) == []
+    with sqlite3.connect(db) as conn:
+        sent_at, suppressed_at = conn.execute(
+            "SELECT notification_sent_at, notification_suppressed_at "
+            "FROM review_packets WHERE packet_id=?",
+            (packet_id,),
+        ).fetchone()
+    assert sent_at is None
+    assert suppressed_at is not None
+
+
+def test_decision_can_atomically_record_duplicate_suppression(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    decision = {
+        "packet_id": packet_id,
+        "decision": "approve",
+        "analyst": "quant",
+        "reason": "same economic event",
+    }
+
+    assert (
+        apply_decision(
+            db,
+            decision,
+            notification_required=True,
+            notification_suppressed=True,
+        )
+        == 1
+    )
+    assert list_notification_outbox(db, limit=10) == []
+    with sqlite3.connect(db) as conn:
+        required, sent_at, suppressed_at = conn.execute(
+            "SELECT notification_required, notification_sent_at, notification_suppressed_at "
+            "FROM review_packets WHERE packet_id=?",
+            (packet_id,),
+        ).fetchone()
+    assert required == 1
+    assert sent_at is None
+    assert suppressed_at is not None
 
 
 def test_list_deadletters_returns_records(tmp_path) -> None:

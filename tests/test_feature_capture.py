@@ -425,6 +425,7 @@ def test_feature_paths_must_remain_beneath_research_root(tmp_path: Path) -> None
 
 def test_worker_and_installer_are_order_incapable_and_hidden() -> None:
     worker = (ROOT / "src/insider_alerts/research/feature_worker.py").read_text(encoding="utf-8")
+    assert "ensure_kill_on_close_process_tree()" in worker
     module = (ROOT / "src/insider_alerts/research/feature_capture.py").read_text(encoding="utf-8")
     installer = (ROOT / "ops/windows/install-feature-capture-task.ps1").read_text(
         encoding="utf-8"

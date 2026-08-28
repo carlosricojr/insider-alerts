@@ -27,7 +27,7 @@ def test_cli_review_apply(monkeypatch, tmp_path) -> None:
         lambda: Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3")),
     )
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         assert db_path.endswith("db.sqlite3")
         assert payload["decision"] == "approve"
         return 1
@@ -49,7 +49,7 @@ def test_cli_review_apply_validation_error(monkeypatch, tmp_path) -> None:
         lambda: Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3")),
     )
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         raise DecisionValidationError("bad")
 
     monkeypatch.setattr(cli, "apply_decision", fake_apply)
@@ -78,7 +78,7 @@ def test_cli_review_apply_not_pending_returns_nonzero(monkeypatch, tmp_path) -> 
         "get_settings",
         lambda: Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3")),
     )
-    monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload: 0)
+    monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload, **kwargs: 0)
 
     runner = CliRunner()
     result = runner.invoke(cli.app, ["review", "apply", "--decision-file", str(decision_path)])
@@ -118,7 +118,7 @@ def test_cli_review_decide(monkeypatch, tmp_path) -> None:
         lambda: Settings(DATABASE_PATH=str(tmp_path / "db.sqlite3")),
     )
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         assert payload["decision"] == "approve"
         assert payload["analyst"] == "quant"
         return 1

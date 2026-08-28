@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from insider_alerts.config import get_settings
+from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
 from insider_alerts.research.capture import resolve_git_commit
 from insider_alerts.research.feature_capture import (
     FeatureCaptureConfig,
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[3]
     try:
+        ensure_kill_on_close_process_tree()
         if args.status:
             print(
                 json.dumps(

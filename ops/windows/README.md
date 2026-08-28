@@ -6,25 +6,41 @@ Install or refresh the background autopilot task:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\windows\install-autopilot-task.ps1 -Start
 ```
 
-The default task is a non-elevated per-user watchdog named `Insider Alerts
-Autopilot Watchdog`. It starts at user logon and has a one-minute recovery
-trigger. Multiple instances are ignored, so recovery triggers do not start a
-second worker while the long-running loop is already alive.
+The installer creates separate non-elevated per-user tasks named `Insider Alerts Autopilot
+Worker` and `Insider Alerts Autopilot Watchdog`. The worker has no independent trigger, preventing
+startup races. The bounded watchdog starts at logon and every minute, starts a stopped worker, and
+restarts a worker only when its durable progress heartbeat exceeds the configured stale threshold.
+That threshold is at least five minutes and may be longer when configured network or quant windows
+require it. When no threshold is passed, the installer derives the minimum safe value from the
+effective settings. The installer, worker, and watchdog validate it against every configured
+network phase, retry stage, database window, and cleanup margin. It is also the hard wall for a
+slow-drip or otherwise hung external call.
 
 Pass `-RunElevated` only from an elevated PowerShell session if the task needs
 highest-privilege execution.
 
-The task launches the virtualenv's `pythonw.exe` directly, so it never creates a
-console window and Task Scheduler retains ownership of the complete worker process
-chain. The worker reads `.env`, writes to `logs\autopilot.out.log` and
+Both tasks launch the virtualenv's `pythonw.exe` directly, so they never create a console window.
+The worker owns its complete descendant tree in a kill-on-close Windows Job Object, so ending a
+hung worker also ends quant and option-capture children before replacement. The worker reads `.env`,
+writes to `logs\autopilot.out.log` and
 `logs\autopilot.err.log`, and sends NTFY notifications for approved decisions by
-default. Passing `-Start` performs a controlled restart so deployed source changes
-are loaded immediately. The looping worker also fingerprints the loaded Python source between
+default. The watchdog writes only bounded operational metadata to
+`logs\autopilot-watchdog.log`; `ops autopilot-health-status` exposes the separate operational
+heartbeat store without reading signal or outcome payloads. Passing `-Start` stops the legacy
+same-named worker before registering both new definitions, then starts the watchdog. If cutover
+fails, or a new worker does not produce a fresh stable runtime heartbeat within 90 seconds, the
+installer stops both replacements, restores both prior definitions, and only then restarts their
+prior running state. Approved notifications carry an atomic delivery intent and are retried by the
+next managed cycle after an interrupted send (at-least-once delivery). Delivery acknowledgement is
+compare-and-set against the exact decision version; co-filing suppression is recorded separately
+and occurs only after the event has a confirmed representative delivery. The looping
+worker also fingerprints the loaded Python source between
 completed cycles. If source changes later, it exits cleanly within one 15-second wait slice so no
-cycle is interrupted. The next one-minute repetition trigger starts the fresh worker; Task
-Scheduler's `RestartCount` applies only to failure exits and is not the recovery mechanism for
-this clean source-change exit. The optional manual hidden launcher also invokes
-`pythonw.exe` directly and never routes through `cmd.exe`.
+cycle is interrupted. The watchdog's next one-minute run starts the fresh worker. A stale restart
+is conservative after system suspend/resume, disables scheduler retries while it fully stops the
+old task, quarantines corrupt heartbeat files only behind that fence, then re-enables and starts a
+replacement. It never starts a replacement after a failed stop. The optional manual hidden launcher
+also invokes `pythonw.exe` directly and never routes through `cmd.exe`.
 
 Install the separate IBKR canary watchdog with:
 

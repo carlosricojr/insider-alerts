@@ -12,6 +12,7 @@ from pytest_httpx import HTTPXMock
 from insider_alerts import cli
 from insider_alerts.config import Settings
 from insider_alerts.notify.ntfy import NtfyTransportEvent
+from insider_alerts.research.capture import ProcessTreeCleanupError
 from insider_alerts.research.notification_transport import (
     NotificationJournalConfig,
     NotificationJournalError,
@@ -486,4 +487,22 @@ def test_runtime_git_commit_is_resolved_once_per_process(
     assert cli._notification_runtime_git_commit(repo_root) == "a" * 40
     assert calls == 1
     assert observed_timeout == 1
+    cli._notification_runtime_git_commit.cache_clear()
+
+
+def test_process_tree_cleanup_uncertainty_is_not_isolated_from_notification_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "active.db"
+    database.touch()
+    settings = Settings(NOTIFICATION_TRANSPORT_DB=str(database))
+
+    def uncertain_git_resolution(repo_root: Path, *, timeout_seconds: int = 10) -> str:
+        raise ProcessTreeCleanupError("tree state unknown")
+
+    monkeypatch.setattr(cli, "resolve_git_commit", uncertain_git_resolution)
+    cli._notification_runtime_git_commit.cache_clear()
+    with pytest.raises(ProcessTreeCleanupError, match="tree state unknown"):
+        cli._notification_transport_observer(settings, {"packet_id": PACKET_ID})
     cli._notification_runtime_git_commit.cache_clear()

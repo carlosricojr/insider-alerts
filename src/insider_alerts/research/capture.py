@@ -139,6 +139,10 @@ class ProcessResult:
     timed_out: bool
 
 
+class ProcessTreeCleanupError(RuntimeError):
+    """A timed-out hidden process may still have live descendants or open pipes."""
+
+
 @dataclass(slots=True, frozen=True)
 class CaptureWindow:
     status: Literal["draft", "armed", "active"]
@@ -505,20 +509,37 @@ def _set_job_state(
             raise RuntimeError(f"lost lease for capture job {job.job_id}")
 
 
-def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+def _kill_process_tree(process: subprocess.Popen[str], *, platform: str = os.name) -> None:
     if process.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        raise ProcessTreeCleanupError(
+            "hidden child exited before its descendant tree could be targeted"
         )
-    if process.poll() is None:
-        process.kill()
-    process.wait(timeout=10)
+    try:
+        if platform == "nt":
+            killed = subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if killed.returncode != 0:
+                detail = (killed.stderr or killed.stdout or "unknown taskkill failure").strip()
+                raise ProcessTreeCleanupError(
+                    f"failed to terminate hidden child process tree: {detail}"
+                )
+        else:
+            process.kill()
+        process.wait(timeout=5)
+    except ProcessTreeCleanupError:
+        raise
+    except subprocess.TimeoutExpired as exc:
+        raise ProcessTreeCleanupError("hidden child did not terminate after tree kill") from exc
+    except Exception as exc:
+        raise ProcessTreeCleanupError(
+            f"hidden child process-tree cleanup failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -> ProcessResult:
@@ -538,7 +559,12 @@ def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -
         return ProcessResult(process.returncode, stdout, stderr, False)
     except subprocess.TimeoutExpired:
         _kill_process_tree(process)
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except Exception as exc:
+            raise ProcessTreeCleanupError(
+                f"hidden child pipes remained unusable after tree kill: {type(exc).__name__}: {exc}"
+            ) from exc
         return ProcessResult(process.returncode or -1, stdout, stderr, True)
 
 
@@ -1746,6 +1772,8 @@ def run_capture_once(
         return CaptureResult(status="idle")
     try:
         return _process_claimed_job(config, job, capture_window=window)
+    except ProcessTreeCleanupError:
+        raise
     except Exception as exc:
         finished = datetime.now(UTC)
         message = f"{type(exc).__name__}: {exc}"

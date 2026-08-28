@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from insider_alerts.research.capture import ProcessResult
+from insider_alerts.research.capture import ProcessResult, ProcessTreeCleanupError
 from insider_alerts.research.option_chain_admission import (
     OptionChainAdmissionConfig,
     OptionChainAdmissionError,
@@ -322,4 +322,59 @@ def test_autopilot_task_remains_windowless_and_enables_reviewed_chain_boundary()
     assert "--alpha-chain-script" in installer
     assert "capture_insider_option_chain.py" in installer
     assert "--option-chain-store-db" in installer
+    assert '"Insider Alerts Autopilot Worker"' in installer
+    assert "--heartbeat-db" in installer
+    assert "--heartbeat-stale-seconds $StaleHeartbeatSeconds" in installer
+    assert "required_stale_seconds" in installer
+    assert "Wait-ForFreshWorker" in installer
+    assert "stably running autopilot worker" in installer
+    assert "ops autopilot-config-validate" in installer
+    assert "Push-Location $repoRoot" in installer
+    assert "TaskName and WorkerTaskName must be distinct" in installer
+    assert "prior tasks were restored" in installer
+    assert "Phase 1: disable and stop every replacement" in installer
+    assert "Phase 2: restore definitions only" in installer
+    assert "Phase 3: only restart prior instances" in installer
+    assert "if ($rollbackErrors.Count -eq 0)" in installer
+    phase_two = installer.index("# Phase 2: restore definitions only")
+    restore_gate = installer.index("if ($rollbackErrors.Count -eq 0)", phase_two)
+    restore_call = installer.index("Register-ScheduledTask -TaskName $snapshot.Name", phase_two)
+    assert restore_gate < restore_call
+    assert "Disable-ScheduledTask -TaskName $Name" in installer
+    stop_function = installer[installer.index("function Stop-TaskAndWait") :]
+    disable_index = stop_function.index("Disable-ScheduledTask -TaskName $Name")
+    post_fence_query_index = stop_function.index(
+        "$task = Get-ScheduledTask -TaskName $Name",
+        disable_index,
+    )
+    running_check_index = stop_function.index('if ($task.State -eq "Running")')
+    assert disable_index < post_fence_query_index < running_check_index
+    assert installer.index("ops autopilot-config-validate") < installer.index(
+        "Stop-TaskAndWait -Name $TaskName"
+    )
+    assert "ops autopilot-watchdog" in installer
+    assert "--quant-timeout-seconds $QuantTimeoutSeconds" in installer
+    assert "--worker-task-name `\"$WorkerTaskName`\"" in installer
+    assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 1)" in installer
+    assert installer.count("New-ScheduledTaskTrigger -AtLogOn") == 1
+    assert "$workerLogonTrigger" not in installer
+    assert installer.index("Stop-TaskAndWait -Name $TaskName") < installer.index(
+        "Register-ScheduledTask `"
+    )
+    assert installer.count("Register-ScheduledTask `") == 2
     assert 'New-ScheduledTaskAction `\n  -Execute $pythonExe' in installer
+
+
+def test_process_tree_cleanup_uncertainty_escapes_option_capture_isolation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    def uncertain_cleanup(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise ProcessTreeCleanupError("tree state unknown")
+
+    with pytest.raises(ProcessTreeCleanupError, match="tree state unknown"):
+        capture_predecision_option_chain(
+            config,
+            packet_id="packet-1",
+            symbol="ABC",
+            process_runner=uncertain_cleanup,
+        )

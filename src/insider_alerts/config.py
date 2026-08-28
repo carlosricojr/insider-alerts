@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS = 10.0
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -86,6 +88,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_retry_bounds(self) -> "Settings":
+        if self.ntfy_retry_min_seconds > self.ntfy_retry_max_seconds:
+            raise ValueError("NTFY_RETRY_MIN_SECONDS cannot exceed NTFY_RETRY_MAX_SECONDS")
+        if self.sec_retry_min_seconds > self.sec_retry_max_seconds:
+            raise ValueError("SEC_RETRY_MIN_SECONDS cannot exceed SEC_RETRY_MAX_SECONDS")
         if self.market_data_retry_min_seconds > self.market_data_retry_max_seconds:
             raise ValueError(
                 "MARKET_DATA_RETRY_MIN_SECONDS cannot exceed MARKET_DATA_RETRY_MAX_SECONDS"

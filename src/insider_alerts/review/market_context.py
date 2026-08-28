@@ -19,6 +19,8 @@ from urllib.parse import quote as url_quote
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from insider_alerts.config import AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
+
 logger = logging.getLogger(__name__)
 
 # Fallback-only HTTP source. Primary is IB Gateway (see _IBBarSource).
@@ -75,11 +77,14 @@ class _IBBarSource:
         ib: Any | None = None
         try:
             ib = IB()
+            # ib_async otherwise lets synchronous requests wait forever. Keep both contract
+            # qualification and historical bars inside the autopilot watchdog budget.
+            ib.RequestTimeout = AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS
             ib.connect(
                 cls._host,
                 cls._port,
                 clientId=cls._client_id,
-                timeout=10,
+                timeout=AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS,
                 readonly=True,
             )
             ib.reqMarketDataType(1)
@@ -119,6 +124,7 @@ class _IBBarSource:
                     "TRADES",
                     useRTH=True,
                     formatDate=2,
+                    timeout=AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("IB bar fetch failed for %s: %s", symbol, exc)

@@ -1,5 +1,8 @@
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -27,6 +30,7 @@ from insider_alerts.backtest.event_study import (
 )
 from insider_alerts.backtest.models import DailyBar, SignalEvent
 from insider_alerts.backtest.readiness import EventStudyReadinessReport
+from insider_alerts.research.capture import ProcessResult
 from insider_alerts.sec.client import SecHttpError
 from insider_alerts.sec.pipeline import BackfillResult, EnrichResult, PollResult, QueueResult
 
@@ -127,6 +131,10 @@ def test_cli_ops_deadletter(monkeypatch) -> None:
 
 def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -194,7 +202,7 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
 
     decisions: list[str] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         decisions.append(str(payload["decision"]))
         return 1
 
@@ -241,6 +249,10 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
 
 def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -306,7 +318,7 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
 
     applied: list[dict[str, object]] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         applied.append(payload)
         return 1
 
@@ -341,6 +353,84 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
     assert applied[0]["confidence"] == 0.92
     assert len(notified) == 1
     assert notified[0]["reason"] == "Quant thesis: large insider open-market buy with unusual size."
+
+
+def test_quant_backend_publishes_progress_on_both_sides_of_bounded_call(
+    monkeypatch,
+) -> None:
+    packet_id = "0000905148-26-000640|0001824653|4"
+    packet = {
+        "packet_id": packet_id,
+        "payload": {"score": 50.0, "rationale": {}},
+    }
+    response = json.dumps(
+        {
+            "decisions": [
+                {
+                    "packet_id": "P00000",
+                    "decision": "reject",
+                    "why": "No measured edge.",
+                    "edge_hypothesis": "None.",
+                    "risk_flags": [],
+                    "evidence": {
+                        "role_tier": "unknown",
+                        "open_market_buy_shares": 0,
+                        "trade_pct_daily_turnover": 0,
+                        "novelty_penalty": 0,
+                        "regime_earnings_shock_flag": False,
+                    },
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("codex.exe", "codex")])
+    monkeypatch.setattr(
+        cli,
+        "run_hidden_process",
+        lambda *args, **kwargs: ProcessResult(0, response, "", False),
+    )
+    progress: list[str] = []
+
+    decisions, error = cli._decide_packets_with_quant(
+        [packet],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=120,
+        quant_thinking="low",
+        quant_batch_size=8,
+        progress_callback=progress.append,
+    )
+
+    assert error is None
+    assert decisions[packet_id].decision == "reject"
+    assert progress == ["quant_backend_0_started", "quant_backend_0_finished"]
+
+
+def test_quant_backend_publishes_finished_progress_after_timeout(monkeypatch) -> None:
+    packet = {
+        "packet_id": "0000905148-26-000640|0001824653|4",
+        "payload": {"score": 50.0, "rationale": {}},
+    }
+    monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("codex.exe", "codex")])
+
+    def timeout(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return ProcessResult(-1, "", "", True)
+
+    monkeypatch.setattr(cli, "run_hidden_process", timeout)
+    progress: list[str] = []
+
+    decisions, error = cli._decide_packets_with_quant(
+        [packet],
+        quant_agent_id="quant-insider",
+        quant_timeout_seconds=120,
+        quant_thinking="low",
+        quant_batch_size=8,
+        progress_callback=progress.append,
+    )
+
+    assert decisions == {}
+    assert error is not None and "failed" in error
+    assert progress == ["quant_backend_0_started", "quant_backend_0_finished"]
 
 
 def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -> None:
@@ -405,7 +495,7 @@ def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -
 
     applied: list[dict[str, object]] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         applied.append(payload)
         return 1
 
@@ -435,6 +525,10 @@ def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -
 
 def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -508,7 +602,7 @@ def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch
         )
 
     monkeypatch.setattr(cli, "_decide_packets_with_quant", fake_quant_decide)
-    monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload: 1)
+    monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload, **kwargs: 1)
     monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
 
     result = runner.invoke(
@@ -532,8 +626,9 @@ def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch
 @dataclass
 class _Completed:
     returncode: int
-    stdout: str
-    stderr: str
+    stdout: str | None
+    stderr: str | None
+    timed_out: bool = False
 
 
 def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
@@ -573,7 +668,7 @@ def test_decide_packets_with_quant_batches_requests(monkeypatch) -> None:
         outer = json.dumps({"type": "result", "is_error": False, "result": inner})
         return _Completed(returncode=0, stdout=outer, stderr="")
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
 
     packets = [
         {
@@ -616,7 +711,7 @@ def test_decide_packets_with_quant_rejects_invalid_schema(monkeypatch) -> None:
         outer = json.dumps({"type": "result", "is_error": False, "result": inner})
         return _Completed(returncode=0, stdout=outer, stderr="")
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
 
     packets = [
         {
@@ -649,7 +744,8 @@ def test_decide_packets_with_quant_fails_over_per_missing_packet_and_surfaces_st
 
     def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
         calls.append(str(args[0]))
-        assert "creationflags" in kwargs
+        assert kwargs["timeout_seconds"] == 40
+        assert kwargs["cwd"] == Path.cwd()
         if args[0] == "claude.exe":
             outer = json.dumps(
                 {
@@ -686,7 +782,7 @@ def test_decide_packets_with_quant_fails_over_per_missing_packet_and_surfaces_st
             stderr="",
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
     packet_id = "0000000000-00-000001|0000000001|4"
     mapped, error = cli._decide_packets_with_quant(
         [
@@ -746,7 +842,7 @@ def test_decide_packets_with_quant_keeps_valid_primary_decision_and_falls_back_o
             stderr="",
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "run_hidden_process", fake_run)
     packet_ids = [
         "0000000000-00-000001|0000000001|4",
         "0000000000-00-000002|0000000002|4",
@@ -774,8 +870,8 @@ def test_decide_packets_with_quant_keeps_valid_primary_decision_and_falls_back_o
 def test_decide_packets_with_quant_handles_nontext_error_streams(monkeypatch) -> None:
     monkeypatch.setattr(cli, "_resolve_quant_cmds", lambda: [("claude.exe", "claude")])
     monkeypatch.setattr(
-        cli.subprocess,
-        "run",
+        cli,
+        "run_hidden_process",
         lambda *args, **kwargs: _Completed(  # type: ignore[arg-type]
             returncode=1,
             stdout=None,
@@ -849,7 +945,7 @@ def test_cli_ops_autopilot_defers_quant_infrastructure_failure(monkeypatch) -> N
     monkeypatch.setattr(
         cli,
         "apply_decision",
-        lambda db_path, payload: applied.append(dict(payload)) or 1,
+        lambda db_path, payload, **kwargs: applied.append(dict(payload)) or 1,
     )
 
     result = runner.invoke(
@@ -884,6 +980,10 @@ def test_cli_ops_autopilot_blocks_main_quant_agent_in_isolated_mode() -> None:
 
 def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
     runner = CliRunner()
+    monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
+    monkeypatch.setattr(
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+    )
     monkeypatch.setattr(
         cli,
         "_load_conviction_history",
@@ -943,7 +1043,7 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
 
     decisions: list[str] = []
 
-    def fake_apply(db_path: str, payload):  # type: ignore[no-untyped-def]
+    def fake_apply(db_path: str, payload, **_kwargs):  # type: ignore[no-untyped-def]
         decisions.append(str(payload["decision"]))
         return 1
 
@@ -1050,7 +1150,7 @@ def test_cli_ops_autopilot_capture_is_causal_and_fail_isolated(
     monkeypatch.setattr(cli, "capture_predecision_option_chain", fake_capture)
     applied: list[dict[str, object]] = []
 
-    def fake_apply(db_path: str, payload: dict[str, object]) -> int:
+    def fake_apply(db_path: str, payload: dict[str, object], **_kwargs: object) -> int:
         events.append("apply")
         applied.append(dict(payload))
         return 1
@@ -1097,6 +1197,365 @@ def test_cli_ops_autopilot_requires_complete_chain_configuration(tmp_path: Path)
 
     assert result.exit_code == 2
     assert "must be provided together" in result.stderr
+
+
+def test_cli_ops_autopilot_requires_timeout_coupled_heartbeat_configuration(
+    tmp_path: Path,
+) -> None:
+    incomplete = CliRunner().invoke(
+        cli.app,
+        ["ops", "autopilot", "--once", "--heartbeat-db", str(tmp_path / "health.db")],
+    )
+    assert incomplete.exit_code == 2
+    assert "must be provided together" in incomplete.stderr
+
+    unsafe = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "299",
+        ],
+    )
+    assert unsafe.exit_code == 2
+    assert "heartbeat stale threshold" in unsafe.stderr
+
+
+def test_cli_autopilot_watchdog_durably_logs_failure_before_reraising(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    def fail(**_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("scheduled task query denied")
+
+    monkeypatch.setattr(cli, "run_autopilot_watchdog", fail)
+    output_log = tmp_path / "autopilot-watchdog.log"
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-watchdog",
+            "--worker-task-name",
+            "Autopilot Worker",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--stale-seconds",
+            "10000",
+            "--output-log",
+            str(output_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(output_log.read_text(encoding="utf-8"))
+    assert payload["action"] == "error"
+    assert payload["error_kind"] == "RuntimeError"
+    assert payload["error_message"] == "scheduled task query denied"
+    assert payload["worker_task_name"] == "Autopilot Worker"
+
+
+def test_cli_autopilot_watchdog_derives_safe_default(monkeypatch, tmp_path: Path) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(cli, "get_settings", lambda: cli.Settings(_env_file=None))
+
+    def capture(**kwargs):  # type: ignore[no-untyped-def]
+        observed.update(kwargs)
+        return {"action": "already_running"}
+
+    monkeypatch.setattr(cli, "run_autopilot_watchdog", capture)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-watchdog",
+            "--worker-task-name",
+            "Autopilot Worker",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--output-log",
+            str(tmp_path / "watchdog.log"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception
+    assert observed["stale_seconds"] == 498
+
+
+def test_cli_autopilot_watchdog_rejects_unsafe_config_before_task_control(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: cli.Settings(_env_file=None, SEC_TIMEOUT_SECONDS=120),
+    )
+
+    def forbidden(**_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("unsafe watchdog must not query or stop the worker")
+
+    monkeypatch.setattr(cli, "run_autopilot_watchdog", forbidden)
+    output_log = tmp_path / "autopilot-watchdog.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-watchdog",
+            "--worker-task-name",
+            "Autopilot Worker",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--stale-seconds",
+            "498",
+            "--quant-timeout-seconds",
+            "120",
+            "--output-log",
+            str(output_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(output_log.read_text(encoding="utf-8"))
+    assert payload["error_kind"] == "ValueError"
+    assert "heartbeat stale threshold" in payload["error_message"]
+
+
+def test_cli_autopilot_preflight_validates_budget_and_process_tree(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "get_settings", lambda: cli.Settings(_env_file=None))
+    monkeypatch.setattr(
+        cli,
+        "ensure_kill_on_close_process_tree",
+        lambda: calls.append("job"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-config-validate",
+            "--quant-timeout-seconds",
+            "120",
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception
+    assert calls == ["job"]
+    assert json.loads(result.stdout)["required_stale_seconds"] == 498
+    assert json.loads(result.stdout)["effective_stale_seconds"] == 498
+
+
+def test_cli_autopilot_preflight_fails_before_process_tree_for_unsafe_budget(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: cli.Settings(_env_file=None, SEC_TIMEOUT_SECONDS=120),
+    )
+    monkeypatch.setattr(
+        cli,
+        "ensure_kill_on_close_process_tree",
+        lambda: calls.append("job"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot-config-validate",
+            "--quant-timeout-seconds",
+            "120",
+            "--heartbeat-stale-seconds",
+            "300",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "heartbeat stale threshold" in result.stderr
+    assert calls == []
+
+
+def test_pythonw_entrypoint_durably_logs_settings_bootstrap_failure(tmp_path: Path) -> None:
+    error_log = tmp_path / "bootstrap.err.log"
+    environment = dict(os.environ)
+    environment["SEC_TIMEOUT_SECONDS"] = "not-a-number"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "insider_alerts.cli",
+            "ops",
+            "autopilot",
+            "--loop",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "10000",
+            "--error-log",
+            str(error_log),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert result.returncode != 0
+    assert "autopilot unhandled process failure (ValidationError:" in error_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_cli_autopilot_loop_logs_process_tree_ownership_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    poll_called = False
+
+    def fail_job() -> None:
+        raise RuntimeError("job ownership denied")
+
+    def forbidden_poll(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal poll_called
+        poll_called = True
+        raise AssertionError("worker must stop before polling")
+
+    monkeypatch.setattr(cli, "ensure_kill_on_close_process_tree", fail_job)
+    monkeypatch.setattr(cli, "run_sec_poll_once", forbidden_poll)
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--loop",
+            "--decision-engine",
+            "rules",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "10000",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert poll_called is False
+    assert "autopilot process failed (RuntimeError: job ownership denied)" in (
+        error_log.read_text(encoding="utf-8")
+    )
+
+
+def test_cli_ops_autopilot_exits_after_persistent_heartbeat_write_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FailingStore:
+        def register_runtime(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def progress(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise sqlite3.OperationalError("health store locked")
+
+    polls = 0
+
+    def fake_poll(settings, *, max_items, dry_run):  # type: ignore[no-untyped-def]
+        nonlocal polls
+        polls += 1
+        return PollResult(0, 0, 0)
+
+    monkeypatch.setattr(cli, "AutopilotHealthStore", lambda path: FailingStore())
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: "a" * 64)
+    monkeypatch.setattr(cli, "run_sec_poll_once", fake_poll)
+    monkeypatch.setattr(
+        cli,
+        "enrich_filings_with_xml_url",
+        lambda settings, *, limit, progress_callback: EnrichResult(0, 0),
+    )
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "10000",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert polls == 1
+    log = error_log.read_text(encoding="utf-8")
+    assert log.count("autopilot heartbeat degraded") == 1
+    assert "unavailable for three consecutive progress writes" in log
+    assert "autopilot process failed" in log
+
+
+def test_cli_ops_autopilot_exits_when_runtime_ownership_is_superseded(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class SupersededStore:
+        def register_runtime(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def progress(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise cli.RuntimeOwnershipError("superseded")
+
+    poll_called = False
+
+    def forbidden_poll(settings, *, max_items, dry_run):  # type: ignore[no-untyped-def]
+        nonlocal poll_called
+        poll_called = True
+        raise AssertionError("superseded runtime must stop before polling")
+
+    monkeypatch.setattr(cli, "AutopilotHealthStore", lambda path: SupersededStore())
+    monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: "a" * 64)
+    monkeypatch.setattr(cli, "run_sec_poll_once", forbidden_poll)
+    error_log = tmp_path / "autopilot.err.log"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+            "--heartbeat-db",
+            str(tmp_path / "health.db"),
+            "--heartbeat-stale-seconds",
+            "10000",
+            "--error-log",
+            str(error_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert poll_called is False
+    assert "autopilot process stopped (RuntimeOwnershipError: superseded)" in (
+        error_log.read_text(encoding="utf-8")
+    )
 
 
 def test_cli_ops_autopilot_once_exits_on_sec_http_error(
@@ -1193,8 +1652,14 @@ def test_cli_ops_autopilot_loop_recovers_from_sec_http_error(
 def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch, tmp_path: Path
 ) -> None:
-    calls: dict[str, object] = {"poll": 0, "sleeps": []}
-    fingerprints = iter(("a" * 64, "a" * 64, "a" * 64, "a" * 64, "b" * 64))
+    calls: dict[str, object] = {
+        "poll": 0,
+        "sleeps": [],
+        "delivered": [],
+        "suppressed": [],
+        "sent": [],
+    }
+    fingerprints = iter(("a" * 64,) * 5 + ("b" * 64,))
 
     def fake_poll(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
         calls["poll"] = int(calls["poll"]) + 1
@@ -1204,21 +1669,83 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
     monkeypatch.setattr(
         cli,
         "enrich_filings_with_xml_url",
-        lambda settings, *, limit: EnrichResult(scanned=0, updated=0),
+        lambda settings, *, limit, progress_callback=None: EnrichResult(
+            scanned=1,
+            updated=0,
+            http_failed=1,
+        ),
     )
     monkeypatch.setattr(
         cli,
         "enqueue_review_packets",
-        lambda settings, *, limit: QueueResult(processed=0, enqueued=0),
+        lambda settings, *, limit, progress_callback=None: QueueResult(
+            processed=1,
+            enqueued=1,
+            market_failed=1,
+        ),
     )
     monkeypatch.setattr(cli, "list_pending_review_packets", lambda db_path, limit: [])
+    outbox_packet = {
+        "packet_id": "0000320193-24-000123|0000320193|4",
+        "payload": {
+            "issuer_symbol": "MKZR",
+            "rationale": {
+                "net_buy_shares": 33400.0,
+                "pre_trade_shares_estimate": 66600.0,
+                "post_trade_shares": 100000.0,
+                "gross_value": 53340.0,
+            },
+        },
+        "decision": {
+            "packet_id": "0000320193-24-000123|0000320193|4",
+            "decision": "approve",
+            "reason": "retry durable alert",
+        },
+    }
+    duplicate_outbox_packet = {
+        **outbox_packet,
+        "packet_id": "0000320193-24-000124|0000320193|4",
+        "decision": {
+            **outbox_packet["decision"],  # type: ignore[dict-item]
+            "packet_id": "0000320193-24-000124|0000320193|4",
+        },
+    }
+    monkeypatch.setattr(
+        cli,
+        "list_notification_outbox",
+        lambda db_path, limit: [outbox_packet, duplicate_outbox_packet],
+    )
+
+    def record_send(_settings, payload, **_kwargs):  # type: ignore[no-untyped-def]
+        calls["sent"].append(payload["packet_id"])  # type: ignore[union-attr]
+        if len(calls["sent"]) == 1:  # type: ignore[arg-type]
+            raise cli.NtfyNotificationError("first representative attempt failed")
+
+    monkeypatch.setattr(cli, "_send_review_notification", record_send)
+    monkeypatch.setattr(
+        cli,
+        "mark_notification_delivered",
+        lambda db_path, packet_id, decision: (
+            calls["delivered"].append(packet_id) or 1  # type: ignore[union-attr]
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "mark_notification_suppressed",
+        lambda db_path, packet_id, decision: (
+            calls["suppressed"].append(packet_id) or 1  # type: ignore[union-attr]
+        ),
+    )
     monkeypatch.setattr(cli, "runtime_source_fingerprint", lambda: next(fingerprints))
+    monkeypatch.setattr(cli, "ensure_kill_on_close_process_tree", lambda: None)
     monkeypatch.setattr(
         cli.time,
         "sleep",
         lambda seconds: calls["sleeps"].append(seconds),  # type: ignore[union-attr]
     )
     output_log = tmp_path / "autopilot.out.log"
+    error_log = tmp_path / "autopilot.err.log"
+    heartbeat_db = tmp_path / "autopilot-health.db"
 
     result = CliRunner().invoke(
         cli.app,
@@ -1230,16 +1757,42 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
             "31",
             "--decision-engine",
             "rules",
+            "--heartbeat-db",
+            str(heartbeat_db),
+            "--heartbeat-stale-seconds",
+            "10000",
             "--output-log",
             str(output_log),
+            "--error-log",
+            str(error_log),
         ],
     )
 
     assert result.exit_code == 0
-    assert calls == {"poll": 1, "sleeps": [15.0, 15.0, 1.0]}
-    message = "autopilot source changed; exiting so the hidden repeating task can start"
+    assert calls == {
+        "poll": 2,
+        "sleeps": [15.0, 15.0, 1.0],
+        "delivered": ["0000320193-24-000123|0000320193|4"],
+        "suppressed": ["0000320193-24-000124|0000320193|4"],
+        "sent": [
+            "0000320193-24-000123|0000320193|4",
+            "0000320193-24-000123|0000320193|4",
+        ],
+    }
+    message = "autopilot source changed; exiting so the hidden watchdog can start"
     assert message in result.stderr
-    assert message in output_log.read_text(encoding="utf-8")
+    output = output_log.read_text(encoding="utf-8")
+    assert message in output
+    assert "autopilot notification outbox suppressed duplicate" in output
+    assert "deferred duplicate behind pending representative" in output
+    assert "notify_suppressed_duplicate=1" in output
+    errors = error_log.read_text(encoding="utf-8")
+    assert "autopilot SEC enrichment degraded (http_failed=1" in errors
+    assert "autopilot review enrichment degraded" in errors
+    assert "market_failed=1" in errors
+    health = cli.AutopilotHealthStore(heartbeat_db).read()
+    assert health["last_progress_stage"] == "source_changed"
+    assert health["last_cycle_success_utc"] is not None
 
 
 def test_cli_ops_autopilot_once_does_not_fingerprint_source(monkeypatch) -> None:
