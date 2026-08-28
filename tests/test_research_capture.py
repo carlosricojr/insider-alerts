@@ -156,6 +156,19 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
     )
 
 
+def _not_applicable_result(*, request_id: str, observed_at: datetime) -> dict[str, Any]:
+    return {
+        "schema_version": "insider-evidence-option-surface-result-v1",
+        "status": "not_applicable",
+        "reason_code": "OPTION_CHAIN_NOT_LISTED",
+        "source_id": "ib_gateway:US_OPTIONS:SMART:type1",
+        "request_id": request_id,
+        "symbol": "TEST",
+        "client_id": 48,
+        "observed_at_utc": observed_at.isoformat(),
+    }
+
+
 def _historical_artifact(
     *, request_id: str, decision_at: datetime, chain_observed_at: datetime | None = None
 ) -> dict[str, Any]:
@@ -1056,6 +1069,193 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
     assert observation["status"] == "captured"
     assert observation["artifact_sha256"] == option_files[0].stem
     assert packet_id in record["payload"]["signal"]["packet_id"]
+
+
+def test_exact_no_chain_result_is_persisted_as_not_applicable_without_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
+    emitted_at: list[datetime] = []
+
+    def no_chain_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        assert not output.exists()
+        emitted_at.append(datetime.now(UTC))
+        return ProcessResult(
+            returncode=4,
+            stdout=json.dumps(
+                _not_applicable_result(
+                    request_id=job_id,
+                    observed_at=emitted_at[-1],
+                )
+            ),
+            stderr="Error 200 from guessed contracts must not be interpreted",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", no_chain_process)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "not_applicable"
+    assert not list((config.artifact_root / "options").glob("*.json"))
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,last_error_kind,last_error_message FROM research_capture_jobs"
+        ).fetchone() == ("complete", None, None)
+        assert conn.execute(
+            "SELECT status,error_kind,error_message FROM research_capture_attempts"
+        ).fetchone() == ("completed", None, None)
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation == {
+        "status": "not_applicable",
+        "as_of_utc": None,
+        "observed_at_utc": capture_module.utc_text(emitted_at[0]),
+        "source": "ib_gateway:US_OPTIONS:SMART:type1",
+        "artifact_ref": None,
+        "artifact_sha256": None,
+        "values": {
+            "schema_version": "insider-evidence-option-surface-result-v1",
+            "reason_code": "OPTION_CHAIN_NOT_LISTED",
+            "request_id": job_id,
+            "symbol": "TEST",
+            "client_id": 48,
+        },
+        "error": None,
+    }
+    assert all(error["stage"] != "options_surface" for error in record["payload"]["errors"])
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("schema_version", "v0"),
+        ("status", "error"),
+        ("reason_code", "PROVIDER_FAILED"),
+        ("source_id", "other"),
+        ("request_id", "other-job"),
+        ("symbol", "OTHER"),
+        ("client_id", 47),
+        ("observed_at_utc", "2026-08-28T12:00:00-04:00"),
+    ],
+)
+def test_no_chain_result_rejects_identity_drift(
+    tmp_path: Path, field: str, invalid: object
+) -> None:
+    output = tmp_path / "must-not-exist.json"
+    payload = _not_applicable_result(
+        request_id="job-1",
+        observed_at=datetime(2026, 8, 28, 16, 0, tzinfo=UTC),
+    )
+    payload[field] = invalid
+
+    with pytest.raises(ValueError):
+        capture_module._validated_option_not_applicable_result(
+            ProcessResult(4, json.dumps(payload), "", False),
+            output=output,
+            expected_request_id="job-1",
+            expected_symbol="TEST",
+        )
+
+
+def test_no_chain_result_rejects_extra_fields_wrong_exit_and_artifact(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "surface.json"
+    payload = _not_applicable_result(
+        request_id="job-1",
+        observed_at=datetime(2026, 8, 28, 16, 0, tzinfo=UTC),
+    )
+    cases = [
+        ProcessResult(4, json.dumps({**payload, "extra": True}), "", False),
+        ProcessResult(1, json.dumps(payload), "", False),
+        ProcessResult(4, "not json", "", False),
+    ]
+    for result in cases:
+        with pytest.raises(ValueError):
+            capture_module._validated_option_not_applicable_result(
+                result,
+                output=output,
+                expected_request_id="job-1",
+                expected_symbol="TEST",
+            )
+
+    output.write_text("forbidden", encoding="utf-8")
+    with pytest.raises(ValueError):
+        capture_module._validated_option_not_applicable_result(
+            ProcessResult(4, json.dumps(payload), "", False),
+            output=output,
+            expected_request_id="job-1",
+            expected_symbol="TEST",
+        )
+
+
+@pytest.mark.parametrize("offset", [timedelta(microseconds=-1), timedelta(seconds=2)])
+def test_no_chain_result_rejects_timestamp_outside_capture_window(
+    tmp_path: Path, offset: timedelta
+) -> None:
+    decision_at = datetime(2026, 8, 28, 16, 0, tzinfo=UTC)
+    payload = _not_applicable_result(
+        request_id="job-1",
+        observed_at=decision_at + offset,
+    )
+
+    with pytest.raises(ValueError):
+        capture_module._validated_option_not_applicable_result(
+            ProcessResult(4, json.dumps(payload), "", False),
+            output=tmp_path / "must-not-exist.json",
+            expected_request_id="job-1",
+            expected_symbol="TEST",
+            observed_not_before=decision_at,
+            observed_not_after=decision_at + timedelta(seconds=1),
+        )
+
+
+def test_invalid_no_chain_result_is_a_typed_terminal_evidence_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def invalid_no_chain_process(_command: list[str], **_kwargs: Any) -> ProcessResult:
+        return ProcessResult(
+            returncode=4,
+            stdout=json.dumps({"status": "not_applicable"}),
+            stderr="",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", invalid_no_chain_process)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RESULT_INVALID"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("complete", "OPTION_RESULT_INVALID")
+        assert conn.execute(
+            "SELECT status,error_kind,retryable FROM research_capture_attempts"
+        ).fetchone() == ("completed", "OPTION_RESULT_INVALID", 0)
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "error"
+    assert observation["error"]["kind"] == "OPTION_RESULT_INVALID"
+    assert any(
+        error["stage"] == "options_surface"
+        and error["kind"] == "OPTION_RESULT_INVALID"
+        for error in record["payload"]["errors"]
+    )
 
 
 def test_retryable_option_failure_keeps_job_durable_without_snapshot(
