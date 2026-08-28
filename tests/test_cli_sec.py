@@ -10,13 +10,23 @@ def test_cli_sec_poll_once(monkeypatch) -> None:
     def fake_run(settings, *, max_items: int, dry_run: bool):  # type: ignore[no-untyped-def]
         assert max_items == 10
         assert dry_run is True
-        return PollResult(fetched=3, inserted=0, skipped_existing=0)
+        return PollResult(
+            fetched=3,
+            inserted=0,
+            skipped_existing=0,
+            source_items_seen=5,
+            source_boundary_rejected=1,
+            source_invalid_items=1,
+        )
 
     monkeypatch.setattr(cli, "run_sec_poll_once", fake_run)
 
     result = runner.invoke(cli.app, ["sec", "poll", "--once", "--max-items", "10", "--dry-run"])
     assert result.exit_code == 0
     assert "fetched=3" in result.stdout
+    assert "source_items_seen=5" in result.stdout
+    assert "source_boundary_rejected=1" in result.stdout
+    assert "source_invalid_items=1" in result.stdout
 
 
 def test_cli_sec_backfill(monkeypatch) -> None:

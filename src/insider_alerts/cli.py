@@ -195,6 +195,9 @@ class AutoPilotCycleResult:
     enqueue_parse_failed: int = 0
     enqueue_market_failed: int = 0
     outbox_notified: int = 0
+    source_items_seen: int = 0
+    source_boundary_rejected: int = 0
+    source_invalid_items: int = 0
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -2042,6 +2045,9 @@ def sec_poll(
             f"(fetched={result.fetched}, "
             f"inserted={result.inserted}, "
             f"skipped_existing={result.skipped_existing}, "
+            f"source_items_seen={result.source_items_seen}, "
+            f"source_boundary_rejected={result.source_boundary_rejected}, "
+            f"source_invalid_items={result.source_invalid_items}, "
             f"dry_run={dry_run})"
         )
         typer.echo(summary)
@@ -3895,11 +3901,17 @@ def ops_autopilot(
             enqueue_parse_failed=enqueue_result.parse_failed,
             enqueue_market_failed=enqueue_result.market_failed,
             outbox_notified=outbox_notified,
+            source_items_seen=poll_result.source_items_seen,
+            source_boundary_rejected=poll_result.source_boundary_rejected,
+            source_invalid_items=poll_result.source_invalid_items,
         )
         cycle_message = (
             "ops autopilot cycle completed "
             f"(fetched={cycle.fetched}, inserted={cycle.inserted}, "
             f"skipped_existing={cycle.skipped_existing}, "
+            f"source_items_seen={cycle.source_items_seen}, "
+            f"source_boundary_rejected={cycle.source_boundary_rejected}, "
+            f"source_invalid_items={cycle.source_invalid_items}, "
             f"enrich_scanned={cycle.enriched_scanned}, enrich_updated={cycle.enriched_updated}, "
             f"enqueue_processed={cycle.enqueue_processed}, "
             f"enqueue_enqueued={cycle.enqueue_enqueued}, "

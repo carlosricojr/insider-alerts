@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
@@ -12,11 +13,23 @@ ACCESSION_COMPACT_RE = re.compile(r"\b(\d{18})\b")
 CIK_LABELED_RE = re.compile(r"\bCIK\s*[:=]?\s*(\d{1,10})\b", re.IGNORECASE)
 CIK_ANY_RE = re.compile(r"\b(\d{10})\b")
 CIK_IN_URL_RE = re.compile(r"/data/(\d{1,10})/", re.IGNORECASE)
-FORM_TYPE_RE = re.compile(r"\b4(?:/A)?\b", re.IGNORECASE)
+FORM_TITLE_PREFIX_RE = re.compile(
+    r"^\s*(?P<form_type>[A-Z0-9][A-Z0-9./-]*)\s*-",
+    re.IGNORECASE,
+)
+FORM4_TYPES = frozenset({"4", "4/A"})
 
 
 class SecRssParseError(RuntimeError):
     """Raised for malformed RSS payloads."""
+
+
+@dataclass(frozen=True, slots=True)
+class RssParseResult:
+    refs: list[FilingRef]
+    items_seen: int
+    source_boundary_rejected: int
+    invalid_items: int
 
 
 def _local_name(tag: str) -> str:
@@ -127,7 +140,36 @@ def _iter_feed_items(root: ET.Element) -> list[ET.Element]:
     raise SecRssParseError(f"unsupported feed root element: {root_name}")
 
 
-def parse_form4_rss(xml_text: str, *, max_items: int | None = None) -> list[FilingRef]:
+def _extract_form4_type(title: str | None, category_terms: list[str]) -> str | None:
+    """Return an exact Form 4 identity from authoritative feed fields.
+
+    SEC's ``type=4`` current-filings endpoint uses prefix matching, so the feed can contain
+    forms such as 424B3, 485BPOS, and 497. Descriptions are metadata and may contain strings
+    such as ``Size: 4 MB``; they must never determine the filing type.
+    """
+    if title:
+        title_match = FORM_TITLE_PREFIX_RE.match(title)
+        if title_match is not None:
+            title_form = title_match.group("form_type").upper()
+            return title_form if title_form in FORM4_TYPES else None
+
+    exact_category_types = {
+        term.strip().upper() for term in category_terms if term.strip().upper() in FORM4_TYPES
+    }
+    if len(exact_category_types) == 1:
+        return next(iter(exact_category_types))
+    return None
+
+
+def _has_explicit_form_identity(title: str | None, category_terms: list[str]) -> bool:
+    return bool((title and FORM_TITLE_PREFIX_RE.match(title)) or category_terms)
+
+
+def parse_form4_rss_with_diagnostics(
+    xml_text: str,
+    *,
+    max_items: int | None = None,
+) -> RssParseResult:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
@@ -136,29 +178,44 @@ def parse_form4_rss(xml_text: str, *, max_items: int | None = None) -> list[Fili
     items = _iter_feed_items(root)
 
     refs: list[FilingRef] = []
+    items_seen = 0
+    source_boundary_rejected = 0
+    invalid_items = 0
     for item in items:
+        items_seen += 1
         title = _first_child_text(item, "title")
         link = _extract_link(item)
         pub_date = _first_child_text(item, "pubDate", "updated", "published")
         description = _first_child_text(item, "description", "summary", "content") or ""
         guid = _first_child_text(item, "guid", "id") or ""
-        category_terms = " ".join(
-            term
+        category_terms = [
+            value
             for node in _children_by_name(item, "category")
-            for term in [node.attrib.get("term", "").strip()]
-            if term
-        )
+            for value in [
+                node.attrib.get("term", "").strip(),
+                (node.text or "").strip(),
+            ]
+            if value
+        ]
 
-        joined = " ".join(part for part in [title, description, guid, category_terms] if part)
+        joined = " ".join(part for part in [title, description, guid, *category_terms] if part)
         accession = _extract_accession(title, description, guid, link)
         cik = _extract_cik(joined, link)
-        form_match = FORM_TYPE_RE.search(" ".join([joined, link or ""]))
+        form_type = _extract_form4_type(title, category_terms)
 
-        if accession is None or cik is None or form_match is None or link is None:
+        if form_type is None:
+            if _has_explicit_form_identity(title, category_terms):
+                source_boundary_rejected += 1
+            else:
+                invalid_items += 1
+            continue
+        if accession is None or cik is None or link is None:
+            invalid_items += 1
             continue
 
         filed_at = _parse_datetime(pub_date)
         if filed_at is None:
+            invalid_items += 1
             continue
 
         refs.append(
@@ -166,7 +223,7 @@ def parse_form4_rss(xml_text: str, *, max_items: int | None = None) -> list[Fili
                 source="sec_rss",
                 cik=cik,
                 accession_number=accession,
-                form_type=form_match.group(0).upper(),
+                form_type=form_type,
                 filed_at=filed_at,
                 filing_detail_url=link,
                 primary_doc_url=None,
@@ -176,6 +233,8 @@ def parse_form4_rss(xml_text: str, *, max_items: int | None = None) -> list[Fili
                     "pubDate": pub_date or "",
                     "description": description,
                     "guid": guid,
+                    "category": " ".join(category_terms),
+                    "feed_form_type": form_type,
                 },
             )
         )
@@ -183,4 +242,13 @@ def parse_form4_rss(xml_text: str, *, max_items: int | None = None) -> list[Fili
         if max_items is not None and len(refs) >= max_items:
             break
 
-    return refs
+    return RssParseResult(
+        refs=refs,
+        items_seen=items_seen,
+        source_boundary_rejected=source_boundary_rejected,
+        invalid_items=invalid_items,
+    )
+
+
+def parse_form4_rss(xml_text: str, *, max_items: int | None = None) -> list[FilingRef]:
+    return parse_form4_rss_with_diagnostics(xml_text, max_items=max_items).refs

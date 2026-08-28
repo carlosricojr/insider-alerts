@@ -14,6 +14,41 @@ SQLITE_CONNECT_TIMEOUT_SECONDS = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 SQLITE_LOCK_RETRY_ATTEMPTS = 6
 SQLITE_LOCK_RETRY_BASE_SLEEP_SECONDS = 0.25
+SEC_PROCESSING_STAGES = frozenset({"xml_enrichment", "review_xml"})
+
+
+def form4_source_boundary_sql(table_alias: str = "") -> str:
+    """Return the legacy eligibility predicate for a trusted Form 4 source row.
+
+    Older SEC RSS rows did not persist a separately validated feed form type. Preserve all rows,
+    but exclude an RSS row when its available title explicitly identifies a different form.
+    Non-RSS and title-missing legacy rows remain eligible for backward compatibility.
+    """
+    if table_alias and not table_alias.replace("_", "").isalnum():
+        raise ValueError("table_alias must be an SQL identifier")
+    prefix = f"{table_alias}." if table_alias else ""
+    source = f"{prefix}source"
+    raw = f"{prefix}raw_rss_entry"
+    title = (
+        f"CASE WHEN json_valid({raw}) "
+        f"THEN trim(json_extract({raw}, '$.title')) ELSE NULL END"
+    )
+    feed_form_type = (
+        f"CASE WHEN json_valid({raw}) "
+        f"THEN upper(trim(json_extract({raw}, '$.feed_form_type'))) ELSE NULL END"
+    )
+    return f"""(
+        json_valid({raw})
+        AND (
+            {source} <> 'sec_rss'
+            OR nullif({title}, '') IS NULL
+            OR (
+                instr({title}, '-') > 0
+                AND upper(trim(substr({title}, 1, instr({title}, '-') - 1))) IN ('4', '4/A')
+            )
+            OR {feed_form_type} IN ('4', '4/A')
+        )
+    )"""
 
 
 @dataclass(slots=True)
@@ -88,6 +123,30 @@ def init_db(db_path: str) -> None:
             WHERE form_type = '4' AND form4_xml_url IS NOT NULL AND form4_xml_url <> ''
             """
         )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sec_processing_rejections (
+                stage TEXT NOT NULL,
+                accession_number TEXT NOT NULL,
+                cik TEXT NOT NULL,
+                form_type TEXT NOT NULL,
+                input_url TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (stage, accession_number, cik, form_type, input_url)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sec_processing_rejections_lookup
+            ON sec_processing_rejections (
+                stage, accession_number, cik, form_type, input_url
+            );
+            CREATE TRIGGER IF NOT EXISTS sec_processing_rejections_no_update
+            BEFORE UPDATE ON sec_processing_rejections
+            BEGIN SELECT RAISE(ABORT, 'SEC processing rejections are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS sec_processing_rejections_no_delete
+            BEFORE DELETE ON sec_processing_rejections
+            BEGIN SELECT RAISE(ABORT, 'SEC processing rejections are append-only'); END;
+            """
+        )
 
         conn.commit()
 
@@ -129,14 +188,26 @@ def upsert_filing_refs(db_path: str, refs: list[FilingRef]) -> StoreResult:
 
 def list_filings_missing_xml(db_path: str, *, limit: int) -> list[FilingRef]:
     init_db(db_path)
+    source_boundary = form4_source_boundary_sql()
     with _connect_sqlite(db_path, write=False) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """
+            f"""
             SELECT source, cik, accession_number, form_type, filed_at,
                    filing_detail_url, primary_doc_url, raw_rss_entry
             FROM filings
             WHERE form4_xml_url IS NULL
+              AND form_type IN ('4', '4/A')
+              AND {source_boundary}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sec_processing_rejections AS rejection
+                  WHERE rejection.stage = 'xml_enrichment'
+                    AND rejection.accession_number = filings.accession_number
+                    AND rejection.cik = filings.cik
+                    AND rejection.form_type = filings.form_type
+                    AND rejection.input_url = filings.filing_detail_url
+              )
             ORDER BY filed_at DESC
             LIMIT ?
             """,
@@ -158,6 +229,36 @@ def list_filings_missing_xml(db_path: str, *, limit: int) -> list[FilingRef]:
             )
         )
     return results
+
+
+def record_sec_processing_rejections(
+    db_path: str,
+    *,
+    stage: str,
+    rejections: Sequence[tuple[str, str, str, str, str]],
+) -> int:
+    """Append deterministic SEC processing rejections without changing source rows."""
+
+    if stage not in SEC_PROCESSING_STAGES:
+        raise ValueError(f"unsupported SEC processing stage: {stage}")
+    if not rejections:
+        return 0
+    init_db(db_path)
+    with _connect_sqlite(db_path, write=True) as conn:
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO sec_processing_rejections (
+                stage, accession_number, cik, form_type, input_url, reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (stage, accession_number, cik, form_type, input_url, reason)
+                for accession_number, cik, form_type, input_url, reason in rejections
+            ],
+        )
+        conn.commit()
+        return conn.total_changes - before
 
 
 def _update_form4_xml_urls_once(
