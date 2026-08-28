@@ -199,6 +199,9 @@ def _finite_number_or_none(value: float | None) -> float | None:
     return value if math.isfinite(value) else None
 
 
+SOURCE_REVISION_CHECK_INTERVAL_SECONDS = 15.0
+
+
 def runtime_source_fingerprint(package_root: Path | None = None) -> str:
     """Hash the Python source that the long-running worker loaded at startup."""
 
@@ -498,7 +501,10 @@ class CanaryRunner:
 
     def source_revision_changed(self) -> bool:
         checked_at = monotonic()
-        if checked_at - self._last_source_check_monotonic < 15.0:
+        if (
+            checked_at - self._last_source_check_monotonic
+            < SOURCE_REVISION_CHECK_INTERVAL_SECONDS
+        ):
             return self._source_changed
         self._last_source_check_monotonic = checked_at
         self._source_changed = runtime_source_fingerprint() != self.runtime_fingerprint
