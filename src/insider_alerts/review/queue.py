@@ -1,15 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
+
+import rfc8785
 
 from insider_alerts.sec.models import FilingRef
 
 VALID_DECISIONS = {"approve", "reject", "escalate", "deadletter"}
 PACKET_ID_RE = re.compile(r"^\d{10}-\d{2}-\d{6}\|\d{10}\|4(?:/A)?$")
+DELIVERY_ACK_VERSION = "notification-delivery-ack-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationDeliveryProof:
+    """Secret-free binding to the exact successful ntfy attempt, when captured."""
+
+    transport_id: str | None
+    attempt_number: int
+    responded_at_utc: datetime
+    request_body_sha256: str
+    route_sha256: str
+    http_status: int
 
 
 class DecisionValidationError(ValueError):
@@ -144,6 +162,31 @@ def ensure_review_tables(db_path: str) -> None:
             CREATE TRIGGER IF NOT EXISTS research_capture_jobs_no_delete
             BEFORE DELETE ON research_capture_jobs
             BEGIN SELECT RAISE(ABORT, 'capture jobs cannot be deleted'); END;
+            CREATE TABLE IF NOT EXISTS notification_delivery_acks (
+                sequence INTEGER PRIMARY KEY,
+                ack_id TEXT NOT NULL UNIQUE,
+                packet_id TEXT NOT NULL,
+                decision_sha256 TEXT NOT NULL,
+                notification_sent_at_utc TEXT NOT NULL,
+                transport_id TEXT,
+                attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+                responded_at_utc TEXT NOT NULL,
+                request_body_sha256 TEXT NOT NULL,
+                route_sha256 TEXT NOT NULL,
+                http_status INTEGER NOT NULL CHECK(http_status BETWEEN 200 AND 299),
+                record_sha256 TEXT NOT NULL UNIQUE,
+                record_json BLOB NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_sequence
+            BEFORE INSERT ON notification_delivery_acks
+            WHEN NEW.sequence<>(SELECT COALESCE(MAX(sequence),0)+1 FROM notification_delivery_acks)
+            BEGIN SELECT RAISE(ABORT, 'notification delivery sequence must be gap-free'); END;
+            CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_no_update
+            BEFORE UPDATE ON notification_delivery_acks
+            BEGIN SELECT RAISE(ABORT, 'notification delivery acknowledgements are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_no_delete
+            BEFORE DELETE ON notification_delivery_acks
+            BEGIN SELECT RAISE(ABORT, 'notification delivery acknowledgements are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS enqueue_research_capture_after_approval
             AFTER UPDATE OF status ON review_packets
             WHEN NEW.status = 'approve' AND OLD.status <> 'approve'
@@ -328,13 +371,38 @@ def mark_notification_delivered(
     db_path: str,
     packet_id: str,
     decision: Mapping[str, object],
+    *,
+    proof: NotificationDeliveryProof,
 ) -> int:
     """CAS-acknowledge the exact decision only after provider success."""
 
     ensure_review_tables(db_path)
-    delivered_at = datetime.now(tz=UTC).isoformat()
     encoded = json.dumps(decision, separators=(",", ":"), sort_keys=True)
+    decision_sha = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    responded_at = proof.responded_at_utc
+    if responded_at.tzinfo is None or responded_at.utcoffset() is None:
+        raise ValueError("notification delivery proof timestamp must be timezone-aware")
+    responded_at_utc = responded_at.astimezone(UTC)
+    delivered_at_value = max(datetime.now(tz=UTC), responded_at_utc)
+    delivered_at = delivered_at_value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    responded_text = (
+        responded_at_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    )
+    if (
+        isinstance(proof.attempt_number, bool)
+        or proof.attempt_number < 1
+        or isinstance(proof.http_status, bool)
+        or proof.http_status < 200
+        or proof.http_status > 299
+        or not re.fullmatch(r"[0-9a-f]{64}", proof.request_body_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", proof.route_sha256)
+        or (
+            proof.transport_id is not None and not re.fullmatch(r"[0-9a-f]{64}", proof.transport_id)
+        )
+    ):
+        raise ValueError("notification delivery proof is invalid")
     with sqlite3.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
             """
             UPDATE review_packets
@@ -346,6 +414,48 @@ def mark_notification_delivered(
             """,
             (delivered_at, packet_id, encoded),
         )
+        if cursor.rowcount == 1:
+            sequence = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM notification_delivery_acks"
+                ).fetchone()[0]
+            )
+            record: dict[str, Any] = {
+                "schema_version": 1,
+                "contract_version": DELIVERY_ACK_VERSION,
+                "packet_id": packet_id,
+                "decision_sha256": decision_sha,
+                "notification_sent_at_utc": delivered_at,
+                "transport_id": proof.transport_id,
+                "attempt_number": proof.attempt_number,
+                "responded_at_utc": responded_text,
+                "request_body_sha256": proof.request_body_sha256,
+                "route_sha256": proof.route_sha256,
+                "http_status": proof.http_status,
+            }
+            record_json = rfc8785.dumps(record)
+            record_sha = hashlib.sha256(record_json).hexdigest()
+            ack_id = hashlib.sha256(
+                f"{DELIVERY_ACK_VERSION}|{packet_id}|{decision_sha}|{delivered_at}".encode()
+            ).hexdigest()
+            conn.execute(
+                "INSERT INTO notification_delivery_acks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    sequence,
+                    ack_id,
+                    packet_id,
+                    decision_sha,
+                    delivered_at,
+                    proof.transport_id,
+                    proof.attempt_number,
+                    responded_text,
+                    proof.request_body_sha256,
+                    proof.route_sha256,
+                    proof.http_status,
+                    record_sha,
+                    record_json,
+                ),
+            )
         conn.commit()
     return int(cursor.rowcount)
 

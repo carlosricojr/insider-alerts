@@ -31,8 +31,20 @@ from insider_alerts.backtest.event_study import (
 from insider_alerts.backtest.models import DailyBar, SignalEvent
 from insider_alerts.backtest.readiness import EventStudyReadinessReport
 from insider_alerts.research.capture import ProcessResult
+from insider_alerts.review.queue import NotificationDeliveryProof
 from insider_alerts.sec.client import SecHttpError
 from insider_alerts.sec.pipeline import BackfillResult, EnrichResult, PollResult, QueueResult
+
+
+def _delivery_proof() -> NotificationDeliveryProof:
+    return NotificationDeliveryProof(
+        transport_id="a" * 64,
+        attempt_number=1,
+        responded_at_utc=datetime.now(UTC),
+        request_body_sha256="b" * 64,
+        route_sha256="c" * 64,
+        http_status=200,
+    )
 
 
 def test_cli_sec_enrich(monkeypatch) -> None:
@@ -133,7 +145,7 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
     monkeypatch.setattr(
-        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision, **kwargs: 1
     )
     monkeypatch.setattr(
         cli,
@@ -212,6 +224,7 @@ def test_cli_ops_autopilot_once(monkeypatch, tmp_path: Path) -> None:
 
     def fake_notify(settings, payload, *, packet=None, dry_message=None):  # type: ignore[no-untyped-def]
         notifications.append(str(payload["decision"]))
+        return _delivery_proof()
 
     monkeypatch.setattr(cli, "_send_review_notification", fake_notify)
 
@@ -251,7 +264,7 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
     monkeypatch.setattr(
-        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision, **kwargs: 1
     )
     monkeypatch.setattr(
         cli,
@@ -328,6 +341,7 @@ def test_cli_ops_autopilot_quant_reason_flows_to_apply_and_notify(monkeypatch) -
 
     def fake_notify(settings, payload, *, packet=None, dry_message=None):  # type: ignore[no-untyped-def]
         notified.append(payload)
+        return _delivery_proof()
 
     monkeypatch.setattr(cli, "_send_review_notification", fake_notify)
 
@@ -500,7 +514,7 @@ def test_cli_ops_autopilot_blocks_low_liquidity_director_approval(monkeypatch) -
         return 1
 
     monkeypatch.setattr(cli, "apply_decision", fake_apply)
-    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: _delivery_proof())
 
     result = runner.invoke(
         cli.app,
@@ -527,7 +541,7 @@ def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
     monkeypatch.setattr(
-        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision, **kwargs: 1
     )
     monkeypatch.setattr(
         cli,
@@ -603,7 +617,7 @@ def test_cli_ops_autopilot_quant_only_requests_baseline_pass_packets(monkeypatch
 
     monkeypatch.setattr(cli, "_decide_packets_with_quant", fake_quant_decide)
     monkeypatch.setattr(cli, "apply_decision", lambda db_path, payload, **kwargs: 1)
-    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_send_review_notification", lambda *args, **kwargs: _delivery_proof())
 
     result = runner.invoke(
         cli.app,
@@ -982,7 +996,7 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
     runner = CliRunner()
     monkeypatch.setattr(cli, "_recent_alerted_event_keys", lambda db_path: set())
     monkeypatch.setattr(
-        cli, "mark_notification_delivered", lambda db_path, packet_id, decision: 1
+        cli, "mark_notification_delivered", lambda db_path, packet_id, decision, **kwargs: 1
     )
     monkeypatch.setattr(
         cli,
@@ -1053,6 +1067,7 @@ def test_cli_ops_autopilot_deadletters_duplicate_packets(monkeypatch) -> None:
 
     def fake_notify(settings, payload, *, packet=None, dry_message=None):  # type: ignore[no-untyped-def]
         notifications.append(str(payload["decision"]))
+        return _delivery_proof()
 
     monkeypatch.setattr(cli, "_send_review_notification", fake_notify)
 
@@ -1720,12 +1735,13 @@ def test_cli_ops_autopilot_loop_exits_cleanly_when_source_changes(
         calls["sent"].append(payload["packet_id"])  # type: ignore[union-attr]
         if len(calls["sent"]) == 1:  # type: ignore[arg-type]
             raise cli.NtfyNotificationError("first representative attempt failed")
+        return _delivery_proof()
 
     monkeypatch.setattr(cli, "_send_review_notification", record_send)
     monkeypatch.setattr(
         cli,
         "mark_notification_delivered",
-        lambda db_path, packet_id, decision: (
+        lambda db_path, packet_id, decision, **kwargs: (
             calls["delivered"].append(packet_id) or 1  # type: ignore[union-attr]
         ),
     )

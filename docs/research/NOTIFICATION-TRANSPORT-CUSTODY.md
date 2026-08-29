@@ -41,6 +41,34 @@ recorded in `logs/notification-transport.err.log`; notification delivery proceed
 trade-off protects the operational alert path. Missing journal data remains missing and cannot be
 retrospectively represented as observed.
 
+## Coverage reconciliation
+
+The operational source now appends a content-addressed `notification_delivery_acks` record in the
+same SQLite transaction that sets `notification_sent_at`. It binds the exact decision digest,
+transport ID, successful retry number, response time, request-body/route digests, and 2xx status.
+If journal setup failed, the acknowledgement is still durable with a null transport ID so the
+notification path remains fail-isolated and the missing custody becomes detectable.
+
+`data/research/notification_coverage.db` seals a separate operational activation. The activation
+fully materializes and closes a read-only source snapshot before opening the journal snapshot. It
+stores item-level content digests and immutable `covered`/`missing` classifications for all visible
+pre-boundary delivered rows. `covered` requires an exact atomic acknowledgement plus its exact
+journal attempt. Older packet-level journal matches are deliberately insufficient, so unbindable
+legacy rows—including the known Form 4/A observer failure—remain missing forever. A later resend
+cannot reclassify them or create historical evidence.
+
+Future membership uses the append-only acknowledgement sequence after the sealed watermark, never
+`notification_sent_at` comparisons. This prevents a transaction that assigns its timestamp before
+the boundary but commits afterward from escaping the monitor. Each future acknowledgement must
+match one exact request/2xx-response attempt, including packet, body, route, retry, ordering, and
+timestamps. Deterministic failures become append-only gap records. Locked, unreadable, or malformed
+stores are reported as degraded and are never mislabeled as observed missingness. Baseline
+missingness is visible but does not make future monitoring permanently unhealthy.
+
+The monitor is capture-health-only. It imports neither broker nor trial code, cannot place orders,
+cannot alter notification delivery, does not read outcomes, and cannot enter `OPP-E07-V1` evidence,
+enrollment, inference, or decisions.
+
 Before activation, the notifier checks only for the journal file and does not resolve source
 provenance. After activation, the loaded Git revision is resolved at most once per process with a
 one-second hidden-process timeout and reused. A one-shot manual notification can therefore pay one
@@ -56,12 +84,29 @@ waiting for the hidden autopilot to reload the new source:
   --activation-at-utc 2026-08-28T12:34:56.000000Z
 ```
 
-Validate without sending a notification:
+Validate the transport journal without sending a notification:
 
 ```powershell
 .\.venv\Scripts\python.exe -m insider_alerts.cli ops notification-journal-status
 ```
 
-No new scheduled task or console process is installed. The existing hidden autopilot emits events
-only when it already sends a review notification. Rollback restores the preceding reviewed source;
-the immutable journal and activation record remain in place.
+After the coverage implementation is merged and deployed, create the acknowledgement schema, wait
+until autopilot has restarted on the deployed source fingerprint, seal the source-snapshot boundary,
+and install the invisible monitor:
+
+```powershell
+.\.venv\Scripts\python.exe -m insider_alerts.research.notification_coverage_worker `
+  --initialize-source-schema
+.\.venv\Scripts\python.exe -m insider_alerts.cli ops notification-coverage-activate
+.\ops\windows\install-notification-coverage-task.ps1 -Start
+.\.venv\Scripts\python.exe -m insider_alerts.cli ops notification-coverage-status
+```
+
+The scheduled action is direct hidden `pythonw.exe`, runs once per minute with `IgnoreNew`, and
+records durable freshness/error health. Strict status exits nonzero for missing activation, stale
+execution, structural degradation, or any post-boundary gap. Rollback restores the preceding
+reviewed source but does not delete the immutable journal, acknowledgement, baseline, or gap
+records. The installer resolves the deployment checkout from `Insider Alerts Live Canary Worker`,
+refuses any other worktree or a dirty/non-synced branch, and validates the sealed paths before task
+registration. If the live configuration uses non-default database paths, pass the matching
+`-SourceDatabase`, `-JournalDatabase`, and `-CoverageDatabase` values to the installer.

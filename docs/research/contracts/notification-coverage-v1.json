@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "contract_id": "notification-coverage-v1",
+  "purpose": "operational_capture_completeness_only",
+  "activation_boundary": "sealed_source_snapshot_and_delivery_ack_sequence_watermark",
+  "source_snapshot_order": "source_fully_materialized_and_closed_before_journal_open",
+  "baseline": {
+    "membership": "visible_nonsuppressed_notification_sent_rows",
+    "covered": "exact_atomic_acknowledgement_and_matching_request_2xx_attempt",
+    "missingness": "immutable_and_never_backfilled",
+    "historical_completeness_claim": "prohibited"
+  },
+  "post_activation": {
+    "membership": "append_only_notification_delivery_ack_sequence_after_watermark",
+    "identity": "exact_transport_id_and_attempt_number",
+    "success": "matching_request_and_2xx_response_before_operational_acknowledgement",
+    "observer_failure": "durable_ack_with_missing_transport_identity"
+  },
+  "failure_semantics": {
+    "source_or_journal_unreadable": "degraded_not_missing",
+    "rollback_or_path_drift": "degraded_not_missing",
+    "deterministic_uncovered_acknowledgement": "append_only_gap",
+    "accepted_baseline_missingness_affects_future_health": false
+  },
+  "freshness_seconds": 180,
+  "isolation": {
+    "reads_trial_outcomes": false,
+    "affects_trial_enrollment": false,
+    "affects_live_orders": false,
+    "affects_notification_delivery": false,
+    "enters_active_evidence_snapshot": false,
+    "supports_pre_activation_transport_claims": false
+  }
+}

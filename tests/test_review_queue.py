@@ -1,9 +1,13 @@
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime
 
+import pytest
+
 from insider_alerts.review.queue import (
     DecisionValidationError,
+    NotificationDeliveryProof,
     apply_decision,
     enqueue_review_packet,
     list_deadletters,
@@ -15,6 +19,17 @@ from insider_alerts.review.queue import (
 )
 from insider_alerts.sec.models import FilingRef
 from insider_alerts.sec.store import init_db
+
+
+def _delivery_proof() -> NotificationDeliveryProof:
+    return NotificationDeliveryProof(
+        transport_id="a" * 64,
+        attempt_number=1,
+        responded_at_utc=datetime(2026, 2, 11, 1, 1, tzinfo=UTC),
+        request_body_sha256="b" * 64,
+        route_sha256="c" * 64,
+        http_status=200,
+    )
 
 
 def _sample_ref(
@@ -85,7 +100,9 @@ def test_apply_decision_validates_schema(tmp_path) -> None:
     updated = apply_decision(db, good, notification_required=True)
     assert updated == 1
 
-    assert mark_notification_delivered(db, good["packet_id"], good) == 1
+    assert mark_notification_delivered(
+        db, good["packet_id"], good, proof=_delivery_proof()
+    ) == 1
     with sqlite3.connect(db) as conn:
         delivered_at = conn.execute(
             "SELECT notification_sent_at FROM review_packets WHERE packet_id = ?",
@@ -131,8 +148,39 @@ def test_notification_intent_is_atomic_and_remains_until_delivery(tmp_path) -> N
     assert outbox[0]["decision"]["reason"] == "send this"  # type: ignore[index]
     decision = outbox[0]["decision"]
     assert isinstance(decision, dict)
-    assert mark_notification_delivered(db, packet_id, decision) == 1
+    assert mark_notification_delivered(
+        db, packet_id, decision, proof=_delivery_proof()
+    ) == 1
     assert list_notification_outbox(db, limit=10) == []
+
+
+def test_invalid_delivery_proof_leaves_outbox_and_ledger_unchanged(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    packet_id = "0000320193-24-000123|0000320193|4"
+    decision = {
+        "packet_id": packet_id,
+        "decision": "approve",
+        "analyst": "quant",
+        "reason": "send this",
+    }
+    assert apply_decision(db, decision, notification_required=True) == 1
+    invalid_proof = NotificationDeliveryProof(
+        transport_id="a" * 64,
+        attempt_number=True,
+        responded_at_utc=datetime.now(UTC),
+        request_body_sha256="b" * 64,
+        route_sha256="c" * 64,
+        http_status=200,
+    )
+
+    with pytest.raises(ValueError, match="invalid"):
+        mark_notification_delivered(db, packet_id, decision, proof=invalid_proof)
+
+    assert [row["packet_id"] for row in list_notification_outbox(db, limit=10)] == [packet_id]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notification_delivery_acks").fetchone()[0] == 0
 
 
 def test_replayed_decision_clears_prior_notification_acknowledgement(tmp_path) -> None:
@@ -147,13 +195,30 @@ def test_replayed_decision_clears_prior_notification_acknowledgement(tmp_path) -
         "reason": "retry later",
     }
     assert apply_decision(db, deadletter, notification_required=True) == 1
-    assert mark_notification_delivered(db, packet_id, deadletter) == 1
+    assert mark_notification_delivered(
+        db, packet_id, deadletter, proof=_delivery_proof()
+    ) == 1
 
     assert replay_deadletter(db, packet_id) == 1
     approval = {**deadletter, "decision": "approve", "reason": "send replay"}
     assert apply_decision(db, approval, notification_required=True) == 1
 
     assert [row["packet_id"] for row in list_notification_outbox(db, limit=10)] == [packet_id]
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        ack = conn.execute("SELECT * FROM notification_delivery_acks").fetchone()
+        assert ack is not None
+        encoded = bytes(ack["record_json"])
+        record = json.loads(encoded)
+        assert int(ack["sequence"]) == 1
+        assert record["contract_version"] == "notification-delivery-ack-v1"
+        assert record["transport_id"] == "a" * 64
+        assert record["http_status"] == 200
+        assert hashlib.sha256(encoded).hexdigest() == ack["record_sha256"]
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE notification_delivery_acks SET http_status=201")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("DELETE FROM notification_delivery_acks")
 
 
 def test_stale_notification_ack_cannot_acknowledge_replayed_decision(tmp_path) -> None:
@@ -172,9 +237,13 @@ def test_stale_notification_ack_cannot_acknowledge_replayed_decision(tmp_path) -
     assert replay_deadletter(db, packet_id) == 1
     assert apply_decision(db, second, notification_required=True) == 1
 
-    assert mark_notification_delivered(db, packet_id, first) == 0
+    assert mark_notification_delivered(
+        db, packet_id, first, proof=_delivery_proof()
+    ) == 0
     assert [row["decision"] for row in list_notification_outbox(db, limit=10)] == [second]
-    assert mark_notification_delivered(db, packet_id, second) == 1
+    assert mark_notification_delivered(
+        db, packet_id, second, proof=_delivery_proof()
+    ) == 1
 
 
 def test_suppression_is_distinct_from_provider_delivery(tmp_path) -> None:

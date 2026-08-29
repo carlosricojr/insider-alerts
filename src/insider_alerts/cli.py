@@ -104,6 +104,12 @@ from insider_alerts.research.capture import (
     run_hidden_process,
 )
 from insider_alerts.research.diagnostics import diagnostic_status
+from insider_alerts.research.notification_coverage import (
+    NotificationCoverageConfig,
+    activate_notification_coverage,
+    notification_coverage_status,
+    run_notification_coverage_once,
+)
 from insider_alerts.research.notification_transport import (
     NotificationJournalConfig,
     NotificationTransportJournal,
@@ -119,6 +125,7 @@ from insider_alerts.research.session_feed import session_feed_status
 from insider_alerts.research.trial_runtime import trial_runtime_status
 from insider_alerts.review.queue import (
     DecisionValidationError,
+    NotificationDeliveryProof,
     apply_decision,
     ensure_review_tables,
     get_review_packet,
@@ -1923,13 +1930,15 @@ def _send_review_notification(
     *,
     packet: dict[str, object] | None = None,
     dry_message: str | None = None,
-) -> None:
+) -> NotificationDeliveryProof:
     notifier = NtfyNotifier(settings)
-    observer, observer_error_handler = _notification_transport_observer(settings, payload)
+    observer, observer_error_handler, transport_id = _notification_transport_observer(
+        settings, payload
+    )
     decision = payload.get("decision", "")
     if decision == "approve" and packet is not None:
         title, message, tags, priority = _build_trade_signal_notification(packet, payload)
-        notifier.send(
+        receipt = notifier.send(
             title=title,
             message=message,
             tags=tags,
@@ -1938,12 +1947,19 @@ def _send_review_notification(
             observer=observer,
             observer_error_handler=observer_error_handler,
         )
-        return
+        return NotificationDeliveryProof(
+            transport_id=transport_id,
+            attempt_number=receipt.attempt_number,
+            responded_at_utc=receipt.responded_at_utc,
+            request_body_sha256=receipt.request_body_sha256,
+            route_sha256=receipt.route_sha256,
+            http_status=receipt.http_status,
+        )
 
     message = f"packet={payload['packet_id']} decision={decision} analyst={payload['analyst']}"
     if dry_message:
         message = f"{message} note={dry_message}"
-    notifier.send(
+    receipt = notifier.send(
         title="Insider Review Applied",
         message=message,
         tags=["insider-alerts", "review"],
@@ -1951,6 +1967,14 @@ def _send_review_notification(
         markdown=False,
         observer=observer,
         observer_error_handler=observer_error_handler,
+    )
+    return NotificationDeliveryProof(
+        transport_id=transport_id,
+        attempt_number=receipt.attempt_number,
+        responded_at_utc=receipt.responded_at_utc,
+        request_body_sha256=receipt.request_body_sha256,
+        route_sha256=receipt.route_sha256,
+        http_status=receipt.http_status,
     )
 
 
@@ -1984,11 +2008,31 @@ def _notification_transport_config(settings: Settings) -> NotificationJournalCon
     )
 
 
+def _notification_coverage_config(settings: Settings) -> NotificationCoverageConfig:
+    repo_root = Path(__file__).resolve().parents[2]
+    source_db = Path(settings.database_path)
+    if not source_db.is_absolute():
+        source_db = repo_root / source_db
+    return NotificationCoverageConfig(
+        source_db=source_db,
+        source_root=repo_root / "data",
+        coverage_db=repo_root / "data" / "research" / "notification_coverage.db",
+        research_root=repo_root / "data" / "research",
+        policy_path=(
+            repo_root / "docs" / "research" / "contracts" / "notification-coverage-v1.json"
+        ),
+        policy_root=repo_root / "docs" / "research" / "contracts",
+        journal=_notification_transport_config(settings),
+        runtime_git_commit=_notification_runtime_git_commit(repo_root),
+    )
+
+
 def _notification_transport_observer(
     settings: Settings, payload: dict[str, str]
 ) -> tuple[
     Callable[[NtfyTransportEvent], None] | None,
     Callable[[Exception], None] | None,
+    str | None,
 ]:
     error_log = Path(__file__).resolve().parents[2] / "logs" / "notification-transport.err.log"
 
@@ -2003,10 +2047,10 @@ def _notification_transport_observer(
 
     packet_id = payload.get("packet_id", "").strip()
     if not packet_id:
-        return None, None
+        return None, None, None
     try:
         if not _notification_transport_database(settings).is_file():
-            return None, None
+            return None, None, None
         config = _notification_transport_config(settings)
         journal = NotificationTransportJournal(config)
         transport_id = notification_transport_id(packet_id, secrets.token_hex(32))
@@ -2014,12 +2058,12 @@ def _notification_transport_observer(
         raise
     except Exception as exc:
         capture_error(exc)
-        return None, capture_error
+        return None, capture_error, None
 
     def observe(event: NtfyTransportEvent) -> None:
         journal.append(packet_id=packet_id, transport_id=transport_id, event=event)
 
-    return observe, capture_error
+    return observe, capture_error, transport_id
 
 
 @notify_app.command("test")
@@ -2242,8 +2286,8 @@ def review_decide(
     typer.echo(f"review decide completed (updated={updated})")
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items()}
-        _send_review_notification(settings, notify_payload, packet=packet)
-        mark_notification_delivered(settings.database_path, packet_id, payload)
+        proof = _send_review_notification(settings, notify_payload, packet=packet)
+        mark_notification_delivered(settings.database_path, packet_id, payload, proof=proof)
 
 
 @review_app.command("apply")
@@ -2292,9 +2336,9 @@ def review_apply(
     typer.echo(f"review apply completed (updated={updated})")
     if notify:
         notify_payload = {k: str(v) for k, v in payload.items() if isinstance(k, str)}
-        _send_review_notification(settings, notify_payload, packet=packet)
+        proof = _send_review_notification(settings, notify_payload, packet=packet)
         if isinstance(packet_id_obj, str):
-            mark_notification_delivered(settings.database_path, packet_id_obj, payload)
+            mark_notification_delivered(settings.database_path, packet_id_obj, payload, proof=proof)
 
 
 @ops_app.command("deadletter-list")
@@ -3782,7 +3826,7 @@ def ops_autopilot(
                 if outbox_event_key is not None:
                     outbox_event_keys_attempted.add(outbox_event_key)
                 try:
-                    _send_review_notification(
+                    proof = _send_review_notification(
                         settings,
                         {key: str(value) for key, value in decision_payload.items()},
                         packet=outbox_packet,
@@ -3792,6 +3836,7 @@ def ops_autopilot(
                         settings.database_path,
                         packet_id,
                         decision_payload,
+                        proof=proof,
                     )
                     if acknowledged == 1 and outbox_event_key is not None:
                         alerted_event_keys.add(outbox_event_key)
@@ -4178,7 +4223,7 @@ def ops_autopilot(
             if should_notify:
                 try:
                     notify_payload = {k: str(v) for k, v in payload.items()}
-                    _send_review_notification(
+                    proof = _send_review_notification(
                         settings,
                         notify_payload,
                         packet=packet,
@@ -4188,6 +4233,7 @@ def ops_autopilot(
                         settings.database_path,
                         packet_id_obj,
                         payload,
+                        proof=proof,
                     )
                     if event_key is not None and acknowledged == 1:
                         alerted_event_keys.add(event_key)
@@ -4778,6 +4824,31 @@ def ops_notification_journal_status() -> None:
             sort_keys=True,
         )
     )
+
+
+@ops_app.command("notification-coverage-activate")
+def ops_notification_coverage_activate() -> None:
+    """Seal the audited post-fix coverage boundary and run its first check."""
+
+    settings = get_settings()
+    config = _notification_coverage_config(settings)
+    activation = activate_notification_coverage(config)
+    reconciliation = run_notification_coverage_once(config)
+    result = {"activation": activation, "reconciliation": reconciliation}
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+    if reconciliation.get("valid") is not True:
+        raise typer.Exit(code=3)
+
+
+@ops_app.command("notification-coverage-status")
+def ops_notification_coverage_status() -> None:
+    """Strictly validate notification coverage and hidden-monitor freshness."""
+
+    settings = get_settings()
+    report = notification_coverage_status(_notification_coverage_config(settings))
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if report.get("valid") is not True:
+        raise typer.Exit(code=3)
 
 
 @ops_app.command("research-capture-status")

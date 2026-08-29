@@ -37,6 +37,17 @@ class NtfyTransportEvent:
     exception_class: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class NtfyDeliveryReceipt:
+    """Secret-free proof of the exact HTTP attempt accepted by ntfy."""
+
+    attempt_number: int
+    responded_at_utc: datetime
+    request_body_sha256: str
+    route_sha256: str
+    http_status: int
+
+
 @dataclass(slots=True)
 class NtfyNotifier:
     settings: Settings
@@ -53,7 +64,7 @@ class NtfyNotifier:
         markdown: bool = True,
         observer: Callable[[NtfyTransportEvent], None] | None = None,
         observer_error_handler: Callable[[Exception], None] | None = None,
-    ) -> None:
+    ) -> NtfyDeliveryReceipt:
         """Send a notification to NTFY using configured topic and auth token."""
         url = f"{str(self.settings.ntfy_base_url).rstrip('/')}/{self.settings.ntfy_topic}"
         headers = self._build_headers(
@@ -85,7 +96,7 @@ class NtfyNotifier:
                     with suppress(Exception):
                         observer_error_handler(exc)
 
-        def _post_once(attempt_number: int) -> None:
+        def _post_once(attempt_number: int) -> NtfyDeliveryReceipt:
             requested_at = _now()
             _emit(
                 NtfyTransportEvent(
@@ -128,8 +139,16 @@ class NtfyNotifier:
                 )
             )
             response.raise_for_status()
+            return NtfyDeliveryReceipt(
+                attempt_number=attempt_number,
+                responded_at_utc=responded_at,
+                request_body_sha256=body_sha,
+                route_sha256=route_sha,
+                http_status=response.status_code,
+            )
 
         try:
+            receipt: NtfyDeliveryReceipt | None = None
             for attempt in Retrying(
                 stop=stop_after_attempt(self.settings.ntfy_retry_attempts),
                 wait=wait_exponential(
@@ -141,9 +160,12 @@ class NtfyNotifier:
                 reraise=True,
             ):
                 with attempt:
-                    _post_once(attempt.retry_state.attempt_number)
+                    receipt = _post_once(attempt.retry_state.attempt_number)
         except httpx.HTTPError as exc:
             raise NtfyNotificationError(f"NTFY notification failed: {exc}") from exc
+        if receipt is None:  # pragma: no cover - tenacity always executes at least once
+            raise NtfyNotificationError("NTFY notification produced no delivery receipt")
+        return receipt
 
     def _build_headers(
         self,

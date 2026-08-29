@@ -200,6 +200,29 @@ def test_unmatched_start_is_explicitly_reported_as_crash_shaped_unknown(
     assert status["unmatched_starts"] == 1
 
 
+def test_status_rejects_cross_packet_attempt_binding(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    activate_notification_journal(config, activated_at_utc=ACTIVATION)
+    journal = NotificationTransportJournal(config)
+    transport_id = notification_transport_id(PACKET_ID, "dispatch-1")
+
+    assert journal.append(
+        packet_id=PACKET_ID,
+        transport_id=transport_id,
+        event=_event("request_started"),
+    )
+    assert journal.append(
+        packet_id=AMENDED_PACKET_ID,
+        transport_id=transport_id,
+        event=_event("response_received", occurred_at=ACTIVATION + timedelta(milliseconds=1)),
+    )
+
+    status = notification_journal_status(config)
+
+    assert status["valid"] is False
+    assert status["integrity_errors"] == [f"attempt_binding_mismatch:{transport_id}:1"]
+
+
 def test_terminal_event_requires_a_start_and_only_one_terminal(tmp_path: Path) -> None:
     config = _config(tmp_path)
     activate_notification_journal(config, activated_at_utc=ACTIVATION)
@@ -385,7 +408,7 @@ def test_review_notification_records_one_complete_dispatch(
         content=b'{"id":"provider_1","time":1787904000}',
     )
 
-    cli._send_review_notification(
+    proof = cli._send_review_notification(
         settings,
         {
             "packet_id": AMENDED_PACKET_ID,
@@ -394,6 +417,11 @@ def test_review_notification_records_one_complete_dispatch(
         },
     )
 
+    assert proof.transport_id == notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")
+    assert proof.attempt_number == 1
+    assert proof.http_status == 200
+    assert len(proof.request_body_sha256) == 64
+    assert len(proof.route_sha256) == 64
     status = notification_journal_status(config)
     assert status["valid"] is True
     assert status["events"] == 2
@@ -445,11 +473,13 @@ def test_observer_setup_failure_does_not_block_notification(
         status_code=200,
     )
 
-    cli._send_review_notification(
+    proof = cli._send_review_notification(
         settings,
         {"packet_id": PACKET_ID, "decision": "reject", "analyst": "operator"},
     )
 
+    assert proof.transport_id is None
+    assert proof.http_status == 200
     assert len(httpx_mock.get_requests()) == 1
     error_log = tmp_path / "logs" / "notification-transport.err.log"
     assert error_log.read_text(encoding="utf-8").endswith(
@@ -471,13 +501,14 @@ def test_inactive_journal_does_not_resolve_git_on_notification_path(
     monkeypatch.setattr(cli, "resolve_git_commit", forbidden_git_resolution)
     cli._notification_runtime_git_commit.cache_clear()
 
-    observer, error_handler = cli._notification_transport_observer(
+    observer, error_handler, transport_id = cli._notification_transport_observer(
         settings,
         {"packet_id": PACKET_ID},
     )
 
     assert observer is None
     assert error_handler is None
+    assert transport_id is None
 
 
 def test_runtime_git_commit_is_resolved_once_per_process(

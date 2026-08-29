@@ -194,6 +194,19 @@ def _connect(path: Path, *, timeout_ms: int, initialize: bool = False) -> sqlite
     return conn
 
 
+def _connect_readonly(path: Path, *, timeout_ms: int) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        f"file:{path.resolve().as_posix()}?mode=ro",
+        uri=True,
+        timeout=timeout_ms / 1000,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA trusted_schema=OFF")
+    return conn
+
+
 def _validate_event(
     *, packet_id: str, transport_id: str, event: NtfyTransportEvent
 ) -> None:
@@ -508,12 +521,14 @@ def notification_transport_id(packet_id: str, dispatch_nonce: str) -> str:
 
 def notification_journal_status(
     config: NotificationJournalConfig,
+    *,
+    _include_validated_events: bool = False,
 ) -> dict[str, Any]:
     database = _confined_database(config)
     if not database.is_file():
         return {"valid": False, "reason": "notification_journal_missing"}
     integrity_errors: list[str] = []
-    with closing(_connect(database, timeout_ms=30_000)) as conn:
+    with closing(_connect_readonly(database, timeout_ms=30_000)) as conn:
         conn.execute("BEGIN")
         integrity_result = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
         if integrity_result != "ok":
@@ -633,8 +648,9 @@ def notification_journal_status(
         or _sha256(current_policy_bytes) != str(configuration["policy_bytes_sha256"])
     ):
         integrity_errors.append("policy_digest_mismatch")
-    starts: dict[tuple[str, int], datetime] = {}
-    terminals: dict[tuple[str, int], datetime] = {}
+    starts: dict[tuple[str, int], tuple[datetime, str, str, str, int]] = {}
+    terminals: dict[tuple[str, int], tuple[datetime, str, str, str, int]] = {}
+    validated_events: list[dict[str, Any]] = []
     phases: dict[str, int] = {phase: 0 for phase in sorted(_PHASES)}
     for expected_sequence, row in enumerate(rows, start=1):
         if int(row["sequence"]) != expected_sequence:
@@ -729,21 +745,39 @@ def notification_journal_status(
         except (AttributeError, TypeError, ValueError, NotificationJournalError):
             integrity_errors.append(f"event_semantics_invalid:{row['event_id']}")
             continue
+        validated_events.append(
+            {
+                **record,
+                "sequence": int(row["sequence"]),
+                "record_sha256": digest,
+            }
+        )
         phase = str(row["phase"])
         phases[phase] = phases.get(phase, 0) + 1
         key = (str(row["transport_id"]), int(row["attempt_number"]))
         occurred = _parse_utc(str(row["occurred_at_utc"]))
+        binding = (
+            occurred,
+            str(row["packet_id"]),
+            str(record["request_body_sha256"]),
+            str(record["route_sha256"]),
+            int(row["sequence"]),
+        )
         if phase == "request_started":
-            starts[key] = occurred
+            starts[key] = binding
         else:
             if key in terminals:
                 integrity_errors.append(f"multiple_terminal_events:{row['event_id']}")
-            terminals[key] = occurred
-    for key, occurred in terminals.items():
+            terminals[key] = binding
+    for key, terminal in terminals.items():
         if key not in starts:
             integrity_errors.append(f"orphan_terminal:{key[0]}:{key[1]}")
-        elif occurred < starts[key]:
+            continue
+        start = starts[key]
+        if terminal[0] < start[0] or terminal[4] <= start[4]:
             integrity_errors.append(f"terminal_before_start:{key[0]}:{key[1]}")
+        if terminal[1:4] != start[1:4]:
+            integrity_errors.append(f"attempt_binding_mismatch:{key[0]}:{key[1]}")
     unmatched = len(set(starts) - set(terminals))
     if not rows:
         if health is not None:
@@ -761,7 +795,7 @@ def notification_journal_status(
         }
         if dict(health) != expected_health:
             integrity_errors.append("health_event_mismatch")
-    return {
+    result: dict[str, Any] = {
         "valid": not integrity_errors,
         "activation_at_utc": activation,
         "events": len(rows),
@@ -770,3 +804,9 @@ def notification_journal_status(
         "integrity_errors": integrity_errors,
         "health": dict(health) if health is not None else None,
     }
+    if _include_validated_events:
+        result["_validated_events"] = validated_events
+        result["_configuration_record_sha256"] = (
+            str(configuration["record_sha256"]) if configuration is not None else None
+        )
+    return result
