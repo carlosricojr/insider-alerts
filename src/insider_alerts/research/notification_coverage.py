@@ -46,6 +46,7 @@ _EXPECTED_POLICY: dict[str, Any] = {
         "identity": "exact_transport_id_and_attempt_number",
         "success": "matching_request_and_2xx_response_before_operational_acknowledgement",
         "observer_failure": "durable_ack_with_missing_transport_identity",
+        "gap_observation_time": "after_snapshot_and_not_before_linked_delivery_evidence",
     },
     "failure_semantics": {
         "source_or_journal_unreadable": "degraded_not_missing",
@@ -274,6 +275,7 @@ def _create_coverage_schema(conn: sqlite3.Connection) -> None:
                 reason TEXT NOT NULL,
                 source_record_sha256 TEXT NOT NULL,
                 ack_id TEXT,
+                evidence_not_before_at_utc TEXT NOT NULL,
                 first_observed_at_utc TEXT NOT NULL,
                 record_sha256 TEXT NOT NULL UNIQUE,
                 record_json BLOB NOT NULL
@@ -999,6 +1001,7 @@ def _validate_coverage_state(
             "reason": str(row["reason"]),
             "source_record_sha256": str(row["source_record_sha256"]),
             "ack_id": row["ack_id"],
+            "evidence_not_before_at_utc": str(row["evidence_not_before_at_utc"]),
             "first_observed_at_utc": str(row["first_observed_at_utc"]),
         }
         if any(gap.get(field) != value for field, value in gap_bindings.items()):
@@ -1011,7 +1014,10 @@ def _validate_coverage_state(
         )
         if gap_bindings["gap_id"] != expected_gap_id:
             raise NotificationCoverageError("coverage gap digest identity is invalid")
-        _parse_utc(str(gap_bindings["first_observed_at_utc"]))
+        evidence_not_before = _parse_utc(str(gap_bindings["evidence_not_before_at_utc"]))
+        first_observed = _parse_utc(str(gap_bindings["first_observed_at_utc"]))
+        if first_observed < evidence_not_before:
+            raise NotificationCoverageError("coverage gap predates its linked evidence")
         gap_ids.append(str(row["gap_id"]))
     return {
         "configuration": record,
@@ -1133,11 +1139,18 @@ def _live_reconciliation(
     for ack in post_acks:
         reason = _ack_gap_reason(ack, journal)
         if reason is not None:
+            evidence_not_before = _utc_text(
+                max(
+                    _parse_utc(ack.notification_sent_at_utc),
+                    _parse_utc(ack.responded_at_utc),
+                )
+            )
             gaps.append(
                 {
                     "reason": reason,
                     "source_record_sha256": ack.record_sha256,
                     "ack_id": ack.ack_id,
+                    "evidence_not_before_at_utc": evidence_not_before,
                 }
             )
     baseline_ids = state["baseline_source_ids"]
@@ -1149,6 +1162,7 @@ def _live_reconciliation(
                     "reason": "unledgered_current_delivery",
                     "source_record_sha256": item.source_record_sha256,
                     "ack_id": None,
+                    "evidence_not_before_at_utc": item.notification_sent_at_utc,
                 }
             )
     deduped: dict[str, dict[str, str | None]] = {}
@@ -1192,6 +1206,9 @@ def _write_health(
     source_prefix_sha256: str | None,
     journal_prefix_sha256: str | None,
 ) -> None:
+    started_at = _utc_text(_parse_utc(started_at))
+    if success_at is not None:
+        success_at = _utc_text(_parse_utc(success_at))
     with closing(_connect_coverage(coverage_path)) as conn, conn:
         existing = conn.execute(
             "SELECT * FROM notification_coverage_health WHERE singleton=1"
@@ -1209,12 +1226,45 @@ def _write_health(
             """
             INSERT INTO notification_coverage_health VALUES(1,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(singleton) DO UPDATE SET
-              last_started_at_utc=excluded.last_started_at_utc,
-              last_success_at_utc=COALESCE(excluded.last_success_at_utc,last_success_at_utc),
-              last_error_kind=excluded.last_error_kind,
-              last_error_message=excluded.last_error_message,
-              post_activation_ack_count=excluded.post_activation_ack_count,
-              current_gap_count=excluded.current_gap_count,
+              last_started_at_utc=CASE
+                WHEN excluded.last_started_at_utc>
+                     notification_coverage_health.last_started_at_utc
+                THEN excluded.last_started_at_utc
+                ELSE notification_coverage_health.last_started_at_utc
+              END,
+              last_success_at_utc=CASE
+                WHEN excluded.last_started_at_utc>
+                     notification_coverage_health.last_started_at_utc
+                THEN COALESCE(
+                  excluded.last_success_at_utc,
+                  notification_coverage_health.last_success_at_utc
+                )
+                ELSE notification_coverage_health.last_success_at_utc
+              END,
+              last_error_kind=CASE
+                WHEN excluded.last_started_at_utc>
+                     notification_coverage_health.last_started_at_utc
+                THEN excluded.last_error_kind
+                ELSE notification_coverage_health.last_error_kind
+              END,
+              last_error_message=CASE
+                WHEN excluded.last_started_at_utc>
+                     notification_coverage_health.last_started_at_utc
+                THEN excluded.last_error_message
+                ELSE notification_coverage_health.last_error_message
+              END,
+              post_activation_ack_count=CASE
+                WHEN excluded.last_started_at_utc>
+                     notification_coverage_health.last_started_at_utc
+                THEN excluded.post_activation_ack_count
+                ELSE notification_coverage_health.post_activation_ack_count
+              END,
+              current_gap_count=CASE
+                WHEN excluded.last_started_at_utc>
+                     notification_coverage_health.last_started_at_utc
+                THEN excluded.current_gap_count
+                ELSE notification_coverage_health.current_gap_count
+              END,
               last_source_ack_sequence=MAX(
                 notification_coverage_health.last_source_ack_sequence,
                 excluded.last_source_ack_sequence
@@ -1265,6 +1315,10 @@ def run_notification_coverage_once(
         gaps = report["current_gaps"]
         if not isinstance(gaps, list):
             raise NotificationCoverageError("coverage reconciliation returned invalid gaps")
+        observed_at = now_fn()
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("coverage observation clock returned a naive timestamp")
+        observed_at = observed_at.astimezone(UTC)
         with closing(_connect_coverage(coverage_path)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             for gap in gaps:
@@ -1288,18 +1342,25 @@ def run_notification_coverage_once(
                     "reason": str(gap["reason"]),
                     "source_record_sha256": str(gap["source_record_sha256"]),
                     "ack_id": gap["ack_id"],
-                    "first_observed_at_utc": started,
+                    "evidence_not_before_at_utc": str(gap["evidence_not_before_at_utc"]),
+                    "first_observed_at_utc": _utc_text(
+                        max(
+                            observed_at,
+                            _parse_utc(str(gap["evidence_not_before_at_utc"])),
+                        )
+                    ),
                 }
                 encoded = _canonical(record)
                 conn.execute(
-                    "INSERT INTO notification_coverage_gaps VALUES(?,?,?,?,?,?,?,?)",
+                    "INSERT INTO notification_coverage_gaps VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         sequence,
                         gap_id,
                         record["reason"],
                         record["source_record_sha256"],
                         record["ack_id"],
-                        started,
+                        record["evidence_not_before_at_utc"],
+                        record["first_observed_at_utc"],
                         _sha256(encoded),
                         encoded,
                     ),

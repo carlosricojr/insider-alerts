@@ -12,6 +12,7 @@ from insider_alerts.review.queue import (
     apply_decision,
     enqueue_review_packet,
     ensure_review_tables,
+    initialize_notification_delivery_schema,
     list_deadletters,
     list_notification_outbox,
     list_pending_review_packets,
@@ -20,7 +21,13 @@ from insider_alerts.review.queue import (
     replay_deadletter,
 )
 from insider_alerts.sec.models import FilingRef
-from insider_alerts.sec.store import init_db
+from insider_alerts.sec.store import init_db as init_sec_db
+
+
+def init_db(db_path: str) -> None:
+    init_sec_db(db_path)
+    ensure_review_tables(db_path)
+    initialize_notification_delivery_schema(db_path)
 
 
 def _delivery_proof() -> NotificationDeliveryProof:
@@ -37,6 +44,7 @@ def _delivery_proof() -> NotificationDeliveryProof:
 def test_delivery_schema_rejects_same_named_noop_immutability_trigger(tmp_path) -> None:
     db = str(tmp_path / "insider_alerts.db")
     ensure_review_tables(db)
+    initialize_notification_delivery_schema(db)
     with sqlite3.connect(db) as conn:
         conn.execute("DROP TRIGGER notification_delivery_acks_no_update")
         conn.execute(
@@ -45,7 +53,39 @@ def test_delivery_schema_rejects_same_named_noop_immutability_trigger(tmp_path) 
         )
 
     with pytest.raises(NotificationDeliverySchemaError, match="definition mismatch"):
-        ensure_review_tables(db)
+        initialize_notification_delivery_schema(db)
+
+
+def test_delivery_schema_drift_is_isolated_from_operational_queue(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    init_db(db)
+    packet_id = "0000320193-24-000123|0000320193|4"
+    enqueue_review_packet(db, _sample_ref(), {"score": 99})
+    decision = {
+        "packet_id": packet_id,
+        "decision": "approve",
+        "analyst": "quant",
+        "reason": "send despite research drift",
+    }
+    assert apply_decision(db, decision, notification_required=True) == 1
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TRIGGER notification_delivery_acks_no_update")
+        conn.execute(
+            "CREATE TRIGGER notification_delivery_acks_no_update "
+            "BEFORE UPDATE ON notification_delivery_acks BEGIN SELECT 1; END"
+        )
+
+    assert [row["packet_id"] for row in list_notification_outbox(db, limit=10)] == [packet_id]
+    assert mark_notification_delivered(db, packet_id, decision, proof=_delivery_proof()) == 1
+    with sqlite3.connect(db) as conn:
+        sent_at = conn.execute(
+            "SELECT notification_sent_at FROM review_packets WHERE packet_id=?", (packet_id,)
+        ).fetchone()[0]
+        acknowledgements = conn.execute(
+            "SELECT COUNT(*) FROM notification_delivery_acks"
+        ).fetchone()[0]
+    assert sent_at is not None
+    assert acknowledgements == 0
 
 
 def _sample_ref(

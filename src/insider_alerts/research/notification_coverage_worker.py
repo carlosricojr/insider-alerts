@@ -17,7 +17,10 @@ from insider_alerts.research.notification_coverage import (
     run_notification_coverage_once,
 )
 from insider_alerts.research.notification_transport import NotificationJournalConfig
-from insider_alerts.review.queue import ensure_review_tables
+from insider_alerts.review.queue import (
+    ensure_review_tables,
+    initialize_notification_delivery_schema,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -92,7 +95,9 @@ def main(argv: list[str] | None = None) -> int:
         ensure_kill_on_close_process_tree()
         config = _config(args, repo_root=repo_root)
         if args.initialize_source_schema:
-            ensure_review_tables(str(confined_notification_coverage_source(config)))
+            source_path = str(confined_notification_coverage_source(config))
+            ensure_review_tables(source_path)
+            initialize_notification_delivery_schema(source_path)
             result: dict[str, object] = {"initialized": True}
         else:
             if args.activate:

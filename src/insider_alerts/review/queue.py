@@ -91,6 +91,16 @@ def validate_notification_delivery_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def initialize_notification_delivery_schema(db_path: str) -> None:
+    """Create and strictly validate the optional delivery-custody ledger."""
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.executescript(NOTIFICATION_DELIVERY_SCHEMA_SQL)
+        validate_notification_delivery_schema(conn)
+        conn.commit()
+
+
 @dataclass(frozen=True, slots=True)
 class NotificationDeliveryProof:
     """Secret-free binding to the exact successful ntfy attempt, when captured."""
@@ -252,8 +262,6 @@ def ensure_review_tables(db_path: str) -> None:
             END;
             """
         )
-        conn.executescript(NOTIFICATION_DELIVERY_SCHEMA_SQL)
-        validate_notification_delivery_schema(conn)
         conn.commit()
 
 
@@ -451,6 +459,14 @@ def mark_notification_delivered(
         raise ValueError("notification delivery proof is invalid")
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        try:
+            validate_notification_delivery_schema(conn)
+        except NotificationDeliverySchemaError:
+            # Custody is research enrichment. Provider delivery remains acknowledged
+            # operationally; the coverage monitor records the missing ledger row.
+            delivery_schema_valid = False
+        else:
+            delivery_schema_valid = True
         cursor = conn.execute(
             """
             UPDATE review_packets
@@ -462,7 +478,7 @@ def mark_notification_delivered(
             """,
             (delivered_at, packet_id, encoded),
         )
-        if cursor.rowcount == 1:
+        if cursor.rowcount == 1 and delivery_schema_valid:
             sequence = int(
                 conn.execute(
                     "SELECT COALESCE(MAX(sequence),0)+1 FROM notification_delivery_acks"

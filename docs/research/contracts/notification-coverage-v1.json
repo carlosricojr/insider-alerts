@@ -14,7 +14,8 @@
     "membership": "append_only_notification_delivery_ack_sequence_after_watermark",
     "identity": "exact_transport_id_and_attempt_number",
     "success": "matching_request_and_2xx_response_before_operational_acknowledgement",
-    "observer_failure": "durable_ack_with_missing_transport_identity"
+    "observer_failure": "durable_ack_with_missing_transport_identity",
+    "gap_observation_time": "after_snapshot_and_not_before_linked_delivery_evidence"
   },
   "failure_semantics": {
     "source_or_journal_unreadable": "degraded_not_missing",

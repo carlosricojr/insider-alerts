@@ -1932,7 +1932,7 @@ def _send_review_notification(
     dry_message: str | None = None,
 ) -> NotificationDeliveryProof:
     notifier = NtfyNotifier(settings)
-    observer, observer_error_handler, transport_id = _notification_transport_observer(
+    observer, observer_error_handler, transport_id_for_attempt = _notification_transport_observer(
         settings, payload
     )
     decision = payload.get("decision", "")
@@ -1948,7 +1948,11 @@ def _send_review_notification(
             observer_error_handler=observer_error_handler,
         )
         return NotificationDeliveryProof(
-            transport_id=transport_id,
+            transport_id=(
+                transport_id_for_attempt(receipt.attempt_number)
+                if transport_id_for_attempt is not None
+                else None
+            ),
             attempt_number=receipt.attempt_number,
             responded_at_utc=receipt.responded_at_utc,
             request_body_sha256=receipt.request_body_sha256,
@@ -1969,7 +1973,11 @@ def _send_review_notification(
         observer_error_handler=observer_error_handler,
     )
     return NotificationDeliveryProof(
-        transport_id=transport_id,
+        transport_id=(
+            transport_id_for_attempt(receipt.attempt_number)
+            if transport_id_for_attempt is not None
+            else None
+        ),
         attempt_number=receipt.attempt_number,
         responded_at_utc=receipt.responded_at_utc,
         request_body_sha256=receipt.request_body_sha256,
@@ -2032,7 +2040,7 @@ def _notification_transport_observer(
 ) -> tuple[
     Callable[[NtfyTransportEvent], None] | None,
     Callable[[Exception], None] | None,
-    str | None,
+    Callable[[int], str | None] | None,
 ]:
     error_log = Path(__file__).resolve().parents[2] / "logs" / "notification-transport.err.log"
 
@@ -2054,6 +2062,7 @@ def _notification_transport_observer(
         config = _notification_transport_config(settings)
         journal = NotificationTransportJournal(config)
         transport_id = notification_transport_id(packet_id, secrets.token_hex(32))
+        persisted_success_attempts: set[int] = set()
     except ProcessTreeCleanupError:
         raise
     except Exception as exc:
@@ -2061,9 +2070,19 @@ def _notification_transport_observer(
         return None, capture_error, None
 
     def observe(event: NtfyTransportEvent) -> None:
-        journal.append(packet_id=packet_id, transport_id=transport_id, event=event)
+        persisted = journal.append(packet_id=packet_id, transport_id=transport_id, event=event)
+        if (
+            persisted
+            and event.phase == "response_received"
+            and event.http_status is not None
+            and 200 <= event.http_status <= 299
+        ):
+            persisted_success_attempts.add(event.attempt_number)
 
-    return observe, capture_error, transport_id
+    def transport_id_for_attempt(attempt_number: int) -> str | None:
+        return transport_id if attempt_number in persisted_success_attempts else None
+
+    return observe, capture_error, transport_id_for_attempt
 
 
 @notify_app.command("test")

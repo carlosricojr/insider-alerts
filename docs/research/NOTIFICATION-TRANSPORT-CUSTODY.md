@@ -64,6 +64,8 @@ match one exact request/2xx-response attempt, including packet, body, route, ret
 timestamps. Deterministic failures become append-only gap records. Locked, unreadable, or malformed
 stores are reported as degraded and are never mislabeled as observed missingness. Baseline
 missingness is visible but does not make future monitoring permanently unhealthy.
+Each immutable gap is timestamped only after its source snapshot completes and never before its
+linked provider response or operational delivery acknowledgement.
 The acknowledgement, journal, and coverage stores validate the exact reviewed table, index, and
 trigger definitions, not merely their names; a same-named replacement is structural degradation.
 
@@ -109,10 +111,17 @@ The scheduled action is direct hidden `pythonw.exe`, runs once per minute with `
 records durable freshness/error health. Strict status exits nonzero for missing activation, stale
 execution, structural degradation, or any post-boundary gap. The installer resolves the deployment
 checkout from `Insider Alerts Live Canary Worker`, requires its complete frozen command and
-effective settings source database to match, refuses any other worktree or a dirty/non-synced
-branch, and validates the sealed paths before task registration. Matching non-default journal and
-coverage paths may be supplied with `-JournalDatabase` and `-CoverageDatabase`; `-SourceDatabase`
-is accepted only when it resolves to the canary's effective source.
+refuses any other worktree or a dirty/non-synced branch, and validates the sealed paths before task
+registration. Matching non-default journal and coverage paths may be supplied with
+`-JournalDatabase` and `-CoverageDatabase`; `-SourceDatabase` is accepted only when it resolves to
+the notification producer's scheduler-effective source.
+
+The installer also binds the actual notification producer, `Insider Alerts Autopilot Worker`, to
+the same executable and checkout, requires its reviewed full argument digest, and resolves source,
+journal, and journal-policy paths from persisted user/machine environment plus the deployment
+checkout's `.env`. Shell-local path overrides are deliberately ignored because scheduled tasks do
+not inherit the installer's transient process environment. Its recent heartbeat must also prove
+that the producer has loaded the current checkout source fingerprint.
 
 After coverage activation, rollback is compatibility-preserving and forward-only. Never deploy a
 preceding revision that lacks the delivery receipt, atomic `notification_delivery_acks` write,
@@ -124,5 +133,9 @@ revision that changes only the faulty behavior and preserves those compatibility
 normal PR gates, merge it to `main`, and deploy it by fast-forward. After either containment or that
 forward rollback, verify the live-canary action is unchanged, the coverage task is either
 deliberately disabled or still targets the retained `pythonw.exe` worker, no post-boundary gaps were
-added, and strict coverage status returns valid after the worker resumes. The immutable journal,
-acknowledgements, baseline, and gaps are never removed or rewritten.
+added, and strict coverage status returns valid after the worker resumes. To recover a deliberately
+disabled task, deploy the compatibility commit and rerun
+`install-notification-coverage-task.ps1 -Start`; the installer validates the existing exact action,
+runs one order-incapable reconciliation to refresh stale health, re-registers/enables the same hidden
+action, and starts it. Then wait for a scheduled cycle and run `notification-coverage-status`.
+The immutable journal, acknowledgements, baseline, and gaps are never removed or rewritten.

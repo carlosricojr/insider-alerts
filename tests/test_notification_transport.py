@@ -492,6 +492,47 @@ def test_observer_setup_failure_does_not_block_notification(
     )
 
 
+def test_observer_append_failure_nulls_transport_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    httpx_mock: HTTPXMock,
+) -> None:
+    config = _config(tmp_path)
+    activate_notification_journal(config, activated_at_utc=ACTIVATION - timedelta(days=1))
+    monkeypatch.setattr(cli, "_notification_transport_config", lambda settings: config)
+    fake_module = tmp_path / "src" / "insider_alerts" / "cli.py"
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+
+    def locked_append(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(NotificationTransportJournal, "append", locked_append)
+    settings = Settings(
+        NTFY_BASE_URL="https://ntfy.example.com",
+        NTFY_TOPIC="private-topic",
+        NTFY_RETRY_ATTEMPTS=1,
+        NOTIFICATION_TRANSPORT_DB=str(config.database),
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://ntfy.example.com/private-topic",
+        status_code=200,
+    )
+
+    proof = cli._send_review_notification(
+        settings,
+        {"packet_id": PACKET_ID, "decision": "reject", "analyst": "operator"},
+    )
+
+    assert proof.transport_id is None
+    assert proof.http_status == 200
+    assert len(httpx_mock.get_requests()) == 1
+    error_log = tmp_path / "logs" / "notification-transport.err.log"
+    assert error_log.read_text(encoding="utf-8").count(
+        "notification transport capture isolated: OperationalError\n"
+    ) == 2
+
+
 def test_inactive_journal_does_not_resolve_git_on_notification_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -506,14 +547,14 @@ def test_inactive_journal_does_not_resolve_git_on_notification_path(
     monkeypatch.setattr(cli, "resolve_git_commit", forbidden_git_resolution)
     cli._notification_runtime_git_commit.cache_clear()
 
-    observer, error_handler, transport_id = cli._notification_transport_observer(
+    observer, error_handler, transport_id_for_attempt = cli._notification_transport_observer(
         settings,
         {"packet_id": PACKET_ID},
     )
 
     assert observer is None
     assert error_handler is None
-    assert transport_id is None
+    assert transport_id_for_attempt is None
 
 
 def test_runtime_git_commit_is_resolved_once_per_process(

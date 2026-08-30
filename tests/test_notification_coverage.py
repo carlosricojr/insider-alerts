@@ -29,6 +29,7 @@ from insider_alerts.review.queue import (
     NotificationDeliveryProof,
     apply_decision,
     ensure_review_tables,
+    initialize_notification_delivery_schema,
     mark_notification_delivered,
     replay_deadletter,
 )
@@ -46,6 +47,7 @@ def _config(tmp_path: Path, *, now: datetime) -> NotificationCoverageConfig:
     research_root.mkdir(parents=True)
     source_db = data_root / "insider_alerts.db"
     ensure_review_tables(str(source_db))
+    initialize_notification_delivery_schema(str(source_db))
     journal = NotificationJournalConfig(
         database=research_root / "notification_transport.db",
         research_root=research_root,
@@ -340,6 +342,48 @@ def test_future_delivery_gap_is_append_only_and_strictly_unhealthy(
         conn.execute("DELETE FROM notification_coverage_gaps")
 
 
+def test_gap_observation_cannot_predate_linked_acknowledgement(tmp_path: Path) -> None:
+    boundary = datetime(2026, 8, 30, 16, 0, tzinfo=UTC)
+    config = _config(tmp_path, now=boundary)
+    activate_notification_coverage(config, now_fn=lambda: boundary)
+    packet = "0000320193-26-000013|0000320193|4"
+    _insert_pending(config, packet, now=boundary)
+    decision = _decision(packet)
+    assert apply_decision(str(config.source_db), decision, notification_required=True) == 1
+    responded = boundary + timedelta(seconds=1)
+    assert (
+        mark_notification_delivered(
+            str(config.source_db),
+            packet,
+            decision,
+            proof=_proof(transport_id=None, responded_at=responded),
+        )
+        == 1
+    )
+    clock = iter(
+        [
+            boundary,
+            boundary + timedelta(seconds=2),
+            boundary + timedelta(seconds=3),
+        ]
+    )
+
+    report = run_notification_coverage_once(config, now_fn=lambda: next(clock))
+
+    assert report["valid"] is False
+    with sqlite3.connect(config.coverage_db) as conn:
+        evidence_at, observed_at = conn.execute(
+            "SELECT evidence_not_before_at_utc,first_observed_at_utc "
+            "FROM notification_coverage_gaps"
+        ).fetchone()
+    assert datetime.fromisoformat(observed_at.replace("Z", "+00:00")) >= datetime.fromisoformat(
+        evidence_at.replace("Z", "+00:00")
+    )
+    assert datetime.fromisoformat(observed_at.replace("Z", "+00:00")) >= boundary + timedelta(
+        seconds=3
+    )
+
+
 def test_unledgered_old_process_ack_is_detected(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     config = _config(tmp_path, now=now)
@@ -410,6 +454,7 @@ def test_status_rejects_configured_source_path_drift(tmp_path: Path) -> None:
     activate_notification_coverage(config, now_fn=lambda: now)
     alternate_source = config.source_root / "alternate.db"
     ensure_review_tables(str(alternate_source))
+    initialize_notification_delivery_schema(str(alternate_source))
     drifted = NotificationCoverageConfig(
         source_db=alternate_source,
         source_root=config.source_root,
@@ -687,6 +732,38 @@ def test_out_of_order_health_writer_preserves_newer_sequence_prefix_pairs(
         ).fetchone()
     assert independent_checkpoint == (3, "e" * 64, 4, "d" * 64)
 
+    _write_health(
+        coverage_db,
+        started_at="2026-08-30T00:00:05Z",
+        success_at=None,
+        error=RuntimeError("newer failure"),
+        post_ack_count=5,
+        current_gap_count=1,
+        source_sequence=3,
+        journal_sequence=4,
+        source_prefix_sha256="e" * 64,
+        journal_prefix_sha256="d" * 64,
+    )
+    _write_health(
+        coverage_db,
+        started_at="2026-08-30T00:00:04Z",
+        success_at="2026-08-30T00:00:04Z",
+        error=None,
+        post_ack_count=4,
+        current_gap_count=0,
+        source_sequence=3,
+        journal_sequence=4,
+        source_prefix_sha256="e" * 64,
+        journal_prefix_sha256="d" * 64,
+    )
+
+    with sqlite3.connect(coverage_db) as conn:
+        health = conn.execute(
+            "SELECT last_started_at_utc,last_error_kind,post_activation_ack_count,"
+            "current_gap_count FROM notification_coverage_health WHERE singleton=1"
+        ).fetchone()
+    assert health == ("2026-08-30T00:00:05.000000Z", "RuntimeError", 5, 1)
+
 
 def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     worker = (
@@ -711,13 +788,24 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "branch --show-current" in installer
     assert "rev-parse origin/main" in installer
     assert "status --porcelain=v1 --untracked-files=all" in installer
-    assert "--status" in installer
+    assert "$preflightArguments" in installer
     assert "$deploymentAction.Arguments -ne $expectedCanaryArguments" in installer
-    assert "get_settings().database_path" in installer
+    assert "Insider Alerts Autopilot Worker" in installer
+    assert "$expectedProducerArgumentsSha256" in installer
+    assert "$producerRepoRoot -ne $repoRoot" in installer
+    assert "AutopilotHealthStore" in installer
+    assert "runtime_source_fingerprint" in installer
+    assert "$producerProgressAge.TotalSeconds -gt 600" in installer
+    assert "GetEnvironmentVariable($environmentName, \"User\")" in installer
+    assert "base64.b64decode(sys.argv[2])" in installer
+    assert "from insider_alerts.config import get_settings; s=get_settings()" in installer
     assert "$sourceDb -ne $effectiveSourceDb" in installer
-    assert "$effectiveSourceOutput = @(& $pythonConsole" in installer
+    assert "$journalDb -ne $effectiveJournalDb" in installer
+    assert "$effectiveSettingsOutput = @(" in installer
+    assert "$IntervalMinutes -ne 1" in installer
     assert "Out-String" not in installer
     assert "confined_notification_coverage_source(config)" in worker
+    assert "initialize_notification_delivery_schema" in worker
     assert "-Hidden" in installer
     assert "-MultipleInstances IgnoreNew" in installer
     assert "-WindowStyle" not in installer
