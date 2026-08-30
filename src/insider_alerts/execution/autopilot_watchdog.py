@@ -154,6 +154,7 @@ class AutopilotHealthStore:
                 );
                 """
             )
+            conn.execute("BEGIN IMMEDIATE")
             columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(autopilot_health)").fetchall()
@@ -178,6 +179,25 @@ class AutopilotHealthStore:
                     "UPDATE autopilot_health SET schema_version=?",
                     (AUTOPILOT_HEALTH_SCHEMA_VERSION,),
                 )
+            elif columns == _HEALTH_COLUMNS:
+                versions = {
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT DISTINCT schema_version FROM autopilot_health"
+                    ).fetchall()
+                }
+                if versions == {1}:
+                    # Repair a legacy non-transactional migration without claiming that its
+                    # runtime ever supplied a configuration binding.
+                    conn.execute(
+                        "UPDATE autopilot_health SET schema_version=?, "
+                        "runtime_configuration_fingerprint='unbound'",
+                        (AUTOPILOT_HEALTH_SCHEMA_VERSION,),
+                    )
+                elif not versions.issubset({AUTOPILOT_HEALTH_SCHEMA_VERSION}):
+                    raise sqlite3.DatabaseError(
+                        "autopilot health schema version is unsupported"
+                    )
 
     def register_runtime(
         self,
@@ -189,9 +209,7 @@ class AutopilotHealthStore:
     ) -> None:
         if not runtime_id or not source_fingerprint:
             raise ValueError("runtime identity and source fingerprint are required")
-        configuration_fingerprint = (
-            runtime_configuration_fingerprint or source_fingerprint
-        )
+        configuration_fingerprint = runtime_configuration_fingerprint or "unbound"
         stamp = _stamp(now)
         self.initialize()
         with closing(self._connect(write=True)) as conn:

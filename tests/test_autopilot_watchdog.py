@@ -96,6 +96,80 @@ def test_health_store_migrates_v1_as_unbound_before_new_runtime_registration(
     assert rebound["runtime_configuration_fingerprint"] == "c" * 64
 
 
+def test_health_store_repairs_interrupted_legacy_migration(tmp_path: Path) -> None:
+    path = tmp_path / "health.db"
+    now = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    store = AutopilotHealthStore(path)
+    store.register_runtime(runtime_id="runtime", source_fingerprint="a" * 64, now=now)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE autopilot_health SET schema_version=1, "
+            "runtime_configuration_fingerprint='ambiguous'"
+        )
+
+    store.initialize()
+
+    repaired = store.read()
+    assert repaired["schema_version"] == 2
+    assert repaired["runtime_configuration_fingerprint"] == "unbound"
+
+
+def test_health_store_rolls_back_legacy_column_when_version_update_fails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "health.db"
+    now = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    stamp = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE autopilot_health (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                schema_version INTEGER NOT NULL,
+                runtime_id TEXT NOT NULL,
+                runtime_started_utc TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                last_progress_utc TEXT NOT NULL,
+                last_progress_stage TEXT NOT NULL,
+                last_cycle_started_utc TEXT,
+                last_cycle_success_utc TEXT,
+                last_error_kind TEXT,
+                last_error_message TEXT
+            );
+            CREATE TRIGGER reject_health_update
+            BEFORE UPDATE ON autopilot_health BEGIN
+              SELECT RAISE(ABORT, 'injected migration failure');
+            END;
+            """
+        )
+        conn.execute(
+            "INSERT INTO autopilot_health VALUES(1,1,?,?,?,?,?,NULL,NULL,NULL,NULL)",
+            ("old-runtime", stamp, "a" * 64, stamp, "cycle_wait"),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected migration failure"):
+        AutopilotHealthStore(path).initialize()
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(autopilot_health)")}
+        version = conn.execute("SELECT schema_version FROM autopilot_health").fetchone()[0]
+    assert "runtime_configuration_fingerprint" not in columns
+    assert version == 1
+
+
+def test_unbound_runtime_never_masquerades_as_configuration_fingerprint(
+    tmp_path: Path,
+) -> None:
+    store = AutopilotHealthStore(tmp_path / "health.db")
+    store.register_runtime(
+        runtime_id="runtime",
+        source_fingerprint="a" * 64,
+        now=datetime(2026, 8, 30, 18, 0, tzinfo=UTC),
+    )
+
+    assert store.read()["runtime_configuration_fingerprint"] == "unbound"
+
+
 def test_task_state_api_does_not_depend_on_localized_display_text() -> None:
     running = subprocess.CompletedProcess([], 0, "__TASK_STATE__=4", "")
     ready = subprocess.CompletedProcess([], 0, "__TASK_STATE__=3", "")
