@@ -243,7 +243,12 @@ $action = New-ScheduledTaskAction `
   -Execute $pythonExe `
   -Argument $arguments `
   -WorkingDirectory $repoRoot
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$userIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$user = $userIdentity.Name
+$userSid = [string]$userIdentity.User.Value
+if ([string]::IsNullOrWhiteSpace($userSid)) {
+  throw "Could not bind the current Windows account SID."
+}
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $intervalTrigger = New-ScheduledTaskTrigger `
   -Once `
@@ -337,20 +342,35 @@ function Assert-RegisteredCoverageTask(
   $timeTriggers = @(
     $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq "MSFT_TaskTimeTrigger" }
   )
+  if ($logonTriggers.Count -ne 1 -or $timeTriggers.Count -ne 1) {
+    throw "The registered task must have exactly one logon and one time trigger."
+  }
+  try {
+    $principalSid = [string](
+      (New-Object System.Security.Principal.NTAccount($task.Principal.UserId)).Translate(
+        [System.Security.Principal.SecurityIdentifier]
+      ).Value
+    )
+    $logonSid = [string](
+      (New-Object System.Security.Principal.NTAccount($logonTriggers[0].UserId)).Translate(
+        [System.Security.Principal.SecurityIdentifier]
+      ).Value
+    )
+  } catch {
+    throw "The registered task account identity could not be resolved to a Windows SID."
+  }
   if (
     $task.TaskPath -ne "\" -or
     $registeredAction.Execute -ne $pythonExe -or
     $registeredAction.WorkingDirectory -ne $repoRoot -or
     $registeredAction.Arguments -ne $arguments -or
     $task.Triggers.Count -ne 2 -or
-    $logonTriggers.Count -ne 1 -or
-    $timeTriggers.Count -ne 1 -or
-    $logonTriggers[0].UserId -ne $user -or
+    $principalSid -ne $userSid -or
+    $logonSid -ne $userSid -or
     -not $logonTriggers[0].Enabled -or
     -not $timeTriggers[0].Enabled -or
     [string]$timeTriggers[0].Repetition.Interval -ne "PT1M" -or
     [string]$timeTriggers[0].Repetition.Duration -ne "P3650D" -or
-    $task.Principal.UserId -ne $user -or
     [string]$task.Principal.LogonType -ne $ExpectedLogonType -or
     [string]$task.Principal.RunLevel -ne "Limited" -or
     [bool]$task.Settings.Enabled -ne $ExpectedEnabled -or

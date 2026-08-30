@@ -814,6 +814,11 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "function Get-CoverageTaskSnapshot" in installer
     assert "function Restore-CoverageTask" in installer
     assert "function Assert-RegisteredCoverageTask" in installer
+    assert "$userSid = [string]$userIdentity.User.Value" in installer
+    assert "System.Security.Principal.NTAccount($task.Principal.UserId)" in installer
+    assert "System.Security.Principal.NTAccount($logonTriggers[0].UserId)" in installer
+    assert "$principalSid -ne $userSid" in installer
+    assert "$logonSid -ne $userSid" in installer
     assert '"Global\\InsiderAlertsNotificationCoverageInstaller-v1"' in installer
     assert "$installMutex.WaitOne(0)" in installer
     assert "-TaskPath \"\\\"" in installer
