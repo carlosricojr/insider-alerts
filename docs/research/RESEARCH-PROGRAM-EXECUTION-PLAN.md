@@ -173,6 +173,10 @@ looks. The terminal dataset itself can exist only after the prospective sample f
 - Preserve each existing ntfy request attempt and provider response in a separately activated,
   secret-free transport journal. Provider acknowledgement is not device receipt; the journal does
   not alter notification retries or enter the active evidence snapshots or decision.
+- Reconcile provider-successful operational acknowledgements to exact journal transport attempts
+  from a separately sealed post-fix boundary. Preserve the known pre-boundary Form 4/A gap as
+  immutable missingness; never use this operational monitor to repair history, affect enrollment,
+  inspect outcomes, or enter the active evidence snapshot.
 - Produce a machine-readable decision artifact plus an operator-readable report at the single look,
   or a no-outcome `KILL/insufficient_enrollment` artifact at the frozen deadline.
 

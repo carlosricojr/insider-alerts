@@ -87,6 +87,23 @@ def test_activation_is_immutable_and_does_not_send_or_append(tmp_path: Path) -> 
         )
 
 
+def test_status_rejects_same_named_noop_journal_trigger(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    activate_notification_journal(config, activated_at_utc=ACTIVATION)
+    with sqlite3.connect(config.database) as conn:
+        conn.execute("DROP TRIGGER notification_transport_events_no_update")
+        conn.execute(
+            "CREATE TRIGGER notification_transport_events_no_update "
+            "BEFORE UPDATE ON notification_transport_events BEGIN SELECT 1; END"
+        )
+
+    report = notification_journal_status(config)
+
+    assert report["valid"] is False
+    assert report["reason"] == "notification_journal_schema_definition_mismatch"
+    assert report["integrity_errors"] == ["trigger:notification_transport_events_no_update"]
+
+
 def test_append_requires_activation_and_ignores_preactivation_event(tmp_path: Path) -> None:
     config = _config(tmp_path)
     journal = NotificationTransportJournal(config)
@@ -104,9 +121,7 @@ def test_append_requires_activation_and_ignores_preactivation_event(tmp_path: Pa
         journal.append(
             packet_id=PACKET_ID,
             transport_id=transport_id,
-            event=_event(
-                "request_started", occurred_at=ACTIVATION - timedelta(microseconds=1)
-            ),
+            event=_event("request_started", occurred_at=ACTIVATION - timedelta(microseconds=1)),
         )
         is False
     )
@@ -200,6 +215,29 @@ def test_unmatched_start_is_explicitly_reported_as_crash_shaped_unknown(
     assert status["unmatched_starts"] == 1
 
 
+def test_status_rejects_cross_packet_attempt_binding(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    activate_notification_journal(config, activated_at_utc=ACTIVATION)
+    journal = NotificationTransportJournal(config)
+    transport_id = notification_transport_id(PACKET_ID, "dispatch-1")
+
+    assert journal.append(
+        packet_id=PACKET_ID,
+        transport_id=transport_id,
+        event=_event("request_started"),
+    )
+    assert journal.append(
+        packet_id=AMENDED_PACKET_ID,
+        transport_id=transport_id,
+        event=_event("response_received", occurred_at=ACTIVATION + timedelta(milliseconds=1)),
+    )
+
+    status = notification_journal_status(config)
+
+    assert status["valid"] is False
+    assert status["integrity_errors"] == [f"attempt_binding_mismatch:{transport_id}:1"]
+
+
 def test_terminal_event_requires_a_start_and_only_one_terminal(tmp_path: Path) -> None:
     config = _config(tmp_path)
     activate_notification_journal(config, activated_at_utc=ACTIVATION)
@@ -226,9 +264,7 @@ def test_terminal_event_requires_a_start_and_only_one_terminal(tmp_path: Path) -
         journal.append(
             packet_id=PACKET_ID,
             transport_id=transport_id,
-            event=_event(
-                "response_received", occurred_at=ACTIVATION + timedelta(milliseconds=2)
-            ),
+            event=_event("response_received", occurred_at=ACTIVATION + timedelta(milliseconds=2)),
         )
 
 
@@ -301,10 +337,8 @@ def test_status_fails_closed_when_an_immutability_trigger_is_missing(
     status = notification_journal_status(config)
 
     assert status["valid"] is False
-    assert status["reason"] == "notification_journal_schema_incomplete"
-    assert status["integrity_errors"] == [
-        "missing_trigger:notification_transport_events_no_update"
-    ]
+    assert status["reason"] == "notification_journal_schema_definition_mismatch"
+    assert status["integrity_errors"] == ["trigger:notification_transport_events_no_update"]
 
 
 def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> None:
@@ -312,7 +346,7 @@ def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> Non
     sqlite3.connect(config.database).close()
     partial = notification_journal_status(config)
     assert partial["valid"] is False
-    assert partial["reason"] == "notification_journal_schema_incomplete"
+    assert partial["reason"] == "notification_journal_schema_definition_mismatch"
 
     config.database.unlink()
     activate_notification_journal(config, activated_at_utc=ACTIVATION)
@@ -323,9 +357,7 @@ def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> Non
         event=_event("request_started"),
     )
     with sqlite3.connect(config.database) as conn:
-        conn.execute(
-            "UPDATE notification_journal_health SET last_phase='response_received'"
-        )
+        conn.execute("UPDATE notification_journal_health SET last_phase='response_received'")
 
     stale = notification_journal_status(config)
     assert stale["valid"] is False
@@ -367,9 +399,7 @@ def test_review_notification_records_one_complete_dispatch(
     httpx_mock: HTTPXMock,
 ) -> None:
     config = _config(tmp_path)
-    activate_notification_journal(
-        config, activated_at_utc=ACTIVATION - timedelta(days=1)
-    )
+    activate_notification_journal(config, activated_at_utc=ACTIVATION - timedelta(days=1))
     monkeypatch.setattr(cli, "_notification_transport_config", lambda settings: config)
     monkeypatch.setattr(cli.secrets, "token_hex", lambda size: "dispatch-nonce")
     settings = Settings(
@@ -385,7 +415,7 @@ def test_review_notification_records_one_complete_dispatch(
         content=b'{"id":"provider_1","time":1787904000}',
     )
 
-    cli._send_review_notification(
+    proof = cli._send_review_notification(
         settings,
         {
             "packet_id": AMENDED_PACKET_ID,
@@ -394,6 +424,11 @@ def test_review_notification_records_one_complete_dispatch(
         },
     )
 
+    assert proof.transport_id == notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")
+    assert proof.attempt_number == 1
+    assert proof.http_status == 200
+    assert len(proof.request_body_sha256) == 64
+    assert len(proof.route_sha256) == 64
     status = notification_journal_status(config)
     assert status["valid"] is True
     assert status["events"] == 2
@@ -408,9 +443,7 @@ def test_review_notification_records_one_complete_dispatch(
             str(row[0])
             for row in conn.execute("SELECT transport_id FROM notification_transport_events")
         }
-    assert transport_ids == {
-        notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")
-    }
+    assert transport_ids == {notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")}
     with sqlite3.connect(config.database) as conn:
         packet_ids = {
             str(row[0])
@@ -445,16 +478,59 @@ def test_observer_setup_failure_does_not_block_notification(
         status_code=200,
     )
 
-    cli._send_review_notification(
+    proof = cli._send_review_notification(
         settings,
         {"packet_id": PACKET_ID, "decision": "reject", "analyst": "operator"},
     )
 
+    assert proof.transport_id is None
+    assert proof.http_status == 200
     assert len(httpx_mock.get_requests()) == 1
     error_log = tmp_path / "logs" / "notification-transport.err.log"
     assert error_log.read_text(encoding="utf-8").endswith(
         "notification transport capture isolated: NotificationJournalError\n"
     )
+
+
+def test_observer_append_failure_nulls_transport_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    httpx_mock: HTTPXMock,
+) -> None:
+    config = _config(tmp_path)
+    activate_notification_journal(config, activated_at_utc=ACTIVATION - timedelta(days=1))
+    monkeypatch.setattr(cli, "_notification_transport_config", lambda settings: config)
+    fake_module = tmp_path / "src" / "insider_alerts" / "cli.py"
+    monkeypatch.setattr(cli, "__file__", str(fake_module))
+
+    def locked_append(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(NotificationTransportJournal, "append", locked_append)
+    settings = Settings(
+        NTFY_BASE_URL="https://ntfy.example.com",
+        NTFY_TOPIC="private-topic",
+        NTFY_RETRY_ATTEMPTS=1,
+        NOTIFICATION_TRANSPORT_DB=str(config.database),
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://ntfy.example.com/private-topic",
+        status_code=200,
+    )
+
+    proof = cli._send_review_notification(
+        settings,
+        {"packet_id": PACKET_ID, "decision": "reject", "analyst": "operator"},
+    )
+
+    assert proof.transport_id is None
+    assert proof.http_status == 200
+    assert len(httpx_mock.get_requests()) == 1
+    error_log = tmp_path / "logs" / "notification-transport.err.log"
+    assert error_log.read_text(encoding="utf-8").count(
+        "notification transport capture isolated: OperationalError\n"
+    ) == 2
 
 
 def test_inactive_journal_does_not_resolve_git_on_notification_path(
@@ -471,13 +547,14 @@ def test_inactive_journal_does_not_resolve_git_on_notification_path(
     monkeypatch.setattr(cli, "resolve_git_commit", forbidden_git_resolution)
     cli._notification_runtime_git_commit.cache_clear()
 
-    observer, error_handler = cli._notification_transport_observer(
+    observer, error_handler, transport_id_for_attempt = cli._notification_transport_observer(
         settings,
         {"packet_id": PACKET_ID},
     )
 
     assert observer is None
     assert error_handler is None
+    assert transport_id_for_attempt is None
 
 
 def test_runtime_git_commit_is_resolved_once_per_process(
