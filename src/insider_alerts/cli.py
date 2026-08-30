@@ -76,6 +76,7 @@ from insider_alerts.execution.autopilot_watchdog import (
     RuntimeOwnershipError,
     autopilot_health_status,
     autopilot_runtime_budget,
+    notification_runtime_configuration_fingerprint,
     run_autopilot_watchdog,
     sec_ingestion_runtime_budget,
     validate_sec_ingestion_stale_threshold,
@@ -4376,6 +4377,12 @@ def ops_autopilot(
             health_store.register_runtime(
                 runtime_id=runtime_id,
                 source_fingerprint=startup_fingerprint,
+                runtime_configuration_fingerprint=(
+                    notification_runtime_configuration_fingerprint(
+                        settings,
+                        repo_root=repo_root,
+                    )
+                ),
                 now=datetime.now(UTC),
             )
         if once:

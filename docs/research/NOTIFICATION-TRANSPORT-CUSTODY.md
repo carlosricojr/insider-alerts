@@ -120,8 +120,14 @@ The installer also binds the actual notification producer, `Insider Alerts Autop
 the same executable and checkout, requires its reviewed full argument digest, and resolves source,
 journal, and journal-policy paths from persisted user/machine environment plus the deployment
 checkout's `.env`. Shell-local path overrides are deliberately ignored because scheduled tasks do
-not inherit the installer's transient process environment. Its recent heartbeat must also prove
-that the producer has loaded the current checkout source fingerprint.
+not inherit the installer's transient process environment. At startup the producer records a
+SHA-256 binding of the exact canonical source, journal, and journal-policy paths it loaded. The
+installer requires that runtime binding, a recent heartbeat, and the current checkout source
+fingerprint all match; changing persisted configuration without restarting the producer therefore
+fails closed instead of silently monitoring a different database. Task replacement is
+transactional: the prior definition and enabled/running state are captured, the complete persisted
+action, triggers, principal, and settings are validated before `-Start`, and any failure restores
+the prior task (or removes a newly created one).
 
 After coverage activation, rollback is compatibility-preserving and forward-only. Never deploy a
 preceding revision that lacks the delivery receipt, atomic `notification_delivery_acks` write,

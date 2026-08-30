@@ -795,6 +795,9 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "$producerRepoRoot -ne $repoRoot" in installer
     assert "AutopilotHealthStore" in installer
     assert "runtime_source_fingerprint" in installer
+    assert "runtime_configuration_fingerprint" in installer
+    assert "notification_runtime_configuration_fingerprint as config_fingerprint" in installer
+    assert "$producerState.loaded_configuration -ne" in installer
     assert "$producerProgressAge.TotalSeconds -gt 600" in installer
     assert "GetEnvironmentVariable($environmentName, \"User\")" in installer
     assert "base64.b64decode(sys.argv[2])" in installer
@@ -808,6 +811,22 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "initialize_notification_delivery_schema" in worker
     assert "-Hidden" in installer
     assert "-MultipleInstances IgnoreNew" in installer
+    assert "function Get-CoverageTaskSnapshot" in installer
+    assert "function Restore-CoverageTask" in installer
+    assert "function Assert-RegisteredCoverageTask" in installer
+    assert '"Global\\InsiderAlertsNotificationCoverageInstaller-v1"' in installer
+    assert "$installMutex.WaitOne(0)" in installer
+    assert "-TaskPath \"\\\"" in installer
+    assert "$settings.Enabled = $false" in installer
+    disabled_validation = installer.index("$registeredTask = Assert-RegisteredCoverageTask")
+    enable_replacement = installer.index("Enable-ScheduledTask -TaskPath", disabled_validation)
+    enabled_validation = installer.index(
+        "$registeredTask = Assert-RegisteredCoverageTask", disabled_validation + 1
+    )
+    start_replacement = installer.index("Start-ScheduledTask -TaskPath", enabled_validation)
+    assert disabled_validation < enable_replacement < enabled_validation < start_replacement
+    assert "P3650D" in installer
+    assert "prior task restoration failed" in installer
     assert "-WindowStyle" not in installer
     assert "HRESULT 0x80070005,Register-ScheduledTask" in installer
 

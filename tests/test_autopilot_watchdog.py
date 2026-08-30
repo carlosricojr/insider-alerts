@@ -7,12 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from insider_alerts.config import Settings
 from insider_alerts.execution import autopilot_watchdog
 from insider_alerts.execution.autopilot_watchdog import (
     AutopilotHealthStore,
     RuntimeOwnershipError,
     autopilot_health_status,
     heartbeat_state,
+    notification_runtime_configuration_fingerprint,
     quarantine_corrupt_health_store,
     run_autopilot_watchdog,
     validate_stale_threshold,
@@ -21,6 +23,77 @@ from insider_alerts.execution.autopilot_watchdog import (
 
 def _task_result(state: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess([], 0, f'"host","task","next","{state}"\n', "")
+
+
+def test_notification_configuration_fingerprint_binds_exact_startup_paths(
+    tmp_path: Path,
+) -> None:
+    first = Settings(
+        _env_file=None,
+        DATABASE_PATH="data/producer-a.db",
+        NOTIFICATION_TRANSPORT_DB="data/journal.db",
+        NOTIFICATION_TRANSPORT_POLICY_PATH="policy.json",
+    )
+    second = Settings(
+        _env_file=None,
+        DATABASE_PATH="data/producer-b.db",
+        NOTIFICATION_TRANSPORT_DB="data/journal.db",
+        NOTIFICATION_TRANSPORT_POLICY_PATH="policy.json",
+    )
+
+    first_fingerprint = notification_runtime_configuration_fingerprint(
+        first, repo_root=tmp_path
+    )
+
+    assert len(first_fingerprint) == 64
+    assert first_fingerprint != notification_runtime_configuration_fingerprint(
+        second, repo_root=tmp_path
+    )
+
+
+def test_health_store_migrates_v1_as_unbound_before_new_runtime_registration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "health.db"
+    now = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    stamp = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE autopilot_health (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                schema_version INTEGER NOT NULL,
+                runtime_id TEXT NOT NULL,
+                runtime_started_utc TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                last_progress_utc TEXT NOT NULL,
+                last_progress_stage TEXT NOT NULL,
+                last_cycle_started_utc TEXT,
+                last_cycle_success_utc TEXT,
+                last_error_kind TEXT,
+                last_error_message TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO autopilot_health VALUES(1,1,?,?,?,?,?,NULL,NULL,NULL,NULL)",
+            ("old-runtime", stamp, "a" * 64, stamp, "cycle_wait"),
+        )
+
+    store = AutopilotHealthStore(path)
+    store.initialize()
+    migrated = store.read()
+    assert migrated["schema_version"] == 2
+    assert migrated["runtime_configuration_fingerprint"] == "unbound"
+
+    store.register_runtime(
+        runtime_id="new-runtime",
+        source_fingerprint="b" * 64,
+        runtime_configuration_fingerprint="c" * 64,
+        now=now + timedelta(seconds=1),
+    )
+    rebound = store.read()
+    assert rebound["runtime_configuration_fingerprint"] == "c" * 64
 
 
 def test_task_state_api_does_not_depend_on_localized_display_text() -> None:

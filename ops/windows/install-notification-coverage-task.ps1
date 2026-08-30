@@ -16,7 +16,7 @@ if ($IntervalMinutes -ne 1) {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptRepoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $deploymentTaskName = "Insider Alerts Live Canary Worker"
-$deploymentTask = Get-ScheduledTask -TaskName $deploymentTaskName -ErrorAction Stop
+$deploymentTask = Get-ScheduledTask -TaskPath "\" -TaskName $deploymentTaskName -ErrorAction Stop
 if ($deploymentTask.Actions.Count -ne 1) {
   throw "The live-canary deployment task must have exactly one action."
 }
@@ -40,7 +40,7 @@ if (
 }
 
 $producerTaskName = "Insider Alerts Autopilot Worker"
-$producerTask = Get-ScheduledTask -TaskName $producerTaskName -ErrorAction Stop
+$producerTask = Get-ScheduledTask -TaskPath "\" -TaskName $producerTaskName -ErrorAction Stop
 if ($producerTask.Actions.Count -ne 1) {
   throw "The notification-producing autopilot task must have exactly one action."
 }
@@ -109,6 +109,7 @@ $producerStateCommand = (
   "from insider_alerts.execution.canary import runtime_source_fingerprint; " +
   "h=AutopilotHealthStore(sys.argv[1]).read(); " +
   "print(json.dumps({'loaded':h['source_fingerprint']," +
+  "'loaded_configuration':h['runtime_configuration_fingerprint']," +
   "'current':runtime_source_fingerprint()," +
   "'last_progress_utc':h['last_progress_utc']},separators=(',',':')))"
 )
@@ -155,9 +156,12 @@ $settingsCommand = (
   "[(os.environ.pop(k,None) if v is None else os.environ.__setitem__(k,v)) " +
   "for k,v in values.items()]; os.chdir(sys.argv[1]); " +
   "from insider_alerts.config import get_settings; s=get_settings(); " +
+  "from insider_alerts.execution.autopilot_watchdog import " +
+  "notification_runtime_configuration_fingerprint as config_fingerprint; " +
   "print(json.dumps({'source':str(Path(s.database_path).resolve())," +
   "'journal':str(Path(s.notification_transport_db).resolve())," +
-  "'journal_policy':str(Path(s.notification_transport_policy_path).resolve())}," +
+  "'journal_policy':str(Path(s.notification_transport_policy_path).resolve())," +
+  "'configuration_fingerprint':config_fingerprint(s,repo_root=Path(sys.argv[1]))}," +
   "separators=(',',':')))"
 )
 $effectiveSettingsOutput = @(
@@ -189,6 +193,13 @@ if ($sourceDb -ne $effectiveSourceDb) {
 if ($journalDb -ne $effectiveJournalDb -or $journalPolicy -ne $effectiveJournalPolicy) {
   throw "Notification coverage journal paths do not match the autopilot's effective settings."
 }
+if (
+  [string]$producerState.loaded_configuration -notmatch "^[0-9a-f]{64}$" -or
+  [string]$producerState.loaded_configuration -ne
+    [string]$effectiveSettings.configuration_fingerprint
+) {
+  throw "Notification coverage settings do not match the running producer's loaded settings."
+}
 
 $arguments = @(
   "-m insider_alerts.research.notification_coverage_worker",
@@ -209,7 +220,7 @@ $preflightArguments = @(
   "--journal-policy", $journalPolicy,
   "--coverage-policy", $coveragePolicy
 )
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$existingTask = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $existingTask) {
   $existingAction = $existingTask.Actions[0]
   if (
@@ -249,55 +260,230 @@ $settings = New-ScheduledTaskSettingsSet `
   -RestartCount 2 `
   -RestartInterval (New-TimeSpan -Minutes 1) `
   -StartWhenAvailable
+$settings.Enabled = $false
 
-$registrationMode = "S4U"
-try {
-  Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger @($logonTrigger, $intervalTrigger) `
-    -Principal $s4uPrincipal `
-    -Settings $settings `
-    -ErrorAction Stop `
-    -Force | Out-Null
-} catch {
-  if ($_.FullyQualifiedErrorId -ne "HRESULT 0x80070005,Register-ScheduledTask") {
-    throw
+function Get-CoverageTaskSnapshot {
+  $task = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction SilentlyContinue
+  if ($null -eq $task) {
+    return [pscustomobject]@{
+      Exists = $false
+      Xml = $null
+      WasEnabled = $false
+      WasRunning = $false
+    }
   }
-  $registrationMode = "InteractiveFallback"
-  $interactivePrincipal = New-ScheduledTaskPrincipal `
-    -UserId $user `
-    -LogonType Interactive `
-    -RunLevel Limited
-  Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger @($logonTrigger, $intervalTrigger) `
-    -Principal $interactivePrincipal `
-    -Settings $settings `
-    -ErrorAction Stop `
-    -Force | Out-Null
-  Write-Warning (
-    "S4U registration was denied (HRESULT 0x80070005); registered '$TaskName' " +
-    "for the current interactive session with interval and logon triggers."
-  )
+  return [pscustomobject]@{
+    Exists = $true
+    Xml = Export-ScheduledTask -TaskPath "\" -TaskName $TaskName
+    WasEnabled = [bool]$task.Settings.Enabled
+    # Rebound only after the existing definition is disabled, closing the trigger race.
+    WasRunning = $false
+  }
 }
 
-if ($Start) {
-  Start-ScheduledTask -TaskName $TaskName
+function Get-DisabledTaskXml([string]$Xml) {
+  [xml]$document = $Xml
+  $namespace = $document.DocumentElement.NamespaceURI
+  $manager = New-Object System.Xml.XmlNamespaceManager($document.NameTable)
+  $manager.AddNamespace("task", $namespace)
+  $settingsNode = $document.SelectSingleNode("/task:Task/task:Settings", $manager)
+  if ($null -eq $settingsNode) {
+    throw "Scheduled task XML has no Settings element."
+  }
+  $enabled = $settingsNode.SelectSingleNode("task:Enabled", $manager)
+  if ($null -eq $enabled) {
+    $enabled = $document.CreateElement("Enabled", $namespace)
+    [void]$settingsNode.AppendChild($enabled)
+  }
+  $enabled.InnerText = "false"
+  return $document.OuterXml
 }
 
-$registeredTask = Get-ScheduledTask -TaskName $TaskName
-$registeredAction = $registeredTask.Actions[0]
-if (
-  $registeredTask.Actions.Count -ne 1 -or
-  $registeredAction.Execute -ne $pythonExe -or
-  $registeredAction.WorkingDirectory -ne $repoRoot -or
-  $registeredAction.Arguments -ne $arguments -or
-  -not $registeredTask.Settings.Hidden -or
-  [string]$registeredTask.Settings.MultipleInstances -ne "IgnoreNew"
+function Stop-CoverageTaskAndWait([bool]$CaptureRunningState) {
+  $task = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction SilentlyContinue
+  if ($null -eq $task) {
+    return
+  }
+  Disable-ScheduledTask -TaskPath "\" -TaskName $TaskName | Out-Null
+  $task = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction Stop
+  if ($CaptureRunningState) {
+    $script:taskSnapshot.WasRunning = ($task.State -eq "Running")
+  }
+  if ($task.State -eq "Running") {
+    Stop-ScheduledTask -TaskPath "\" -TaskName $TaskName
+    $deadline = (Get-Date).AddSeconds(15)
+    do {
+      Start-Sleep -Milliseconds 250
+      $task = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction Stop
+    } while ($task.State -eq "Running" -and (Get-Date) -lt $deadline)
+    if ($task.State -eq "Running") {
+      throw "Timed out stopping the existing notification-coverage task."
+    }
+  }
+}
+
+function Assert-RegisteredCoverageTask(
+  [string]$ExpectedLogonType,
+  [bool]$ExpectedEnabled
 ) {
-  throw "The registered notification-coverage task failed exact post-registration validation."
+  $task = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction Stop
+  if ($task.Actions.Count -ne 1) {
+    throw "The registered task must have exactly one action."
+  }
+  $registeredAction = $task.Actions[0]
+  $logonTriggers = @(
+    $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq "MSFT_TaskLogonTrigger" }
+  )
+  $timeTriggers = @(
+    $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq "MSFT_TaskTimeTrigger" }
+  )
+  if (
+    $task.TaskPath -ne "\" -or
+    $registeredAction.Execute -ne $pythonExe -or
+    $registeredAction.WorkingDirectory -ne $repoRoot -or
+    $registeredAction.Arguments -ne $arguments -or
+    $task.Triggers.Count -ne 2 -or
+    $logonTriggers.Count -ne 1 -or
+    $timeTriggers.Count -ne 1 -or
+    $logonTriggers[0].UserId -ne $user -or
+    -not $logonTriggers[0].Enabled -or
+    -not $timeTriggers[0].Enabled -or
+    [string]$timeTriggers[0].Repetition.Interval -ne "PT1M" -or
+    [string]$timeTriggers[0].Repetition.Duration -ne "P3650D" -or
+    $task.Principal.UserId -ne $user -or
+    [string]$task.Principal.LogonType -ne $ExpectedLogonType -or
+    [string]$task.Principal.RunLevel -ne "Limited" -or
+    [bool]$task.Settings.Enabled -ne $ExpectedEnabled -or
+    -not $task.Settings.Hidden -or
+    [string]$task.Settings.MultipleInstances -ne "IgnoreNew" -or
+    [string]$task.Settings.ExecutionTimeLimit -ne "PT5M" -or
+    [int]$task.Settings.RestartCount -ne 2 -or
+    [string]$task.Settings.RestartInterval -ne "PT1M" -or
+    -not $task.Settings.StartWhenAvailable -or
+    $task.Settings.DisallowStartIfOnBatteries -or
+    $task.Settings.StopIfGoingOnBatteries
+  ) {
+    throw "The registered notification-coverage task failed exact post-registration validation."
+  }
+  return $task
 }
-$registeredTask | Add-Member -NotePropertyName RegistrationMode -NotePropertyValue $registrationMode
-$registeredTask
+
+function Restore-CoverageTask {
+  Stop-CoverageTaskAndWait -CaptureRunningState $false
+  if (-not $taskSnapshot.Exists) {
+    $created = Get-ScheduledTask -TaskPath "\" -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -ne $created) {
+      Unregister-ScheduledTask -TaskPath "\" -TaskName $TaskName -Confirm:$false
+    }
+    return
+  }
+  $disabledXml = Get-DisabledTaskXml -Xml $taskSnapshot.Xml
+  Register-ScheduledTask `
+    -TaskPath "\" `
+    -TaskName $TaskName `
+    -Xml $disabledXml `
+    -Force | Out-Null
+  if ($taskSnapshot.WasRunning) {
+    Enable-ScheduledTask -TaskPath "\" -TaskName $TaskName | Out-Null
+    Start-ScheduledTask -TaskPath "\" -TaskName $TaskName
+    if (-not $taskSnapshot.WasEnabled) {
+      Disable-ScheduledTask -TaskPath "\" -TaskName $TaskName | Out-Null
+    }
+  } elseif ($taskSnapshot.WasEnabled) {
+    Enable-ScheduledTask -TaskPath "\" -TaskName $TaskName | Out-Null
+  }
+}
+
+$installMutex = New-Object System.Threading.Mutex(
+  $false,
+  "Global\InsiderAlertsNotificationCoverageInstaller-v1"
+)
+$mutexAcquired = $false
+try {
+  try {
+    $mutexAcquired = $installMutex.WaitOne(0)
+  } catch [System.Threading.AbandonedMutexException] {
+    $mutexAcquired = $true
+  }
+  if (-not $mutexAcquired) {
+    throw "Another notification-coverage installation is already in progress."
+  }
+
+  $taskSnapshot = Get-CoverageTaskSnapshot
+  $mutationStarted = $false
+  try {
+    if ($taskSnapshot.Exists) {
+      $mutationStarted = $true
+      Stop-CoverageTaskAndWait -CaptureRunningState $true
+    }
+    $registrationMode = "S4U"
+    $expectedLogonType = "S4U"
+    try {
+      $mutationStarted = $true
+      Register-ScheduledTask `
+        -TaskPath "\" `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger @($logonTrigger, $intervalTrigger) `
+        -Principal $s4uPrincipal `
+        -Settings $settings `
+        -ErrorAction Stop `
+        -Force | Out-Null
+    } catch {
+      if ($_.FullyQualifiedErrorId -ne "HRESULT 0x80070005,Register-ScheduledTask") {
+        throw
+      }
+      $registrationMode = "InteractiveFallback"
+      $expectedLogonType = "Interactive"
+      $interactivePrincipal = New-ScheduledTaskPrincipal `
+        -UserId $user `
+        -LogonType Interactive `
+        -RunLevel Limited
+      Register-ScheduledTask `
+        -TaskPath "\" `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger @($logonTrigger, $intervalTrigger) `
+        -Principal $interactivePrincipal `
+        -Settings $settings `
+        -ErrorAction Stop `
+        -Force | Out-Null
+      Write-Warning (
+        "S4U registration was denied (HRESULT 0x80070005); registered '$TaskName' " +
+        "for the current interactive session with interval and logon triggers."
+      )
+    }
+
+    $registeredTask = Assert-RegisteredCoverageTask `
+      -ExpectedLogonType $expectedLogonType `
+      -ExpectedEnabled $false
+    Enable-ScheduledTask -TaskPath "\" -TaskName $TaskName | Out-Null
+    $registeredTask = Assert-RegisteredCoverageTask `
+      -ExpectedLogonType $expectedLogonType `
+      -ExpectedEnabled $true
+    if ($Start) {
+      Start-ScheduledTask -TaskPath "\" -TaskName $TaskName
+    }
+  } catch {
+    $installError = $_
+    if ($mutationStarted) {
+      try {
+        Restore-CoverageTask
+      } catch {
+        throw (
+          "Notification-coverage installation failed ('$($installError.Exception.Message)') " +
+          "and prior task restoration failed ('$($_.Exception.Message)')."
+        )
+      }
+    }
+    throw $installError
+  }
+  $registeredTask | Add-Member -NotePropertyName RegistrationMode -NotePropertyValue $registrationMode
+  $resultTask = $registeredTask
+} finally {
+  if ($mutexAcquired) {
+    $installMutex.ReleaseMutex()
+  }
+  $installMutex.Dispose()
+}
+$resultTask

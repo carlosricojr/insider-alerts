@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -16,7 +17,7 @@ from pathlib import Path
 from insider_alerts.config import AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS, Settings
 from insider_alerts.research.option_chain_admission import OPTION_CHAIN_CAPTURE_TIMEOUT_SECONDS
 
-AUTOPILOT_HEALTH_SCHEMA_VERSION = 1
+AUTOPILOT_HEALTH_SCHEMA_VERSION = 2
 MIN_STALE_SECONDS = 300
 STALE_SAFETY_MARGIN_SECONDS = 70
 SQLITE_STAGE_BUDGET_SECONDS = 200.0
@@ -40,6 +41,7 @@ _HEALTH_COLUMNS = frozenset(
         "runtime_id",
         "runtime_started_utc",
         "source_fingerprint",
+        "runtime_configuration_fingerprint",
         "last_progress_utc",
         "last_progress_stage",
         "last_cycle_started_utc",
@@ -52,6 +54,7 @@ _REQUIRED_TEXT_COLUMNS = (
     "runtime_id",
     "runtime_started_utc",
     "source_fingerprint",
+    "runtime_configuration_fingerprint",
     "last_progress_utc",
     "last_progress_stage",
 )
@@ -63,6 +66,28 @@ _OPTIONAL_TEXT_COLUMNS = (
 )
 
 TaskRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+
+def notification_runtime_configuration_fingerprint(
+    settings: Settings,
+    *,
+    repo_root: Path,
+) -> str:
+    """Bind the notification producer to its startup-effective custody paths."""
+
+    def canonical_path(value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute():
+            path = repo_root / path
+        return str(path.resolve())
+
+    payload = {
+        "journal_database": canonical_path(settings.notification_transport_db),
+        "journal_policy": canonical_path(settings.notification_transport_policy_path),
+        "source_database": canonical_path(settings.database_path),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class RuntimeOwnershipError(RuntimeError):
@@ -110,7 +135,7 @@ class AutopilotHealthStore:
         return conn
 
     def initialize(self) -> None:
-        with closing(self._connect(write=True)) as conn:
+        with closing(self._connect(write=True)) as conn, conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS autopilot_health (
@@ -119,6 +144,7 @@ class AutopilotHealthStore:
                     runtime_id TEXT NOT NULL,
                     runtime_started_utc TEXT NOT NULL,
                     source_fingerprint TEXT NOT NULL,
+                    runtime_configuration_fingerprint TEXT NOT NULL,
                     last_progress_utc TEXT NOT NULL,
                     last_progress_stage TEXT NOT NULL,
                     last_cycle_started_utc TEXT,
@@ -128,6 +154,30 @@ class AutopilotHealthStore:
                 );
                 """
             )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(autopilot_health)").fetchall()
+            }
+            legacy_columns = _HEALTH_COLUMNS - {"runtime_configuration_fingerprint"}
+            if columns == legacy_columns:
+                versions = {
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT DISTINCT schema_version FROM autopilot_health"
+                    ).fetchall()
+                }
+                if not versions.issubset({1}):
+                    raise sqlite3.DatabaseError(
+                        "legacy autopilot health schema version is unsupported"
+                    )
+                conn.execute(
+                    "ALTER TABLE autopilot_health ADD COLUMN "
+                    "runtime_configuration_fingerprint TEXT NOT NULL DEFAULT 'unbound'"
+                )
+                conn.execute(
+                    "UPDATE autopilot_health SET schema_version=?",
+                    (AUTOPILOT_HEALTH_SCHEMA_VERSION,),
+                )
 
     def register_runtime(
         self,
@@ -135,9 +185,13 @@ class AutopilotHealthStore:
         runtime_id: str,
         source_fingerprint: str,
         now: datetime,
+        runtime_configuration_fingerprint: str | None = None,
     ) -> None:
         if not runtime_id or not source_fingerprint:
             raise ValueError("runtime identity and source fingerprint are required")
+        configuration_fingerprint = (
+            runtime_configuration_fingerprint or source_fingerprint
+        )
         stamp = _stamp(now)
         self.initialize()
         with closing(self._connect(write=True)) as conn:
@@ -146,15 +200,18 @@ class AutopilotHealthStore:
                 """
                 INSERT INTO autopilot_health(
                     singleton,schema_version,runtime_id,runtime_started_utc,
-                    source_fingerprint,last_progress_utc,last_progress_stage,
+                    source_fingerprint,runtime_configuration_fingerprint,
+                    last_progress_utc,last_progress_stage,
                     last_cycle_started_utc,last_cycle_success_utc,last_error_kind,
                     last_error_message
-                ) VALUES(1,?,?,?,?,?,'runtime_started',NULL,NULL,NULL,NULL)
+                ) VALUES(1,?,?,?,?,?,?,'runtime_started',NULL,NULL,NULL,NULL)
                 ON CONFLICT(singleton) DO UPDATE SET
                     schema_version=excluded.schema_version,
                     runtime_id=excluded.runtime_id,
                     runtime_started_utc=excluded.runtime_started_utc,
                     source_fingerprint=excluded.source_fingerprint,
+                    runtime_configuration_fingerprint=
+                        excluded.runtime_configuration_fingerprint,
                     last_progress_utc=excluded.last_progress_utc,
                     last_progress_stage=excluded.last_progress_stage,
                     last_cycle_started_utc=NULL,
@@ -165,6 +222,7 @@ class AutopilotHealthStore:
                     runtime_id,
                     stamp,
                     source_fingerprint,
+                    configuration_fingerprint,
                     stamp,
                 ),
             )
