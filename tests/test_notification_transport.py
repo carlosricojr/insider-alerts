@@ -87,6 +87,23 @@ def test_activation_is_immutable_and_does_not_send_or_append(tmp_path: Path) -> 
         )
 
 
+def test_status_rejects_same_named_noop_journal_trigger(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    activate_notification_journal(config, activated_at_utc=ACTIVATION)
+    with sqlite3.connect(config.database) as conn:
+        conn.execute("DROP TRIGGER notification_transport_events_no_update")
+        conn.execute(
+            "CREATE TRIGGER notification_transport_events_no_update "
+            "BEFORE UPDATE ON notification_transport_events BEGIN SELECT 1; END"
+        )
+
+    report = notification_journal_status(config)
+
+    assert report["valid"] is False
+    assert report["reason"] == "notification_journal_schema_definition_mismatch"
+    assert report["integrity_errors"] == ["trigger:notification_transport_events_no_update"]
+
+
 def test_append_requires_activation_and_ignores_preactivation_event(tmp_path: Path) -> None:
     config = _config(tmp_path)
     journal = NotificationTransportJournal(config)
@@ -104,9 +121,7 @@ def test_append_requires_activation_and_ignores_preactivation_event(tmp_path: Pa
         journal.append(
             packet_id=PACKET_ID,
             transport_id=transport_id,
-            event=_event(
-                "request_started", occurred_at=ACTIVATION - timedelta(microseconds=1)
-            ),
+            event=_event("request_started", occurred_at=ACTIVATION - timedelta(microseconds=1)),
         )
         is False
     )
@@ -249,9 +264,7 @@ def test_terminal_event_requires_a_start_and_only_one_terminal(tmp_path: Path) -
         journal.append(
             packet_id=PACKET_ID,
             transport_id=transport_id,
-            event=_event(
-                "response_received", occurred_at=ACTIVATION + timedelta(milliseconds=2)
-            ),
+            event=_event("response_received", occurred_at=ACTIVATION + timedelta(milliseconds=2)),
         )
 
 
@@ -324,10 +337,8 @@ def test_status_fails_closed_when_an_immutability_trigger_is_missing(
     status = notification_journal_status(config)
 
     assert status["valid"] is False
-    assert status["reason"] == "notification_journal_schema_incomplete"
-    assert status["integrity_errors"] == [
-        "missing_trigger:notification_transport_events_no_update"
-    ]
+    assert status["reason"] == "notification_journal_schema_definition_mismatch"
+    assert status["integrity_errors"] == ["trigger:notification_transport_events_no_update"]
 
 
 def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> None:
@@ -335,7 +346,7 @@ def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> Non
     sqlite3.connect(config.database).close()
     partial = notification_journal_status(config)
     assert partial["valid"] is False
-    assert partial["reason"] == "notification_journal_schema_incomplete"
+    assert partial["reason"] == "notification_journal_schema_definition_mismatch"
 
     config.database.unlink()
     activate_notification_journal(config, activated_at_utc=ACTIVATION)
@@ -346,9 +357,7 @@ def test_status_rejects_partial_database_and_stale_health(tmp_path: Path) -> Non
         event=_event("request_started"),
     )
     with sqlite3.connect(config.database) as conn:
-        conn.execute(
-            "UPDATE notification_journal_health SET last_phase='response_received'"
-        )
+        conn.execute("UPDATE notification_journal_health SET last_phase='response_received'")
 
     stale = notification_journal_status(config)
     assert stale["valid"] is False
@@ -390,9 +399,7 @@ def test_review_notification_records_one_complete_dispatch(
     httpx_mock: HTTPXMock,
 ) -> None:
     config = _config(tmp_path)
-    activate_notification_journal(
-        config, activated_at_utc=ACTIVATION - timedelta(days=1)
-    )
+    activate_notification_journal(config, activated_at_utc=ACTIVATION - timedelta(days=1))
     monkeypatch.setattr(cli, "_notification_transport_config", lambda settings: config)
     monkeypatch.setattr(cli.secrets, "token_hex", lambda size: "dispatch-nonce")
     settings = Settings(
@@ -436,9 +443,7 @@ def test_review_notification_records_one_complete_dispatch(
             str(row[0])
             for row in conn.execute("SELECT transport_id FROM notification_transport_events")
         }
-    assert transport_ids == {
-        notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")
-    }
+    assert transport_ids == {notification_transport_id(AMENDED_PACKET_ID, "dispatch-nonce")}
     with sqlite3.connect(config.database) as conn:
         packet_ids = {
             str(row[0])

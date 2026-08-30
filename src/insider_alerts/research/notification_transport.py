@@ -207,9 +207,7 @@ def _connect_readonly(path: Path, *, timeout_ms: int) -> sqlite3.Connection:
     return conn
 
 
-def _validate_event(
-    *, packet_id: str, transport_id: str, event: NtfyTransportEvent
-) -> None:
+def _validate_event(*, packet_id: str, transport_id: str, event: NtfyTransportEvent) -> None:
     if not _PACKET_ID.fullmatch(packet_id):
         raise NotificationJournalError("packet_id is invalid")
     if not _SHA256.fullmatch(transport_id):
@@ -225,9 +223,7 @@ def _validate_event(
         event.route_sha256
     ):
         raise NotificationJournalError("notification request digest is invalid")
-    if event.response_body_sha256 is not None and not _SHA256.fullmatch(
-        event.response_body_sha256
-    ):
+    if event.response_body_sha256 is not None and not _SHA256.fullmatch(event.response_body_sha256):
         raise NotificationJournalError("notification response digest is invalid")
     if event.provider_message_id is not None and not _PROVIDER_ID.fullmatch(
         event.provider_message_id
@@ -241,11 +237,73 @@ def _validate_event(
         isinstance(event.http_status, bool) or not 100 <= event.http_status <= 599
     ):
         raise NotificationJournalError("HTTP status is invalid")
-    if event.exception_class is not None and not _EXCEPTION_CLASS.fullmatch(
-        event.exception_class
-    ):
+    if event.exception_class is not None and not _EXCEPTION_CLASS.fullmatch(event.exception_class):
         raise NotificationJournalError("exception class is invalid")
     NotificationTransportJournal._validate_phase(event)
+
+
+_JOURNAL_SCHEMA_SQL_SHA256 = {
+    (
+        "index",
+        "notification_transport_events_attempt",
+    ): "002440e020c9f218681bcf8c6d2b257c4c8f09f0464ea484e8a9640f6d9e2a94",
+    (
+        "table",
+        "notification_journal_configuration",
+    ): "e5399b1bbca29182b858f5d0a8a734d85eca38e06bdf9753fe5902041a70b09c",
+    (
+        "table",
+        "notification_journal_health",
+    ): "ba583c5811437078ec1f671db68393792a32f472f5b01d494a30d9f5869fc7dc",
+    (
+        "table",
+        "notification_transport_events",
+    ): "beb4457144e4c16bfe95990caa9ef58510021ca85a67fcc2af1227ec2a7ec2b7",
+    (
+        "trigger",
+        "notification_journal_configuration_no_delete",
+    ): "e83742a3eb8aa55f730ccaa5f2af3f5f929e657a7ecc36aa3f78c12192ec816d",
+    (
+        "trigger",
+        "notification_journal_configuration_no_update",
+    ): "ecf03d9f0fb5006018fd7dc55e0bc2259674f48712ab806278c2af9366f30a9d",
+    (
+        "trigger",
+        "notification_transport_events_no_delete",
+    ): "6c4a00961138b1b541c6fb9c6285a6e8a407d9d2f52501aadab378471f701bb4",
+    (
+        "trigger",
+        "notification_transport_events_no_update",
+    ): "f54ebcb0ee6d3ded2f687d4e8397f9a8a5d3192bcbdf10d96f126483fff3efc3",
+    (
+        "trigger",
+        "notification_transport_events_one_terminal",
+    ): "57b2b2cdde9a0740efacab2d8b35a72fe7fd32e0c9c57e612fdc717a286178ff",
+    (
+        "trigger",
+        "notification_transport_events_sequence",
+    ): "5f4dbce4614bd1413ab8aca1299674df8d26a7b78078ebc24e332904474ae2f1",
+    (
+        "trigger",
+        "notification_transport_events_terminal_requires_start",
+    ): "9799a58ae4112094c7856d5303f5ba1a0f06b24fff1977bc0d7dd5749313bf38",
+}
+
+
+def _journal_schema_definition_mismatches(conn: sqlite3.Connection) -> list[str]:
+    actual = {
+        (str(row["type"]), str(row["name"])): _sha256(" ".join(str(row["sql"]).split()).encode())
+        for row in conn.execute(
+            "SELECT type,name,sql FROM sqlite_master WHERE "
+            "(name LIKE 'notification_journal_%' OR name LIKE 'notification_transport_%') "
+            "AND sql IS NOT NULL"
+        ).fetchall()
+    }
+    return sorted(
+        f"{kind}:{name}"
+        for kind, name in set(_JOURNAL_SCHEMA_SQL_SHA256) | set(actual)
+        if _JOURNAL_SCHEMA_SQL_SHA256.get((kind, name)) != actual.get((kind, name))
+    )
 
 
 def _ensure_schema(config: NotificationJournalConfig) -> None:
@@ -322,6 +380,11 @@ def _ensure_schema(config: NotificationJournalConfig) -> None:
             );
             """
         )
+        mismatched = _journal_schema_definition_mismatches(conn)
+        if mismatched:
+            raise NotificationJournalError(
+                f"notification journal schema definition mismatch: {mismatched}"
+            )
 
 
 def activate_notification_journal(
@@ -365,8 +428,7 @@ def activate_notification_journal(
                 str(existing["activated_at_utc"]) != activation
                 or str(existing["policy_sha256"]) != policy_sha
                 or str(existing["policy_bytes_sha256"]) != _sha256(policy_bytes)
-                or str(existing["initial_runtime_git_commit"])
-                != config.runtime_git_commit
+                or str(existing["initial_runtime_git_commit"]) != config.runtime_git_commit
                 or str(existing["record_sha256"]) != digest
                 or persisted != encoded
             ):
@@ -396,19 +458,16 @@ class NotificationTransportJournal:
         database = _confined_database(self.config)
         if not database.is_file():
             raise NotificationJournalNotActive("notification journal is not activated")
-        with closing(
-            _connect(database, timeout_ms=self.config.write_timeout_ms)
-        ) as conn:
+        with closing(_connect(database, timeout_ms=self.config.write_timeout_ms)) as conn:
             conn.execute("BEGIN IMMEDIATE")
             configuration = conn.execute(
                 "SELECT * FROM notification_journal_configuration WHERE singleton=1"
             ).fetchone()
             if configuration is None:
                 raise NotificationJournalNotActive("notification journal is not activated")
-            if (
-                str(configuration["policy_sha256"]) != policy_sha
-                or str(configuration["policy_bytes_sha256"]) != _sha256(policy_bytes)
-            ):
+            if str(configuration["policy_sha256"]) != policy_sha or str(
+                configuration["policy_bytes_sha256"]
+            ) != _sha256(policy_bytes):
                 raise NotificationJournalError("notification journal policy changed")
             occurred = _utc_text(event.occurred_at_utc)
             if event.occurred_at_utc.astimezone(UTC) < _parse_utc(
@@ -416,9 +475,7 @@ class NotificationTransportJournal:
             ):
                 conn.rollback()
                 return False
-            event_id = _sha256(
-                f"{transport_id}|{event.attempt_number}|{event.phase}".encode()
-            )
+            event_id = _sha256(f"{transport_id}|{event.attempt_number}|{event.phase}".encode())
             record = {
                 "schema_version": 1,
                 "contract_version": JOURNAL_VERSION,
@@ -530,40 +587,19 @@ def notification_journal_status(
     integrity_errors: list[str] = []
     with closing(_connect_readonly(database, timeout_ms=30_000)) as conn:
         conn.execute("BEGIN")
+        schema_mismatches = _journal_schema_definition_mismatches(conn)
+        if schema_mismatches:
+            return {
+                "valid": False,
+                "reason": "notification_journal_schema_definition_mismatch",
+                "integrity_errors": schema_mismatches,
+            }
         integrity_result = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
         if integrity_result != "ok":
             return {
                 "valid": False,
                 "reason": "notification_journal_integrity_check_failed",
                 "integrity_errors": [integrity_result],
-            }
-        objects = {
-            (str(row[0]), str(row[1]))
-            for row in conn.execute(
-                "SELECT type,name FROM sqlite_master WHERE type IN ('table','trigger')"
-            )
-        }
-        required_objects = {
-            ("table", "notification_journal_configuration"),
-            ("table", "notification_transport_events"),
-            ("table", "notification_journal_health"),
-            ("trigger", "notification_journal_configuration_no_update"),
-            ("trigger", "notification_journal_configuration_no_delete"),
-            ("trigger", "notification_transport_events_sequence"),
-            ("trigger", "notification_transport_events_one_terminal"),
-            ("trigger", "notification_transport_events_terminal_requires_start"),
-            ("trigger", "notification_transport_events_no_update"),
-            ("trigger", "notification_transport_events_no_delete"),
-        }
-        missing_objects = sorted(required_objects - objects)
-        if missing_objects:
-            return {
-                "valid": False,
-                "reason": "notification_journal_schema_incomplete",
-                "integrity_errors": [
-                    f"missing_{object_type}:{name}"
-                    for object_type, name in missing_objects
-                ],
             }
         schema = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -624,9 +660,7 @@ def notification_journal_status(
                 if (
                     config_record.get("contract_version") != JOURNAL_VERSION
                     or not _SHA256.fullmatch(str(config_record.get("policy_sha256")))
-                    or not _SHA256.fullmatch(
-                        str(config_record.get("policy_bytes_sha256"))
-                    )
+                    or not _SHA256.fullmatch(str(config_record.get("policy_bytes_sha256")))
                     or not re.fullmatch(
                         r"[0-9a-f]{40}",
                         str(config_record.get("initial_runtime_git_commit")),

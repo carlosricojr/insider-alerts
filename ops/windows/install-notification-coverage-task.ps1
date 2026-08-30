@@ -27,12 +27,16 @@ if ($repoRoot -ne $scriptRepoRoot) {
 }
 $pythonExe = Join-Path $repoRoot ".venv\Scripts\pythonw.exe"
 $pythonConsole = Join-Path $repoRoot ".venv\Scripts\python.exe"
-$expectedCanaryPrefix = "-m insider_alerts.cli ops live-canary"
+$expectedCanaryArguments = (
+  "-m insider_alerts.cli ops live-canary --loop --interval 15 --live --notify " +
+  "--invalid-commission-handling reject --arm-phrase I_ACCEPT_LIVE_CANARY_RISK " +
+  "--output-log logs/live-canary.out.log --error-log logs/live-canary.err.log"
+)
 if (
   $deploymentAction.Execute -ne $pythonExe -or
-  -not $deploymentAction.Arguments.StartsWith("$expectedCanaryPrefix ")
+  $deploymentAction.Arguments -ne $expectedCanaryArguments
 ) {
-  throw "The live-canary task does not identify the expected deployment runtime."
+  throw "The live-canary task does not exactly match the reviewed frozen command."
 }
 
 $branch = (& git -C $repoRoot branch --show-current).Trim()
@@ -62,6 +66,23 @@ foreach ($path in @($pythonExe, $pythonConsole, $sourceDb, $journalDb, $coverage
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     throw "Missing required notification-coverage file at $path"
   }
+}
+
+$settingsCommand = (
+  "import os,sys; from pathlib import Path; os.chdir(sys.argv[1]); " +
+  "from insider_alerts.config import get_settings; " +
+  "print(Path(get_settings().database_path).resolve())"
+)
+$effectiveSourceText = (& $pythonConsole -c $settingsCommand $repoRoot | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($effectiveSourceText)) {
+  throw "Could not resolve the live canary's effective source database."
+}
+$effectiveSourceDb = (Resolve-Path -LiteralPath $effectiveSourceText -ErrorAction Stop).Path
+if ($sourceDb -ne $effectiveSourceDb) {
+  throw (
+    "Notification coverage source '$sourceDb' does not match the live canary source " +
+    "'$effectiveSourceDb'."
+  )
 }
 
 $arguments = @(

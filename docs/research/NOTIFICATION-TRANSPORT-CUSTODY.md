@@ -64,6 +64,8 @@ match one exact request/2xx-response attempt, including packet, body, route, ret
 timestamps. Deterministic failures become append-only gap records. Locked, unreadable, or malformed
 stores are reported as degraded and are never mislabeled as observed missingness. Baseline
 missingness is visible but does not make future monitoring permanently unhealthy.
+The acknowledgement, journal, and coverage stores validate the exact reviewed table, index, and
+trigger definitions, not merely their names; a same-named replacement is structural degradation.
 
 The monitor is capture-health-only. It imports neither broker nor trial code, cannot place orders,
 cannot alter notification delivery, does not read outcomes, and cannot enter `OPP-E07-V1` evidence,
@@ -107,6 +109,8 @@ records durable freshness/error health. Strict status exits nonzero for missing 
 execution, structural degradation, or any post-boundary gap. Rollback restores the preceding
 reviewed source but does not delete the immutable journal, acknowledgement, baseline, or gap
 records. The installer resolves the deployment checkout from `Insider Alerts Live Canary Worker`,
-refuses any other worktree or a dirty/non-synced branch, and validates the sealed paths before task
-registration. If the live configuration uses non-default database paths, pass the matching
-`-SourceDatabase`, `-JournalDatabase`, and `-CoverageDatabase` values to the installer.
+requires its complete frozen command and effective settings source database to match, refuses any
+other worktree or a dirty/non-synced branch, and validates the sealed paths before task
+registration. Matching non-default journal and coverage paths may be supplied with
+`-JournalDatabase` and `-CoverageDatabase`; `-SourceDatabase` is accepted only when it resolves to
+the canary's effective source.

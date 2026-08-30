@@ -187,9 +187,7 @@ def test_activation_freezes_known_missing_baseline_without_backfill(tmp_path: Pa
     )
     _insert_pending(config, NORMAL_PACKET, now=normal_response - timedelta(minutes=1))
     normal_decision = _decision(NORMAL_PACKET)
-    assert (
-        apply_decision(str(config.source_db), normal_decision, notification_required=True) == 1
-    )
+    assert apply_decision(str(config.source_db), normal_decision, notification_required=True) == 1
     assert (
         mark_notification_delivered(
             str(config.source_db),
@@ -377,6 +375,33 @@ def test_source_schema_and_paths_fail_closed_as_degraded(tmp_path: Path) -> None
     assert status["reason"] == "notification_coverage_degraded"
 
 
+def test_status_rejects_same_named_noop_source_and_coverage_triggers(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    source_config = _config(tmp_path / "source", now=now)
+    activate_notification_coverage(source_config, now_fn=lambda: now)
+    with sqlite3.connect(source_config.source_db) as conn:
+        conn.execute("DROP TRIGGER notification_delivery_acks_no_update")
+        conn.execute(
+            "CREATE TRIGGER notification_delivery_acks_no_update "
+            "BEFORE UPDATE ON notification_delivery_acks BEGIN SELECT 1; END"
+        )
+    source_status = notification_coverage_status(source_config, now=now + timedelta(seconds=1))
+    assert source_status["valid"] is False
+    assert "schema definition mismatch" in source_status["detail"]
+
+    coverage_config = _config(tmp_path / "coverage", now=now)
+    activate_notification_coverage(coverage_config, now_fn=lambda: now)
+    with sqlite3.connect(coverage_config.coverage_db) as conn:
+        conn.execute("DROP TRIGGER notification_coverage_gaps_no_delete")
+        conn.execute(
+            "CREATE TRIGGER notification_coverage_gaps_no_delete "
+            "BEFORE DELETE ON notification_coverage_gaps BEGIN SELECT 1; END"
+        )
+    coverage_status = notification_coverage_status(coverage_config, now=now + timedelta(seconds=1))
+    assert coverage_status["valid"] is False
+    assert "schema definition mismatch" in coverage_status["detail"]
+
+
 def test_status_rejects_configured_source_path_drift(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     config = _config(tmp_path, now=now)
@@ -529,6 +554,51 @@ def test_status_rejects_post_activation_prefix_substitution(tmp_path: Path) -> N
     assert "prefix changed after monitoring" in status["detail"]
 
 
+def test_status_rejects_post_activation_journal_prefix_substitution(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    config = _config(tmp_path, now=now)
+    activate_notification_coverage(config, now_fn=lambda: now)
+    response = now + timedelta(seconds=1)
+    _journal_attempt(
+        config,
+        packet_id=NORMAL_PACKET,
+        transport_id=notification_transport_id(NORMAL_PACKET, "post-activation"),
+        started_at=response - timedelta(milliseconds=1),
+        responded_at=response,
+    )
+    assert (
+        run_notification_coverage_once(config, now_fn=lambda: now + timedelta(seconds=2))["valid"]
+        is True
+    )
+
+    with sqlite3.connect(config.journal.database) as conn:
+        trigger_sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='notification_transport_events_no_update'"
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            "SELECT sequence,record_json FROM notification_transport_events ORDER BY sequence"
+        ).fetchall()
+        conn.execute("DROP TRIGGER notification_transport_events_no_update")
+        for sequence, raw_record in rows:
+            record = json.loads(bytes(raw_record))
+            record["route_sha256"] = "e" * 64
+            encoded = json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
+            conn.execute(
+                "UPDATE notification_transport_events SET record_sha256=?,record_json=? "
+                "WHERE sequence=?",
+                (hashlib.sha256(encoded).hexdigest(), encoded, sequence),
+            )
+        conn.execute(trigger_sql)
+
+    status = notification_coverage_status(config, now=now + timedelta(seconds=3))
+
+    assert status["valid"] is False
+    assert "prefix changed after monitoring" in status["detail"]
+
+
 def test_status_rejects_stale_and_future_worker_health(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     config = _config(tmp_path, now=now)
@@ -537,8 +607,7 @@ def test_status_rejects_stale_and_future_worker_health(tmp_path: Path) -> None:
     stale_at = (now - timedelta(minutes=4)).isoformat()
     with sqlite3.connect(config.coverage_db) as conn:
         conn.execute(
-            "UPDATE notification_coverage_health "
-            "SET last_started_at_utc=?,last_success_at_utc=?",
+            "UPDATE notification_coverage_health SET last_started_at_utc=?,last_success_at_utc=?",
             (stale_at, stale_at),
         )
     stale = notification_coverage_status(config, now=now)
@@ -548,8 +617,7 @@ def test_status_rejects_stale_and_future_worker_health(tmp_path: Path) -> None:
     future_at = (now + timedelta(minutes=1)).isoformat()
     with sqlite3.connect(config.coverage_db) as conn:
         conn.execute(
-            "UPDATE notification_coverage_health "
-            "SET last_started_at_utc=?,last_success_at_utc=?",
+            "UPDATE notification_coverage_health SET last_started_at_utc=?,last_success_at_utc=?",
             (future_at, future_at),
         )
     future = notification_coverage_status(config, now=now)
@@ -579,7 +647,9 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "rev-parse origin/main" in installer
     assert "status --porcelain=v1 --untracked-files=all" in installer
     assert "--status" in installer
-    assert '.StartsWith("$expectedCanaryPrefix ")' in installer
+    assert "$deploymentAction.Arguments -ne $expectedCanaryArguments" in installer
+    assert "get_settings().database_path" in installer
+    assert "$sourceDb -ne $effectiveSourceDb" in installer
     assert "confined_notification_coverage_source(config)" in worker
     assert "-Hidden" in installer
     assert "-MultipleInstances IgnoreNew" in installer
@@ -602,4 +672,27 @@ def test_source_initialization_uses_the_monitor_path_confinement(tmp_path: Path)
     )
 
     with pytest.raises(NotificationCoverageError, match="escaped"):
+        confined_notification_coverage_source(escaped)
+
+
+def test_source_initialization_rejects_dangling_reparse_point(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    config = _config(tmp_path, now=now)
+    dangling = config.source_root / "dangling.db"
+    try:
+        dangling.symlink_to(tmp_path / "missing-target.db")
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a test symlink: {exc}")
+    escaped = NotificationCoverageConfig(
+        source_db=dangling,
+        source_root=config.source_root,
+        coverage_db=config.coverage_db,
+        research_root=config.research_root,
+        policy_path=config.policy_path,
+        policy_root=config.policy_root,
+        journal=config.journal,
+        runtime_git_commit=config.runtime_git_commit,
+    )
+
+    with pytest.raises(NotificationCoverageError, match="reparse"):
         confined_notification_coverage_source(escaped)

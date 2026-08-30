@@ -8,8 +8,10 @@ import pytest
 from insider_alerts.review.queue import (
     DecisionValidationError,
     NotificationDeliveryProof,
+    NotificationDeliverySchemaError,
     apply_decision,
     enqueue_review_packet,
+    ensure_review_tables,
     list_deadletters,
     list_notification_outbox,
     list_pending_review_packets,
@@ -30,6 +32,20 @@ def _delivery_proof() -> NotificationDeliveryProof:
         route_sha256="c" * 64,
         http_status=200,
     )
+
+
+def test_delivery_schema_rejects_same_named_noop_immutability_trigger(tmp_path) -> None:
+    db = str(tmp_path / "insider_alerts.db")
+    ensure_review_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TRIGGER notification_delivery_acks_no_update")
+        conn.execute(
+            "CREATE TRIGGER notification_delivery_acks_no_update "
+            "BEFORE UPDATE ON notification_delivery_acks BEGIN SELECT 1; END"
+        )
+
+    with pytest.raises(NotificationDeliverySchemaError, match="definition mismatch"):
+        ensure_review_tables(db)
 
 
 def _sample_ref(
@@ -100,9 +116,7 @@ def test_apply_decision_validates_schema(tmp_path) -> None:
     updated = apply_decision(db, good, notification_required=True)
     assert updated == 1
 
-    assert mark_notification_delivered(
-        db, good["packet_id"], good, proof=_delivery_proof()
-    ) == 1
+    assert mark_notification_delivered(db, good["packet_id"], good, proof=_delivery_proof()) == 1
     with sqlite3.connect(db) as conn:
         delivered_at = conn.execute(
             "SELECT notification_sent_at FROM review_packets WHERE packet_id = ?",
@@ -132,25 +146,26 @@ def test_notification_intent_is_atomic_and_remains_until_delivery(tmp_path) -> N
     enqueue_review_packet(db, _sample_ref(), {"score": 99})
     packet_id = "0000320193-24-000123|0000320193|4"
 
-    assert apply_decision(
-        db,
-        {
-            "packet_id": packet_id,
-            "decision": "approve",
-            "analyst": "quant",
-            "reason": "send this",
-        },
-        notification_required=True,
-    ) == 1
+    assert (
+        apply_decision(
+            db,
+            {
+                "packet_id": packet_id,
+                "decision": "approve",
+                "analyst": "quant",
+                "reason": "send this",
+            },
+            notification_required=True,
+        )
+        == 1
+    )
 
     outbox = list_notification_outbox(db, limit=10)
     assert [row["packet_id"] for row in outbox] == [packet_id]
     assert outbox[0]["decision"]["reason"] == "send this"  # type: ignore[index]
     decision = outbox[0]["decision"]
     assert isinstance(decision, dict)
-    assert mark_notification_delivered(
-        db, packet_id, decision, proof=_delivery_proof()
-    ) == 1
+    assert mark_notification_delivered(db, packet_id, decision, proof=_delivery_proof()) == 1
     assert list_notification_outbox(db, limit=10) == []
 
 
@@ -195,9 +210,7 @@ def test_replayed_decision_clears_prior_notification_acknowledgement(tmp_path) -
         "reason": "retry later",
     }
     assert apply_decision(db, deadletter, notification_required=True) == 1
-    assert mark_notification_delivered(
-        db, packet_id, deadletter, proof=_delivery_proof()
-    ) == 1
+    assert mark_notification_delivered(db, packet_id, deadletter, proof=_delivery_proof()) == 1
 
     assert replay_deadletter(db, packet_id) == 1
     approval = {**deadletter, "decision": "approve", "reason": "send replay"}
@@ -237,13 +250,9 @@ def test_stale_notification_ack_cannot_acknowledge_replayed_decision(tmp_path) -
     assert replay_deadletter(db, packet_id) == 1
     assert apply_decision(db, second, notification_required=True) == 1
 
-    assert mark_notification_delivered(
-        db, packet_id, first, proof=_delivery_proof()
-    ) == 0
+    assert mark_notification_delivered(db, packet_id, first, proof=_delivery_proof()) == 0
     assert [row["decision"] for row in list_notification_outbox(db, limit=10)] == [second]
-    assert mark_notification_delivered(
-        db, packet_id, second, proof=_delivery_proof()
-    ) == 1
+    assert mark_notification_delivered(db, packet_id, second, proof=_delivery_proof()) == 1
 
 
 def test_suppression_is_distinct_from_provider_delivery(tmp_path) -> None:
@@ -384,6 +393,4 @@ def test_list_pending_review_packets_prioritizes_oldest_retry(tmp_path) -> None:
 
     rows = list_pending_review_packets(db, limit=1)
 
-    assert [row["packet_id"] for row in rows] == [
-        "0000320193-24-000123|0000320193|4"
-    ]
+    assert [row["packet_id"] for row in rows] == ["0000320193-24-000123|0000320193|4"]

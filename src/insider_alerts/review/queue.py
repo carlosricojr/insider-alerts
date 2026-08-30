@@ -17,6 +17,79 @@ VALID_DECISIONS = {"approve", "reject", "escalate", "deadletter"}
 PACKET_ID_RE = re.compile(r"^\d{10}-\d{2}-\d{6}\|\d{10}\|4(?:/A)?$")
 DELIVERY_ACK_VERSION = "notification-delivery-ack-v1"
 
+NOTIFICATION_DELIVERY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS notification_delivery_acks (
+    sequence INTEGER PRIMARY KEY,
+    ack_id TEXT NOT NULL UNIQUE,
+    packet_id TEXT NOT NULL,
+    decision_sha256 TEXT NOT NULL,
+    notification_sent_at_utc TEXT NOT NULL,
+    transport_id TEXT,
+    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+    responded_at_utc TEXT NOT NULL,
+    request_body_sha256 TEXT NOT NULL,
+    route_sha256 TEXT NOT NULL,
+    http_status INTEGER NOT NULL CHECK(http_status BETWEEN 200 AND 299),
+    record_sha256 TEXT NOT NULL UNIQUE,
+    record_json BLOB NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_sequence
+BEFORE INSERT ON notification_delivery_acks
+WHEN NEW.sequence<>(SELECT COALESCE(MAX(sequence),0)+1 FROM notification_delivery_acks)
+BEGIN SELECT RAISE(ABORT, 'notification delivery sequence must be gap-free'); END;
+CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_no_update
+BEFORE UPDATE ON notification_delivery_acks
+BEGIN SELECT RAISE(ABORT, 'notification delivery acknowledgements are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_no_delete
+BEFORE DELETE ON notification_delivery_acks
+BEGIN SELECT RAISE(ABORT, 'notification delivery acknowledgements are immutable'); END;
+"""
+
+
+class NotificationDeliverySchemaError(RuntimeError):
+    """The delivery acknowledgement ledger does not match the reviewed schema."""
+
+
+def _normalized_schema_sql(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _expected_notification_delivery_schema() -> dict[tuple[str, str], str]:
+    with sqlite3.connect(":memory:") as expected:
+        expected.executescript(NOTIFICATION_DELIVERY_SCHEMA_SQL)
+        return {
+            (str(row[0]), str(row[1])): _normalized_schema_sql(str(row[2]))
+            for row in expected.execute(
+                "SELECT type,name,sql FROM sqlite_master "
+                "WHERE name LIKE 'notification_delivery_acks%' AND sql IS NOT NULL"
+            )
+        }
+
+
+_EXPECTED_NOTIFICATION_DELIVERY_SCHEMA = _expected_notification_delivery_schema()
+
+
+def validate_notification_delivery_schema(conn: sqlite3.Connection) -> None:
+    """Reject missing or same-named substituted acknowledgement objects."""
+
+    expected = _EXPECTED_NOTIFICATION_DELIVERY_SCHEMA
+    actual = {
+        (str(row[0]), str(row[1])): _normalized_schema_sql(str(row[2]))
+        for row in conn.execute(
+            "SELECT type,name,sql FROM sqlite_master "
+            "WHERE name LIKE 'notification_delivery_acks%' AND sql IS NOT NULL"
+        )
+    }
+    if actual != expected:
+        mismatched = sorted(
+            f"{kind}:{name}"
+            for kind, name in set(expected) | set(actual)
+            if expected.get((kind, name)) != actual.get((kind, name))
+        )
+        raise NotificationDeliverySchemaError(
+            f"notification delivery schema definition mismatch: {mismatched}"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class NotificationDeliveryProof:
@@ -162,31 +235,6 @@ def ensure_review_tables(db_path: str) -> None:
             CREATE TRIGGER IF NOT EXISTS research_capture_jobs_no_delete
             BEFORE DELETE ON research_capture_jobs
             BEGIN SELECT RAISE(ABORT, 'capture jobs cannot be deleted'); END;
-            CREATE TABLE IF NOT EXISTS notification_delivery_acks (
-                sequence INTEGER PRIMARY KEY,
-                ack_id TEXT NOT NULL UNIQUE,
-                packet_id TEXT NOT NULL,
-                decision_sha256 TEXT NOT NULL,
-                notification_sent_at_utc TEXT NOT NULL,
-                transport_id TEXT,
-                attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
-                responded_at_utc TEXT NOT NULL,
-                request_body_sha256 TEXT NOT NULL,
-                route_sha256 TEXT NOT NULL,
-                http_status INTEGER NOT NULL CHECK(http_status BETWEEN 200 AND 299),
-                record_sha256 TEXT NOT NULL UNIQUE,
-                record_json BLOB NOT NULL
-            );
-            CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_sequence
-            BEFORE INSERT ON notification_delivery_acks
-            WHEN NEW.sequence<>(SELECT COALESCE(MAX(sequence),0)+1 FROM notification_delivery_acks)
-            BEGIN SELECT RAISE(ABORT, 'notification delivery sequence must be gap-free'); END;
-            CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_no_update
-            BEFORE UPDATE ON notification_delivery_acks
-            BEGIN SELECT RAISE(ABORT, 'notification delivery acknowledgements are immutable'); END;
-            CREATE TRIGGER IF NOT EXISTS notification_delivery_acks_no_delete
-            BEFORE DELETE ON notification_delivery_acks
-            BEGIN SELECT RAISE(ABORT, 'notification delivery acknowledgements are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS enqueue_research_capture_after_approval
             AFTER UPDATE OF status ON review_packets
             WHEN NEW.status = 'approve' AND OLD.status <> 'approve'
@@ -204,6 +252,8 @@ def ensure_review_tables(db_path: str) -> None:
             END;
             """
         )
+        conn.executescript(NOTIFICATION_DELIVERY_SCHEMA_SQL)
+        validate_notification_delivery_schema(conn)
         conn.commit()
 
 
@@ -385,9 +435,7 @@ def mark_notification_delivered(
     responded_at_utc = responded_at.astimezone(UTC)
     delivered_at_value = max(datetime.now(tz=UTC), responded_at_utc)
     delivered_at = delivered_at_value.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    responded_text = (
-        responded_at_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    )
+    responded_text = responded_at_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
     if (
         isinstance(proof.attempt_number, bool)
         or proof.attempt_number < 1

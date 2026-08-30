@@ -20,7 +20,12 @@ from insider_alerts.research.notification_transport import (
     NotificationJournalConfig,
     notification_journal_status,
 )
-from insider_alerts.review.queue import DELIVERY_ACK_VERSION, PACKET_ID_RE
+from insider_alerts.review.queue import (
+    DELIVERY_ACK_VERSION,
+    PACKET_ID_RE,
+    NotificationDeliverySchemaError,
+    validate_notification_delivery_schema,
+)
 
 COVERAGE_VERSION = "notification-coverage-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -166,7 +171,7 @@ def _confined(path: Path, *, root: Path, kind: str) -> Path:
     cursor = confined_root
     for part in target.relative_to(confined_root).parts:
         cursor /= part
-        if cursor.exists() and _is_reparse_point(cursor):
+        if _is_reparse_point(cursor):
             raise NotificationCoverageError(f"{kind} traverses a reparse point")
     return target
 
@@ -300,9 +305,18 @@ def _ensure_store(path: Path) -> None:
             );
             """
         )
+        mismatched = _coverage_schema_definition_mismatches(conn)
+        if mismatched:
+            raise NotificationCoverageError(
+                f"notification coverage schema definition mismatch: {mismatched}"
+            )
 
 
 def _source_schema_descriptor(conn: sqlite3.Connection) -> dict[str, Any]:
+    try:
+        validate_notification_delivery_schema(conn)
+    except NotificationDeliverySchemaError as exc:
+        raise NotificationCoverageError(str(exc)) from exc
     required_objects = {
         ("table", "review_packets"),
         ("table", "notification_delivery_acks"),
@@ -533,6 +547,10 @@ def confined_notification_coverage_source(config: NotificationCoverageConfig) ->
     """Resolve the configured source only after applying the monitor's confinement rules."""
 
     source, _, _, _ = _paths(config)
+    if not source.is_file() or _is_reparse_point(source):
+        raise NotificationCoverageError(
+            "coverage source database must be an existing regular non-reparse file"
+        )
     return source
 
 
@@ -603,29 +621,71 @@ def _baseline_attempt(
     return start, response
 
 
-def _coverage_objects(conn: sqlite3.Connection) -> set[tuple[str, str]]:
-    return {
-        (str(row["type"]), str(row["name"]))
+_COVERAGE_SCHEMA_SQL_SHA256 = {
+    (
+        "table",
+        "notification_coverage_baseline",
+    ): "2be67c0ac5e81f5abe91564c8f3153e18df8620b65158becfdbc2cc52a427645",
+    (
+        "table",
+        "notification_coverage_configuration",
+    ): "2e77b1950562ea7779c5d68e56df90e675251d42d8049ddb30a013688269e937",
+    (
+        "table",
+        "notification_coverage_gaps",
+    ): "5ab43fea5d3c3a3d90e1139cd97893223a695f51cebd823f4747a7fcd347a1e0",
+    (
+        "table",
+        "notification_coverage_health",
+    ): "ef62de4776b612786be406d8003d17c723e64a76e9b39f1291028834cdd72e67",
+    (
+        "trigger",
+        "notification_coverage_baseline_no_delete",
+    ): "e3f3d95436698263c3c9e1426b590a557074ecc8c6664d045f2af52e42b7a4ed",
+    (
+        "trigger",
+        "notification_coverage_baseline_no_update",
+    ): "53b1691cb01ee381bb547ce0760cc691bfdc4529d911d8bfed195eeadb4e9814",
+    (
+        "trigger",
+        "notification_coverage_baseline_sequence",
+    ): "cc81a1c992a940e0be0f170e8e1fdbdf15d28a8bc562b2ef299c2a53c1bf3a2f",
+    (
+        "trigger",
+        "notification_coverage_configuration_no_delete",
+    ): "69b8ab433dd0f9f202ab4aa095798b2c53b147d5d42772637ca7ba591c2ceb9f",
+    (
+        "trigger",
+        "notification_coverage_configuration_no_update",
+    ): "fbf18dee0566067e6d3a253a87c4e1e39db94aa47e1dc35782851dd37014f2b8",
+    (
+        "trigger",
+        "notification_coverage_gaps_no_delete",
+    ): "1dfd8ef9e3b80245a9d5b4c1f28db8d90372a82c3c8fc30a1f04fda02f83cec1",
+    (
+        "trigger",
+        "notification_coverage_gaps_no_update",
+    ): "66b737c0c9b22017e4d78a49f217edde18b35f8a3b1e77ff5ef5f0312d7b46df",
+    (
+        "trigger",
+        "notification_coverage_gaps_sequence",
+    ): "56908813879a861a2122f55adaf5bcdaaeef6ec7ca4af17000bced2a09ab3c1a",
+}
+
+
+def _coverage_schema_definition_mismatches(conn: sqlite3.Connection) -> list[str]:
+    actual = {
+        (str(row["type"]), str(row["name"])): _sha256(" ".join(str(row["sql"]).split()).encode())
         for row in conn.execute(
-            "SELECT type,name FROM sqlite_master WHERE type IN ('table','trigger')"
+            "SELECT type,name,sql FROM sqlite_master "
+            "WHERE name LIKE 'notification_coverage_%' AND sql IS NOT NULL"
         ).fetchall()
     }
-
-
-_COVERAGE_OBJECTS = {
-    ("table", "notification_coverage_configuration"),
-    ("table", "notification_coverage_baseline"),
-    ("table", "notification_coverage_gaps"),
-    ("table", "notification_coverage_health"),
-    ("trigger", "notification_coverage_configuration_no_update"),
-    ("trigger", "notification_coverage_configuration_no_delete"),
-    ("trigger", "notification_coverage_baseline_sequence"),
-    ("trigger", "notification_coverage_baseline_no_update"),
-    ("trigger", "notification_coverage_baseline_no_delete"),
-    ("trigger", "notification_coverage_gaps_sequence"),
-    ("trigger", "notification_coverage_gaps_no_update"),
-    ("trigger", "notification_coverage_gaps_no_delete"),
-}
+    return sorted(
+        f"{kind}:{name}"
+        for kind, name in set(_COVERAGE_SCHEMA_SQL_SHA256) | set(actual)
+        if _COVERAGE_SCHEMA_SQL_SHA256.get((kind, name)) != actual.get((kind, name))
+    )
 
 
 def activate_notification_coverage(
@@ -700,9 +760,7 @@ def activate_notification_coverage(
         "policy_bytes_sha256": _sha256(policy_bytes),
         "source_schema_sha256": source.schema_sha256,
         "source_ack_snapshot_sha256": _sha256(
-            _canonical(
-                {"record_sha256": [ack.record_sha256 for ack in source.acknowledgements]}
-            )
+            _canonical({"record_sha256": [ack.record_sha256 for ack in source.acknowledgements]})
         ),
         "source_ack_sequence_watermark": max(
             (ack.sequence for ack in source.acknowledgements), default=0
@@ -764,8 +822,7 @@ def activate_notification_coverage(
                 ),
             )
         conn.execute(
-            "INSERT INTO notification_coverage_health "
-            "VALUES(1,?,?,NULL,NULL,0,0,?,?,?,?)",
+            "INSERT INTO notification_coverage_health VALUES(1,?,?,NULL,NULL,0,0,?,?,?,?)",
             (
                 activated_at,
                 activated_at,
@@ -793,10 +850,10 @@ def _read_coverage_state(
     try:
         with closing(_connect_readonly(coverage_path)) as conn:
             conn.execute("BEGIN")
-            missing_objects = sorted(_COVERAGE_OBJECTS - _coverage_objects(conn))
-            if missing_objects:
+            mismatched_objects = _coverage_schema_definition_mismatches(conn)
+            if mismatched_objects:
                 raise NotificationCoverageError(
-                    f"notification coverage schema is incomplete: {missing_objects}"
+                    f"notification coverage schema definition mismatch: {mismatched_objects}"
                 )
             configuration = conn.execute(
                 "SELECT * FROM notification_coverage_configuration WHERE singleton=1"
@@ -872,9 +929,7 @@ def _validate_coverage_state(
         raise NotificationCoverageError("coverage activation semantics are invalid")
     config_bindings = {
         "activated_at_utc": str(configuration["activated_at_utc"]),
-        "source_ack_sequence_watermark": int(
-            configuration["source_ack_sequence_watermark"]
-        ),
+        "source_ack_sequence_watermark": int(configuration["source_ack_sequence_watermark"]),
         "journal_sequence_watermark": int(configuration["journal_sequence_watermark"]),
         "baseline_sent_count": int(configuration["baseline_sent_count"]),
         "baseline_covered_count": int(configuration["baseline_covered_count"]),
@@ -956,8 +1011,7 @@ def _validate_coverage_state(
     ):
         raise NotificationCoverageError("coverage baseline partition mismatch")
     if (
-        record.get("baseline_all_sha256")
-        != _sha256(_canonical({"items": sorted(baseline_ids)}))
+        record.get("baseline_all_sha256") != _sha256(_canonical({"items": sorted(baseline_ids)}))
         or record.get("baseline_covered_sha256")
         != _sha256(_canonical({"items": sorted(covered_ids)}))
         or record.get("baseline_missing_sha256")
@@ -1018,9 +1072,7 @@ def _live_reconciliation(
         "journal_database_ref": journal_path.relative_to(
             Path(os.path.abspath(config.research_root))
         ).as_posix(),
-        "policy_ref": policy_path.relative_to(
-            Path(os.path.abspath(config.policy_root))
-        ).as_posix(),
+        "policy_ref": policy_path.relative_to(Path(os.path.abspath(config.policy_root))).as_posix(),
     }
     if any(config_record.get(field) != value for field, value in expected_refs.items()):
         raise NotificationCoverageError("coverage configured paths changed after activation")
@@ -1043,11 +1095,7 @@ def _live_reconciliation(
         raise NotificationCoverageError("notification evidence sequence rolled back")
     source_prefix_sha = _sha256(
         _canonical(
-            {
-                "record_sha256": [
-                    ack.record_sha256 for ack in source.acknowledgements[:watermark]
-                ]
-            }
+            {"record_sha256": [ack.record_sha256 for ack in source.acknowledgements[:watermark]]}
         )
     )
     journal_prefix_sha = _sha256(
@@ -1066,9 +1114,7 @@ def _live_reconciliation(
     ) or journal_prefix_sha != config_record.get("journal_snapshot_sha256"):
         raise NotificationCoverageError("notification evidence prefix changed after activation")
     current_source_prefix_sha = _sha256(
-        _canonical(
-            {"record_sha256": [ack.record_sha256 for ack in source.acknowledgements]}
-        )
+        _canonical({"record_sha256": [ack.record_sha256 for ack in source.acknowledgements]})
     )
     if health is not None:
         try:
@@ -1091,8 +1137,7 @@ def _live_reconciliation(
             _canonical(
                 {
                     "record_sha256": [
-                        ack.record_sha256
-                        for ack in source.acknowledgements[:prior_source_sequence]
+                        ack.record_sha256 for ack in source.acknowledgements[:prior_source_sequence]
                     ]
                 }
             )
@@ -1112,9 +1157,7 @@ def _live_reconciliation(
             observed_source_prefix_sha != prior_source_prefix_sha
             or observed_journal_prefix_sha != prior_journal_prefix_sha
         ):
-            raise NotificationCoverageError(
-                "notification evidence prefix changed after monitoring"
-            )
+            raise NotificationCoverageError("notification evidence prefix changed after monitoring")
     post_acks = [ack for ack in source.acknowledgements if ack.sequence > watermark]
     gaps: list[dict[str, str | None]] = []
     ack_identities = {
