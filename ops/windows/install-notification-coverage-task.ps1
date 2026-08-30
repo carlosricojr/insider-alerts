@@ -327,6 +327,27 @@ function Stop-CoverageTaskAndWait([bool]$CaptureRunningState) {
   }
 }
 
+function Resolve-AccountSid([string]$AccountId) {
+  if ([string]::IsNullOrWhiteSpace($AccountId)) {
+    throw "The registered task account identity is empty."
+  }
+  try {
+    return [string](
+      (New-Object System.Security.Principal.SecurityIdentifier($AccountId)).Value
+    )
+  } catch {
+    try {
+      return [string](
+        (New-Object System.Security.Principal.NTAccount($AccountId)).Translate(
+          [System.Security.Principal.SecurityIdentifier]
+        ).Value
+      )
+    } catch {
+      throw "The registered task account identity could not be resolved to a Windows SID."
+    }
+  }
+}
+
 function Assert-RegisteredCoverageTask(
   [string]$ExpectedLogonType,
   [bool]$ExpectedEnabled
@@ -345,20 +366,8 @@ function Assert-RegisteredCoverageTask(
   if ($logonTriggers.Count -ne 1 -or $timeTriggers.Count -ne 1) {
     throw "The registered task must have exactly one logon and one time trigger."
   }
-  try {
-    $principalSid = [string](
-      (New-Object System.Security.Principal.NTAccount($task.Principal.UserId)).Translate(
-        [System.Security.Principal.SecurityIdentifier]
-      ).Value
-    )
-    $logonSid = [string](
-      (New-Object System.Security.Principal.NTAccount($logonTriggers[0].UserId)).Translate(
-        [System.Security.Principal.SecurityIdentifier]
-      ).Value
-    )
-  } catch {
-    throw "The registered task account identity could not be resolved to a Windows SID."
-  }
+  $principalSid = Resolve-AccountSid -AccountId $task.Principal.UserId
+  $logonSid = Resolve-AccountSid -AccountId $logonTriggers[0].UserId
   if (
     $task.TaskPath -ne "\" -or
     $registeredAction.Execute -ne $pythonExe -or

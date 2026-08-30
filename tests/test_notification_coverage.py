@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -814,9 +815,12 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "function Get-CoverageTaskSnapshot" in installer
     assert "function Restore-CoverageTask" in installer
     assert "function Assert-RegisteredCoverageTask" in installer
+    assert "function Resolve-AccountSid" in installer
     assert "$userSid = [string]$userIdentity.User.Value" in installer
-    assert "System.Security.Principal.NTAccount($task.Principal.UserId)" in installer
-    assert "System.Security.Principal.NTAccount($logonTriggers[0].UserId)" in installer
+    assert "System.Security.Principal.SecurityIdentifier($AccountId)" in installer
+    assert "System.Security.Principal.NTAccount($AccountId)" in installer
+    assert "Resolve-AccountSid -AccountId $task.Principal.UserId" in installer
+    assert "Resolve-AccountSid -AccountId $logonTriggers[0].UserId" in installer
     assert "$principalSid -ne $userSid" in installer
     assert "$logonSid -ne $userSid" in installer
     assert '"Global\\InsiderAlertsNotificationCoverageInstaller-v1"' in installer
@@ -834,6 +838,116 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "prior task restoration failed" in installer
     assert "-WindowStyle" not in installer
     assert "HRESULT 0x80070005,Register-ScheduledTask" in installer
+
+
+@pytest.mark.skipif(
+    not hasattr(subprocess, "CREATE_NO_WINDOW"),
+    reason="PowerShell Task Scheduler identity behavior is Windows-only",
+)
+def test_installer_accepts_equivalent_account_representations_and_rejects_mismatch() -> None:
+    installer = str(
+        ROOT / "ops" / "windows" / "install-notification-coverage-task.ps1"
+    ).replace("'", "''")
+    script = rf"""
+$tokens=$null
+$errors=$null
+$ast=[System.Management.Automation.Language.Parser]::ParseFile(
+  '{installer}', [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -ne 0) {{ throw 'installer parse failed' }}
+foreach ($name in @('Resolve-AccountSid','Assert-RegisteredCoverageTask')) {{
+  $functionAst=$ast.Find({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $node.Name -eq $name
+  }}, $true)
+  if ($null -eq $functionAst) {{ throw "missing function $name" }}
+  Invoke-Expression $functionAst.Extent.Text
+}}
+$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()
+$fullName=$identity.Name
+$bareName=($identity.Name -split '\\')[-1]
+$userSid=[string]$identity.User.Value
+$TaskName='Mock Coverage'
+$pythonExe='C:\mock\pythonw.exe'
+$repoRoot='C:\mock'
+$arguments='-m mock'
+function Get-ScheduledTask {{ return $script:fakeTask }}
+function New-FakeTask(
+  [string]$PrincipalUser,
+  [string]$LogonUser,
+  [string]$LogonType,
+  [bool]$Enabled
+) {{
+  $logon=[pscustomobject]@{{
+    CimClass=[pscustomobject]@{{CimClassName='MSFT_TaskLogonTrigger'}}
+    UserId=$LogonUser
+    Enabled=$true
+  }}
+  $time=[pscustomobject]@{{
+    CimClass=[pscustomobject]@{{CimClassName='MSFT_TaskTimeTrigger'}}
+    Enabled=$true
+    Repetition=[pscustomobject]@{{Interval='PT1M';Duration='P3650D'}}
+  }}
+  return [pscustomobject]@{{
+    TaskPath='\'
+    Actions=@([pscustomobject]@{{
+      Execute=$pythonExe;WorkingDirectory=$repoRoot;Arguments=$arguments
+    }})
+    Triggers=@($logon,$time)
+    Principal=[pscustomobject]@{{
+      UserId=$PrincipalUser;LogonType=$LogonType;RunLevel='Limited'
+    }}
+    Settings=[pscustomobject]@{{
+      Enabled=$Enabled;Hidden=$true;MultipleInstances='IgnoreNew'
+      ExecutionTimeLimit='PT5M';RestartCount=2;RestartInterval='PT1M'
+      StartWhenAvailable=$true;DisallowStartIfOnBatteries=$false
+      StopIfGoingOnBatteries=$false
+    }}
+  }}
+}}
+function Assert-Passes(
+  [string]$PrincipalUser,
+  [string]$LogonUser,
+  [string]$LogonType,
+  [bool]$Enabled
+) {{
+  $script:fakeTask=New-FakeTask $PrincipalUser $LogonUser $LogonType $Enabled
+  Assert-RegisteredCoverageTask `
+    -ExpectedLogonType $LogonType `
+    -ExpectedEnabled $Enabled | Out-Null
+}}
+Assert-Passes $fullName $bareName 'Interactive' $false
+Assert-Passes $bareName $fullName 'S4U' $true
+Assert-Passes $userSid $userSid 'Interactive' $false
+$script:fakeTask=New-FakeTask 'S-1-1-0' $userSid 'Interactive' $false
+try {{
+  Assert-RegisteredCoverageTask -ExpectedLogonType 'Interactive' -ExpectedEnabled $false
+  throw 'mismatched SID was accepted'
+}} catch {{
+  if ($_.Exception.Message -eq 'mismatched SID was accepted') {{ throw }}
+}}
+$script:fakeTask=New-FakeTask 'DefinitelyMissingAccount_51' $userSid 'S4U' $false
+try {{
+  Assert-RegisteredCoverageTask -ExpectedLogonType 'S4U' -ExpectedEnabled $false
+  throw 'unresolvable account was accepted'
+}} catch {{
+  if ($_.Exception.Message -eq 'unresolvable account was accepted') {{ throw }}
+  if ($_.Exception.Message -notmatch 'could not be resolved') {{ throw }}
+}}
+'identity behavior: OK'
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "identity behavior: OK" in completed.stdout
 
 
 def test_source_initialization_uses_the_monitor_path_confinement(tmp_path: Path) -> None:
