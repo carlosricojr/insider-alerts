@@ -220,10 +220,8 @@ def _connect_coverage(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _ensure_store(path: Path) -> None:
-    with closing(_connect_coverage(path)) as conn, conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(
+def _create_coverage_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS notification_coverage_configuration (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -304,7 +302,33 @@ def _ensure_store(path: Path) -> None:
                 last_journal_prefix_sha256 TEXT NOT NULL
             );
             """
-        )
+    )
+
+
+def _coverage_schema_definitions(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    return {
+        (str(row["type"]), str(row["name"])): " ".join(str(row["sql"]).split())
+        for row in conn.execute(
+            "SELECT type,name,sql FROM sqlite_master "
+            "WHERE name LIKE 'notification_coverage_%' AND sql IS NOT NULL"
+        ).fetchall()
+    }
+
+
+def _expected_coverage_schema() -> dict[tuple[str, str], str]:
+    with sqlite3.connect(":memory:") as expected:
+        expected.row_factory = sqlite3.Row
+        _create_coverage_schema(expected)
+        return _coverage_schema_definitions(expected)
+
+
+_EXPECTED_COVERAGE_SCHEMA = _expected_coverage_schema()
+
+
+def _ensure_store(path: Path) -> None:
+    with closing(_connect_coverage(path)) as conn, conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        _create_coverage_schema(conn)
         mismatched = _coverage_schema_definition_mismatches(conn)
         if mismatched:
             raise NotificationCoverageError(
@@ -621,70 +645,12 @@ def _baseline_attempt(
     return start, response
 
 
-_COVERAGE_SCHEMA_SQL_SHA256 = {
-    (
-        "table",
-        "notification_coverage_baseline",
-    ): "2be67c0ac5e81f5abe91564c8f3153e18df8620b65158becfdbc2cc52a427645",
-    (
-        "table",
-        "notification_coverage_configuration",
-    ): "2e77b1950562ea7779c5d68e56df90e675251d42d8049ddb30a013688269e937",
-    (
-        "table",
-        "notification_coverage_gaps",
-    ): "5ab43fea5d3c3a3d90e1139cd97893223a695f51cebd823f4747a7fcd347a1e0",
-    (
-        "table",
-        "notification_coverage_health",
-    ): "ef62de4776b612786be406d8003d17c723e64a76e9b39f1291028834cdd72e67",
-    (
-        "trigger",
-        "notification_coverage_baseline_no_delete",
-    ): "e3f3d95436698263c3c9e1426b590a557074ecc8c6664d045f2af52e42b7a4ed",
-    (
-        "trigger",
-        "notification_coverage_baseline_no_update",
-    ): "53b1691cb01ee381bb547ce0760cc691bfdc4529d911d8bfed195eeadb4e9814",
-    (
-        "trigger",
-        "notification_coverage_baseline_sequence",
-    ): "cc81a1c992a940e0be0f170e8e1fdbdf15d28a8bc562b2ef299c2a53c1bf3a2f",
-    (
-        "trigger",
-        "notification_coverage_configuration_no_delete",
-    ): "69b8ab433dd0f9f202ab4aa095798b2c53b147d5d42772637ca7ba591c2ceb9f",
-    (
-        "trigger",
-        "notification_coverage_configuration_no_update",
-    ): "fbf18dee0566067e6d3a253a87c4e1e39db94aa47e1dc35782851dd37014f2b8",
-    (
-        "trigger",
-        "notification_coverage_gaps_no_delete",
-    ): "1dfd8ef9e3b80245a9d5b4c1f28db8d90372a82c3c8fc30a1f04fda02f83cec1",
-    (
-        "trigger",
-        "notification_coverage_gaps_no_update",
-    ): "66b737c0c9b22017e4d78a49f217edde18b35f8a3b1e77ff5ef5f0312d7b46df",
-    (
-        "trigger",
-        "notification_coverage_gaps_sequence",
-    ): "56908813879a861a2122f55adaf5bcdaaeef6ec7ca4af17000bced2a09ab3c1a",
-}
-
-
 def _coverage_schema_definition_mismatches(conn: sqlite3.Connection) -> list[str]:
-    actual = {
-        (str(row["type"]), str(row["name"])): _sha256(" ".join(str(row["sql"]).split()).encode())
-        for row in conn.execute(
-            "SELECT type,name,sql FROM sqlite_master "
-            "WHERE name LIKE 'notification_coverage_%' AND sql IS NOT NULL"
-        ).fetchall()
-    }
+    actual = _coverage_schema_definitions(conn)
     return sorted(
         f"{kind}:{name}"
-        for kind, name in set(_COVERAGE_SCHEMA_SQL_SHA256) | set(actual)
-        if _COVERAGE_SCHEMA_SQL_SHA256.get((kind, name)) != actual.get((kind, name))
+        for kind, name in set(_EXPECTED_COVERAGE_SCHEMA) | set(actual)
+        if _EXPECTED_COVERAGE_SCHEMA.get((kind, name)) != actual.get((kind, name))
     )
 
 

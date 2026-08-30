@@ -82,8 +82,9 @@ After the reviewed merge is present on clean synced `main`, seal the boundary be
 waiting for the hidden autopilot to reload the new source:
 
 ```powershell
+$activationAtUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.ffffffZ")
 .\.venv\Scripts\python.exe -m insider_alerts.cli ops notification-journal-activate `
-  --activation-at-utc 2026-08-28T12:34:56.000000Z
+  --activation-at-utc $activationAtUtc
 ```
 
 Validate the transport journal without sending a notification:

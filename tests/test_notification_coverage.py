@@ -641,6 +641,8 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "insider_alerts.research.trial" not in worker + module
     assert "mode=ro" in module
     assert "PRAGMA query_only=ON" in module
+    assert "_EXPECTED_COVERAGE_SCHEMA = _expected_coverage_schema()" in module
+    assert "_COVERAGE_SCHEMA_SQL_SHA256" not in module
     assert "pythonw.exe" in installer
     assert "Insider Alerts Live Canary Worker" in installer
     assert "branch --show-current" in installer
@@ -650,6 +652,8 @@ def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:
     assert "$deploymentAction.Arguments -ne $expectedCanaryArguments" in installer
     assert "get_settings().database_path" in installer
     assert "$sourceDb -ne $effectiveSourceDb" in installer
+    assert "$effectiveSourceOutput = @(& $pythonConsole" in installer
+    assert "Out-String" not in installer
     assert "confined_notification_coverage_source(config)" in worker
     assert "-Hidden" in installer
     assert "-MultipleInstances IgnoreNew" in installer

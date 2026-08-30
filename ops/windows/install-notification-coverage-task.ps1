@@ -73,9 +73,13 @@ $settingsCommand = (
   "from insider_alerts.config import get_settings; " +
   "print(Path(get_settings().database_path).resolve())"
 )
-$effectiveSourceText = (& $pythonConsole -c $settingsCommand $repoRoot | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($effectiveSourceText)) {
+$effectiveSourceOutput = @(& $pythonConsole -c $settingsCommand $repoRoot)
+if ($LASTEXITCODE -ne 0 -or $effectiveSourceOutput.Count -ne 1) {
   throw "Could not resolve the live canary's effective source database."
+}
+$effectiveSourceText = ([string]$effectiveSourceOutput[0]).Trim()
+if ([string]::IsNullOrWhiteSpace($effectiveSourceText)) {
+  throw "The live canary's effective source database is empty."
 }
 $effectiveSourceDb = (Resolve-Path -LiteralPath $effectiveSourceText -ErrorAction Stop).Path
 if ($sourceDb -ne $effectiveSourceDb) {
