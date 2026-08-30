@@ -12,6 +12,8 @@ from insider_alerts.notify.ntfy import NtfyTransportEvent
 from insider_alerts.research.notification_coverage import (
     NotificationCoverageConfig,
     NotificationCoverageError,
+    _ensure_store,
+    _write_health,
     activate_notification_coverage,
     confined_notification_coverage_source,
     notification_coverage_status,
@@ -623,6 +625,67 @@ def test_status_rejects_stale_and_future_worker_health(tmp_path: Path) -> None:
     future = notification_coverage_status(config, now=now)
     assert future["valid"] is False
     assert "coverage_health_from_future" in future["integrity_errors"]
+
+
+def test_out_of_order_health_writer_preserves_newer_sequence_prefix_pairs(
+    tmp_path: Path,
+) -> None:
+    coverage_db = tmp_path / "notification_coverage.db"
+    _ensure_store(coverage_db)
+    _write_health(
+        coverage_db,
+        started_at="2026-08-30T00:00:02Z",
+        success_at="2026-08-30T00:00:02Z",
+        error=None,
+        post_ack_count=2,
+        current_gap_count=0,
+        source_sequence=2,
+        journal_sequence=4,
+        source_prefix_sha256="b" * 64,
+        journal_prefix_sha256="d" * 64,
+    )
+
+    _write_health(
+        coverage_db,
+        started_at="2026-08-30T00:00:01Z",
+        success_at="2026-08-30T00:00:01Z",
+        error=None,
+        post_ack_count=1,
+        current_gap_count=0,
+        source_sequence=1,
+        journal_sequence=2,
+        source_prefix_sha256="a" * 64,
+        journal_prefix_sha256="c" * 64,
+    )
+
+    with sqlite3.connect(coverage_db) as conn:
+        checkpoint = conn.execute(
+            "SELECT last_source_ack_sequence,last_source_prefix_sha256,"
+            "last_journal_sequence,last_journal_prefix_sha256 "
+            "FROM notification_coverage_health WHERE singleton=1"
+        ).fetchone()
+    assert checkpoint == (2, "b" * 64, 4, "d" * 64)
+
+    _write_health(
+        coverage_db,
+        started_at="2026-08-30T00:00:03Z",
+        success_at="2026-08-30T00:00:03Z",
+        error=None,
+        post_ack_count=3,
+        current_gap_count=0,
+        source_sequence=3,
+        journal_sequence=3,
+        source_prefix_sha256="e" * 64,
+        journal_prefix_sha256="f" * 64,
+    )
+
+    with sqlite3.connect(coverage_db) as conn:
+        independent_checkpoint = conn.execute(
+            "SELECT last_source_ack_sequence,last_source_prefix_sha256,"
+            "last_journal_sequence,last_journal_prefix_sha256 "
+            "FROM notification_coverage_health WHERE singleton=1"
+        ).fetchone()
+    assert independent_checkpoint == (3, "e" * 64, 4, "d" * 64)
 
 
 def test_worker_and_installer_are_order_incapable_hidden_and_strict() -> None:

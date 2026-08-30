@@ -1223,8 +1223,18 @@ def _write_health(
                 notification_coverage_health.last_journal_sequence,
                 excluded.last_journal_sequence
               ),
-              last_source_prefix_sha256=excluded.last_source_prefix_sha256,
-              last_journal_prefix_sha256=excluded.last_journal_prefix_sha256
+              last_source_prefix_sha256=CASE
+                WHEN excluded.last_source_ack_sequence>
+                     notification_coverage_health.last_source_ack_sequence
+                THEN excluded.last_source_prefix_sha256
+                ELSE notification_coverage_health.last_source_prefix_sha256
+              END,
+              last_journal_prefix_sha256=CASE
+                WHEN excluded.last_journal_sequence>
+                     notification_coverage_health.last_journal_sequence
+                THEN excluded.last_journal_prefix_sha256
+                ELSE notification_coverage_health.last_journal_prefix_sha256
+              END
             """,
             (
                 started_at,

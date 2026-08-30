@@ -107,11 +107,22 @@ and install the invisible monitor:
 
 The scheduled action is direct hidden `pythonw.exe`, runs once per minute with `IgnoreNew`, and
 records durable freshness/error health. Strict status exits nonzero for missing activation, stale
-execution, structural degradation, or any post-boundary gap. Rollback restores the preceding
-reviewed source but does not delete the immutable journal, acknowledgement, baseline, or gap
-records. The installer resolves the deployment checkout from `Insider Alerts Live Canary Worker`,
-requires its complete frozen command and effective settings source database to match, refuses any
-other worktree or a dirty/non-synced branch, and validates the sealed paths before task
-registration. Matching non-default journal and coverage paths may be supplied with
-`-JournalDatabase` and `-CoverageDatabase`; `-SourceDatabase` is accepted only when it resolves to
-the canary's effective source.
+execution, structural degradation, or any post-boundary gap. The installer resolves the deployment
+checkout from `Insider Alerts Live Canary Worker`, requires its complete frozen command and
+effective settings source database to match, refuses any other worktree or a dirty/non-synced
+branch, and validates the sealed paths before task registration. Matching non-default journal and
+coverage paths may be supplied with `-JournalDatabase` and `-CoverageDatabase`; `-SourceDatabase`
+is accepted only when it resolves to the canary's effective source.
+
+After coverage activation, rollback is compatibility-preserving and forward-only. Never deploy a
+preceding revision that lacks the delivery receipt, atomic `notification_delivery_acks` write,
+coverage schema initializer, or worker entry point: doing so would both break the scheduled target
+and create irreversible post-boundary custody gaps. Contain a monitor-only fault by disabling
+`Insider Alerts Notification Coverage` while leaving the deployed notification acknowledgement
+path intact; stale monitor health then remains explicit. Prepare a reviewed commit from the deployed
+revision that changes only the faulty behavior and preserves those compatibility surfaces, pass the
+normal PR gates, merge it to `main`, and deploy it by fast-forward. After either containment or that
+forward rollback, verify the live-canary action is unchanged, the coverage task is either
+deliberately disabled or still targets the retained `pythonw.exe` worker, no post-boundary gaps were
+added, and strict coverage status returns valid after the worker resumes. The immutable journal,
+acknowledgements, baseline, and gaps are never removed or rewritten.
