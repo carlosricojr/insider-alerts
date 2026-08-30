@@ -126,8 +126,8 @@ installer requires that runtime binding, a recent heartbeat, and the current che
 fingerprint all match; changing persisted configuration without restarting the producer therefore
 fails closed instead of silently monitoring a different database. Task replacement is
 transactional: the prior definition and enabled/running state are captured, the complete persisted
-action, triggers, principal, and settings are validated before `-Start`, and any failure restores
-the prior task (or removes a newly created one).
+action, triggers, principal SID (rather than its display-name spelling), and settings are validated
+before `-Start`, and any failure restores the prior task (or removes a newly created one).
 
 After coverage activation, rollback is compatibility-preserving and forward-only. Never deploy a
 preceding revision that lacks the delivery receipt, atomic `notification_delivery_acks` write,
