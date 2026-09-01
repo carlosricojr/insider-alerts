@@ -20,6 +20,7 @@ if ($IntervalMinutes -lt 1) {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "research-capture-task-action.ps1")
+. (Join-Path $scriptDir "research-path-validation.ps1")
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $alphaRootResolved = (Resolve-Path $AlphaRoot).Path
 $historyDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoryDatabase)) {
@@ -58,70 +59,9 @@ $pacingDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoricalPacingDataba
   [System.IO.Path]::GetFullPath((Join-Path $repoRoot $HistoricalPacingDatabase))
 }
 foreach ($databasePath in @($chainStorePath, $pacingDatabasePath)) {
-  if (-not $databasePath.StartsWith(
-    $researchPrefix,
-    [System.StringComparison]::OrdinalIgnoreCase
-  )) {
-    throw "Research option databases must remain beneath $researchRoot"
-  }
-  $databaseParent = Split-Path -Parent $databasePath
-  $cursor = $databaseParent
-  while (-not (Test-Path -LiteralPath $cursor)) {
-    if (-not $cursor.StartsWith(
-      $researchPrefix,
-      [System.StringComparison]::OrdinalIgnoreCase
-    )) {
-      throw "Research option database parent escaped $researchRoot"
-    }
-    $parent = Split-Path -Parent $cursor
-    if ($parent -eq $cursor) {
-      throw "Unable to prove research option database confinement for $databasePath"
-    }
-    $cursor = $parent
-  }
-  while ($true) {
-    $cursorItem = Get-Item -LiteralPath $cursor
-    if ($cursorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-      throw "Research option database parent cannot be a reparse point: $cursor"
-    }
-    if ($cursor.Equals($researchRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-      break
-    }
-    if (-not $cursor.StartsWith(
-      $researchPrefix,
-      [System.StringComparison]::OrdinalIgnoreCase
-    )) {
-      throw "Research option database parent escaped $researchRoot"
-    }
-    $parent = Split-Path -Parent $cursor
-    if ($parent -eq $cursor) {
-      throw "Unable to prove research option database confinement for $databasePath"
-    }
-    $cursor = $parent
-  }
-  New-Item -ItemType Directory -Path $databaseParent -Force | Out-Null
-  $cursor = $databaseParent
-  while ($true) {
-    $cursorItem = Get-Item -LiteralPath $cursor
-    if ($cursorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-      throw "Research option database parent cannot be a reparse point: $cursor"
-    }
-    if ($cursor.Equals($researchRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-      break
-    }
-    if (-not $cursor.StartsWith(
-      $researchPrefix,
-      [System.StringComparison]::OrdinalIgnoreCase
-    )) {
-      throw "Research option database parent escaped $researchRoot"
-    }
-    $cursor = Split-Path -Parent $cursor
-  }
-  if ((Test-Path -LiteralPath $databasePath) -and
-      ((Get-Item -LiteralPath $databasePath).Attributes -band
-       [System.IO.FileAttributes]::ReparsePoint)) {
-    throw "Research option database cannot be a reparse point: $databasePath"
-  }
+  Initialize-ResearchDatabaseParent `
+    -DatabasePath $databasePath `
+    -ResearchRoot $researchRoot
 }
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 $artifactRootItem = Get-Item -LiteralPath $artifactRoot
