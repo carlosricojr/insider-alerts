@@ -94,6 +94,14 @@ from insider_alerts.execution.canary import (
     status_report as live_canary_status_report,
 )
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
+from insider_alerts.execution.operational_alerts import (
+    DELIVERY_DEADLINE_SECONDS,
+    FailureKind,
+    OperationalIncidentTracker,
+    OperationalNotificationAction,
+    classify_operational_failure,
+    operational_incident_status,
+)
 from insider_alerts.execution.watchdog import append_watchdog_log, run_scheduled_task_watchdog
 from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
 from insider_alerts.notify.ntfy import NtfyNotificationError, NtfyNotifier, NtfyTransportEvent
@@ -4743,7 +4751,120 @@ def ops_live_canary(
         with path.open("a", encoding="utf-8") as handle:
             handle.write(message.rstrip() + "\n")
 
+    def report_operational_issue(message: str) -> None:
+        with contextlib.suppress(Exception):
+            typer.secho(message, fg=typer.colors.YELLOW, err=True)
+        with contextlib.suppress(Exception):
+            append_process_log(error_log_path, message)
+
+    incident_tracker: OperationalIncidentTracker | None = None
+    next_tracker_initialization_at = datetime.min.replace(tzinfo=UTC)
+
+    def ensure_incident_tracker(now: datetime) -> OperationalIncidentTracker | None:
+        nonlocal incident_tracker, next_tracker_initialization_at
+        if not notify:
+            return None
+        if incident_tracker is not None:
+            return incident_tracker
+        observed_at = now.astimezone(UTC)
+        if observed_at < next_tracker_initialization_at:
+            return None
+        try:
+            incident_tracker = OperationalIncidentTracker(config.ledger_db)
+        except Exception as exc:
+            next_tracker_initialization_at = observed_at + timedelta(minutes=1)
+            report_operational_issue(
+                "canary operational alert initialization isolated: "
+                f"{type(exc).__name__}"
+            )
+        return incident_tracker
+
     async def run() -> None:
+        operational_transitions: asyncio.Queue[tuple[FailureKind | None, datetime]] = (
+            asyncio.Queue()
+        )
+
+        async def deliver_operational(
+            tracker: OperationalIncidentTracker,
+            action: OperationalNotificationAction,
+        ) -> None:
+            try:
+                dispatch = await tracker.dispatch(settings, action)
+            except Exception as exc:
+                report_operational_issue(
+                    "canary operational dispatch isolated: " f"{type(exc).__name__}"
+                )
+                return
+            if dispatch.status == "failed":
+                report_operational_issue(
+                    "canary operational notification isolated: "
+                    f"{dispatch.error_kind or 'unknown'}"
+                )
+
+        def record_operational_transition(
+            failure_kind: FailureKind | None,
+            observed_at: datetime,
+        ) -> tuple[OperationalIncidentTracker, OperationalNotificationAction] | None:
+            transition_name = "recovery" if failure_kind is None else "outage"
+            try:
+                tracker = ensure_incident_tracker(observed_at)
+                if tracker is None:
+                    return None
+                action = (
+                    tracker.record_success(now=observed_at)
+                    if failure_kind is None
+                    else tracker.record_failure(failure_kind, now=observed_at)
+                )
+            except Exception as exc:
+                report_operational_issue(
+                    f"canary operational {transition_name} tracking isolated: "
+                    f"{type(exc).__name__}"
+                )
+                return None
+            return (tracker, action) if action is not None else None
+
+        async def process_operational_batch(
+            batch: list[tuple[FailureKind | None, datetime]],
+        ) -> None:
+            try:
+                actions = [
+                    recorded
+                    for transition in batch
+                    if (recorded := record_operational_transition(*transition)) is not None
+                ]
+                for tracker, action in actions:
+                    await deliver_operational(tracker, action)
+            finally:
+                for _ in batch:
+                    operational_transitions.task_done()
+
+        async def process_operational_transitions() -> None:
+            while True:
+                batch = [await operational_transitions.get()]
+                while True:
+                    try:
+                        batch.append(operational_transitions.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                await process_operational_batch(batch)
+
+        operational_processor = (
+            asyncio.create_task(process_operational_transitions())
+            if notify and loop
+            else None
+        )
+
+        async def submit_operational_transition(failure_kind: FailureKind | None) -> None:
+            transition = (failure_kind, datetime.now(UTC))
+            if not notify:
+                return
+            if loop:
+                operational_transitions.put_nowait(transition)
+                return
+            recorded = record_operational_transition(*transition)
+            if recorded is not None:
+                await deliver_operational(*recorded)
+
         try:
             while True:
                 if runner.source_revision_changed():
@@ -4759,6 +4880,7 @@ def ops_live_canary(
                     result_line = json.dumps(asdict(result), sort_keys=True)
                     typer.echo(result_line)
                     append_process_log(output_log_path, result_line)
+                    await submit_operational_transition(None)
                     if notifier is not None and any(
                         (
                             result.live_submitted,
@@ -4795,12 +4917,27 @@ def ops_live_canary(
                         err=True,
                     )
                     append_process_log(error_log_path, f"live canary cycle failed closed: {exc}")
+                    await submit_operational_transition(classify_operational_failure(exc))
                     if not loop:
                         raise typer.Exit(code=1) from exc
                 if not loop:
                     return
                 await asyncio.sleep(poll_delay_seconds(config, datetime.now(UTC)))
         finally:
+            if operational_processor is not None:
+                try:
+                    await asyncio.wait_for(
+                        operational_transitions.join(),
+                        timeout=2 * DELIVERY_DEADLINE_SECONDS + 1,
+                    )
+                except TimeoutError:
+                    report_operational_issue(
+                        "canary operational shutdown drain timed out; "
+                        "remaining state will reconcile on restart"
+                    )
+                finally:
+                    operational_processor.cancel()
+                    await asyncio.gather(operational_processor, return_exceptions=True)
             runner.broker.disconnect()
 
     asyncio.run(run())
@@ -4815,7 +4952,9 @@ def ops_live_canary_status(
 ) -> None:
     """Show canary state without connecting to IBKR or changing broker state."""
 
-    typer.echo(json.dumps(live_canary_status_report(str(ledger_path)), indent=2, sort_keys=True))
+    report = live_canary_status_report(str(ledger_path))
+    report["operational_incidents"] = operational_incident_status(ledger_path)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
 
 @ops_app.command("notification-journal-activate")
