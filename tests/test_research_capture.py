@@ -887,6 +887,105 @@ def test_reclaimed_preupgrade_partial_attempt_uses_a_new_append_only_number(
         ).fetchone() == ("complete", 2, "f" * 64)
 
 
+def test_final_preupgrade_partial_attempt_reconciles_existing_evidence_without_recapture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    captures = 0
+
+    def capture_once(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        nonlocal captures
+        captures += 1
+        return None, None, None, "OPTION_CAPTURE_UNAVAILABLE", "fixture", False
+
+    monkeypatch.setattr(capture_module, "_capture_options", capture_once)
+    first = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+    assert first.status == "completed"
+    with sqlite3.connect(source_db) as conn:
+        conn.execute("DROP TRIGGER research_capture_complete_immutable")
+        for attempt_number in (2, 3):
+            conn.execute(
+                "INSERT INTO research_capture_attempts("
+                "job_id,attempt_number,started_at_utc,finished_at_utc,status,"
+                "error_kind,error_message,retryable) "
+                "SELECT job_id,?,?,?,'retry','PREUPGRADE_PARTIAL','fixture',1 "
+                "FROM research_capture_jobs",
+                (
+                    attempt_number,
+                    capture_module.utc_text(decision_at + timedelta(seconds=attempt_number)),
+                    capture_module.utc_text(
+                        decision_at + timedelta(seconds=attempt_number, milliseconds=1)
+                    ),
+                ),
+            )
+        conn.execute(
+            "UPDATE research_capture_jobs SET status='leased',attempt_count=3,"
+            "lease_owner='preupgrade-worker',lease_expires_at_utc=?,record_sha256=NULL",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)),),
+        )
+    ensure_review_tables(str(source_db))
+
+    recovered = run_capture_once(config, now=decision_at + timedelta(seconds=6))
+
+    assert recovered.status == "completed"
+    assert recovered.option_status == "recovered_existing"
+    assert recovered.snapshot_sha256 == first.snapshot_sha256
+    assert captures == 1
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,attempt_count,record_sha256 FROM research_capture_jobs"
+        ).fetchone() == ("complete", 3, first.snapshot_sha256)
+        assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone() == (3,)
+
+
+def test_final_preupgrade_partial_attempt_without_evidence_fails_without_recapture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
+        for attempt_number in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO research_capture_attempts("
+                "job_id,attempt_number,started_at_utc,finished_at_utc,status,"
+                "error_kind,error_message,retryable) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    attempt_number,
+                    capture_module.utc_text(decision_at + timedelta(seconds=attempt_number)),
+                    capture_module.utc_text(
+                        decision_at + timedelta(seconds=attempt_number, milliseconds=1)
+                    ),
+                    "retry",
+                    "PREUPGRADE_PARTIAL",
+                    "fixture",
+                    1,
+                ),
+            )
+        conn.execute(
+            "UPDATE research_capture_jobs SET status='leased',attempt_count=3,"
+            "lease_owner='preupgrade-worker',lease_expires_at_utc=?",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)),),
+        )
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: pytest.fail("must not recapture"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=6))
+
+    assert result.status == "failed"
+    assert result.option_status == "CAPTURE_ATTEMPTS_EXHAUSTED"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,attempt_count,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("failed", 3, "CAPTURE_ATTEMPTS_EXHAUSTED")
+        assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone() == (3,)
+
+
 def test_lease_ownership_is_rechecked_before_immutable_snapshot_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1646,6 +1745,33 @@ def test_content_address_fsync_failure_removes_staging_file(
     assert list(option_root.iterdir()) == []
 
 
+def test_content_address_fdopen_failure_removes_created_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    original_fdopen = capture_module.os.fdopen
+
+    def fail_fdopen(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        capture_module.os.close(descriptor)
+        raise OSError("simulated fdopen failure")
+
+    monkeypatch.setattr(capture_module.os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+            capture_module._publish_content_addressed(
+                option_root,
+                b"payload",
+                suffix=".json",
+                research_root=research_root,
+            )
+    finally:
+        monkeypatch.setattr(capture_module.os, "fdopen", original_fdopen)
+
+    assert list(option_root.iterdir()) == []
+
+
 def test_option_staging_cleanup_failure_is_persisted_as_typed_missingness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2139,6 +2265,41 @@ def test_artifact_root_escape_is_rejected_before_any_child_launch(
         match="artifact root escaped",
     ):
         run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+
+def test_alpha_runtime_reparse_ancestor_is_rejected_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    base = _config(tmp_path, source_db)
+    runtime = tmp_path / "linked-alpha"
+    scripts = runtime / "scripts"
+    outside_venv = tmp_path / "outside-venv"
+    scripts.mkdir(parents=True)
+    (outside_venv / "Scripts").mkdir(parents=True)
+    (scripts / "capture.py").write_text("# live\n", encoding="utf-8")
+    (scripts / "historical.py").write_text("# historical\n", encoding="utf-8")
+    (outside_venv / "Scripts" / "python.exe").write_bytes(b"python")
+    try:
+        (runtime / ".venv").symlink_to(outside_venv, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    config = replace(
+        base,
+        alpha_python=runtime / ".venv" / "Scripts" / "python.exe",
+        alpha_script=scripts / "capture.py",
+        alpha_historical_script=scripts / "historical.py",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RUNTIME_INVALID"
 
 
 def test_artifact_root_reparse_point_is_rejected_before_child_launch(
@@ -2655,6 +2816,59 @@ if (Test-Path -LiteralPath (Join-Path $env:OUTSIDE_ROOT 'nested')) { exit 8 }
     assert not (outside / "nested").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_research_runtime_validation_rejects_junction_ancestor(tmp_path: Path) -> None:
+    helper = ROOT / "ops/windows/research-path-validation.ps1"
+    checkout = tmp_path / "checkout"
+    outside = tmp_path / "outside-runtime"
+    junction = checkout / ".venv"
+    checkout.mkdir()
+    (outside / "Scripts").mkdir(parents=True)
+    executable = outside / "Scripts" / "python.exe"
+    executable.write_bytes(b"python")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH_HELPER": str(helper),
+            "CHECKOUT_ROOT": str(checkout),
+            "OUTSIDE_ROOT": str(outside),
+            "JUNCTION_PATH": str(junction),
+            "RUNTIME_PATH": str(junction / "Scripts" / "python.exe"),
+        }
+    )
+    command = """
+New-Item -ItemType Junction -Path $env:JUNCTION_PATH -Target $env:OUTSIDE_ROOT | Out-Null
+. $env:PATH_HELPER
+try {
+  Assert-ResearchRuntimePath `
+    -Path $env:RUNTIME_PATH `
+    -CheckoutRoot $env:CHECKOUT_ROOT
+  exit 9
+} catch {
+  if ($_.Exception.Message -notlike '*reparse point*') { throw }
+}
+exit 0
+"""
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     installer = (ROOT / "ops/windows/install-research-capture-task.ps1").read_text(encoding="utf-8")
 
@@ -2663,6 +2877,7 @@ def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     assert "capture_insider_historical_option_evidence.py" in installer
     assert '. (Join-Path $scriptDir "research-capture-task-action.ps1")' in installer
     assert '. (Join-Path $scriptDir "research-path-validation.ps1")' in installer
+    assert "Assert-ResearchRuntimePath -Path $path" in installer
     assert "-ArtifactRoot $artifactRoot" in installer
     assert "-Execute $actionSpec.Execute" in installer
     assert "-Argument $actionSpec.Argument" in installer

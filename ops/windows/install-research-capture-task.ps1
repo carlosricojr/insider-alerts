@@ -22,7 +22,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "research-capture-task-action.ps1")
 . (Join-Path $scriptDir "research-path-validation.ps1")
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
-$alphaRootResolved = (Resolve-Path $AlphaRoot).Path
+$alphaRootResolved = [System.IO.Path]::GetFullPath($AlphaRoot)
 $historyDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoryDatabase)) {
   $HistoryDatabase
 } else {
@@ -91,6 +91,12 @@ foreach ($path in @(
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     throw "Missing required capture executable or script at $path"
   }
+}
+foreach ($path in @($pythonExe, $validationPython)) {
+  Assert-ResearchRuntimePath -Path $path -CheckoutRoot $repoRoot
+}
+foreach ($path in @($alphaPython, $alphaScript, $alphaHistoricalScript)) {
+  Assert-ResearchRuntimePath -Path $path -CheckoutRoot $alphaRootResolved
 }
 
 $validationOutput = & $validationPython `

@@ -206,6 +206,19 @@ def _is_reparse_point(path: Path) -> bool:
     return path.is_symlink() or bool(reparse_flag and attributes & reparse_flag)
 
 
+def _reject_reparse_path(path: Path, *, root: Path, label: str) -> None:
+    lexical_root = Path(os.path.abspath(root))
+    lexical_path = Path(os.path.abspath(path))
+    if not lexical_path.is_relative_to(lexical_root):
+        raise OptionRuntimeValidationError(f"{label} escaped its configured checkout")
+    cursor = lexical_root
+    for part in (".", *lexical_path.relative_to(lexical_root).parts):
+        if part != ".":
+            cursor /= part
+        if _is_reparse_point(cursor):
+            raise OptionRuntimeValidationError(f"{label} contains a reparse point")
+
+
 def _confined_research_db(path: Path, *, research_root: Path) -> Path:
     lexical_root = Path(os.path.abspath(research_root))
     lexical_path = Path(os.path.abspath(path))
@@ -517,6 +530,19 @@ def _locked_artifact_directory_under_mutex(
 
 
 def _validated_option_runtime(config: CaptureConfig) -> _ValidatedOptionRuntime:
+    lexical_python = Path(os.path.abspath(config.alpha_python))
+    lexical_script = Path(os.path.abspath(config.alpha_script))
+    lexical_historical_script = Path(os.path.abspath(config.alpha_historical_script))
+    lexical_runtime_root = lexical_script.parent.parent
+    lexical_scripts_root = lexical_runtime_root / "scripts"
+    if (
+        lexical_script.parent != lexical_scripts_root
+        or lexical_historical_script.parent != lexical_scripts_root
+        or lexical_python != lexical_runtime_root / ".venv" / "Scripts" / "python.exe"
+    ):
+        raise OptionRuntimeValidationError("alpha runtime paths do not belong to one checkout")
+    for path in (lexical_python, lexical_script, lexical_historical_script):
+        _reject_reparse_path(path, root=lexical_runtime_root, label="alpha runtime path")
     try:
         if _is_reparse_point(config.source_db):
             raise OptionRuntimeValidationError("source database cannot be a reparse point")
@@ -704,12 +730,7 @@ def _claim_job(
             """
             SELECT * FROM research_capture_jobs
             WHERE ((status IN ('pending', 'retry') AND attempt_count < ?)
-               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?
-                   AND (attempt_count < ? OR NOT EXISTS (
-                       SELECT 1 FROM research_capture_attempts attempts
-                       WHERE attempts.job_id = research_capture_jobs.job_id
-                         AND attempts.attempt_number = research_capture_jobs.attempt_count
-                   ))))
+               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?))
             ORDER BY decision_at_utc, job_id
             LIMIT 100
             """,
@@ -717,7 +738,6 @@ def _claim_job(
                 config.max_attempts,
                 config.max_attempts,
                 utc_text(now),
-                config.max_attempts,
             ),
         ).fetchall()
         selected: sqlite3.Row | None = None
@@ -739,7 +759,8 @@ def _claim_job(
         ).fetchone()
         attempt_count = (
             previous_attempt_count + 1
-            if str(selected["status"]) != "leased" or existing_attempt is not None
+            if str(selected["status"]) != "leased"
+            or (existing_attempt is not None and previous_attempt_count < config.max_attempts)
             else previous_attempt_count
         )
         cursor = conn.execute(
@@ -844,6 +865,54 @@ def _renew_job_lease(config: CaptureConfig, job: CaptureJob, *, now: datetime) -
             (
                 utc_text(now + timedelta(seconds=config.lease_seconds)),
                 utc_text(now),
+                job.job_id,
+                job.lease_owner,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"lost lease for capture job {job.job_id}")
+
+
+def _attempt_exists(config: CaptureConfig, job: CaptureJob) -> bool:
+    with _connect(config.source_db, write=False) as conn:
+        return (
+            conn.execute(
+                "SELECT 1 FROM research_capture_attempts WHERE job_id=? AND attempt_number=?",
+                (job.job_id, job.attempt_count),
+            ).fetchone()
+            is not None
+        )
+
+
+def _finish_job_without_new_attempt(
+    config: CaptureConfig,
+    job: CaptureJob,
+    *,
+    finished_at: datetime,
+    job_state: str,
+    error_kind: str | None,
+    error_message: str | None,
+    record_sha256: str | None = None,
+) -> None:
+    with _connect(config.source_db, write=True) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_capture_jobs
+            SET status=?, lease_owner=NULL, lease_expires_at_utc=NULL, updated_at_utc=?,
+                last_error_kind=?, last_error_message=?, record_sha256=?
+            WHERE job_id=? AND status='leased' AND lease_owner=?
+              AND EXISTS (
+                  SELECT 1 FROM research_capture_attempts attempts
+                  WHERE attempts.job_id = research_capture_jobs.job_id
+                    AND attempts.attempt_number = research_capture_jobs.attempt_count
+              )
+            """,
+            (
+                job_state,
+                utc_text(finished_at),
+                error_kind,
+                error_message[:MAX_ERROR_LENGTH] if error_message else None,
+                record_sha256,
                 job.job_id,
                 job.lease_owner,
             ),
@@ -983,15 +1052,29 @@ def _publish_content_addressed_locked(
         if destination.read_bytes() != data:
             raise ArtifactPublicationError(f"content-address collision at {destination}")
         return destination, digest
-    staging = root / f".{digest}.{os.getpid()}.tmp"
+    staging = root / f".{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     staging_created = False
     primary_error: BaseException | None = None
     try:
-        with staging.open("xb") as handle:
-            staging_created = True
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        descriptor = os.open(
+            staging,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        staging_created = True
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
         os.link(staging, destination)
     except FileExistsError as exc:
         try:
@@ -2291,19 +2374,31 @@ def _process_claimed_job(
     started = datetime.now(UTC)
     timer = monotonic()
     existing_sha = _existing_snapshot_sha(config.evidence_db, job.job_id)
+    existing_attempt = _attempt_exists(config, job)
     if existing_sha is not None:
-        _finish_job_attempt(
-            config,
-            job,
-            started_at=started,
-            finished_at=started,
-            attempt_status="completed",
-            job_state="complete",
-            error_kind=None,
-            error_message=None,
-            retryable=False,
-            record_sha256=existing_sha,
-        )
+        if existing_attempt:
+            _finish_job_without_new_attempt(
+                config,
+                job,
+                finished_at=started,
+                job_state="complete",
+                error_kind=None,
+                error_message=None,
+                record_sha256=existing_sha,
+            )
+        else:
+            _finish_job_attempt(
+                config,
+                job,
+                started_at=started,
+                finished_at=started,
+                attempt_status="completed",
+                job_state="complete",
+                error_kind=None,
+                error_message=None,
+                retryable=False,
+                record_sha256=existing_sha,
+            )
         _heartbeat(config, now=started, result="recovered_existing", job_id=job.job_id)
         return CaptureResult(
             status="completed",
@@ -2311,6 +2406,19 @@ def _process_claimed_job(
             snapshot_sha256=existing_sha,
             option_status="recovered_existing",
         )
+    if existing_attempt and job.attempt_count >= config.max_attempts:
+        exhaustion_kind = "CAPTURE_ATTEMPTS_EXHAUSTED"
+        exhaustion_message = "capture attempts exhausted before finalization"
+        _finish_job_without_new_attempt(
+            config,
+            job,
+            finished_at=started,
+            job_state="failed",
+            error_kind=exhaustion_kind,
+            error_message=exhaustion_message,
+        )
+        _heartbeat(config, now=started, result="failed", job_id=job.job_id)
+        return CaptureResult(status="failed", job_id=job.job_id, option_status=exhaustion_kind)
     deadline = job.decision_at + timedelta(seconds=config.capture_deadline_seconds)
     option_artifact: dict[str, Any] | None
     option_path: Path | None

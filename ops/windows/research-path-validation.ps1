@@ -76,3 +76,50 @@ function Initialize-ResearchDatabaseParent {
     throw "Research option database cannot be a reparse point: $databaseFull"
   }
 }
+
+function Assert-ResearchRuntimePath {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$CheckoutRoot
+  )
+
+  $rootFull = [System.IO.Path]::GetFullPath($CheckoutRoot).TrimEnd('\')
+  $pathFull = [System.IO.Path]::GetFullPath($Path)
+  $rootPrefix = $rootFull + '\'
+  if (-not $pathFull.StartsWith(
+    $rootPrefix,
+    [System.StringComparison]::OrdinalIgnoreCase
+  )) {
+    throw "Research runtime path escaped its configured checkout: $pathFull"
+  }
+
+  $cursor = $pathFull
+  $isLeaf = $true
+  while ($true) {
+    if (-not (Test-Path -LiteralPath $cursor)) {
+      throw "Research runtime path is unavailable: $cursor"
+    }
+    $item = Get-Item -LiteralPath $cursor -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      throw "Research runtime path cannot contain a reparse point: $cursor"
+    }
+    if ($isLeaf -and $item.PSIsContainer) {
+      throw "Research runtime executable or script must be a regular file: $pathFull"
+    }
+    if (-not $isLeaf -and -not $item.PSIsContainer) {
+      throw "Research runtime ancestor must be a regular directory: $cursor"
+    }
+    if ($cursor.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+      break
+    }
+    $parent = Split-Path -Parent $cursor
+    if ($parent -eq $cursor -or -not $parent.StartsWith(
+      $rootFull,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+      throw "Unable to prove research runtime confinement for $pathFull"
+    }
+    $cursor = $parent
+    $isLeaf = $false
+  }
+}

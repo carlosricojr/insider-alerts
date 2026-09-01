@@ -67,4 +67,4 @@ jobs:
           pip install -e .[dev]
 
       - name: Windows research boundary tests
-        run: pytest tests/test_research_capture.py
+        run: pytest tests/test_research_capture.py tests/test_windows_job.py
