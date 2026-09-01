@@ -5,7 +5,9 @@ import json
 import os
 import sqlite3
 import subprocess
-from contextlib import closing
+import sys
+import time
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -702,6 +704,87 @@ def test_terminal_option_failure_is_persisted_as_valid_immutable_snapshot(
     assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {"error": 1}
 
 
+def test_capture_mutex_is_acquired_before_the_job_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    entries = 0
+
+    @contextmanager
+    def assert_prelease_mutex(_research_root: Path, **_kwargs: Any) -> Any:
+        nonlocal entries
+        entries += 1
+        if entries == 1:
+            with sqlite3.connect(source_db) as conn:
+                assert conn.execute(
+                    "SELECT status FROM research_capture_jobs"
+                ).fetchone() == ("pending",)
+        yield
+
+    monkeypatch.setattr(capture_module, "_artifact_process_mutex", assert_prelease_mutex)
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (
+            None,
+            None,
+            None,
+            "OPTION_RUNTIME_INVALID",
+            "test boundary",
+            False,
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert entries >= 2
+
+
+def test_expired_worker_cannot_finalize_a_reclaimed_lease(tmp_path: Path) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    window = CaptureWindow(
+        status="active",
+        policy_sha256=_policy_sha(config),
+        activated_at=datetime(2000, 1, 1, tzinfo=UTC),
+        deadline=datetime(2100, 1, 1, tzinfo=UTC),
+    )
+    first = capture_module._claim_job(
+        config,
+        worker_id="worker-one",
+        now=decision_at + timedelta(seconds=2),
+        window=window,
+    )
+    assert first is not None
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "UPDATE research_capture_jobs SET lease_expires_at_utc=?",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)),),
+        )
+    second = capture_module._claim_job(
+        config,
+        worker_id="worker-two",
+        now=decision_at + timedelta(seconds=3),
+        window=window,
+    )
+    assert second is not None
+
+    with pytest.raises(RuntimeError, match="lost lease"):
+        capture_module._set_job_state(
+            config,
+            first,
+            state="failed",
+            now=decision_at + timedelta(seconds=4),
+        )
+
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,lease_owner FROM research_capture_jobs"
+        ).fetchone() == ("leased", "worker-two")
+
+
 def test_evidence_store_migrates_legacy_status_rows_without_rewriting_them(
     tmp_path: Path,
 ) -> None:
@@ -1059,7 +1142,7 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
     def successful_process(command: list[str], **kwargs: Any) -> ProcessResult:
         output = Path(command[command.index("--output") + 1])
         assert output.is_absolute()
-        assert output.parent == expected_artifact_root / ".staging"
+        assert output.parent.resolve() == expected_artifact_root / ".staging"
         assert output.parent.is_dir()
         assert kwargs["cwd"] == config.alpha_script.parent.parent.resolve()
         request_id = command[command.index("--request-id") + 1]
@@ -1140,6 +1223,83 @@ def test_option_publication_directory_cannot_be_swapped_after_validation(
     assert observation["status"] == "captured"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative contract")
+def test_posix_artifact_access_remains_bound_to_the_validated_directory(
+    tmp_path: Path,
+) -> None:
+    research_root = tmp_path / "research"
+    artifact_root = research_root / "artifacts"
+    outside = tmp_path / "outside"
+    artifact_root.mkdir(parents=True)
+    outside.mkdir()
+
+    with capture_module._locked_artifact_directory(
+        artifact_root, research_root=research_root
+    ) as locked:
+        original = artifact_root.with_name("artifacts-original")
+        artifact_root.rename(original)
+        artifact_root.symlink_to(outside, target_is_directory=True)
+        (locked / "bound.txt").write_text("bound", encoding="utf-8")
+
+    assert (original / "bound.txt").read_text(encoding="utf-8") == "bound"
+    assert not (outside / "bound.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows named-mutex contract")
+def test_windows_artifact_mutex_serializes_independent_processes(tmp_path: Path) -> None:
+    research_root = tmp_path / "research"
+    research_root.mkdir()
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    acquired = tmp_path / "acquired"
+    holder_code = (
+        "import sys,time; from pathlib import Path; "
+        "from insider_alerts.research.capture import _artifact_process_mutex; "
+        "root,ready,release=map(Path,sys.argv[1:4]); "
+        "cm=_artifact_process_mutex(root,timeout_seconds=10); cm.__enter__(); "
+        "ready.write_text('ready'); "
+        "deadline=time.monotonic()+10; "
+        "exec('while not release.exists() and time.monotonic() < deadline:\\n "
+        "time.sleep(0.05)'); cm.__exit__(None,None,None)"
+    )
+    waiter_code = (
+        "import sys; from pathlib import Path; "
+        "from insider_alerts.research.capture import _artifact_process_mutex; "
+        "root,acquired=map(Path,sys.argv[1:3]); "
+        "cm=_artifact_process_mutex(root,timeout_seconds=10); cm.__enter__(); "
+        "acquired.write_text('acquired'); cm.__exit__(None,None,None)"
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(research_root), str(ready), str(release)],
+        creationflags=flags,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready.exists()
+        waiter = subprocess.Popen(
+            [sys.executable, "-c", waiter_code, str(research_root), str(acquired)],
+            creationflags=flags,
+        )
+        try:
+            time.sleep(0.5)
+            assert not acquired.exists()
+            release.write_text("release", encoding="utf-8")
+            assert waiter.wait(timeout=5) == 0
+            assert acquired.read_text(encoding="utf-8") == "acquired"
+        finally:
+            if waiter.poll() is None:
+                waiter.kill()
+                waiter.wait(timeout=5)
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if holder.poll() is None:
+            holder.wait(timeout=5)
+    assert holder.returncode == 0
+
+
 def test_option_publication_failure_is_persisted_as_typed_missingness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1181,6 +1341,47 @@ def test_option_publication_failure_is_persisted_as_typed_missingness(
     observation = record["payload"]["observations"]["options_surface"]
     assert observation["status"] == "error"
     assert observation["error"]["kind"] == "OPTION_ARTIFACT_PUBLICATION_FAILED"
+
+
+def test_option_staging_cleanup_failure_is_persisted_as_typed_missingness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        output.write_text(
+            json.dumps(_live_option_artifact(request_id=request_id)),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    original_unlink = Path.unlink
+    staging_unlinks = 0
+
+    def fail_final_staging_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal staging_unlinks
+        if path.parent.name == ".staging" and path.suffix == ".json":
+            staging_unlinks += 1
+            if staging_unlinks == 2:
+                raise PermissionError("simulated locked staging output")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    monkeypatch.setattr(Path, "unlink", fail_final_staging_cleanup)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_STAGING_CLEANUP_FAILED"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "error"
+    assert observation["error"]["kind"] == "OPTION_STAGING_CLEANUP_FAILED"
 
 
 def test_exact_no_chain_result_is_persisted_as_not_applicable_without_error(
@@ -1417,7 +1618,7 @@ def test_closed_venue_uses_one_cutoff_bound_historical_fallback(
         calls.append((command, int(kwargs["timeout_seconds"])))
         output = Path(command[command.index("--output") + 1])
         assert output.is_absolute()
-        assert output.parent == expected_artifact_root / ".staging"
+        assert output.parent.resolve() == expected_artifact_root / ".staging"
         assert kwargs["cwd"] == config.alpha_script.parent.parent.resolve()
         if command[1] == str(config.alpha_script):
             return ProcessResult(
@@ -2079,3 +2280,10 @@ def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     ancestor_validation = installer.index("Research artifact ancestor cannot be a reparse point")
     artifact_creation = installer.index("New-Item -ItemType Directory -Path $artifactRoot")
     assert ancestor_validation < artifact_creation
+    database_validation = installer.index(
+        "Research option database parent cannot be a reparse point"
+    )
+    database_parent_creation = installer.index(
+        "New-Item -ItemType Directory -Path $databaseParent"
+    )
+    assert database_validation < database_parent_creation

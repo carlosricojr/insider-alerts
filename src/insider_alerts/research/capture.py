@@ -148,6 +148,7 @@ class CaptureJob:
     source_first_observed_at: datetime
     decision_at: datetime
     attempt_count: int
+    lease_owner: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -280,7 +281,9 @@ def _confined_artifact_subdirectory(artifact_root: Path, name: str) -> Path:
 
 
 @contextmanager
-def _artifact_process_mutex(research_root: Path) -> Iterator[None]:
+def _artifact_process_mutex(
+    research_root: Path, *, timeout_seconds: int = 180
+) -> Iterator[None]:
     if os.name != "nt":
         yield
         return
@@ -311,7 +314,7 @@ def _artifact_process_mutex(research_root: Path) -> Iterator[None]:
         )
     acquired = False
     try:
-        wait_result = int(wait_for_single_object(handle, 180_000))
+        wait_result = int(wait_for_single_object(handle, timeout_seconds * 1_000))
         if wait_result not in {0x00000000, 0x00000080}:
             if wait_result == 0x00000102:
                 raise OptionRuntimeValidationError("artifact process mutex timed out")
@@ -343,7 +346,28 @@ def _locked_artifact_directory_under_mutex(
 
     verified = _confined_artifact_root(path, research_root=research_root)
     if os.name != "nt":
-        yield verified
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            directory_fd = os.open(verified, flags)
+        except OSError as exc:
+            raise OptionRuntimeValidationError(
+                f"artifact directory could not be pinned: {verified}"
+            ) from exc
+        try:
+            opened = os.fstat(directory_fd)
+            current = os.stat(verified, follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise OptionRuntimeValidationError(
+                    f"artifact directory changed during validation: {verified}"
+                )
+            descriptor_path = Path(f"/proc/self/fd/{directory_fd}")
+            if not descriptor_path.is_dir():
+                raise OptionRuntimeValidationError(
+                    "handle-relative artifact access is unavailable on this platform"
+                )
+            yield descriptor_path
+        finally:
+            os.close(directory_fd)
         return
 
     import ctypes
@@ -663,6 +687,7 @@ def _claim_job(
             source_first_observed_at=parse_utc(str(selected["source_first_observed_at_utc"])),
             decision_at=parse_utc(str(selected["decision_at_utc"])),
             attempt_count=attempt_count,
+            lease_owner=worker_id,
         )
 
 
@@ -714,7 +739,7 @@ def _set_job_state(
             UPDATE research_capture_jobs
             SET status=?, lease_owner=NULL, lease_expires_at_utc=NULL, updated_at_utc=?,
                 last_error_kind=?, last_error_message=?, record_sha256=?
-            WHERE job_id=? AND status='leased'
+            WHERE job_id=? AND status='leased' AND lease_owner=?
             """,
             (
                 state,
@@ -723,6 +748,26 @@ def _set_job_state(
                 error_message[:MAX_ERROR_LENGTH] if error_message else None,
                 record_sha256,
                 job.job_id,
+                job.lease_owner,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"lost lease for capture job {job.job_id}")
+
+
+def _renew_job_lease(config: CaptureConfig, job: CaptureJob, *, now: datetime) -> None:
+    with _connect(config.source_db, write=True) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE research_capture_jobs
+            SET lease_expires_at_utc=?, updated_at_utc=?
+            WHERE job_id=? AND status='leased' AND lease_owner=?
+            """,
+            (
+                utc_text(now + timedelta(seconds=config.lease_seconds)),
+                utc_text(now),
+                job.job_id,
+                job.lease_owner,
             ),
         )
         if cursor.rowcount != 1:
@@ -762,10 +807,19 @@ def _kill_process_tree(process: subprocess.Popen[str], *, platform: str = os.nam
         ) from exc
 
 
-def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -> ProcessResult:
+def run_hidden_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    pass_fds: tuple[int, ...] = (),
+) -> ProcessResult:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if os.name == "nt":
         flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    popen_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        popen_kwargs["pass_fds"] = pass_fds
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -773,6 +827,7 @@ def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -
         stderr=subprocess.PIPE,
         text=True,
         creationflags=flags,
+        **popen_kwargs,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
@@ -797,11 +852,25 @@ def _publish_content_addressed(
 ) -> tuple[Path, str]:
     try:
         with _locked_artifact_directory(root, research_root=research_root) as locked_root:
-            return _publish_content_addressed_locked(locked_root, data, suffix=suffix)
+            destination, digest = _publish_content_addressed_locked(
+                locked_root, data, suffix=suffix
+            )
+            return root / destination.name, digest
     except OptionRuntimeValidationError as exc:
         raise ArtifactPublicationError(f"content-address root is invalid: {root}") from exc
     except OSError as exc:
         raise ArtifactPublicationError(f"content-address publication failed: {root}") from exc
+
+
+def _inherited_descriptor_for(path: Path) -> tuple[int, ...]:
+    if os.name == "nt" or path.parent.parent != Path("/proc/self/fd"):
+        return ()
+    try:
+        descriptor = int(path.parent.name)
+        os.fstat(descriptor)
+    except (OSError, ValueError) as exc:
+        raise OptionRuntimeValidationError("staging directory handle is unavailable") from exc
+    return (descriptor,)
 
 
 def _publish_content_addressed_locked(
@@ -980,7 +1049,41 @@ def _capture_options_with_runtime(
 ) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
     staging_dir = runtime.staging_root
     output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.{job.attempt_count}.json"
-    output.unlink(missing_ok=True)
+    try:
+        with _managed_staging_output(output):
+            return _capture_options_with_managed_output(config, job, runtime, output=output)
+    except ArtifactPublicationError as exc:
+        return None, None, None, "OPTION_STAGING_CLEANUP_FAILED", str(exc), False
+
+
+@contextmanager
+def _managed_staging_output(path: Path) -> Iterator[Path]:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ArtifactPublicationError(f"staging cleanup failed: {path}") from exc
+    try:
+        yield path
+    except BaseException as exc:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            exc.add_note(f"staging cleanup also failed: {cleanup_exc}")
+        raise
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ArtifactPublicationError(f"staging cleanup failed: {path}") from exc
+
+
+def _capture_options_with_managed_output(
+    config: CaptureConfig,
+    job: CaptureJob,
+    runtime: _ValidatedOptionRuntime,
+    *,
+    output: Path,
+) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
     symbol = str(json.loads(job.payload_json).get("issuer_symbol", "")).upper()
     provider_requested_at = datetime.now(UTC)
     try:
@@ -997,12 +1100,11 @@ def _capture_options_with_runtime(
             ],
             cwd=runtime.alpha_runtime_root,
             timeout_seconds=config.option_timeout_seconds,
+            pass_fds=_inherited_descriptor_for(output),
         )
     except OSError as exc:
-        output.unlink(missing_ok=True)
         return None, None, None, "OPTION_CAPTURE_LAUNCH_FAILED", str(exc), False
     if result.timed_out:
-        output.unlink(missing_ok=True)
         return None, None, None, "OPTION_CAPTURE_TIMEOUT", "alpha-core timed out", True
     if result.returncode == OPTION_SURFACE_NOT_APPLICABLE_EXIT_CODE:
         try:
@@ -1015,14 +1117,13 @@ def _capture_options_with_runtime(
                 observed_not_after=datetime.now(UTC),
             )
         except (OSError, TypeError, ValueError) as exc:
-            output.unlink(missing_ok=True)
             return None, None, None, "OPTION_RESULT_INVALID", str(exc), False
         return unavailable, None, None, None, None, False
     if result.returncode != 0:
-        output.unlink(missing_ok=True)
         message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
         normalized_message = message.casefold()
         if "venue session is not open" in normalized_message:
+            _renew_job_lease(config, job, now=datetime.now(UTC))
             return _capture_historical_options(config, job, symbol=symbol)
         retryable = any(
             token in normalized_message
@@ -1069,8 +1170,6 @@ def _capture_options_with_runtime(
         return None, None, None, "OPTION_ARTIFACT_PUBLICATION_FAILED", str(exc), False
     except (KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         return None, None, None, "OPTION_ARTIFACT_INVALID", str(exc), False
-    finally:
-        output.unlink(missing_ok=True)
 
 
 def _history_target_id(value: Any) -> str:
@@ -1242,7 +1341,27 @@ def _capture_historical_options_with_runtime(
 ) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
     staging_dir = runtime.staging_root
     output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.historical.json"
-    output.unlink(missing_ok=True)
+    try:
+        with _managed_staging_output(output):
+            return _capture_historical_options_with_managed_output(
+                config,
+                job,
+                symbol=symbol,
+                runtime=runtime,
+                output=output,
+            )
+    except ArtifactPublicationError as exc:
+        return None, None, None, "OPTION_HISTORY_STAGING_CLEANUP_FAILED", str(exc), False
+
+
+def _capture_historical_options_with_managed_output(
+    config: CaptureConfig,
+    job: CaptureJob,
+    *,
+    symbol: str,
+    runtime: _ValidatedOptionRuntime,
+    output: Path,
+) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
     try:
         result = run_hidden_process(
             [
@@ -1263,12 +1382,11 @@ def _capture_historical_options_with_runtime(
             ],
             cwd=runtime.alpha_runtime_root,
             timeout_seconds=config.historical_option_timeout_seconds,
+            pass_fds=_inherited_descriptor_for(output),
         )
     except OSError as exc:
-        output.unlink(missing_ok=True)
         return None, None, None, "OPTION_HISTORY_LAUNCH_FAILED", str(exc), False
     if result.timed_out:
-        output.unlink(missing_ok=True)
         return (
             None,
             None,
@@ -1278,7 +1396,6 @@ def _capture_historical_options_with_runtime(
             False,
         )
     if result.returncode != 0:
-        output.unlink(missing_ok=True)
         message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
         return None, None, None, "OPTION_HISTORY_PROCESS_FAILED", message, False
     try:
@@ -1304,8 +1421,6 @@ def _capture_historical_options_with_runtime(
         return None, None, None, "OPTION_HISTORY_PUBLICATION_FAILED", str(exc), False
     except (KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         return None, None, None, "OPTION_HISTORY_ARTIFACT_INVALID", str(exc), False
-    finally:
-        output.unlink(missing_ok=True)
 
 
 def _candidate_context(path: Path, packet_id: str) -> dict[str, Any] | None:
@@ -2163,6 +2278,25 @@ def run_capture_once(
     if window.status != "active":
         _heartbeat(config, now=now, result=f"idle_registry_{window.status}", job_id=None)
         return CaptureResult(status="idle")
+    # Acquire cross-process ownership before leasing a job. A process waiting for
+    # another option capture therefore cannot let its database lease expire before
+    # it has begun work.
+    with _artifact_process_mutex(config.research_root):
+        return _run_active_capture_once(
+            config,
+            now=now,
+            worker_id=worker_id,
+            window=window,
+        )
+
+
+def _run_active_capture_once(
+    config: CaptureConfig,
+    *,
+    now: datetime,
+    worker_id: str,
+    window: CaptureWindow,
+) -> CaptureResult:
     job = _claim_job(config, worker_id=worker_id, now=now, window=window)
     if job is None:
         _heartbeat(config, now=now, result="idle", job_id=None)
