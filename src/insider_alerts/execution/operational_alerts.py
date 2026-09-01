@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, sleep
-from typing import Literal, cast
+from typing import Literal
 
 import httpx
 
@@ -666,13 +666,14 @@ def _optional_utc(value: object) -> datetime | None:
 
 
 def _failure_kind(value: str) -> FailureKind:
-    allowed: tuple[FailureKind, ...] = (
-        "ibkr_gateway_unavailable",
-        "ibkr_execution_failure",
-        "operating_system_failure",
-        "sqlite_failure",
-        "validation_failure",
-    )
-    if value not in allowed:
+    allowed: dict[str, FailureKind] = {
+        "ibkr_gateway_unavailable": "ibkr_gateway_unavailable",
+        "ibkr_execution_failure": "ibkr_execution_failure",
+        "operating_system_failure": "operating_system_failure",
+        "sqlite_failure": "sqlite_failure",
+        "validation_failure": "validation_failure",
+    }
+    failure_kind = allowed.get(value)
+    if failure_kind is None:
         raise ValueError("invalid operational failure kind in ledger")
-    return cast(FailureKind, value)
+    return failure_kind

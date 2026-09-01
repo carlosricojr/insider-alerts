@@ -52,6 +52,8 @@ it recovers. The notification path must remain isolated from trading and researc
 - Implemented on `fix/gateway-outage-alert` with 14 focused state-machine and CLI tests.
 - Full local gates passed on 2026-09-01: `ruff`, strict `mypy` on Windows and Linux, and the
   complete `pytest` suite (five expected skips).
+- Initial Linux CI exposed interpreter-dependent literal narrowing in `_failure_kind`; the final
+  typed lookup passes Mypy under the CI-equivalent Python 3.12/Linux target as well as Windows.
 - Three independent hostile `codex exec` review passes found and drove fixes for crash-window
   suppression, stale cross-process sends, blocking budgets, optional-schema isolation,
   same-event-loop Windows mutex re-entry, and retryable tracker initialization. The final pass
