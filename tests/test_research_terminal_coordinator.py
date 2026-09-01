@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,33 @@ def _config(tmp_path: Path, *, populated: bool) -> TerminalBuildConfig:
         artifact_root=tmp_path / "artifacts",
         activation_db=tmp_path / "activation.db",
     )
+
+
+def _main_args(
+    config: TerminalBuildConfig, *, output: Path, error: Path
+) -> list[str]:
+    return [
+        "--trial-db",
+        str(config.trial_db),
+        "--diagnostics-db",
+        str(config.diagnostics_db),
+        "--canary-ledger-db",
+        str(config.canary_ledger_db),
+        "--source-db",
+        str(config.source_db),
+        "--registry-path",
+        str(config.registry_path),
+        "--seal-db",
+        str(config.seal_db),
+        "--artifact-root",
+        str(config.artifact_root),
+        "--activation-db",
+        str(config.activation_db),
+        "--output-log",
+        str(output),
+        "--error-log",
+        str(error),
+    ]
 
 
 def test_deadline_path_records_outcome_free_insufficient_enrollment(
@@ -216,6 +244,7 @@ def test_main_treats_scientific_kill_as_operational_success(
     output = tmp_path / "coordinator.log"
     error = tmp_path / "coordinator.err.log"
     monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(coordinator, "_startup_validation_failure", lambda _config: None)
     monkeypatch.setattr(
         coordinator,
         "run_terminal_coordinator_once",
@@ -241,6 +270,7 @@ def test_main_logs_degradation_and_returns_retryable_exit(
     output = tmp_path / "coordinator.log"
     error = tmp_path / "coordinator.err.log"
     monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(coordinator, "_startup_validation_failure", lambda _config: None)
     monkeypatch.setattr(
         coordinator,
         "run_terminal_coordinator_once",
@@ -257,11 +287,314 @@ def test_main_logs_degradation_and_returns_retryable_exit(
     assert "database is locked" in error.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("git_subcommand", "reason"),
+    [
+        ("show", "prospective_registry_invalid:activation_git_artifact_unverifiable"),
+        ("merge-base", "prospective_registry_invalid:activation_git_commit_unverifiable"),
+    ],
+)
+def test_startup_preflight_maps_real_git_timeouts_before_store_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_subcommand: str,
+    reason: str,
+) -> None:
+    config = _config(tmp_path, populated=False)
+    real_run = subprocess.run
+    faulted_commands: list[tuple[str, ...]] = []
+
+    def timeout_on_command(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        command = tuple(str(item) for item in args)
+        if len(command) > 1 and command[0] == "git" and command[1] == git_subcommand:
+            faulted_commands.append(command)
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_run(args, *positional, **keywords)
+
+    monkeypatch.setattr(inference.subprocess, "run", timeout_on_command)
+
+    result = coordinator._startup_validation_failure(config)
+
+    assert result == coordinator.TerminalCoordinatorResult("invalid", reason=reason)
+    assert len(faulted_commands) == 1
+    assert not config.seal_db.exists()
+
+
+def test_main_recovers_real_git_show_timeout_before_running_coordinator_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, populated=False)
+    output = tmp_path / "coordinator.log"
+    error = tmp_path / "coordinator.err.log"
+    real_subprocess_run = subprocess.run
+    real_coordinator_run = coordinator.run_terminal_coordinator_once
+    remaining_faults = 1
+    body_calls = 0
+    delays: list[float] = []
+
+    def fail_first_show(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        nonlocal remaining_faults
+        command = tuple(str(item) for item in args)
+        if command[:2] == ("git", "show") and remaining_faults:
+            remaining_faults -= 1
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_subprocess_run(args, *positional, **keywords)
+
+    def counted_body(
+        body_config: TerminalBuildConfig,
+    ) -> coordinator.TerminalCoordinatorResult:
+        nonlocal body_calls
+        body_calls += 1
+        return real_coordinator_run(body_config)
+
+    monkeypatch.setattr(inference.subprocess, "run", fail_first_show)
+    monkeypatch.setattr(coordinator, "run_terminal_coordinator_once", counted_body)
+    monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(coordinator, "sleep", delays.append)
+
+    exit_code = coordinator.main(_main_args(config, output=output, error=error))
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert remaining_faults == 0
+    assert delays == [coordinator.STARTUP_VALIDATION_RETRY_DELAYS_SECONDS[0]]
+    assert body_calls == 1
+    assert record["status"] == "collecting"
+    assert record["startup_retry_count"] == 1
+    assert record["startup_retry_reason"] == (
+        "prospective_registry_invalid:activation_git_artifact_unverifiable"
+    )
+    assert not error.exists()
+
+
+def test_repeated_real_git_unavailability_degrades_without_running_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, populated=False)
+    output = tmp_path / "coordinator.log"
+    error = tmp_path / "coordinator.err.log"
+    real_subprocess_run = subprocess.run
+    delays: list[float] = []
+    timeout_count = 0
+
+    def always_timeout(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        nonlocal timeout_count
+        command = tuple(str(item) for item in args)
+        if command[:2] == ("git", "show"):
+            timeout_count += 1
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_subprocess_run(args, *positional, **keywords)
+
+    monkeypatch.setattr(inference.subprocess, "run", always_timeout)
+    monkeypatch.setattr(
+        coordinator,
+        "run_terminal_coordinator_once",
+        lambda _config: (_ for _ in ()).throw(AssertionError("coordinator body ran")),
+    )
+    monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(coordinator, "sleep", delays.append)
+
+    exit_code = coordinator.main(_main_args(config, output=output, error=error))
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    reason = "prospective_registry_invalid:activation_git_artifact_unverifiable"
+    assert exit_code == 2
+    assert timeout_count == 1 + len(coordinator.STARTUP_VALIDATION_RETRY_DELAYS_SECONDS)
+    assert delays == list(coordinator.STARTUP_VALIDATION_RETRY_DELAYS_SECONDS)
+    assert record["status"] == "degraded"
+    assert record["action"] == "none"
+    assert record["reason"] == f"startup_git_validation_unavailable:{reason}"
+    assert record["startup_retry_count"] == len(
+        coordinator.STARTUP_VALIDATION_RETRY_DELAYS_SECONDS
+    )
+    assert record["startup_retry_reason"] == reason
+    assert "degraded: startup_git_validation_unavailable" in error.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_git_timeout_after_preflight_never_retries_coordinator_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, populated=False)
+    output = tmp_path / "coordinator.log"
+    error = tmp_path / "coordinator.err.log"
+    real_subprocess_run = subprocess.run
+    real_coordinator_run = coordinator.run_terminal_coordinator_once
+    body_active = False
+    body_calls = 0
+
+    def timeout_in_body(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        command = tuple(str(item) for item in args)
+        if body_active and command[:2] == ("git", "show"):
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_subprocess_run(args, *positional, **keywords)
+
+    def marked_body(
+        body_config: TerminalBuildConfig,
+    ) -> coordinator.TerminalCoordinatorResult:
+        nonlocal body_active, body_calls
+        body_calls += 1
+        body_active = True
+        try:
+            return real_coordinator_run(body_config)
+        finally:
+            body_active = False
+
+    monkeypatch.setattr(inference.subprocess, "run", timeout_in_body)
+    monkeypatch.setattr(coordinator, "run_terminal_coordinator_once", marked_body)
+    monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(
+        coordinator,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(AssertionError("unexpected retry")),
+    )
+
+    exit_code = coordinator.main(_main_args(config, output=output, error=error))
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 3
+    assert body_calls == 1
+    assert record["status"] == "invalid"
+    assert record["reason"] == (
+        "prospective_registry_invalid:activation_git_artifact_unverifiable"
+    )
+    assert not config.seal_db.exists()
+
+
+def test_git_timeout_during_decision_revalidation_preserves_single_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inference, "TARGET_ENROLLED_TRADES", 2)
+    monkeypatch.setattr(inference, "MINIMUM_DISTINCT_ENTRY_DATES", 2)
+    monkeypatch.setattr(coordinator, "_transition_allowed", lambda _now: True)
+    config = _config(tmp_path, populated=True)
+    sealed = coordinator.run_terminal_coordinator_once(
+        config, now=datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
+    )
+    assert sealed.status == "sealed"
+    store = inference.TrialSealStore(config.seal_db)
+    receipt_before = store.receipt("terminal_seal")
+    assert receipt_before is not None
+
+    output = tmp_path / "coordinator.log"
+    error = tmp_path / "coordinator.err.log"
+    real_subprocess_run = subprocess.run
+    real_decide = coordinator.decide_terminal_dataset
+    decision_active = False
+    decision_calls = 0
+
+    def timeout_in_decision(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        command = tuple(str(item) for item in args)
+        if decision_active and command[:2] == ("git", "show"):
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_subprocess_run(args, *positional, **keywords)
+
+    def marked_decide(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal decision_active, decision_calls
+        decision_calls += 1
+        decision_active = True
+        try:
+            return real_decide(*args, **kwargs)
+        finally:
+            decision_active = False
+
+    monkeypatch.setattr(inference.subprocess, "run", timeout_in_decision)
+    monkeypatch.setattr(coordinator, "decide_terminal_dataset", marked_decide)
+    monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(
+        coordinator,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(AssertionError("unexpected retry")),
+    )
+
+    exit_code = coordinator.main(_main_args(config, output=output, error=error))
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 3
+    assert decision_calls == 1
+    assert record["status"] == "invalid"
+    assert record["reason"] == (
+        "prospective_registry_invalid:activation_git_artifact_unverifiable"
+    )
+    assert store.receipt("terminal_seal") == receipt_before
+    assert store.existing_report() is None
+
+
+def test_git_timeout_after_pending_stage_does_not_create_terminal_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inference, "TARGET_ENROLLED_TRADES", 2)
+    monkeypatch.setattr(inference, "MINIMUM_DISTINCT_ENTRY_DATES", 2)
+    monkeypatch.setattr(coordinator, "_transition_allowed", lambda _now: True)
+    config = _config(tmp_path, populated=True)
+    store = inference.TrialSealStore(config.seal_db)
+    real_subprocess_run = subprocess.run
+    timeout_count = 0
+
+    def timeout_after_pending(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        nonlocal timeout_count
+        command = tuple(str(item) for item in args)
+        if command[:2] == ("git", "show") and store.pending_terminal() is not None:
+            timeout_count += 1
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_subprocess_run(args, *positional, **keywords)
+
+    monkeypatch.setattr(inference.subprocess, "run", timeout_after_pending)
+
+    result = coordinator.run_terminal_coordinator_once(
+        config, now=datetime(2026, 2, 10, 15, 0, tzinfo=UTC)
+    )
+
+    assert result.status == "invalid"
+    assert result.action == "none"
+    assert result.reason == (
+        "terminal_preseal_validation_failed:activation_git_artifact_unverifiable"
+    )
+    assert timeout_count == 1
+    assert store.pending_terminal() is not None
+    assert store.receipt("terminal_seal") is None
+    assert store.existing_report() is None
+
+
+def test_git_timeout_after_deadline_receipt_preserves_blinded_partial_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, populated=False)
+    monkeypatch.setattr(coordinator, "_transition_allowed", lambda _now: True)
+    store = inference.TrialSealStore(config.seal_db)
+    real_subprocess_run = subprocess.run
+    timeout_count = 0
+
+    def timeout_after_receipt(args, *positional, **keywords):  # type: ignore[no-untyped-def]
+        nonlocal timeout_count
+        command = tuple(str(item) for item in args)
+        if command[:2] == ("git", "show") and store.receipt("deadline_miss") is not None:
+            timeout_count += 1
+            raise subprocess.TimeoutExpired(command, timeout=5)
+        return real_subprocess_run(args, *positional, **keywords)
+
+    monkeypatch.setattr(inference.subprocess, "run", timeout_after_receipt)
+    now = inference.enrollment_deadline(ACTIVATED_AT) + timedelta(minutes=1)
+
+    result = coordinator.run_terminal_coordinator_once(config, now=now)
+
+    receipt = store.receipt("deadline_miss")
+    assert receipt is not None
+    assert result.status == "invalid"
+    assert result.action == "deadline_decide"
+    assert result.reason == "activation_git_artifact_unverifiable"
+    assert result.deadline_miss_receipt_sha256 == receipt["receipt_sha256"]
+    assert timeout_count == 1
+    assert store.existing_report() is None
+
+
 def test_main_returns_persistent_failure_when_log_append_fails_after_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     error = tmp_path / "coordinator.err.log"
     monkeypatch.setattr(coordinator, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(coordinator, "_startup_validation_failure", lambda _config: None)
     monkeypatch.setattr(
         coordinator,
         "run_terminal_coordinator_once",

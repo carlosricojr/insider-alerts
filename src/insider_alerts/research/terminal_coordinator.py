@@ -6,9 +6,10 @@ import argparse
 import contextlib
 import json
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, time
 from pathlib import Path
+from time import sleep
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -37,6 +38,13 @@ from insider_alerts.research.trial_runtime import (
 NEW_YORK = ZoneInfo("America/New_York")
 TRANSITION_WINDOW_START_ET = time(20, 30)
 TRANSITION_WINDOW_END_ET = time(23, 59, 59, 999999)
+STARTUP_VALIDATION_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
+_RETRYABLE_STARTUP_VALIDATION_REASONS = frozenset(
+    {
+        "prospective_registry_invalid:activation_git_artifact_unverifiable",
+        "prospective_registry_invalid:activation_git_commit_unverifiable",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +76,8 @@ class TerminalCoordinatorResult:
     terminal_seal_receipt_sha256: str | None = None
     deadline_miss_receipt_sha256: str | None = None
     decision_report_sha256: str | None = None
+    startup_retry_count: int = 0
+    startup_retry_reason: str | None = None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -307,6 +317,87 @@ def run_terminal_coordinator_once(
         )
 
 
+def _startup_validation_failure(
+    config: TerminalBuildConfig,
+) -> TerminalCoordinatorResult | None:
+    """Validate Git and activation custody before the transition-capable run begins."""
+
+    try:
+        _validated_trial_window(_trial_config(config))
+    except sqlite3.OperationalError as exc:
+        status: Literal["degraded", "failed"] = (
+            "degraded" if _is_sqlite_contention(exc) else "failed"
+        )
+        return TerminalCoordinatorResult(
+            status, reason=f"sqlite_operational_error:{exc}"[:500]
+        )
+    except (
+        TerminalBuildInvalid,
+        TrialInvalid,
+        TrialRuntimeInvalid,
+        sqlite3.DatabaseError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+        return TerminalCoordinatorResult("invalid", reason=str(exc)[:500])
+    except OSError as exc:
+        return TerminalCoordinatorResult(
+            "degraded", reason=f"{type(exc).__name__}:{exc}"[:500]
+        )
+    return None
+
+
+def _retryable_startup_validation_failure(
+    result: TerminalCoordinatorResult | None,
+) -> bool:
+    """Return whether the isolated startup preflight had transient Git unavailability."""
+
+    return result is not None and result.reason in _RETRYABLE_STARTUP_VALIDATION_REASONS
+
+
+def _run_with_startup_validation_retries(
+    config: TerminalBuildConfig,
+) -> TerminalCoordinatorResult:
+    startup_failure = _startup_validation_failure(config)
+    retry_count = 0
+    retry_reason: str | None = None
+    for delay_seconds in STARTUP_VALIDATION_RETRY_DELAYS_SECONDS:
+        if startup_failure is None:
+            return replace(
+                run_terminal_coordinator_once(config),
+                startup_retry_count=retry_count,
+                startup_retry_reason=retry_reason,
+            )
+        if not _retryable_startup_validation_failure(startup_failure):
+            return replace(
+                startup_failure,
+                startup_retry_count=retry_count,
+                startup_retry_reason=retry_reason,
+            )
+        retry_reason = retry_reason or startup_failure.reason
+        sleep(delay_seconds)
+        retry_count += 1
+        startup_failure = _startup_validation_failure(config)
+    if startup_failure is None:
+        return replace(
+            run_terminal_coordinator_once(config),
+            startup_retry_count=retry_count,
+            startup_retry_reason=retry_reason,
+        )
+    if _retryable_startup_validation_failure(startup_failure):
+        return TerminalCoordinatorResult(
+            "degraded",
+            reason=f"startup_git_validation_unavailable:{startup_failure.reason}"[:500],
+            startup_retry_count=retry_count,
+            startup_retry_reason=retry_reason,
+        )
+    return replace(
+        startup_failure,
+        startup_retry_count=retry_count,
+        startup_retry_reason=retry_reason,
+    )
+
+
 def _append_record(path: Path, result: TerminalCoordinatorResult) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {"recorded_at_utc": datetime.now(UTC).isoformat(), **asdict(result)}
@@ -336,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         ensure_kill_on_close_process_tree()
-        result = run_terminal_coordinator_once(config)
+        result = _run_with_startup_validation_retries(config)
         _append_record(args.output_log, result)
         if result.status in {"degraded", "failed", "invalid"}:
             _append_error(args.error_log, result)
