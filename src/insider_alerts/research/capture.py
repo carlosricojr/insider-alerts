@@ -12,7 +12,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -331,7 +331,7 @@ def _artifact_process_mutex(
                     raise OptionRuntimeValidationError(
                         "artifact process lock could not be opened"
                     ) from exc
-            deadline = monotonic() + timeout_seconds
+            deadline = perf_counter() + timeout_seconds
             try:
                 while True:
                     try:
@@ -340,7 +340,7 @@ def _artifact_process_mutex(
                         )
                         break
                     except BlockingIOError as exc:
-                        if monotonic() >= deadline:
+                        if perf_counter() >= deadline:
                             raise OptionRuntimeValidationError(
                                 "artifact process lock timed out"
                             ) from exc
@@ -704,7 +704,12 @@ def _claim_job(
             """
             SELECT * FROM research_capture_jobs
             WHERE ((status IN ('pending', 'retry') AND attempt_count < ?)
-               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?))
+               OR (status = 'leased' AND attempt_count <= ? AND lease_expires_at_utc <= ?
+                   AND (attempt_count < ? OR NOT EXISTS (
+                       SELECT 1 FROM research_capture_attempts attempts
+                       WHERE attempts.job_id = research_capture_jobs.job_id
+                         AND attempts.attempt_number = research_capture_jobs.attempt_count
+                   ))))
             ORDER BY decision_at_utc, job_id
             LIMIT 100
             """,
@@ -712,6 +717,7 @@ def _claim_job(
                 config.max_attempts,
                 config.max_attempts,
                 utc_text(now),
+                config.max_attempts,
             ),
         ).fetchall()
         selected: sqlite3.Row | None = None
@@ -727,10 +733,14 @@ def _claim_job(
             conn.commit()
             return None
         previous_attempt_count = int(selected["attempt_count"])
+        existing_attempt = conn.execute(
+            "SELECT 1 FROM research_capture_attempts WHERE job_id=? AND attempt_number=?",
+            (str(selected["job_id"]), previous_attempt_count),
+        ).fetchone()
         attempt_count = (
-            previous_attempt_count
-            if str(selected["status"]) == "leased"
-            else previous_attempt_count + 1
+            previous_attempt_count + 1
+            if str(selected["status"]) != "leased" or existing_attempt is not None
+            else previous_attempt_count
         )
         cursor = conn.execute(
             """
@@ -805,7 +815,7 @@ def _finish_job_attempt(
             raise RuntimeError(f"lost lease for capture job {job.job_id}")
         conn.execute(
             """
-            INSERT OR IGNORE INTO research_capture_attempts(
+            INSERT INTO research_capture_attempts(
                 job_id, attempt_number, started_at_utc, finished_at_utc, status,
                 error_kind, error_message, retryable
             ) VALUES(?,?,?,?,?,?,?,?)
@@ -843,7 +853,7 @@ def _renew_job_lease(config: CaptureConfig, job: CaptureJob, *, now: datetime) -
 
 
 def _kill_process_tree(process: subprocess.Popen[str], *, platform: str = os.name) -> None:
-    if process.poll() is not None:
+    if platform == "nt" and process.poll() is not None:
         raise ProcessTreeCleanupError(
             "hidden child exited before its descendant tree could be targeted"
         )
@@ -865,7 +875,8 @@ def _kill_process_tree(process: subprocess.Popen[str], *, platform: str = os.nam
         else:
             os_portable: Any = os
             signal_portable: Any = signal
-            os_portable.killpg(process.pid, signal_portable.SIGKILL)
+            with suppress(ProcessLookupError):
+                os_portable.killpg(process.pid, signal_portable.SIGKILL)
         process.wait(timeout=5)
     except ProcessTreeCleanupError:
         raise
@@ -973,21 +984,42 @@ def _publish_content_addressed_locked(
             raise ArtifactPublicationError(f"content-address collision at {destination}")
         return destination, digest
     staging = root / f".{digest}.{os.getpid()}.tmp"
-    with staging.open("xb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    staging_created = False
+    primary_error: BaseException | None = None
     try:
+        with staging.open("xb") as handle:
+            staging_created = True
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.link(staging, destination)
     except FileExistsError as exc:
-        if _is_reparse_point(destination) or not destination.is_file():
-            raise ArtifactPublicationError(
-                f"content-address destination is not a regular file: {destination}"
-            ) from exc
-        if destination.read_bytes() != data:
-            raise ArtifactPublicationError(f"content-address collision at {destination}") from exc
+        try:
+            if _is_reparse_point(destination) or not destination.is_file():
+                raise ArtifactPublicationError(
+                    f"content-address destination is not a regular file: {destination}"
+                ) from exc
+            if destination.read_bytes() != data:
+                raise ArtifactPublicationError(
+                    f"content-address collision at {destination}"
+                ) from exc
+        except BaseException as collision_error:
+            primary_error = collision_error
+            raise
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        staging.unlink(missing_ok=True)
+        if staging_created:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        f"publication staging cleanup also failed: {cleanup_exc}"
+                    )
+                else:
+                    raise
     return destination, digest
 
 

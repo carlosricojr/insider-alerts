@@ -818,6 +818,75 @@ def test_expired_worker_cannot_finalize_a_reclaimed_lease(tmp_path: Path) -> Non
         assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone() == (0,)
 
 
+def test_reclaimed_preupgrade_partial_attempt_uses_a_new_append_only_number(
+    tmp_path: Path,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    window = CaptureWindow(
+        status="active",
+        policy_sha256=_policy_sha(config),
+        activated_at=datetime(2000, 1, 1, tzinfo=UTC),
+        deadline=datetime(2100, 1, 1, tzinfo=UTC),
+    )
+    first = capture_module._claim_job(
+        config,
+        worker_id="preupgrade-worker",
+        now=decision_at + timedelta(seconds=2),
+        window=window,
+    )
+    assert first is not None
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "INSERT INTO research_capture_attempts("
+            "job_id,attempt_number,started_at_utc,finished_at_utc,status,"
+            "error_kind,error_message,retryable) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                first.job_id,
+                first.attempt_count,
+                capture_module.utc_text(decision_at + timedelta(seconds=2)),
+                capture_module.utc_text(decision_at + timedelta(seconds=3)),
+                "retry",
+                "PREUPGRADE_PARTIAL",
+                "fixture",
+                1,
+            ),
+        )
+        conn.execute(
+            "UPDATE research_capture_jobs SET lease_expires_at_utc=? WHERE job_id=?",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)), first.job_id),
+        )
+
+    reclaimed = capture_module._claim_job(
+        config,
+        worker_id="current-worker",
+        now=decision_at + timedelta(seconds=4),
+        window=window,
+    )
+    assert reclaimed is not None
+    assert reclaimed.attempt_count == 2
+    capture_module._finish_job_attempt(
+        config,
+        reclaimed,
+        started_at=decision_at + timedelta(seconds=4),
+        finished_at=decision_at + timedelta(seconds=5),
+        attempt_status="completed",
+        job_state="complete",
+        error_kind=None,
+        error_message=None,
+        retryable=False,
+        record_sha256="f" * 64,
+    )
+
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT attempt_number,status FROM research_capture_attempts ORDER BY attempt_number"
+        ).fetchall() == [(1, "retry"), (2, "completed")]
+        assert conn.execute(
+            "SELECT status,attempt_count,record_sha256 FROM research_capture_jobs"
+        ).fetchone() == ("complete", 2, "f" * 64)
+
+
 def test_lease_ownership_is_rechecked_before_immutable_snapshot_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1411,6 +1480,29 @@ def test_posix_timeout_kills_the_entire_child_process_group(tmp_path: Path) -> N
     assert not survivor_marker.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+def test_posix_timeout_kills_pipe_holder_after_group_leader_exits(tmp_path: Path) -> None:
+    survivor_marker = tmp_path / "exited-leader-descendant-survived"
+    descendant = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(2); Path(sys.argv[1]).write_text('survived')"
+    )
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant!r},sys.argv[1]])"
+    )
+
+    result = capture_module.run_hidden_process(
+        [sys.executable, "-c", parent, str(survivor_marker)],
+        cwd=tmp_path,
+        timeout_seconds=1,
+    )
+    time.sleep(2)
+
+    assert result.timed_out
+    assert not survivor_marker.exists()
+
+
 def test_artifact_mutex_serializes_independent_processes(tmp_path: Path) -> None:
     research_root = tmp_path / "research"
     research_root.mkdir()
@@ -1529,6 +1621,29 @@ def test_option_publication_failure_is_persisted_as_typed_missingness(
     observation = record["payload"]["observations"]["options_surface"]
     assert observation["status"] == "error"
     assert observation["error"]["kind"] == "OPTION_ARTIFACT_PUBLICATION_FAILED"
+
+
+def test_content_address_fsync_failure_removes_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        capture_module.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("simulated fsync failure")),
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert list(option_root.iterdir()) == []
 
 
 def test_option_staging_cleanup_failure_is_persisted_as_typed_missingness(
