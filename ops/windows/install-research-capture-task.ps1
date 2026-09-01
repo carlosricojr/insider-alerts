@@ -31,14 +31,20 @@ $historyDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoryDatabase)) {
 $historyDatabaseResolved = (Resolve-Path $historyDatabasePath).Path
 $dataRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "data"))
 $researchRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "data\research"))
-foreach ($ancestor in @($repoRoot, $dataRoot)) {
-  if (-not (Test-Path -LiteralPath $ancestor -PathType Container)) {
-    throw "Research artifact ancestor is unavailable: $ancestor"
-  }
-  $ancestorItem = Get-Item -LiteralPath $ancestor
-  if ($ancestorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-    throw "Research artifact ancestor cannot be a reparse point: $ancestor"
-  }
+if (-not (Test-Path -LiteralPath $repoRoot -PathType Container)) {
+  throw "Research artifact ancestor is unavailable: $repoRoot"
+}
+$repoRootItem = Get-Item -LiteralPath $repoRoot
+if ($repoRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+  throw "Research artifact ancestor cannot be a reparse point: $repoRoot"
+}
+if (-not (Test-Path -LiteralPath $dataRoot)) {
+  New-Item -ItemType Directory -Path $dataRoot | Out-Null
+}
+$dataRootItem = Get-Item -LiteralPath $dataRoot
+if (-not $dataRootItem.PSIsContainer -or
+    ($dataRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+  throw "Research artifact ancestor cannot be a reparse point: $dataRoot"
 }
 New-Item -ItemType Directory -Path $researchRoot -Force | Out-Null
 $researchRootItem = Get-Item -LiteralPath $researchRoot

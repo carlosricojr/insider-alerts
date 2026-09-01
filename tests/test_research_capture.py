@@ -1772,6 +1772,113 @@ def test_content_address_fdopen_failure_removes_created_staging_file(
     assert list(option_root.iterdir()) == []
 
 
+@pytest.mark.parametrize("failure_stage", ["write", "flush"])
+def test_content_address_stream_failure_removes_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+
+    class FailingStream:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+
+        def __enter__(self) -> FailingStream:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            capture_module.os.close(self.descriptor)
+
+        def write(self, _data: bytes) -> None:
+            if failure_stage == "write":
+                raise OSError("simulated write failure")
+
+        def flush(self) -> None:
+            if failure_stage == "flush":
+                raise OSError("simulated flush failure")
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+    monkeypatch.setattr(
+        capture_module.os,
+        "fdopen",
+        lambda descriptor, *_args, **_kwargs: FailingStream(descriptor),
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert list(option_root.iterdir()) == []
+
+
+def test_content_address_link_failure_removes_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        capture_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("simulated link failure")),
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert list(option_root.iterdir()) == []
+
+
+def test_content_address_primary_failure_precedes_staging_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    original_unlink = Path.unlink
+    monkeypatch.setattr(
+        capture_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("simulated link failure")),
+    )
+
+    def fail_staging_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.parent.resolve() == option_root.resolve() and path.suffix == ".tmp":
+            raise PermissionError("simulated staging cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_staging_cleanup)
+
+    with pytest.raises(
+        capture_module.ArtifactPublicationError, match="publication failed"
+    ) as error:
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert isinstance(error.value.__cause__, OSError)
+    assert "simulated link failure" in str(error.value.__cause__)
+    assert any(
+        "publication staging cleanup also failed" in note
+        for note in getattr(error.value.__cause__, "__notes__", [])
+    )
+
+
 def test_option_staging_cleanup_failure_is_persisted_as_typed_missingness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2885,7 +2992,10 @@ def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 15)" in installer
     assert "-MultipleInstances IgnoreNew" in installer
     ancestor_validation = installer.index("Research artifact ancestor cannot be a reparse point")
+    data_creation = installer.index("New-Item -ItemType Directory -Path $dataRoot")
+    data_validation = installer.index("$dataRootItem = Get-Item -LiteralPath $dataRoot")
     artifact_creation = installer.index("New-Item -ItemType Directory -Path $artifactRoot")
+    assert data_creation < data_validation
     assert ancestor_validation < artifact_creation
     path_helper = (ROOT / "ops/windows/research-path-validation.ps1").read_text(
         encoding="utf-8"
