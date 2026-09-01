@@ -6,7 +6,7 @@ import argparse
 import contextlib
 import json
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, time
 from pathlib import Path
 from time import sleep
@@ -76,6 +76,8 @@ class TerminalCoordinatorResult:
     terminal_seal_receipt_sha256: str | None = None
     deadline_miss_receipt_sha256: str | None = None
     decision_report_sha256: str | None = None
+    startup_retry_count: int = 0
+    startup_retry_reason: str | None = None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -357,21 +359,43 @@ def _run_with_startup_validation_retries(
     config: TerminalBuildConfig,
 ) -> TerminalCoordinatorResult:
     startup_failure = _startup_validation_failure(config)
+    retry_count = 0
+    retry_reason: str | None = None
     for delay_seconds in STARTUP_VALIDATION_RETRY_DELAYS_SECONDS:
         if startup_failure is None:
-            return run_terminal_coordinator_once(config)
+            return replace(
+                run_terminal_coordinator_once(config),
+                startup_retry_count=retry_count,
+                startup_retry_reason=retry_reason,
+            )
         if not _retryable_startup_validation_failure(startup_failure):
-            return startup_failure
+            return replace(
+                startup_failure,
+                startup_retry_count=retry_count,
+                startup_retry_reason=retry_reason,
+            )
+        retry_reason = retry_reason or startup_failure.reason
         sleep(delay_seconds)
+        retry_count += 1
         startup_failure = _startup_validation_failure(config)
     if startup_failure is None:
-        return run_terminal_coordinator_once(config)
+        return replace(
+            run_terminal_coordinator_once(config),
+            startup_retry_count=retry_count,
+            startup_retry_reason=retry_reason,
+        )
     if _retryable_startup_validation_failure(startup_failure):
         return TerminalCoordinatorResult(
             "degraded",
             reason=f"startup_git_validation_unavailable:{startup_failure.reason}"[:500],
+            startup_retry_count=retry_count,
+            startup_retry_reason=retry_reason,
         )
-    return startup_failure
+    return replace(
+        startup_failure,
+        startup_retry_count=retry_count,
+        startup_retry_reason=retry_reason,
+    )
 
 
 def _append_record(path: Path, result: TerminalCoordinatorResult) -> None:

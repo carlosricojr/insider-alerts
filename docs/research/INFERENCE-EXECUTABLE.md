@@ -70,7 +70,9 @@ unbound wrapper runs a separate startup custody preflight and retries only its e
 launch/timeout failures, using bounded 5/15/30-second delays inside the same hidden process. After
 the preflight succeeds, the transition-capable coordinator body executes at most once. Repeated
 startup Git unavailability is operational `degraded`, while every scientific-integrity failure and
-every coordinator-body result remains non-retryable. Transitions are restricted to the daily
+every coordinator-body result remains non-retryable. Blinded operational logs retain the startup
+retry count and first recovered reason so recurring Git instability remains observable without
+exposing outcomes. Transitions are restricted to the daily
 after-hours window so
 terminal reconciliation locks cannot interfere with live position management.
 

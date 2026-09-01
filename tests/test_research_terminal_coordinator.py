@@ -360,6 +360,10 @@ def test_main_recovers_real_git_show_timeout_before_running_coordinator_once(
     assert delays == [coordinator.STARTUP_VALIDATION_RETRY_DELAYS_SECONDS[0]]
     assert body_calls == 1
     assert record["status"] == "collecting"
+    assert record["startup_retry_count"] == 1
+    assert record["startup_retry_reason"] == (
+        "prospective_registry_invalid:activation_git_artifact_unverifiable"
+    )
     assert not error.exists()
 
 
@@ -400,6 +404,10 @@ def test_repeated_real_git_unavailability_degrades_without_running_coordinator(
     assert record["status"] == "degraded"
     assert record["action"] == "none"
     assert record["reason"] == f"startup_git_validation_unavailable:{reason}"
+    assert record["startup_retry_count"] == len(
+        coordinator.STARTUP_VALIDATION_RETRY_DELAYS_SECONDS
+    )
+    assert record["startup_retry_reason"] == reason
     assert "degraded: startup_git_validation_unavailable" in error.read_text(
         encoding="utf-8"
     )

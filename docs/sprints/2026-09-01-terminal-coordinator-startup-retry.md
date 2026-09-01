@@ -44,7 +44,11 @@ terminal transition invariant.
   after pending-terminal staging, after a deadline receipt, and during decision revalidation.
 - The complete post-fix local gate passed: Ruff, strict Mypy across all 66 source files, and the
   full Pytest suite (five expected skips). All 28 focused coordinator tests also pass.
-- The final exact-diff adversarial re-review reported no actionable findings; it independently
+- The pre-commit exact-diff adversarial re-review reported no actionable findings; it independently
   verified phase-isolated retries, real Git timeout paths, at-most-once body execution, unchanged
   hidden-task behavior, and no activation-bound or live-policy changes.
+- The exact-head rung-2 review found one low-severity observability gap: recovered retries were
+  indistinguishable from clean startup. The wrapper now logs only blinded retry count and first
+  failure reason; no outcome or transition data was added. The complete Ruff, strict Mypy, focused
+  coordinator, and full Pytest gates pass after this response.
 - PR review, merge, deployment, and post-deployment verification remain pending.
