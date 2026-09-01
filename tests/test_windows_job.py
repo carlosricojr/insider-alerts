@@ -95,7 +95,7 @@ def test_exited_parent_with_unknown_descendants_is_fatal_cleanup_uncertainty() -
             return 0
 
     with pytest.raises(ProcessTreeCleanupError, match="descendant tree"):
-        capture_module._kill_process_tree(ExitedProcess())  # type: ignore[arg-type]
+        capture_module._kill_process_tree(ExitedProcess(), platform="nt")  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process-tree contract")
