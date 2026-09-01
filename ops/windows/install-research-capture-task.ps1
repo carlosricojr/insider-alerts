@@ -19,17 +19,41 @@ if ($IntervalMinutes -lt 1) {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir "research-capture-task-action.ps1")
+. (Join-Path $scriptDir "research-path-validation.ps1")
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
-$alphaRootResolved = (Resolve-Path $AlphaRoot).Path
+$alphaRootResolved = [System.IO.Path]::GetFullPath($AlphaRoot)
 $historyDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoryDatabase)) {
   $HistoryDatabase
 } else {
   Join-Path $repoRoot $HistoryDatabase
 }
 $historyDatabaseResolved = (Resolve-Path $historyDatabasePath).Path
+$dataRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "data"))
 $researchRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "data\research"))
+if (-not (Test-Path -LiteralPath $repoRoot -PathType Container)) {
+  throw "Research artifact ancestor is unavailable: $repoRoot"
+}
+$repoRootItem = Get-Item -LiteralPath $repoRoot
+if ($repoRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+  throw "Research artifact ancestor cannot be a reparse point: $repoRoot"
+}
+if (-not (Test-Path -LiteralPath $dataRoot)) {
+  New-Item -ItemType Directory -Path $dataRoot | Out-Null
+}
+$dataRootItem = Get-Item -LiteralPath $dataRoot
+if (-not $dataRootItem.PSIsContainer -or
+    ($dataRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+  throw "Research artifact ancestor cannot be a reparse point: $dataRoot"
+}
 New-Item -ItemType Directory -Path $researchRoot -Force | Out-Null
+$researchRootItem = Get-Item -LiteralPath $researchRoot
+if (-not $researchRootItem.PSIsContainer -or
+    ($researchRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+  throw "Research root must be a regular directory: $researchRoot"
+}
 $researchPrefix = $researchRoot.TrimEnd('\') + '\'
+$artifactRoot = [System.IO.Path]::GetFullPath((Join-Path $researchRoot "artifacts"))
 $chainStorePath = if ([System.IO.Path]::IsPathRooted($OptionChainStoreDatabase)) {
   [System.IO.Path]::GetFullPath($OptionChainStoreDatabase)
 } else {
@@ -41,39 +65,19 @@ $pacingDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoricalPacingDataba
   [System.IO.Path]::GetFullPath((Join-Path $repoRoot $HistoricalPacingDatabase))
 }
 foreach ($databasePath in @($chainStorePath, $pacingDatabasePath)) {
-  if (-not $databasePath.StartsWith(
-    $researchPrefix,
-    [System.StringComparison]::OrdinalIgnoreCase
-  )) {
-    throw "Research option databases must remain beneath $researchRoot"
-  }
-  New-Item -ItemType Directory -Path (Split-Path -Parent $databasePath) -Force | Out-Null
-  $cursor = Split-Path -Parent $databasePath
-  while ($true) {
-    $cursorItem = Get-Item -LiteralPath $cursor
-    if ($cursorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-      throw "Research option database parent cannot be a reparse point: $cursor"
-    }
-    if ($cursor.Equals($researchRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-      break
-    }
-    if (-not $cursor.StartsWith(
+  Initialize-ResearchDatabaseParent `
+    -DatabasePath $databasePath `
+    -ResearchRoot $researchRoot
+}
+New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
+$artifactRootItem = Get-Item -LiteralPath $artifactRoot
+if (-not $artifactRootItem.PSIsContainer -or
+    ($artifactRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+    -not $artifactRootItem.FullName.StartsWith(
       $researchPrefix,
       [System.StringComparison]::OrdinalIgnoreCase
     )) {
-      throw "Research option database parent escaped $researchRoot"
-    }
-    $parent = Split-Path -Parent $cursor
-    if ($parent -eq $cursor) {
-      throw "Unable to prove research option database confinement for $databasePath"
-    }
-    $cursor = $parent
-  }
-  if ((Test-Path -LiteralPath $databasePath) -and
-      ((Get-Item -LiteralPath $databasePath).Attributes -band
-       [System.IO.FileAttributes]::ReparsePoint)) {
-    throw "Research option database cannot be a reparse point: $databasePath"
-  }
+  throw "Research artifact root must be a regular directory beneath $researchRoot"
 }
 $pythonExe = Join-Path $repoRoot ".venv\Scripts\pythonw.exe"
 $validationPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
@@ -94,6 +98,12 @@ foreach ($path in @(
     throw "Missing required capture executable or script at $path"
   }
 }
+foreach ($path in @($pythonExe, $validationPython)) {
+  Assert-ResearchRuntimePath -Path $path -CheckoutRoot $repoRoot
+}
+foreach ($path in @($alphaPython, $alphaScript, $alphaHistoricalScript)) {
+  Assert-ResearchRuntimePath -Path $path -CheckoutRoot $alphaRootResolved
+}
 
 $validationOutput = & $validationPython `
   -m insider_alerts.research.history_worker `
@@ -104,21 +114,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = @(
-  "-m insider_alerts.research.worker",
-  "--alpha-python `"$alphaPython`"",
-  "--alpha-script `"$alphaScript`"",
-  "--alpha-historical-script `"$alphaHistoricalScript`"",
-  "--option-chain-store-db `"$chainStorePath`"",
-  "--historical-pacing-db `"$pacingDatabasePath`"",
-  "--history-db `"$historyDatabaseResolved`"",
-  "--history-snapshot-sha256 $HistorySnapshotSha256",
-  "--error-log `"$repoRoot\logs\research-capture.err.log`""
-) -join " "
+$actionSpec = New-ResearchCaptureTaskActionSpec `
+  -PythonExe $pythonExe `
+  -RepoRoot $repoRoot `
+  -ArtifactRoot $artifactRoot `
+  -AlphaPython $alphaPython `
+  -AlphaScript $alphaScript `
+  -AlphaHistoricalScript $alphaHistoricalScript `
+  -ChainStorePath $chainStorePath `
+  -PacingDatabasePath $pacingDatabasePath `
+  -HistoryDatabase $historyDatabaseResolved `
+  -HistorySnapshotSha256 $HistorySnapshotSha256
 $action = New-ScheduledTaskAction `
-  -Execute $pythonExe `
-  -Argument $arguments `
-  -WorkingDirectory $repoRoot
+  -Execute $actionSpec.Execute `
+  -Argument $actionSpec.Argument `
+  -WorkingDirectory $actionSpec.WorkingDirectory
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $intervalTrigger = New-ScheduledTaskTrigger `
   -Once `

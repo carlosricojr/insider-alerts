@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
-from contextlib import closing
+import sys
+import time
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -138,7 +141,7 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
     return CaptureConfig(
         source_db=source_db,
         evidence_db=tmp_path / "evidence.db",
-        artifact_root=tmp_path / "artifacts",
+        artifact_root=research / "artifacts",
         research_root=research,
         alpha_python=python,
         alpha_script=scripts / "capture.py",
@@ -166,6 +169,36 @@ def _not_applicable_result(*, request_id: str, observed_at: datetime) -> dict[st
         "symbol": "TEST",
         "client_id": 48,
         "observed_at_utc": observed_at.isoformat(),
+    }
+
+
+def _live_option_artifact(*, request_id: str) -> dict[str, Any]:
+    captured = datetime.now(UTC)
+    return {
+        "schema_version": "insider-evidence-option-surface-v1",
+        "artifact_status": "RESEARCH_ONLY",
+        "source_id": "ib_gateway:US_OPTIONS:SMART:type1",
+        "request_id": request_id,
+        "symbol": "TEST",
+        "client_id": 48,
+        "market_data_type": 1,
+        "requested_at_utc": (captured - timedelta(seconds=1)).isoformat(),
+        "source_max_ts_utc": captured.isoformat(),
+        "captured_at_utc": captured.isoformat(),
+        "min_dte_days": 3,
+        "max_dte_days": 30,
+        "max_expiries": 3,
+        "max_contracts_per_expiry": 120,
+        "surfaces": [
+            {
+                "expiry": "2026-09-18",
+                "underlying_price": 10.0,
+                "underlying_bid": 9.99,
+                "underlying_ask": 10.01,
+                "underlying_source_timestamp_utc": captured.isoformat(),
+                "quotes": [{}],
+            }
+        ],
     }
 
 
@@ -671,6 +704,326 @@ def test_terminal_option_failure_is_persisted_as_valid_immutable_snapshot(
     assert capture_status(config.source_db, config.evidence_db)["owner_history"] == {"error": 1}
 
 
+def test_capture_mutex_is_acquired_before_the_job_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    entries = 0
+
+    @contextmanager
+    def assert_prelease_mutex(_research_root: Path, **_kwargs: Any) -> Any:
+        nonlocal entries
+        entries += 1
+        if entries == 1:
+            with sqlite3.connect(source_db) as conn:
+                assert conn.execute(
+                    "SELECT status FROM research_capture_jobs"
+                ).fetchone() == ("pending",)
+        yield
+
+    monkeypatch.setattr(capture_module, "_artifact_process_mutex", assert_prelease_mutex)
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (
+            None,
+            None,
+            None,
+            "OPTION_RUNTIME_INVALID",
+            "test boundary",
+            False,
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert entries >= 2
+
+
+def test_claim_clock_advances_by_time_spent_waiting_for_process_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    observed_claim_time: datetime | None = None
+    readings = iter((100.0, 105.5))
+
+    @contextmanager
+    def process_lock(_research_root: Path, **_kwargs: Any) -> Any:
+        yield
+
+    def capture_claim_time(*_args: Any, now: datetime, **_kwargs: Any) -> None:
+        nonlocal observed_claim_time
+        observed_claim_time = now
+        return None
+
+    monkeypatch.setattr(capture_module, "_artifact_process_mutex", process_lock)
+    monkeypatch.setattr(capture_module, "_claim_job", capture_claim_time)
+    monkeypatch.setattr(capture_module, "perf_counter", lambda: next(readings))
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "idle"
+    assert observed_claim_time == decision_at + timedelta(seconds=7.5)
+
+
+def test_expired_worker_cannot_finalize_a_reclaimed_lease(tmp_path: Path) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    window = CaptureWindow(
+        status="active",
+        policy_sha256=_policy_sha(config),
+        activated_at=datetime(2000, 1, 1, tzinfo=UTC),
+        deadline=datetime(2100, 1, 1, tzinfo=UTC),
+    )
+    first = capture_module._claim_job(
+        config,
+        worker_id="worker-one",
+        now=decision_at + timedelta(seconds=2),
+        window=window,
+    )
+    assert first is not None
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "UPDATE research_capture_jobs SET lease_expires_at_utc=?",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)),),
+        )
+    second = capture_module._claim_job(
+        config,
+        worker_id="worker-two",
+        now=decision_at + timedelta(seconds=3),
+        window=window,
+    )
+    assert second is not None
+
+    with pytest.raises(RuntimeError, match="lost lease"):
+        capture_module._finish_job_attempt(
+            config,
+            first,
+            started_at=decision_at + timedelta(seconds=2),
+            finished_at=decision_at + timedelta(seconds=4),
+            attempt_status="failed",
+            job_state="failed",
+            error_kind="TEST",
+            error_message="test",
+            retryable=False,
+        )
+
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,lease_owner FROM research_capture_jobs"
+        ).fetchone() == ("leased", "worker-two")
+        assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone() == (0,)
+
+
+def test_reclaimed_preupgrade_partial_attempt_uses_a_new_append_only_number(
+    tmp_path: Path,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    window = CaptureWindow(
+        status="active",
+        policy_sha256=_policy_sha(config),
+        activated_at=datetime(2000, 1, 1, tzinfo=UTC),
+        deadline=datetime(2100, 1, 1, tzinfo=UTC),
+    )
+    first = capture_module._claim_job(
+        config,
+        worker_id="preupgrade-worker",
+        now=decision_at + timedelta(seconds=2),
+        window=window,
+    )
+    assert first is not None
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "INSERT INTO research_capture_attempts("
+            "job_id,attempt_number,started_at_utc,finished_at_utc,status,"
+            "error_kind,error_message,retryable) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                first.job_id,
+                first.attempt_count,
+                capture_module.utc_text(decision_at + timedelta(seconds=2)),
+                capture_module.utc_text(decision_at + timedelta(seconds=3)),
+                "retry",
+                "PREUPGRADE_PARTIAL",
+                "fixture",
+                1,
+            ),
+        )
+        conn.execute(
+            "UPDATE research_capture_jobs SET lease_expires_at_utc=? WHERE job_id=?",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)), first.job_id),
+        )
+
+    reclaimed = capture_module._claim_job(
+        config,
+        worker_id="current-worker",
+        now=decision_at + timedelta(seconds=4),
+        window=window,
+    )
+    assert reclaimed is not None
+    assert reclaimed.attempt_count == 2
+    capture_module._finish_job_attempt(
+        config,
+        reclaimed,
+        started_at=decision_at + timedelta(seconds=4),
+        finished_at=decision_at + timedelta(seconds=5),
+        attempt_status="completed",
+        job_state="complete",
+        error_kind=None,
+        error_message=None,
+        retryable=False,
+        record_sha256="f" * 64,
+    )
+
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT attempt_number,status FROM research_capture_attempts ORDER BY attempt_number"
+        ).fetchall() == [(1, "retry"), (2, "completed")]
+        assert conn.execute(
+            "SELECT status,attempt_count,record_sha256 FROM research_capture_jobs"
+        ).fetchone() == ("complete", 2, "f" * 64)
+
+
+def test_final_preupgrade_partial_attempt_reconciles_existing_evidence_without_recapture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    captures = 0
+
+    def capture_once(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        nonlocal captures
+        captures += 1
+        return None, None, None, "OPTION_CAPTURE_UNAVAILABLE", "fixture", False
+
+    monkeypatch.setattr(capture_module, "_capture_options", capture_once)
+    first = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+    assert first.status == "completed"
+    with sqlite3.connect(source_db) as conn:
+        conn.execute("DROP TRIGGER research_capture_complete_immutable")
+        for attempt_number in (2, 3):
+            conn.execute(
+                "INSERT INTO research_capture_attempts("
+                "job_id,attempt_number,started_at_utc,finished_at_utc,status,"
+                "error_kind,error_message,retryable) "
+                "SELECT job_id,?,?,?,'retry','PREUPGRADE_PARTIAL','fixture',1 "
+                "FROM research_capture_jobs",
+                (
+                    attempt_number,
+                    capture_module.utc_text(decision_at + timedelta(seconds=attempt_number)),
+                    capture_module.utc_text(
+                        decision_at + timedelta(seconds=attempt_number, milliseconds=1)
+                    ),
+                ),
+            )
+        conn.execute(
+            "UPDATE research_capture_jobs SET status='leased',attempt_count=3,"
+            "lease_owner='preupgrade-worker',lease_expires_at_utc=?,record_sha256=NULL",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)),),
+        )
+    ensure_review_tables(str(source_db))
+
+    recovered = run_capture_once(config, now=decision_at + timedelta(seconds=6))
+
+    assert recovered.status == "completed"
+    assert recovered.option_status == "recovered_existing"
+    assert recovered.snapshot_sha256 == first.snapshot_sha256
+    assert captures == 1
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,attempt_count,record_sha256 FROM research_capture_jobs"
+        ).fetchone() == ("complete", 3, first.snapshot_sha256)
+        assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone() == (3,)
+
+
+def test_final_preupgrade_partial_attempt_without_evidence_fails_without_recapture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    with sqlite3.connect(source_db) as conn:
+        job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
+        for attempt_number in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO research_capture_attempts("
+                "job_id,attempt_number,started_at_utc,finished_at_utc,status,"
+                "error_kind,error_message,retryable) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    attempt_number,
+                    capture_module.utc_text(decision_at + timedelta(seconds=attempt_number)),
+                    capture_module.utc_text(
+                        decision_at + timedelta(seconds=attempt_number, milliseconds=1)
+                    ),
+                    "retry",
+                    "PREUPGRADE_PARTIAL",
+                    "fixture",
+                    1,
+                ),
+            )
+        conn.execute(
+            "UPDATE research_capture_jobs SET status='leased',attempt_count=3,"
+            "lease_owner='preupgrade-worker',lease_expires_at_utc=?",
+            (capture_module.utc_text(decision_at + timedelta(seconds=1)),),
+        )
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: pytest.fail("must not recapture"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=6))
+
+    assert result.status == "failed"
+    assert result.option_status == "CAPTURE_ATTEMPTS_EXHAUSTED"
+    with sqlite3.connect(source_db) as conn:
+        assert conn.execute(
+            "SELECT status,attempt_count,last_error_kind FROM research_capture_jobs"
+        ).fetchone() == ("failed", 3, "CAPTURE_ATTEMPTS_EXHAUSTED")
+        assert conn.execute("SELECT COUNT(*) FROM research_capture_attempts").fetchone() == (3,)
+
+
+def test_lease_ownership_is_rechecked_before_immutable_snapshot_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    snapshot_calls = 0
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (
+            None,
+            None,
+            None,
+            "OPTION_CAPTURE_UNAVAILABLE",
+            "fixture",
+            False,
+        ),
+    )
+
+    def lose_lease(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("lost lease before snapshot")
+
+    def count_snapshot(*_args: Any, **_kwargs: Any) -> str:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return "f" * 64
+
+    monkeypatch.setattr(capture_module, "_renew_job_lease", lose_lease)
+    monkeypatch.setattr(capture_module, "_append_snapshot", count_snapshot)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "retry_scheduled"
+    assert snapshot_calls == 0
+    with sqlite3.connect(config.evidence_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM evidence_snapshots").fetchone() == (0,)
+
+
 def test_evidence_store_migrates_legacy_status_rows_without_rewriting_them(
     tmp_path: Path,
 ) -> None:
@@ -1018,38 +1371,21 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_db, packet_id, decision_at = _approved_job(tmp_path)
-    config = _config(tmp_path, source_db)
+    monkeypatch.chdir(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        artifact_root=Path("research/artifacts"),
+    )
+    expected_artifact_root = (tmp_path / "research" / "artifacts").resolve()
 
-    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+    def successful_process(command: list[str], **kwargs: Any) -> ProcessResult:
         output = Path(command[command.index("--output") + 1])
+        assert output.is_absolute()
+        assert output.parent.resolve() == expected_artifact_root / ".staging"
+        assert output.parent.is_dir()
+        assert kwargs["cwd"] == config.alpha_script.parent.parent.resolve()
         request_id = command[command.index("--request-id") + 1]
-        captured = datetime.now(UTC)
-        artifact = {
-            "schema_version": "insider-evidence-option-surface-v1",
-            "artifact_status": "RESEARCH_ONLY",
-            "source_id": "ib_gateway:US_OPTIONS:SMART:type1",
-            "request_id": request_id,
-            "symbol": "TEST",
-            "client_id": 48,
-            "market_data_type": 1,
-            "requested_at_utc": (captured - timedelta(seconds=1)).isoformat(),
-            "source_max_ts_utc": captured.isoformat(),
-            "captured_at_utc": captured.isoformat(),
-            "min_dte_days": 3,
-            "max_dte_days": 30,
-            "max_expiries": 3,
-            "max_contracts_per_expiry": 120,
-            "surfaces": [
-                {
-                    "expiry": "2026-09-18",
-                    "underlying_price": 10.0,
-                    "underlying_bid": 9.99,
-                    "underlying_ask": 10.01,
-                    "underlying_source_timestamp_utc": captured.isoformat(),
-                    "quotes": [{}],
-                }
-            ],
-        }
+        artifact = _live_option_artifact(request_id=request_id)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(artifact), encoding="utf-8")
         return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
@@ -1059,7 +1395,7 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
 
     assert result.status == "completed"
     assert result.option_status == "captured"
-    option_files = list((config.artifact_root / "options").glob("*.json"))
+    option_files = list((expected_artifact_root / "options").glob("*.json"))
     assert len(option_files) == 1
     assert option_files[0].stem == sha256_bytes(option_files[0].read_bytes())
     with sqlite3.connect(config.evidence_db) as conn:
@@ -1069,6 +1405,553 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
     assert observation["status"] == "captured"
     assert observation["artifact_sha256"] == option_files[0].stem
     assert packet_id in record["payload"]["signal"]["packet_id"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-share contract")
+def test_option_publication_directory_cannot_be_swapped_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        output.write_text(
+            json.dumps(_live_option_artifact(request_id=request_id)),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    original_publish_locked = capture_module._publish_content_addressed_locked
+    swap_was_denied = False
+
+    def attack_after_publication_lock(
+        root: Path,
+        data: bytes,
+        *,
+        suffix: str,
+    ) -> tuple[Path, str]:
+        nonlocal swap_was_denied
+        replacement = root.with_name("options-replacement")
+        try:
+            root.rename(replacement)
+        except OSError:
+            swap_was_denied = True
+        else:
+            replacement.rename(root)
+            pytest.fail("validated publication directory was renameable while pinned")
+        return original_publish_locked(root, data, suffix=suffix)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    monkeypatch.setattr(
+        capture_module,
+        "_publish_content_addressed_locked",
+        attack_after_publication_lock,
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert swap_was_denied
+    assert result.status == "completed"
+    assert result.option_status == "captured"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "captured"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative contract")
+def test_posix_artifact_access_remains_bound_to_the_validated_directory(
+    tmp_path: Path,
+) -> None:
+    research_root = tmp_path / "research"
+    artifact_root = research_root / "artifacts"
+    outside = tmp_path / "outside"
+    artifact_root.mkdir(parents=True)
+    outside.mkdir()
+
+    with capture_module._locked_artifact_directory(
+        artifact_root, research_root=research_root
+    ) as locked:
+        original = artifact_root.with_name("artifacts-original")
+        artifact_root.rename(original)
+        artifact_root.symlink_to(outside, target_is_directory=True)
+        (locked / "bound.txt").write_text("bound", encoding="utf-8")
+
+    assert (original / "bound.txt").read_text(encoding="utf-8") == "bound"
+    assert not (outside / "bound.txt").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative contract")
+def test_posix_ancestor_swap_is_rejected_during_component_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    artifact_parent = research_root / "artifacts"
+    option_root = artifact_parent / "options"
+    outside_parent = tmp_path / "outside"
+    outside_option_root = outside_parent / "options"
+    option_root.mkdir(parents=True)
+    outside_option_root.mkdir(parents=True)
+    original_confine = capture_module._confined_artifact_root
+    swapped = False
+
+    def swap_after_validation(path: Path, *, research_root: Path) -> Path:
+        nonlocal swapped
+        verified = original_confine(path, research_root=research_root)
+        if not swapped:
+            swapped = True
+            artifact_parent.rename(artifact_parent.with_name("artifacts-original"))
+            artifact_parent.symlink_to(outside_parent, target_is_directory=True)
+        return verified
+
+    monkeypatch.setattr(capture_module, "_confined_artifact_root", swap_after_validation)
+
+    with (
+        pytest.raises(capture_module.OptionRuntimeValidationError, match="could not be pinned"),
+        capture_module._locked_artifact_directory(
+            option_root, research_root=research_root
+        ),
+    ):
+        pytest.fail("ancestor swap must fail closed")
+
+    assert not (outside_option_root / "unexpected").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative contract")
+def test_posix_publication_rejects_detached_lexical_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    outside = tmp_path / "outside"
+    outside_options = outside / "options"
+    option_root.mkdir(parents=True)
+    outside_options.mkdir(parents=True)
+    original_publish = capture_module._publish_content_addressed_locked
+
+    def detach_after_publish(root: Path, data: bytes, *, suffix: str) -> tuple[Path, str]:
+        published = original_publish(root, data, suffix=suffix)
+        (outside_options / published[0].name).write_bytes(data)
+        lexical_parent = option_root.parent
+        lexical_parent.rename(lexical_parent.with_name("artifacts-original"))
+        lexical_parent.symlink_to(outside, target_is_directory=True)
+        return published
+
+    monkeypatch.setattr(
+        capture_module,
+        "_publish_content_addressed_locked",
+        detach_after_publish,
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="path changed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+def test_posix_timeout_kills_the_entire_child_process_group(tmp_path: Path) -> None:
+    survivor_marker = tmp_path / "descendant-survived"
+    descendant = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(2); Path(sys.argv[1]).write_text('survived')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant!r},sys.argv[1]]); "
+        "time.sleep(10)"
+    )
+
+    result = capture_module.run_hidden_process(
+        [sys.executable, "-c", parent, str(survivor_marker)],
+        cwd=tmp_path,
+        timeout_seconds=1,
+    )
+    time.sleep(2)
+
+    assert result.timed_out
+    assert not survivor_marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+def test_posix_timeout_kills_pipe_holder_after_group_leader_exits(tmp_path: Path) -> None:
+    survivor_marker = tmp_path / "exited-leader-descendant-survived"
+    descendant = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(2); Path(sys.argv[1]).write_text('survived')"
+    )
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant!r},sys.argv[1]])"
+    )
+
+    result = capture_module.run_hidden_process(
+        [sys.executable, "-c", parent, str(survivor_marker)],
+        cwd=tmp_path,
+        timeout_seconds=1,
+    )
+    time.sleep(2)
+
+    assert result.timed_out
+    assert not survivor_marker.exists()
+
+
+def test_artifact_mutex_serializes_independent_processes(tmp_path: Path) -> None:
+    research_root = tmp_path / "research"
+    research_root.mkdir()
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    acquired = tmp_path / "acquired"
+    holder_code = (
+        "import sys,time; from pathlib import Path; "
+        "from insider_alerts.research.capture import _artifact_process_mutex; "
+        "root,ready,release=map(Path,sys.argv[1:4]); "
+        "cm=_artifact_process_mutex(root,timeout_seconds=10); cm.__enter__(); "
+        "ready.write_text('ready'); "
+        "deadline=time.monotonic()+10; "
+        "exec('while not release.exists() and time.monotonic() < deadline:\\n "
+        "time.sleep(0.05)'); cm.__exit__(None,None,None)"
+    )
+    waiter_code = (
+        "import sys; from pathlib import Path; "
+        "from insider_alerts.research.capture import _artifact_process_mutex; "
+        "root,acquired=map(Path,sys.argv[1:3]); "
+        "cm=_artifact_process_mutex(root,timeout_seconds=10); cm.__enter__(); "
+        "acquired.write_text('acquired'); cm.__exit__(None,None,None)"
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(research_root), str(ready), str(release)],
+        creationflags=flags,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready.exists()
+        waiter = subprocess.Popen(
+            [sys.executable, "-c", waiter_code, str(research_root), str(acquired)],
+            creationflags=flags,
+        )
+        try:
+            time.sleep(0.5)
+            assert not acquired.exists()
+            release.write_text("release", encoding="utf-8")
+            assert waiter.wait(timeout=5) == 0
+            assert acquired.read_text(encoding="utf-8") == "acquired"
+        finally:
+            if waiter.poll() is None:
+                waiter.kill()
+                waiter.wait(timeout=5)
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if holder.poll() is None:
+            holder.wait(timeout=5)
+    assert holder.returncode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows recursive handle contract")
+def test_windows_recursive_mutex_and_directory_handles_release_cleanly(tmp_path: Path) -> None:
+    research_root = tmp_path / "research"
+    artifact_root = research_root / "artifacts"
+    artifact_root.mkdir(parents=True)
+
+    with (
+        capture_module._artifact_process_mutex(research_root, timeout_seconds=2),
+        capture_module._artifact_process_mutex(research_root, timeout_seconds=2),
+        capture_module._locked_artifact_directory(
+            artifact_root, research_root=research_root
+        ),
+        capture_module._locked_artifact_directory(
+            artifact_root, research_root=research_root
+        ),
+    ):
+        assert capture_module._WINDOWS_ARTIFACT_HANDLES
+
+    assert capture_module._WINDOWS_ARTIFACT_HANDLES == {}
+    source = (ROOT / "src/insider_alerts/research/capture.py").read_text(encoding="utf-8")
+    assert 'f"Global\\\\InsiderAlertsResearchArtifacts-' in source
+
+
+def test_option_publication_failure_is_persisted_as_typed_missingness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        output.write_text(
+            json.dumps(_live_option_artifact(request_id=request_id)),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    original_publish_locked = capture_module._publish_content_addressed_locked
+
+    def fail_option_publication(
+        root: Path, data: bytes, *, suffix: str
+    ) -> tuple[Path, str]:
+        if root.resolve().name == "options":
+            raise OSError("simulated publication failure")
+        return original_publish_locked(root, data, suffix=suffix)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    monkeypatch.setattr(
+        capture_module,
+        "_publish_content_addressed_locked",
+        fail_option_publication,
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_ARTIFACT_PUBLICATION_FAILED"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "error"
+    assert observation["error"]["kind"] == "OPTION_ARTIFACT_PUBLICATION_FAILED"
+
+
+def test_content_address_fsync_failure_removes_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        capture_module.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("simulated fsync failure")),
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert list(option_root.iterdir()) == []
+
+
+def test_content_address_fdopen_failure_removes_created_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    original_fdopen = capture_module.os.fdopen
+
+    def fail_fdopen(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        capture_module.os.close(descriptor)
+        raise OSError("simulated fdopen failure")
+
+    monkeypatch.setattr(capture_module.os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+            capture_module._publish_content_addressed(
+                option_root,
+                b"payload",
+                suffix=".json",
+                research_root=research_root,
+            )
+    finally:
+        monkeypatch.setattr(capture_module.os, "fdopen", original_fdopen)
+
+    assert list(option_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "flush"])
+def test_content_address_stream_failure_removes_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+
+    class FailingStream:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+
+        def __enter__(self) -> FailingStream:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            capture_module.os.close(self.descriptor)
+
+        def write(self, _data: bytes) -> None:
+            if failure_stage == "write":
+                raise OSError("simulated write failure")
+
+        def flush(self) -> None:
+            if failure_stage == "flush":
+                raise OSError("simulated flush failure")
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+    monkeypatch.setattr(
+        capture_module.os,
+        "fdopen",
+        lambda descriptor, *_args, **_kwargs: FailingStream(descriptor),
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert list(option_root.iterdir()) == []
+
+
+def test_content_address_link_failure_removes_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        capture_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("simulated link failure")),
+    )
+
+    with pytest.raises(capture_module.ArtifactPublicationError, match="publication failed"):
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert list(option_root.iterdir()) == []
+
+
+def test_content_address_primary_failure_precedes_staging_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    research_root = tmp_path / "research"
+    option_root = research_root / "artifacts" / "options"
+    option_root.mkdir(parents=True)
+    original_unlink = Path.unlink
+    monkeypatch.setattr(
+        capture_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("simulated link failure")),
+    )
+
+    def fail_staging_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.parent.resolve() == option_root.resolve() and path.suffix == ".tmp":
+            raise PermissionError("simulated staging cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_staging_cleanup)
+
+    with pytest.raises(
+        capture_module.ArtifactPublicationError, match="publication failed"
+    ) as error:
+        capture_module._publish_content_addressed(
+            option_root,
+            b"payload",
+            suffix=".json",
+            research_root=research_root,
+        )
+
+    assert isinstance(error.value.__cause__, OSError)
+    assert "simulated link failure" in str(error.value.__cause__)
+    assert any(
+        "publication staging cleanup also failed" in note
+        for note in getattr(error.value.__cause__, "__notes__", [])
+    )
+
+
+def test_option_staging_cleanup_failure_is_persisted_as_typed_missingness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        output.write_text(
+            json.dumps(_live_option_artifact(request_id=request_id)),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    original_unlink = Path.unlink
+    staging_unlinks = 0
+
+    def fail_final_staging_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal staging_unlinks
+        if path.parent.resolve().name == ".staging" and path.suffix == ".json":
+            staging_unlinks += 1
+            if staging_unlinks == 2:
+                raise PermissionError("simulated locked staging output")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    monkeypatch.setattr(Path, "unlink", fail_final_staging_cleanup)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_STAGING_CLEANUP_FAILED"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "error"
+    assert observation["error"]["kind"] == "OPTION_STAGING_CLEANUP_FAILED"
+
+
+def test_primary_option_failure_precedes_simultaneous_staging_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    original_unlink = Path.unlink
+    staging_unlinks = 0
+
+    def fail_process(*_args: Any, **_kwargs: Any) -> ProcessResult:
+        return ProcessResult(returncode=2, stdout="", stderr="provider rejected", timed_out=False)
+
+    def fail_final_staging_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal staging_unlinks
+        if path.parent.resolve().name == ".staging" and path.suffix == ".json":
+            staging_unlinks += 1
+            if staging_unlinks == 2:
+                raise PermissionError("simulated locked staging output")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", fail_process)
+    monkeypatch.setattr(Path, "unlink", fail_final_staging_cleanup)
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_CAPTURE_PROCESS_FAILED"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    error = record["payload"]["observations"]["options_surface"]["error"]
+    assert error["kind"] == "OPTION_CAPTURE_PROCESS_FAILED"
+    assert "staging cleanup failed" in error["message"]
 
 
 def test_exact_no_chain_result_is_persisted_as_not_applicable_without_error(
@@ -1291,13 +2174,22 @@ def test_closed_venue_uses_one_cutoff_bound_historical_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_db, _, decision_at = _approved_job(tmp_path)
-    config = _config(tmp_path, source_db)
+    monkeypatch.chdir(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        artifact_root=Path("research/artifacts"),
+    )
+    expected_artifact_root = (tmp_path / "research" / "artifacts").resolve()
     with sqlite3.connect(source_db) as conn:
         job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
     calls: list[tuple[list[str], int]] = []
 
     def process(command: list[str], **kwargs: Any) -> ProcessResult:
         calls.append((command, int(kwargs["timeout_seconds"])))
+        output = Path(command[command.index("--output") + 1])
+        assert output.is_absolute()
+        assert output.parent.resolve() == expected_artifact_root / ".staging"
+        assert kwargs["cwd"] == config.alpha_script.parent.parent.resolve()
         if command[1] == str(config.alpha_script):
             return ProcessResult(
                 returncode=1,
@@ -1308,7 +2200,6 @@ def test_closed_venue_uses_one_cutoff_bound_historical_fallback(
                 ),
                 timed_out=False,
             )
-        output = Path(command[command.index("--output") + 1])
         artifact = _historical_artifact(request_id=job_id, decision_at=decision_at)
         _install_chain_custody(config.option_chain_store_db, artifact)
         output.write_text(
@@ -1462,6 +2353,166 @@ def test_option_database_escape_is_rejected_before_any_child_launch(
     assert launches == 0
 
 
+def test_artifact_root_escape_is_rejected_before_any_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        artifact_root=tmp_path / "outside-artifacts",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    with pytest.raises(
+        capture_module.OptionRuntimeValidationError,
+        match="artifact root escaped",
+    ):
+        run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+
+def test_alpha_runtime_reparse_ancestor_is_rejected_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    base = _config(tmp_path, source_db)
+    runtime = tmp_path / "linked-alpha"
+    scripts = runtime / "scripts"
+    outside_venv = tmp_path / "outside-venv"
+    scripts.mkdir(parents=True)
+    (outside_venv / "Scripts").mkdir(parents=True)
+    (scripts / "capture.py").write_text("# live\n", encoding="utf-8")
+    (scripts / "historical.py").write_text("# historical\n", encoding="utf-8")
+    (outside_venv / "Scripts" / "python.exe").write_bytes(b"python")
+    try:
+        (runtime / ".venv").symlink_to(outside_venv, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    config = replace(
+        base,
+        alpha_python=runtime / ".venv" / "Scripts" / "python.exe",
+        alpha_script=scripts / "capture.py",
+        alpha_historical_script=scripts / "historical.py",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RUNTIME_INVALID"
+
+
+def test_artifact_root_reparse_point_is_rejected_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    config.artifact_root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        config.artifact_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    with pytest.raises(
+        capture_module.OptionRuntimeValidationError,
+        match="artifact root is unavailable or contains a reparse point",
+    ):
+        run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+
+@pytest.mark.parametrize("child_name", [".staging", "options"])
+def test_artifact_child_reparse_point_is_rejected_before_child_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    child_name: str,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    config.artifact_root.mkdir(parents=True)
+    outside = tmp_path / f"outside-{child_name.removeprefix('.')}"
+    outside.mkdir()
+    try:
+        (config.artifact_root / child_name).symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RUNTIME_INVALID"
+
+
+def test_artifact_root_path_is_not_part_of_scientific_configuration_hash(
+    tmp_path: Path,
+) -> None:
+    source_db, _, _ = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    relocated = replace(config, artifact_root=config.research_root / "other-artifacts")
+
+    assert capture_module._configuration_sha(relocated) == capture_module._configuration_sha(
+        config
+    )
+
+
+def test_snapshot_publication_accepts_resolved_research_root_behind_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actual_root = tmp_path / "actual"
+    actual_root.mkdir()
+    source_db, _, decision_at = _approved_job(actual_root)
+    alias_root = tmp_path / "alias"
+    try:
+        alias_root.symlink_to(actual_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    base = _config(actual_root, source_db)
+    config = replace(
+        base,
+        source_db=alias_root / "source.db",
+        evidence_db=alias_root / "evidence.db",
+        research_root=alias_root / "research",
+        artifact_root=alias_root / "research" / "artifacts",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (
+            None,
+            None,
+            None,
+            "OPTION_CAPTURE_UNAVAILABLE",
+            "fixture",
+            False,
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_CAPTURE_UNAVAILABLE"
+    assert len(list((actual_root / "research" / "artifacts" / "snapshots").glob("*.json"))) == 1
+
+
 def test_research_root_cannot_be_rebound_away_from_source_data_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1471,6 +2522,7 @@ def test_research_root_cannot_be_rebound_away_from_source_data_root(
     config = replace(
         _config(tmp_path, source_db),
         research_root=outside_research,
+        artifact_root=outside_research / "artifacts",
         option_chain_store_db=outside_research / "chain.db",
         historical_pacing_db=outside_research / "pacing.db",
     )
@@ -1666,6 +2718,7 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
     assert job_calls == [True]
     assert len(calls) == 1
     assert calls[0].alpha_historical_script == tmp_path / "alpha-history.py"
+    assert calls[0].artifact_root == tmp_path / "artifacts"
     assert calls[0].option_chain_store_db == tmp_path / "option-chain.db"
     assert calls[0].historical_pacing_db == tmp_path / "historical-pacing.db"
     assert calls[0].research_root == ROOT / "data" / "research"
@@ -1675,6 +2728,58 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
         "snapshot_sha256": None,
         "status": "idle",
     }
+
+
+def test_worker_resolves_only_relative_artifact_root_against_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[CaptureConfig] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(worker_module, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(worker_module, "ensure_review_tables", lambda _path: None)
+    monkeypatch.setattr(worker_module, "resolve_git_commit", lambda _root: "a" * 40)
+    monkeypatch.setattr(
+        worker_module,
+        "run_capture_once",
+        lambda config: calls.append(config) or CaptureResult(status="idle"),
+    )
+    args = [
+        "--database-path",
+        "data/source.db",
+        "--evidence-db",
+        "data/research/evidence.db",
+        "--artifact-root",
+        "data/research/artifacts",
+        "--canary-ledger",
+        "data/canary.db",
+        "--history-db",
+        "data/research/history.db",
+        "--history-snapshot-sha256",
+        "b" * 64,
+        "--alpha-python",
+        "../alpha/.venv/Scripts/python.exe",
+        "--alpha-script",
+        "../alpha/scripts/capture.py",
+        "--alpha-historical-script",
+        "../alpha/scripts/historical.py",
+        "--option-chain-store-db",
+        "data/research/option-chain.db",
+        "--historical-pacing-db",
+        "data/research/pacing.db",
+        "--error-log",
+        "logs/research-capture.err.log",
+    ]
+
+    assert worker_module.main(args) == 0
+
+    assert len(calls) == 1
+    config = calls[0]
+    assert config.source_db == Path("data/source.db")
+    assert config.evidence_db == Path("data/research/evidence.db")
+    assert config.artifact_root == ROOT / "data" / "research" / "artifacts"
+    assert config.alpha_python == Path("../alpha/.venv/Scripts/python.exe")
+    assert config.option_chain_store_db == Path("data/research/option-chain.db")
+    assert config.activation_db == Path("data/research/activation.db")
 
 
 def test_worker_main_persists_and_logs_fatal_setup_failure(
@@ -1696,13 +2801,209 @@ def test_worker_main_persists_and_logs_fatal_setup_failure(
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows Scheduled Task action contract")
+def test_research_task_action_builder_emits_exact_hidden_worker_command() -> None:
+    helper = ROOT / "ops/windows/research-capture-task-action.ps1"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ACTION_HELPER": str(helper),
+            "ACTION_PYTHON": r"C:\fixture repo\.venv\Scripts\pythonw.exe",
+            "ACTION_REPO": r"C:\fixture repo",
+            "ACTION_ARTIFACTS": r"C:\fixture repo\data\research\artifacts",
+            "ACTION_ALPHA_PYTHON": r"C:\alpha\.venv\Scripts\python.exe",
+            "ACTION_ALPHA_SCRIPT": r"C:\alpha\scripts\capture.py",
+            "ACTION_ALPHA_HISTORY": r"C:\alpha\scripts\history.py",
+            "ACTION_CHAIN": r"C:\fixture repo\data\research\chain.db",
+            "ACTION_PACING": r"C:\fixture repo\data\research\pacing.db",
+            "ACTION_HISTORY": r"C:\fixture repo\data\research\history.db",
+            "ACTION_SHA": "a" * 64,
+        }
+    )
+    command = """
+. $env:ACTION_HELPER
+$spec = New-ResearchCaptureTaskActionSpec `
+  -PythonExe $env:ACTION_PYTHON `
+  -RepoRoot $env:ACTION_REPO `
+  -ArtifactRoot $env:ACTION_ARTIFACTS `
+  -AlphaPython $env:ACTION_ALPHA_PYTHON `
+  -AlphaScript $env:ACTION_ALPHA_SCRIPT `
+  -AlphaHistoricalScript $env:ACTION_ALPHA_HISTORY `
+  -ChainStorePath $env:ACTION_CHAIN `
+  -PacingDatabasePath $env:ACTION_PACING `
+  -HistoryDatabase $env:ACTION_HISTORY `
+  -HistorySnapshotSha256 $env:ACTION_SHA
+$spec | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert json.loads(result.stdout) == {
+        "Execute": environment["ACTION_PYTHON"],
+        "Argument": (
+            "-m insider_alerts.research.worker "
+            '--artifact-root "C:\\fixture repo\\data\\research\\artifacts" '
+            '--alpha-python "C:\\alpha\\.venv\\Scripts\\python.exe" '
+            '--alpha-script "C:\\alpha\\scripts\\capture.py" '
+            '--alpha-historical-script "C:\\alpha\\scripts\\history.py" '
+            '--option-chain-store-db "C:\\fixture repo\\data\\research\\chain.db" '
+            '--historical-pacing-db "C:\\fixture repo\\data\\research\\pacing.db" '
+            '--history-db "C:\\fixture repo\\data\\research\\history.db" '
+            f'--history-snapshot-sha256 {"a" * 64} '
+            '--error-log "C:\\fixture repo\\logs\\research-capture.err.log"'
+        ),
+        "WorkingDirectory": environment["ACTION_REPO"],
+    }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_research_database_parent_validation_rejects_junction_before_creation(
+    tmp_path: Path,
+) -> None:
+    helper = ROOT / "ops/windows/research-path-validation.ps1"
+    research_root = tmp_path / "research"
+    outside = tmp_path / "outside"
+    junction = research_root / "redirect"
+    research_root.mkdir()
+    outside.mkdir()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH_HELPER": str(helper),
+            "RESEARCH_ROOT": str(research_root),
+            "OUTSIDE_ROOT": str(outside),
+            "JUNCTION_PATH": str(junction),
+            "DATABASE_PATH": str(junction / "nested" / "chain.db"),
+        }
+    )
+    command = """
+New-Item -ItemType Junction -Path $env:JUNCTION_PATH -Target $env:OUTSIDE_ROOT | Out-Null
+. $env:PATH_HELPER
+try {
+  Initialize-ResearchDatabaseParent `
+    -DatabasePath $env:DATABASE_PATH `
+    -ResearchRoot $env:RESEARCH_ROOT
+  exit 9
+} catch {
+  if ($_.Exception.Message -notlike '*reparse point*') { throw }
+}
+if (Test-Path -LiteralPath (Join-Path $env:OUTSIDE_ROOT 'nested')) { exit 8 }
+"""
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert not (outside / "nested").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_research_runtime_validation_rejects_junction_ancestor(tmp_path: Path) -> None:
+    helper = ROOT / "ops/windows/research-path-validation.ps1"
+    checkout = tmp_path / "checkout"
+    outside = tmp_path / "outside-runtime"
+    junction = checkout / ".venv"
+    checkout.mkdir()
+    (outside / "Scripts").mkdir(parents=True)
+    executable = outside / "Scripts" / "python.exe"
+    executable.write_bytes(b"python")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH_HELPER": str(helper),
+            "CHECKOUT_ROOT": str(checkout),
+            "OUTSIDE_ROOT": str(outside),
+            "JUNCTION_PATH": str(junction),
+            "RUNTIME_PATH": str(junction / "Scripts" / "python.exe"),
+        }
+    )
+    command = """
+New-Item -ItemType Junction -Path $env:JUNCTION_PATH -Target $env:OUTSIDE_ROOT | Out-Null
+. $env:PATH_HELPER
+try {
+  Assert-ResearchRuntimePath `
+    -Path $env:RUNTIME_PATH `
+    -CheckoutRoot $env:CHECKOUT_ROOT
+  exit 9
+} catch {
+  if ($_.Exception.Message -notlike '*reparse point*') { throw }
+}
+exit 0
+"""
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     installer = (ROOT / "ops/windows/install-research-capture-task.ps1").read_text(encoding="utf-8")
 
     assert ".venv\\Scripts\\pythonw.exe" in installer
     assert '"--loop"' not in installer
     assert "capture_insider_historical_option_evidence.py" in installer
-    assert '"--option-chain-store-db' in installer
-    assert '"--historical-pacing-db' in installer
+    assert '. (Join-Path $scriptDir "research-capture-task-action.ps1")' in installer
+    assert '. (Join-Path $scriptDir "research-path-validation.ps1")' in installer
+    assert "Assert-ResearchRuntimePath -Path $path" in installer
+    assert "-ArtifactRoot $artifactRoot" in installer
+    assert "-Execute $actionSpec.Execute" in installer
+    assert "-Argument $actionSpec.Argument" in installer
+    assert "-WorkingDirectory $actionSpec.WorkingDirectory" in installer
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 15)" in installer
     assert "-MultipleInstances IgnoreNew" in installer
+    ancestor_validation = installer.index("Research artifact ancestor cannot be a reparse point")
+    data_creation = installer.index("New-Item -ItemType Directory -Path $dataRoot")
+    data_validation = installer.index("$dataRootItem = Get-Item -LiteralPath $dataRoot")
+    artifact_creation = installer.index("New-Item -ItemType Directory -Path $artifactRoot")
+    assert data_creation < data_validation
+    assert ancestor_validation < artifact_creation
+    path_helper = (ROOT / "ops/windows/research-path-validation.ps1").read_text(
+        encoding="utf-8"
+    )
+    database_validation = path_helper.index(
+        "Research option database parent cannot be a reparse point"
+    )
+    database_parent_creation = path_helper.index(
+        "New-Item -ItemType Directory -Path $databaseParent"
+    )
+    assert database_validation < database_parent_creation

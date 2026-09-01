@@ -170,6 +170,11 @@ looks. The terminal dataset itself can exist only after the prospective sample f
 - Preserve raw point-in-time SEC Companyfacts responses in a separately activated capture-only
   stream for future fresh-sample market-cap research. This stream cannot delay enrollment, alter
   the active evidence snapshot/configuration hash, read outcomes, or enter the current decision.
+- Keep cross-process option artifacts on absolute, validated paths beneath `data/research`.
+  Serialize before leasing a job, bind every lease transition to its owner, and use pinned
+  handle-relative access on platforms where directory renames remain possible after validation.
+  Option publication or staging-cleanup failures become typed missingness when the snapshot store
+  is writable; a snapshot-store failure fails the cycle closed, and neither case is backfilled.
 - Preserve each existing ntfy request attempt and provider response in a separately activated,
   secret-free transport journal. Provider acknowledgement is not device receipt; the journal does
   not alter notification retries or enter the active evidence snapshots or decision.
