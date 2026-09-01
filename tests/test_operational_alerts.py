@@ -101,6 +101,38 @@ def test_outage_threshold_durable_dedupe_and_recovery(monkeypatch, tmp_path) -> 
     }
 
 
+def test_tracker_closes_every_sqlite_connection(monkeypatch, tmp_path) -> None:
+    started = datetime(2026, 9, 1, 4, 0, tzinfo=UTC)
+    ledger = tmp_path / "canary.db"
+    CanaryStore(str(ledger))
+    tracker = OperationalIncidentTracker(ledger)
+    connections: list[sqlite3.Connection] = []
+    real_connect = tracker._connect
+
+    def tracked_connect() -> sqlite3.Connection:
+        connection = real_connect()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(tracker, "_connect", tracked_connect)
+    tracker.record_failure("ibkr_gateway_unavailable", now=started)
+    outage = tracker.record_failure(
+        "ibkr_gateway_unavailable", now=started + timedelta(minutes=5)
+    )
+    assert outage is not None
+    _dispatch_success(monkeypatch, started + timedelta(minutes=5, seconds=1))
+    assert asyncio.run(tracker.dispatch(Settings(), outage)).status == "delivered"
+    recovery = tracker.record_success(now=started + timedelta(minutes=6))
+    assert recovery is not None
+    _dispatch_success(monkeypatch, started + timedelta(minutes=6, seconds=1))
+    assert asyncio.run(tracker.dispatch(Settings(), recovery)).status == "delivered"
+
+    assert len(connections) == 7
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+
 def test_indeterminate_outage_attempt_is_preserved_through_recovery(
     monkeypatch, tmp_path
 ) -> None:

@@ -49,7 +49,7 @@ it recovers. The notification path must remain isolated from trading and researc
   session; the relaunched GUI never authenticated or opened port 4001.
 - `claude -p` design challenge attempted on 2026-09-01 but refused by the service because the
   account had reached its Fable 5 usage limit. No Claude review result was produced.
-- Implemented on `fix/gateway-outage-alert` with 14 focused state-machine and CLI tests.
+- Implemented on `fix/gateway-outage-alert` with 15 focused state-machine and CLI tests.
 - Full local gates passed on 2026-09-01: `ruff`, strict `mypy` on Windows and Linux, and the
   complete `pytest` suite (five expected skips).
 - Initial Linux CI exposed interpreter-dependent literal narrowing in `_failure_kind`; the final
@@ -59,4 +59,8 @@ it recovers. The notification path must remain isolated from trading and researc
   same-event-loop Windows mutex re-entry, and retryable tracker initialization. The final pass
   reported no actionable findings. Remaining at-least-once duplicate and one-cycle timestamp lag
   risks are documented design tradeoffs to verify after deployment.
+- CodeRabbit's substantive first-head review found two issues: CI had already replaced the
+  platform-dependent cast, and every tracker connection is now explicitly closed with a focused
+  no-leak regression test. The current-head App is adaptively limited and the CLI is absent, so
+  the required exact-head rung-2 review remains pending.
 - PR review, merge, deployment, and live outage/recovery verification remain pending.

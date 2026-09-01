@@ -8,7 +8,7 @@ import os
 import sqlite3
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -181,7 +181,9 @@ class OperationalIncidentTracker:
         return conn
 
     def _ensure_schema(self) -> None:
-        with _operational_mutex(self.path, timeout_seconds=1.0), self._connect() as conn:
+        with _operational_mutex(self.path, timeout_seconds=1.0), closing(
+            self._connect()
+        ) as conn:
             conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -217,7 +219,7 @@ class OperationalIncidentTracker:
         failure_kind = _failure_kind(failure_kind)
         observed_at = _as_utc(now)
         stamp = observed_at.isoformat()
-        with _operational_mutex(self.path), self._connect() as conn:
+        with _operational_mutex(self.path), closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             pending_recoveries = conn.execute(
                 """
@@ -329,7 +331,7 @@ class OperationalIncidentTracker:
     def record_success(self, *, now: datetime) -> OperationalNotificationAction | None:
         observed_at = _as_utc(now)
         stamp = observed_at.isoformat()
-        with _operational_mutex(self.path), self._connect() as conn:
+        with _operational_mutex(self.path), closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM operational_incidents WHERE component=? AND recovered_at IS NULL",
@@ -446,7 +448,7 @@ class OperationalIncidentTracker:
             if action.phase == "outage"
             else "recovered_at IS NOT NULL AND recovery_abandoned_at IS NULL"
         )
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 f"""
                 SELECT 1 FROM operational_incidents
@@ -472,7 +474,7 @@ class OperationalIncidentTracker:
             else "recovered_at IS NOT NULL AND recovery_abandoned_at IS NULL"
         )
         event_phase = "outage" if is_outage else "recovery"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 f"""
@@ -503,7 +505,7 @@ class OperationalIncidentTracker:
     ) -> None:
         stamp = _as_utc(now).isoformat()
         event_phase = "outage" if action.phase == "outage" else "recovery"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             _event(
                 conn,
                 stamp,
