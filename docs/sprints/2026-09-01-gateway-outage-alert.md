@@ -31,8 +31,9 @@ it recovers. The notification path must remain isolated from trading and researc
 5. Preserve every observed lifecycle outcome in a single ordered coroutine queue and fence the
    durable state machine with a cross-session, ledger-keyed OS mutex. Revalidate the exact
    reservation under that fence, use an asynchronous five-second total HTTP deadline, and process
-   the queue in the background so the next broker cycle is not gated. Diagnostics are best-effort
-   and transient tracker initialization failures retry once per minute.
+   the queue in the background so the next broker cycle is not gated. Drain all already-observed
+   transitions into durable state before dispatch and use a bounded graceful shutdown drain.
+   Diagnostics are best-effort and transient tracker initialization failures retry once per minute.
 
 ## Verification
 
@@ -50,7 +51,7 @@ it recovers. The notification path must remain isolated from trading and researc
   session; the relaunched GUI never authenticated or opened port 4001.
 - `claude -p` design challenge attempted on 2026-09-01 but refused by the service because the
   account had reached its Fable 5 usage limit. No Claude review result was produced.
-- Implemented on `fix/gateway-outage-alert` with 15 focused state-machine and CLI tests.
+- Implemented on `fix/gateway-outage-alert` with 16 focused state-machine and CLI tests.
 - Full local gates passed on 2026-09-01: `ruff`, strict `mypy` on Windows and Linux, and the
   complete `pytest` suite (five expected skips).
 - Initial Linux CI exposed interpreter-dependent literal narrowing in `_failure_kind`; the final
@@ -66,5 +67,9 @@ it recovers. The notification path must remain isolated from trading and researc
   the review ladder authorized a rung-2 agent review without waiting on the published cooldown.
 - The first exact-head rung-2 pass found that skip-on-lock bookkeeping could discard a lifecycle
   outcome during a five-second send. An ordered background transition queue now preserves those
-  outcomes while keeping broker cycles independent; exact-head re-review remains pending.
+  outcomes while keeping broker cycles independent.
+- The next exact-head pass found queued failure/recovery dispatch ordering and graceful-shutdown
+  gaps. Batching now applies every already-observed transition before dispatch so stale recovery
+  revalidation fails closed, and shutdown drains queued state before cancellation. Exact-head
+  re-review remains pending.
 - PR review, merge, deployment, and live outage/recovery verification remain pending.

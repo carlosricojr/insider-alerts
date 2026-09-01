@@ -459,7 +459,7 @@ def test_cli_operational_diagnostic_log_failure_is_best_effort(
     assert "operational recovery tracking isolated: OperationalError" in result.output
 
 
-def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
+def test_loop_preserves_transitions_and_drains_them_on_shutdown(
     monkeypatch, tmp_path
 ) -> None:
     ledger = tmp_path / "canary.db"
@@ -475,6 +475,7 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
         "dispatch_completed": False,
     }
     release_dispatch = asyncio.Event()
+    sleep_calls = 0
 
     class FailingRunner:
         def __init__(self, config, broker) -> None:  # type: ignore[no-untyped-def]
@@ -482,7 +483,7 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
             self.broker = _FakeBroker()
 
         def source_revision_changed(self) -> bool:
-            return state["cycles"] >= 2 and state["failure_transitions"] >= 2
+            return state["cycles"] >= 2
 
         async def cycle(self, *, disconnect_after: bool) -> CycleResult:
             assert disconnect_after is False
@@ -499,7 +500,10 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
         return OperationalDispatchResult("stale")
 
     async def yield_once(seconds):  # type: ignore[no-untyped-def]
-        await asyncio.tasks.sleep(0)
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            await asyncio.tasks.sleep(0)
 
     real_record_failure = OperationalIncidentTracker.record_failure
 
@@ -526,3 +530,93 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
         "dispatch_started": True,
         "dispatch_completed": True,
     }
+
+
+def test_loop_batches_renewed_failure_before_recovery_dispatch(
+    monkeypatch, tmp_path
+) -> None:
+    ledger = tmp_path / "canary.db"
+    started = datetime.now(UTC) - timedelta(minutes=10)
+    CanaryStore(str(ledger))
+    OperationalIncidentTracker(ledger).record_failure(
+        "ibkr_gateway_unavailable", now=started
+    )
+    state = {
+        "cycles": 0,
+        "failure_transitions": 0,
+        "success_transitions": 0,
+        "dispatch_started": False,
+    }
+    release_dispatch = asyncio.Event()
+    sent_phases: list[str] = []
+
+    class FlappingRunner:
+        def __init__(self, config, broker) -> None:  # type: ignore[no-untyped-def]
+            self.store = CanaryStore(str(config.ledger_db))
+            self.broker = _FakeBroker()
+
+        def source_revision_changed(self) -> bool:
+            return (
+                state["cycles"] >= 3
+                and state["failure_transitions"] >= 2
+                and state["success_transitions"] >= 1
+            )
+
+        async def cycle(self, *, disconnect_after: bool) -> CycleResult:
+            assert disconnect_after is False
+            state["cycles"] += 1
+            if state["cycles"] == 2:
+                return CycleResult()
+            if state["cycles"] == 3:
+                assert state["dispatch_started"] is True
+                release_dispatch.set()
+            raise IbkrExecutionError("IBKR_GATEWAY_STARTUP_SYNC_FAILED: unavailable")
+
+    async def controlled_send(settings, action):  # type: ignore[no-untyped-def]
+        sent_phases.append(action.phase)
+        if action.phase == "outage":
+            state["dispatch_started"] = True
+            await release_dispatch.wait()
+        return _receipt(datetime.now(UTC))
+
+    async def yield_once(seconds):  # type: ignore[no-untyped-def]
+        await asyncio.tasks.sleep(0)
+
+    real_record_failure = OperationalIncidentTracker.record_failure
+    real_record_success = OperationalIncidentTracker.record_success
+
+    def counted_failure(self, failure_kind, *, now):  # type: ignore[no-untyped-def]
+        state["failure_transitions"] += 1
+        return real_record_failure(self, failure_kind, now=now)
+
+    def counted_success(self, *, now):  # type: ignore[no-untyped-def]
+        state["success_transitions"] += 1
+        return real_record_success(self, now=now)
+
+    monkeypatch.setattr(cli, "CanaryRunner", FlappingRunner)
+    monkeypatch.setattr(alert_module, "send_operational_notification", controlled_send)
+    monkeypatch.setattr(
+        cli.OperationalIncidentTracker,
+        "record_failure",
+        counted_failure,
+    )
+    monkeypatch.setattr(
+        cli.OperationalIncidentTracker,
+        "record_success",
+        counted_success,
+    )
+    monkeypatch.setattr(cli.asyncio, "sleep", yield_once)
+    result = CliRunner().invoke(
+        cli.app,
+        ["ops", "live-canary", "--loop", "--notify", "--ledger-path", str(ledger)],
+    )
+
+    assert result.exit_code == 0
+    assert state == {
+        "cycles": 3,
+        "failure_transitions": 2,
+        "success_transitions": 1,
+        "dispatch_started": True,
+    }
+    assert sent_phases == ["outage"]
+    assert operational_incident_status(ledger)["active"] is not None

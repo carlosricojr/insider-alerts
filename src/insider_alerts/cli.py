@@ -95,6 +95,7 @@ from insider_alerts.execution.canary import (
 )
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 from insider_alerts.execution.operational_alerts import (
+    DELIVERY_DEADLINE_SECONDS,
     FailureKind,
     OperationalIncidentTracker,
     OperationalNotificationAction,
@@ -4800,35 +4801,52 @@ def ops_live_canary(
                     f"{dispatch.error_kind or 'unknown'}"
                 )
 
-        async def process_operational_transition(
+        def record_operational_transition(
             failure_kind: FailureKind | None,
             observed_at: datetime,
-        ) -> None:
+        ) -> tuple[OperationalIncidentTracker, OperationalNotificationAction] | None:
             transition_name = "recovery" if failure_kind is None else "outage"
             try:
                 tracker = ensure_incident_tracker(observed_at)
                 if tracker is None:
-                    return
+                    return None
                 action = (
                     tracker.record_success(now=observed_at)
                     if failure_kind is None
                     else tracker.record_failure(failure_kind, now=observed_at)
                 )
-                if action is not None:
-                    await deliver_operational(tracker, action)
             except Exception as exc:
                 report_operational_issue(
                     f"canary operational {transition_name} tracking isolated: "
                     f"{type(exc).__name__}"
                 )
+                return None
+            return (tracker, action) if action is not None else None
+
+        async def process_operational_batch(
+            batch: list[tuple[FailureKind | None, datetime]],
+        ) -> None:
+            try:
+                actions = [
+                    recorded
+                    for transition in batch
+                    if (recorded := record_operational_transition(*transition)) is not None
+                ]
+                for tracker, action in actions:
+                    await deliver_operational(tracker, action)
+            finally:
+                for _ in batch:
+                    operational_transitions.task_done()
 
         async def process_operational_transitions() -> None:
             while True:
-                transition = await operational_transitions.get()
-                try:
-                    await process_operational_transition(*transition)
-                finally:
-                    operational_transitions.task_done()
+                batch = [await operational_transitions.get()]
+                while True:
+                    try:
+                        batch.append(operational_transitions.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                await process_operational_batch(batch)
 
         operational_processor = (
             asyncio.create_task(process_operational_transitions())
@@ -4843,7 +4861,9 @@ def ops_live_canary(
             if loop:
                 operational_transitions.put_nowait(transition)
                 return
-            await process_operational_transition(*transition)
+            recorded = record_operational_transition(*transition)
+            if recorded is not None:
+                await deliver_operational(*recorded)
 
         try:
             while True:
@@ -4905,8 +4925,19 @@ def ops_live_canary(
                 await asyncio.sleep(poll_delay_seconds(config, datetime.now(UTC)))
         finally:
             if operational_processor is not None:
-                operational_processor.cancel()
-                await asyncio.gather(operational_processor, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        operational_transitions.join(),
+                        timeout=2 * DELIVERY_DEADLINE_SECONDS + 1,
+                    )
+                except TimeoutError:
+                    report_operational_issue(
+                        "canary operational shutdown drain timed out; "
+                        "remaining state will reconcile on restart"
+                    )
+                finally:
+                    operational_processor.cancel()
+                    await asyncio.gather(operational_processor, return_exceptions=True)
             runner.broker.disconnect()
 
     asyncio.run(run())
