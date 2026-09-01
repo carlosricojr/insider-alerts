@@ -95,6 +95,7 @@ from insider_alerts.execution.canary import (
 )
 from insider_alerts.execution.ibkr import IbkrBroker, IbkrExecutionError
 from insider_alerts.execution.operational_alerts import (
+    FailureKind,
     OperationalIncidentTracker,
     OperationalNotificationAction,
     classify_operational_failure,
@@ -4778,16 +4779,16 @@ def ops_live_canary(
         return incident_tracker
 
     async def run() -> None:
-        operational_dispatch_tasks: set[asyncio.Task[None]] = set()
-        operational_lifecycle_lock = asyncio.Lock()
+        operational_transitions: asyncio.Queue[tuple[FailureKind | None, datetime]] = (
+            asyncio.Queue()
+        )
 
-        async def deliver_operational(action: OperationalNotificationAction) -> None:
-            tracker = incident_tracker
-            if tracker is None:
-                return
+        async def deliver_operational(
+            tracker: OperationalIncidentTracker,
+            action: OperationalNotificationAction,
+        ) -> None:
             try:
-                async with operational_lifecycle_lock:
-                    dispatch = await tracker.dispatch(settings, action)
+                dispatch = await tracker.dispatch(settings, action)
             except Exception as exc:
                 report_operational_issue(
                     "canary operational dispatch isolated: " f"{type(exc).__name__}"
@@ -4799,50 +4800,50 @@ def ops_live_canary(
                     f"{dispatch.error_kind or 'unknown'}"
                 )
 
-        async def dispatch_operational(action: OperationalNotificationAction) -> None:
-            if not loop:
-                await deliver_operational(action)
-                return
-            task = asyncio.create_task(deliver_operational(action))
-            operational_dispatch_tasks.add(task)
-            task.add_done_callback(operational_dispatch_tasks.discard)
-
-        async def record_successful_cycle() -> None:
-            if operational_lifecycle_lock.locked():
-                return
+        async def process_operational_transition(
+            failure_kind: FailureKind | None,
+            observed_at: datetime,
+        ) -> None:
+            transition_name = "recovery" if failure_kind is None else "outage"
             try:
-                async with operational_lifecycle_lock:
-                    tracker = ensure_incident_tracker(datetime.now(UTC))
-                    if tracker is None:
-                        return
-                    action = tracker.record_success(now=datetime.now(UTC))
+                tracker = ensure_incident_tracker(observed_at)
+                if tracker is None:
+                    return
+                action = (
+                    tracker.record_success(now=observed_at)
+                    if failure_kind is None
+                    else tracker.record_failure(failure_kind, now=observed_at)
+                )
                 if action is not None:
-                    await dispatch_operational(action)
+                    await deliver_operational(tracker, action)
             except Exception as exc:
                 report_operational_issue(
-                    "canary operational recovery tracking isolated: "
+                    f"canary operational {transition_name} tracking isolated: "
                     f"{type(exc).__name__}"
                 )
 
-        async def record_failed_cycle(exc: Exception) -> None:
-            if operational_lifecycle_lock.locked():
+        async def process_operational_transitions() -> None:
+            while True:
+                transition = await operational_transitions.get()
+                try:
+                    await process_operational_transition(*transition)
+                finally:
+                    operational_transitions.task_done()
+
+        operational_processor = (
+            asyncio.create_task(process_operational_transitions())
+            if notify and loop
+            else None
+        )
+
+        async def submit_operational_transition(failure_kind: FailureKind | None) -> None:
+            transition = (failure_kind, datetime.now(UTC))
+            if not notify:
                 return
-            try:
-                async with operational_lifecycle_lock:
-                    tracker = ensure_incident_tracker(datetime.now(UTC))
-                    if tracker is None:
-                        return
-                    action = tracker.record_failure(
-                        classify_operational_failure(exc),
-                        now=datetime.now(UTC),
-                    )
-                if action is not None:
-                    await dispatch_operational(action)
-            except Exception as tracking_exc:
-                report_operational_issue(
-                    "canary operational outage tracking isolated: "
-                    f"{type(tracking_exc).__name__}"
-                )
+            if loop:
+                operational_transitions.put_nowait(transition)
+                return
+            await process_operational_transition(*transition)
 
         try:
             while True:
@@ -4859,7 +4860,7 @@ def ops_live_canary(
                     result_line = json.dumps(asdict(result), sort_keys=True)
                     typer.echo(result_line)
                     append_process_log(output_log_path, result_line)
-                    await record_successful_cycle()
+                    await submit_operational_transition(None)
                     if notifier is not None and any(
                         (
                             result.live_submitted,
@@ -4896,21 +4897,16 @@ def ops_live_canary(
                         err=True,
                     )
                     append_process_log(error_log_path, f"live canary cycle failed closed: {exc}")
-                    await record_failed_cycle(exc)
+                    await submit_operational_transition(classify_operational_failure(exc))
                     if not loop:
                         raise typer.Exit(code=1) from exc
                 if not loop:
                     return
                 await asyncio.sleep(poll_delay_seconds(config, datetime.now(UTC)))
         finally:
-            pending_dispatches = tuple(operational_dispatch_tasks)
-            for task in pending_dispatches:
-                task.cancel()
-            if pending_dispatches:
-                await asyncio.gather(
-                    *pending_dispatches,
-                    return_exceptions=True,
-                )
+            if operational_processor is not None:
+                operational_processor.cancel()
+                await asyncio.gather(operational_processor, return_exceptions=True)
             runner.broker.disconnect()
 
     asyncio.run(run())

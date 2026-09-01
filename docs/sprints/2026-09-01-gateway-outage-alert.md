@@ -28,10 +28,11 @@ it recovers. The notification path must remain isolated from trading and researc
    the indeterminate side effect. Resolve a pre-threshold transient silently.
 4. Abandon an undelivered recovery notice if another failure begins, avoiding a stale recovery
    message during a renewed outage.
-5. Fence transition and dispatch with both a coroutine lock and a cross-session, ledger-keyed OS
-   mutex. Revalidate the exact reservation under those fences, use an asynchronous five-second
-   total HTTP deadline, and dispatch in the background so the next broker cycle is not gated.
-   Diagnostics are best-effort and transient tracker initialization failures retry once per minute.
+5. Preserve every observed lifecycle outcome in a single ordered coroutine queue and fence the
+   durable state machine with a cross-session, ledger-keyed OS mutex. Revalidate the exact
+   reservation under that fence, use an asynchronous five-second total HTTP deadline, and process
+   the queue in the background so the next broker cycle is not gated. Diagnostics are best-effort
+   and transient tracker initialization failures retry once per minute.
 
 ## Verification
 
@@ -62,5 +63,8 @@ it recovers. The notification path must remain isolated from trading and researc
 - CodeRabbit's substantive first-head review found two issues: CI had already replaced the
   platform-dependent cast, and every tracker connection is now explicitly closed with a focused
   no-leak regression test. The current-head App is adaptively limited and the CLI is absent, so
-  the required exact-head rung-2 review remains pending.
+  the review ladder authorized a rung-2 agent review without waiting on the published cooldown.
+- The first exact-head rung-2 pass found that skip-on-lock bookkeeping could discard a lifecycle
+  outcome during a five-second send. An ordered background transition queue now preserves those
+  outcomes while keeping broker cycles independent; exact-head re-review remains pending.
 - PR review, merge, deployment, and live outage/recovery verification remain pending.

@@ -15,6 +15,7 @@ from insider_alerts.execution import operational_alerts as alert_module
 from insider_alerts.execution.canary import CanaryStore, CycleResult
 from insider_alerts.execution.errors import IbkrExecutionError
 from insider_alerts.execution.operational_alerts import (
+    OperationalDispatchResult,
     OperationalIncidentTracker,
     OperationalNotificationAction,
     classify_operational_failure,
@@ -471,8 +472,9 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
         "cycles": 0,
         "failure_transitions": 0,
         "dispatch_started": False,
-        "dispatch_cancelled": False,
+        "dispatch_completed": False,
     }
+    release_dispatch = asyncio.Event()
 
     class FailingRunner:
         def __init__(self, config, broker) -> None:  # type: ignore[no-untyped-def]
@@ -480,20 +482,21 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
             self.broker = _FakeBroker()
 
         def source_revision_changed(self) -> bool:
-            return state["cycles"] >= 2
+            return state["cycles"] >= 2 and state["failure_transitions"] >= 2
 
         async def cycle(self, *, disconnect_after: bool) -> CycleResult:
             assert disconnect_after is False
             state["cycles"] += 1
+            if state["cycles"] == 2:
+                assert state["dispatch_started"] is True
+                release_dispatch.set()
             raise IbkrExecutionError("IBKR_GATEWAY_STARTUP_SYNC_FAILED: unavailable")
 
     async def blocked_dispatch(self, settings, action):  # type: ignore[no-untyped-def]
         state["dispatch_started"] = True
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            state["dispatch_cancelled"] = True
-            raise
+        await release_dispatch.wait()
+        state["dispatch_completed"] = True
+        return OperationalDispatchResult("stale")
 
     async def yield_once(seconds):  # type: ignore[no-untyped-def]
         await asyncio.tasks.sleep(0)
@@ -519,7 +522,7 @@ def test_loop_does_not_gate_next_broker_cycle_on_notification_dispatch(
     assert result.exit_code == 0
     assert state == {
         "cycles": 2,
-        "failure_transitions": 1,
+        "failure_transitions": 2,
         "dispatch_started": True,
-        "dispatch_cancelled": True,
+        "dispatch_completed": True,
     }
