@@ -7,9 +7,11 @@ import platform
 import sqlite3
 import stat
 import subprocess
+import threading
 import uuid
-from contextlib import closing
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -51,6 +53,8 @@ _OPTION_SURFACE_RESULT_FIELDS = frozenset(
         "observed_at_utc",
     }
 )
+_WINDOWS_ARTIFACT_HANDLES: dict[str, tuple[int, int]] = {}
+_WINDOWS_ARTIFACT_HANDLE_LOCK = threading.RLock()
 
 
 @dataclass(slots=True, frozen=True)
@@ -114,12 +118,20 @@ class OptionRuntimeValidationError(RuntimeError):
     """The configured alpha runtime or research database path is not confined."""
 
 
+class ArtifactPublicationError(RuntimeError):
+    """A validated artifact could not be published to its content-addressed store."""
+
+
 @dataclass(slots=True, frozen=True)
 class _ValidatedOptionRuntime:
     alpha_python: Path
     alpha_script: Path
     alpha_historical_script: Path
     alpha_runtime_root: Path
+    research_root: Path
+    artifact_root: Path
+    staging_root: Path
+    options_root: Path
     option_chain_store_db: Path
     historical_pacing_db: Path
 
@@ -217,6 +229,135 @@ def _confined_research_db(path: Path, *, research_root: Path) -> Path:
     return candidate
 
 
+def _confined_artifact_root(path: Path, *, research_root: Path) -> Path:
+    lexical_root = Path(os.path.abspath(research_root))
+    lexical_path = Path(os.path.abspath(path))
+    if not lexical_path.is_relative_to(lexical_root) or lexical_path == lexical_root:
+        raise OptionRuntimeValidationError("artifact root escaped data/research")
+    if not lexical_root.is_dir() or _is_reparse_point(lexical_root):
+        raise OptionRuntimeValidationError("data/research is unavailable or a reparse point")
+    cursor = lexical_root
+    for part in lexical_path.relative_to(lexical_root).parts:
+        cursor /= part
+        try:
+            cursor.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise OptionRuntimeValidationError("artifact root is unavailable") from exc
+        if not cursor.is_dir() or _is_reparse_point(cursor):
+            raise OptionRuntimeValidationError(
+                "artifact root is unavailable or contains a reparse point"
+            )
+    try:
+        resolved_root = lexical_root.resolve(strict=True)
+        resolved_path = lexical_path.resolve(strict=True)
+    except OSError as exc:
+        raise OptionRuntimeValidationError("artifact root is unavailable") from exc
+    if not resolved_path.is_relative_to(resolved_root):
+        raise OptionRuntimeValidationError("artifact root escaped data/research")
+    return resolved_path
+
+
+def _confined_artifact_subdirectory(artifact_root: Path, name: str) -> Path:
+    if Path(name).name != name or name in {"", ".", ".."}:
+        raise OptionRuntimeValidationError("artifact subdirectory name is invalid")
+    candidate = artifact_root / name
+    try:
+        candidate.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise OptionRuntimeValidationError("artifact subdirectory is unavailable") from exc
+    if not candidate.is_dir() or _is_reparse_point(candidate):
+        raise OptionRuntimeValidationError(
+            "artifact subdirectory is unavailable or a reparse point"
+        )
+    try:
+        resolved_root = artifact_root.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise OptionRuntimeValidationError("artifact subdirectory is unavailable") from exc
+    if resolved_candidate.parent != resolved_root:
+        raise OptionRuntimeValidationError("artifact subdirectory escaped artifact root")
+    return resolved_candidate
+
+
+@contextmanager
+def _locked_artifact_directory(path: Path, *, research_root: Path) -> Iterator[Path]:
+    """Pin every Windows ancestor so a validated path cannot be renamed or replaced."""
+
+    verified = _confined_artifact_root(path, research_root=research_root)
+    if os.name != "nt":
+        yield verified
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    read_attributes_and_delete = 0x00000080 | 0x00010000
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    open_directory_without_following = 0x02000000 | 0x00200000
+    lexical_root = Path(os.path.abspath(research_root))
+    lexical_path = Path(os.path.abspath(verified))
+    acquired_keys: list[str] = []
+    try:
+        with _WINDOWS_ARTIFACT_HANDLE_LOCK:
+            cursor = lexical_root
+            for part in (None, *lexical_path.relative_to(lexical_root).parts):
+                if part is not None:
+                    cursor /= part
+                key = os.path.normcase(str(cursor))
+                existing = _WINDOWS_ARTIFACT_HANDLES.get(key)
+                if existing is not None:
+                    _WINDOWS_ARTIFACT_HANDLES[key] = (existing[0], existing[1] + 1)
+                    acquired_keys.append(key)
+                    continue
+                handle = create_file(
+                    str(cursor),
+                    read_attributes_and_delete,
+                    share_read_write,
+                    None,
+                    open_existing,
+                    open_directory_without_following,
+                    None,
+                )
+                if handle == invalid_handle:
+                    raise OptionRuntimeValidationError(
+                        f"artifact directory could not be pinned: {cursor}"
+                    ) from ctypes.WinError(ctypes.get_last_error())
+                handle_value = int(handle)
+                _WINDOWS_ARTIFACT_HANDLES[key] = (handle_value, 1)
+                acquired_keys.append(key)
+                if not cursor.is_dir() or _is_reparse_point(cursor):
+                    raise OptionRuntimeValidationError(
+                        f"artifact directory changed during validation: {cursor}"
+                    )
+        yield _confined_artifact_root(lexical_path, research_root=lexical_root)
+    finally:
+        with _WINDOWS_ARTIFACT_HANDLE_LOCK:
+            for key in reversed(acquired_keys):
+                handle, count = _WINDOWS_ARTIFACT_HANDLES[key]
+                if count == 1:
+                    close_handle(handle)
+                    del _WINDOWS_ARTIFACT_HANDLES[key]
+                else:
+                    _WINDOWS_ARTIFACT_HANDLES[key] = (handle, count - 1)
+
+
 def _validated_option_runtime(config: CaptureConfig) -> _ValidatedOptionRuntime:
     try:
         if _is_reparse_point(config.source_db):
@@ -255,11 +396,16 @@ def _validated_option_runtime(config: CaptureConfig) -> _ValidatedOptionRuntime:
         raise OptionRuntimeValidationError("research root parent is unavailable") from exc
     if research_parent != source_db.parent:
         raise OptionRuntimeValidationError("research root is not bound to the source data root")
+    artifact_root = _confined_artifact_root(config.artifact_root, research_root=research_root)
     return _ValidatedOptionRuntime(
         alpha_python=alpha_python,
         alpha_script=alpha_script,
         alpha_historical_script=alpha_historical_script,
         alpha_runtime_root=runtime_root,
+        research_root=research_root.resolve(strict=True),
+        artifact_root=artifact_root,
+        staging_root=_confined_artifact_subdirectory(artifact_root, ".staging"),
+        options_root=_confined_artifact_subdirectory(artifact_root, "options"),
         option_chain_store_db=_confined_research_db(
             config.option_chain_store_db, research_root=research_root
         ),
@@ -583,13 +729,32 @@ def run_hidden_process(command: list[str], *, cwd: Path, timeout_seconds: int) -
         return ProcessResult(process.returncode or -1, stdout, stderr, True)
 
 
-def _publish_content_addressed(root: Path, data: bytes, *, suffix: str) -> tuple[Path, str]:
+def _publish_content_addressed(
+    root: Path,
+    data: bytes,
+    *,
+    suffix: str,
+    research_root: Path,
+) -> tuple[Path, str]:
+    try:
+        with _locked_artifact_directory(root, research_root=research_root) as locked_root:
+            return _publish_content_addressed_locked(locked_root, data, suffix=suffix)
+    except OptionRuntimeValidationError as exc:
+        raise ArtifactPublicationError(f"content-address root is invalid: {root}") from exc
+
+
+def _publish_content_addressed_locked(
+    root: Path, data: bytes, *, suffix: str
+) -> tuple[Path, str]:
     digest = sha256_bytes(data)
-    root.mkdir(parents=True, exist_ok=True)
     destination = root / f"{digest}{suffix}"
     if destination.exists():
+        if _is_reparse_point(destination) or not destination.is_file():
+            raise ArtifactPublicationError(
+                f"content-address destination is not a regular file: {destination}"
+            )
         if destination.read_bytes() != data:
-            raise RuntimeError(f"content-address collision at {destination}")
+            raise ArtifactPublicationError(f"content-address collision at {destination}")
         return destination, digest
     staging = root / f".{digest}.{os.getpid()}.tmp"
     with staging.open("xb") as handle:
@@ -599,8 +764,12 @@ def _publish_content_addressed(root: Path, data: bytes, *, suffix: str) -> tuple
     try:
         os.link(staging, destination)
     except FileExistsError as exc:
+        if _is_reparse_point(destination) or not destination.is_file():
+            raise ArtifactPublicationError(
+                f"content-address destination is not a regular file: {destination}"
+            ) from exc
         if destination.read_bytes() != data:
-            raise RuntimeError(f"content-address collision at {destination}") from exc
+            raise ArtifactPublicationError(f"content-address collision at {destination}") from exc
     finally:
         staging.unlink(missing_ok=True)
     return destination, digest
@@ -730,8 +899,25 @@ def _capture_options(
         runtime = _validated_option_runtime(config)
     except OptionRuntimeValidationError as exc:
         return None, None, None, "OPTION_RUNTIME_INVALID", str(exc), False
-    staging_dir = config.artifact_root / ".staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with _locked_artifact_directory(
+            runtime.staging_root, research_root=runtime.research_root
+        ) as staging_root:
+            return _capture_options_with_runtime(
+                config,
+                job,
+                replace(runtime, staging_root=staging_root),
+            )
+    except OptionRuntimeValidationError as exc:
+        return None, None, None, "OPTION_RUNTIME_INVALID", str(exc), False
+
+
+def _capture_options_with_runtime(
+    config: CaptureConfig,
+    job: CaptureJob,
+    runtime: _ValidatedOptionRuntime,
+) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
+    staging_dir = runtime.staging_root
     output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.{job.attempt_count}.json"
     output.unlink(missing_ok=True)
     symbol = str(json.loads(job.payload_json).get("issuer_symbol", "")).upper()
@@ -812,9 +998,14 @@ def _capture_options(
             raise ValueError("option artifact has no captured surfaces")
         rfc8785.dumps(artifact)
         destination, digest = _publish_content_addressed(
-            config.artifact_root / "options", raw, suffix=".json"
+            runtime.options_root,
+            raw,
+            suffix=".json",
+            research_root=runtime.research_root,
         )
         return artifact, destination, digest, None, None, False
+    except ArtifactPublicationError as exc:
+        return None, None, None, "OPTION_ARTIFACT_PUBLICATION_FAILED", str(exc), False
     except (KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         return None, None, None, "OPTION_ARTIFACT_INVALID", str(exc), False
     finally:
@@ -967,8 +1158,28 @@ def _capture_historical_options(
         runtime = _validated_option_runtime(config)
     except OptionRuntimeValidationError as exc:
         return None, None, None, "OPTION_RUNTIME_INVALID", str(exc), False
-    staging_dir = config.artifact_root / ".staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with _locked_artifact_directory(
+            runtime.staging_root, research_root=runtime.research_root
+        ) as staging_root:
+            return _capture_historical_options_with_runtime(
+                config,
+                job,
+                symbol=symbol,
+                runtime=replace(runtime, staging_root=staging_root),
+            )
+    except OptionRuntimeValidationError as exc:
+        return None, None, None, "OPTION_RUNTIME_INVALID", str(exc), False
+
+
+def _capture_historical_options_with_runtime(
+    config: CaptureConfig,
+    job: CaptureJob,
+    *,
+    symbol: str,
+    runtime: _ValidatedOptionRuntime,
+) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None, str | None, bool]:
+    staging_dir = runtime.staging_root
     output = staging_dir / f"{sha256_bytes(job.job_id.encode())}.historical.json"
     output.unlink(missing_ok=True)
     try:
@@ -1022,9 +1233,14 @@ def _capture_historical_options(
         )
         rfc8785.dumps(artifact)
         destination, digest = _publish_content_addressed(
-            config.artifact_root / "options", raw, suffix=".json"
+            runtime.options_root,
+            raw,
+            suffix=".json",
+            research_root=runtime.research_root,
         )
         return artifact, destination, digest, None, None, False
+    except ArtifactPublicationError as exc:
+        return None, None, None, "OPTION_HISTORY_PUBLICATION_FAILED", str(exc), False
     except (KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         return None, None, None, "OPTION_HISTORY_ARTIFACT_INVALID", str(exc), False
     finally:
@@ -1609,7 +1825,13 @@ def _append_snapshot(
             expected_policy_sha256=capture_window.policy_sha256,
         )
         record_bytes = rfc8785.dumps(snapshot)
-        _publish_content_addressed(config.artifact_root / "snapshots", record_bytes, suffix=".json")
+        snapshot_root = _confined_artifact_subdirectory(config.artifact_root, "snapshots")
+        _publish_content_addressed(
+            snapshot_root,
+            record_bytes,
+            suffix=".json",
+            research_root=config.research_root,
+        )
         conn.execute(
             """
             INSERT INTO evidence_snapshots(
@@ -1864,6 +2086,13 @@ def run_capture_once(
     now: datetime | None = None,
     worker_id: str | None = None,
 ) -> CaptureResult:
+    config = replace(
+        config,
+        artifact_root=_confined_artifact_root(
+            config.artifact_root,
+            research_root=config.research_root,
+        ),
+    )
     now = (now or datetime.now(UTC)).astimezone(UTC)
     worker_id = worker_id or f"{platform.node()}:{os.getpid()}"
     ensure_evidence_store(config.evidence_db)

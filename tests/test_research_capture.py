@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 from contextlib import closing
@@ -138,7 +139,7 @@ def _config(tmp_path: Path, source_db: Path) -> CaptureConfig:
     return CaptureConfig(
         source_db=source_db,
         evidence_db=tmp_path / "evidence.db",
-        artifact_root=tmp_path / "artifacts",
+        artifact_root=research / "artifacts",
         research_root=research,
         alpha_python=python,
         alpha_script=scripts / "capture.py",
@@ -166,6 +167,36 @@ def _not_applicable_result(*, request_id: str, observed_at: datetime) -> dict[st
         "symbol": "TEST",
         "client_id": 48,
         "observed_at_utc": observed_at.isoformat(),
+    }
+
+
+def _live_option_artifact(*, request_id: str) -> dict[str, Any]:
+    captured = datetime.now(UTC)
+    return {
+        "schema_version": "insider-evidence-option-surface-v1",
+        "artifact_status": "RESEARCH_ONLY",
+        "source_id": "ib_gateway:US_OPTIONS:SMART:type1",
+        "request_id": request_id,
+        "symbol": "TEST",
+        "client_id": 48,
+        "market_data_type": 1,
+        "requested_at_utc": (captured - timedelta(seconds=1)).isoformat(),
+        "source_max_ts_utc": captured.isoformat(),
+        "captured_at_utc": captured.isoformat(),
+        "min_dte_days": 3,
+        "max_dte_days": 30,
+        "max_expiries": 3,
+        "max_contracts_per_expiry": 120,
+        "surfaces": [
+            {
+                "expiry": "2026-09-18",
+                "underlying_price": 10.0,
+                "underlying_bid": 9.99,
+                "underlying_ask": 10.01,
+                "underlying_source_timestamp_utc": captured.isoformat(),
+                "quotes": [{}],
+            }
+        ],
     }
 
 
@@ -1018,38 +1049,21 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_db, packet_id, decision_at = _approved_job(tmp_path)
-    config = _config(tmp_path, source_db)
+    monkeypatch.chdir(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        artifact_root=Path("research/artifacts"),
+    )
+    expected_artifact_root = (tmp_path / "research" / "artifacts").resolve()
 
-    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+    def successful_process(command: list[str], **kwargs: Any) -> ProcessResult:
         output = Path(command[command.index("--output") + 1])
+        assert output.is_absolute()
+        assert output.parent == expected_artifact_root / ".staging"
+        assert output.parent.is_dir()
+        assert kwargs["cwd"] == config.alpha_script.parent.parent.resolve()
         request_id = command[command.index("--request-id") + 1]
-        captured = datetime.now(UTC)
-        artifact = {
-            "schema_version": "insider-evidence-option-surface-v1",
-            "artifact_status": "RESEARCH_ONLY",
-            "source_id": "ib_gateway:US_OPTIONS:SMART:type1",
-            "request_id": request_id,
-            "symbol": "TEST",
-            "client_id": 48,
-            "market_data_type": 1,
-            "requested_at_utc": (captured - timedelta(seconds=1)).isoformat(),
-            "source_max_ts_utc": captured.isoformat(),
-            "captured_at_utc": captured.isoformat(),
-            "min_dte_days": 3,
-            "max_dte_days": 30,
-            "max_expiries": 3,
-            "max_contracts_per_expiry": 120,
-            "surfaces": [
-                {
-                    "expiry": "2026-09-18",
-                    "underlying_price": 10.0,
-                    "underlying_bid": 9.99,
-                    "underlying_ask": 10.01,
-                    "underlying_source_timestamp_utc": captured.isoformat(),
-                    "quotes": [{}],
-                }
-            ],
-        }
+        artifact = _live_option_artifact(request_id=request_id)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(artifact), encoding="utf-8")
         return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
@@ -1059,7 +1073,7 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
 
     assert result.status == "completed"
     assert result.option_status == "captured"
-    option_files = list((config.artifact_root / "options").glob("*.json"))
+    option_files = list((expected_artifact_root / "options").glob("*.json"))
     assert len(option_files) == 1
     assert option_files[0].stem == sha256_bytes(option_files[0].read_bytes())
     with sqlite3.connect(config.evidence_db) as conn:
@@ -1069,6 +1083,104 @@ def test_successful_option_capture_is_content_addressed_and_referenced(
     assert observation["status"] == "captured"
     assert observation["artifact_sha256"] == option_files[0].stem
     assert packet_id in record["payload"]["signal"]["packet_id"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-share contract")
+def test_option_publication_directory_cannot_be_swapped_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        output.write_text(
+            json.dumps(_live_option_artifact(request_id=request_id)),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    original_publish_locked = capture_module._publish_content_addressed_locked
+    swap_was_denied = False
+
+    def attack_after_publication_lock(
+        root: Path,
+        data: bytes,
+        *,
+        suffix: str,
+    ) -> tuple[Path, str]:
+        nonlocal swap_was_denied
+        replacement = root.with_name("options-replacement")
+        try:
+            root.rename(replacement)
+        except OSError:
+            swap_was_denied = True
+        else:
+            replacement.rename(root)
+            pytest.fail("validated publication directory was renameable while pinned")
+        return original_publish_locked(root, data, suffix=suffix)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    monkeypatch.setattr(
+        capture_module,
+        "_publish_content_addressed_locked",
+        attack_after_publication_lock,
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert swap_was_denied
+    assert result.status == "completed"
+    assert result.option_status == "captured"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "captured"
+
+
+def test_option_publication_failure_is_persisted_as_typed_missingness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    def successful_process(command: list[str], **_kwargs: Any) -> ProcessResult:
+        output = Path(command[command.index("--output") + 1])
+        request_id = command[command.index("--request-id") + 1]
+        output.write_text(
+            json.dumps(_live_option_artifact(request_id=request_id)),
+            encoding="utf-8",
+        )
+        return ProcessResult(returncode=0, stdout="", stderr="", timed_out=False)
+
+    original_publish_locked = capture_module._publish_content_addressed_locked
+
+    def fail_option_publication(
+        root: Path, data: bytes, *, suffix: str
+    ) -> tuple[Path, str]:
+        if root.name == "options":
+            raise capture_module.ArtifactPublicationError("simulated publication failure")
+        return original_publish_locked(root, data, suffix=suffix)
+
+    monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
+    monkeypatch.setattr(
+        capture_module,
+        "_publish_content_addressed_locked",
+        fail_option_publication,
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_ARTIFACT_PUBLICATION_FAILED"
+    with sqlite3.connect(config.evidence_db) as conn:
+        row = conn.execute("SELECT record_json FROM evidence_snapshots").fetchone()
+    record = json.loads(bytes(row[0]))
+    observation = record["payload"]["observations"]["options_surface"]
+    assert observation["status"] == "error"
+    assert observation["error"]["kind"] == "OPTION_ARTIFACT_PUBLICATION_FAILED"
 
 
 def test_exact_no_chain_result_is_persisted_as_not_applicable_without_error(
@@ -1291,13 +1403,22 @@ def test_closed_venue_uses_one_cutoff_bound_historical_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_db, _, decision_at = _approved_job(tmp_path)
-    config = _config(tmp_path, source_db)
+    monkeypatch.chdir(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        artifact_root=Path("research/artifacts"),
+    )
+    expected_artifact_root = (tmp_path / "research" / "artifacts").resolve()
     with sqlite3.connect(source_db) as conn:
         job_id = str(conn.execute("SELECT job_id FROM research_capture_jobs").fetchone()[0])
     calls: list[tuple[list[str], int]] = []
 
     def process(command: list[str], **kwargs: Any) -> ProcessResult:
         calls.append((command, int(kwargs["timeout_seconds"])))
+        output = Path(command[command.index("--output") + 1])
+        assert output.is_absolute()
+        assert output.parent == expected_artifact_root / ".staging"
+        assert kwargs["cwd"] == config.alpha_script.parent.parent.resolve()
         if command[1] == str(config.alpha_script):
             return ProcessResult(
                 returncode=1,
@@ -1308,7 +1429,6 @@ def test_closed_venue_uses_one_cutoff_bound_historical_fallback(
                 ),
                 timed_out=False,
             )
-        output = Path(command[command.index("--output") + 1])
         artifact = _historical_artifact(request_id=job_id, decision_at=decision_at)
         _install_chain_custody(config.option_chain_store_db, artifact)
         output.write_text(
@@ -1462,6 +1582,92 @@ def test_option_database_escape_is_rejected_before_any_child_launch(
     assert launches == 0
 
 
+def test_artifact_root_escape_is_rejected_before_any_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = replace(
+        _config(tmp_path, source_db),
+        artifact_root=tmp_path / "outside-artifacts",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    with pytest.raises(
+        capture_module.OptionRuntimeValidationError,
+        match="artifact root escaped",
+    ):
+        run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+
+def test_artifact_root_reparse_point_is_rejected_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    config.artifact_root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        config.artifact_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    with pytest.raises(
+        capture_module.OptionRuntimeValidationError,
+        match="artifact root is unavailable or contains a reparse point",
+    ):
+        run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+
+@pytest.mark.parametrize("child_name", [".staging", "options"])
+def test_artifact_child_reparse_point_is_rejected_before_child_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    child_name: str,
+) -> None:
+    source_db, _, decision_at = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+    config.artifact_root.mkdir(parents=True)
+    outside = tmp_path / f"outside-{child_name.removeprefix('.')}"
+    outside.mkdir()
+    try:
+        (config.artifact_root / child_name).symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    monkeypatch.setattr(
+        capture_module,
+        "run_hidden_process",
+        lambda *_args, **_kwargs: pytest.fail("must not launch"),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_RUNTIME_INVALID"
+
+
+def test_artifact_root_path_is_not_part_of_scientific_configuration_hash(
+    tmp_path: Path,
+) -> None:
+    source_db, _, _ = _approved_job(tmp_path)
+    config = _config(tmp_path, source_db)
+
+    relocated = replace(config, artifact_root=config.research_root / "other-artifacts")
+
+    assert capture_module._configuration_sha(relocated) == capture_module._configuration_sha(
+        config
+    )
+
+
 def test_research_root_cannot_be_rebound_away_from_source_data_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1471,6 +1677,7 @@ def test_research_root_cannot_be_rebound_away_from_source_data_root(
     config = replace(
         _config(tmp_path, source_db),
         research_root=outside_research,
+        artifact_root=outside_research / "artifacts",
         option_chain_store_db=outside_research / "chain.db",
         historical_pacing_db=outside_research / "pacing.db",
     )
@@ -1666,6 +1873,7 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
     assert job_calls == [True]
     assert len(calls) == 1
     assert calls[0].alpha_historical_script == tmp_path / "alpha-history.py"
+    assert calls[0].artifact_root == tmp_path / "artifacts"
     assert calls[0].option_chain_store_db == tmp_path / "option-chain.db"
     assert calls[0].historical_pacing_db == tmp_path / "historical-pacing.db"
     assert calls[0].research_root == ROOT / "data" / "research"
@@ -1675,6 +1883,58 @@ def test_worker_main_runs_exactly_one_bounded_capture_cycle(
         "snapshot_sha256": None,
         "status": "idle",
     }
+
+
+def test_worker_resolves_only_relative_artifact_root_against_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[CaptureConfig] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(worker_module, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(worker_module, "ensure_review_tables", lambda _path: None)
+    monkeypatch.setattr(worker_module, "resolve_git_commit", lambda _root: "a" * 40)
+    monkeypatch.setattr(
+        worker_module,
+        "run_capture_once",
+        lambda config: calls.append(config) or CaptureResult(status="idle"),
+    )
+    args = [
+        "--database-path",
+        "data/source.db",
+        "--evidence-db",
+        "data/research/evidence.db",
+        "--artifact-root",
+        "data/research/artifacts",
+        "--canary-ledger",
+        "data/canary.db",
+        "--history-db",
+        "data/research/history.db",
+        "--history-snapshot-sha256",
+        "b" * 64,
+        "--alpha-python",
+        "../alpha/.venv/Scripts/python.exe",
+        "--alpha-script",
+        "../alpha/scripts/capture.py",
+        "--alpha-historical-script",
+        "../alpha/scripts/historical.py",
+        "--option-chain-store-db",
+        "data/research/option-chain.db",
+        "--historical-pacing-db",
+        "data/research/pacing.db",
+        "--error-log",
+        "logs/research-capture.err.log",
+    ]
+
+    assert worker_module.main(args) == 0
+
+    assert len(calls) == 1
+    config = calls[0]
+    assert config.source_db == Path("data/source.db")
+    assert config.evidence_db == Path("data/research/evidence.db")
+    assert config.artifact_root == ROOT / "data" / "research" / "artifacts"
+    assert config.alpha_python == Path("../alpha/.venv/Scripts/python.exe")
+    assert config.option_chain_store_db == Path("data/research/option-chain.db")
+    assert config.activation_db == Path("data/research/activation.db")
 
 
 def test_worker_main_persists_and_logs_fatal_setup_failure(
@@ -1696,13 +1956,84 @@ def test_worker_main_persists_and_logs_fatal_setup_failure(
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows Scheduled Task action contract")
+def test_research_task_action_builder_emits_exact_hidden_worker_command() -> None:
+    helper = ROOT / "ops/windows/research-capture-task-action.ps1"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ACTION_HELPER": str(helper),
+            "ACTION_PYTHON": r"C:\fixture repo\.venv\Scripts\pythonw.exe",
+            "ACTION_REPO": r"C:\fixture repo",
+            "ACTION_ARTIFACTS": r"C:\fixture repo\data\research\artifacts",
+            "ACTION_ALPHA_PYTHON": r"C:\alpha\.venv\Scripts\python.exe",
+            "ACTION_ALPHA_SCRIPT": r"C:\alpha\scripts\capture.py",
+            "ACTION_ALPHA_HISTORY": r"C:\alpha\scripts\history.py",
+            "ACTION_CHAIN": r"C:\fixture repo\data\research\chain.db",
+            "ACTION_PACING": r"C:\fixture repo\data\research\pacing.db",
+            "ACTION_HISTORY": r"C:\fixture repo\data\research\history.db",
+            "ACTION_SHA": "a" * 64,
+        }
+    )
+    command = """
+. $env:ACTION_HELPER
+$spec = New-ResearchCaptureTaskActionSpec `
+  -PythonExe $env:ACTION_PYTHON `
+  -RepoRoot $env:ACTION_REPO `
+  -ArtifactRoot $env:ACTION_ARTIFACTS `
+  -AlphaPython $env:ACTION_ALPHA_PYTHON `
+  -AlphaScript $env:ACTION_ALPHA_SCRIPT `
+  -AlphaHistoricalScript $env:ACTION_ALPHA_HISTORY `
+  -ChainStorePath $env:ACTION_CHAIN `
+  -PacingDatabasePath $env:ACTION_PACING `
+  -HistoryDatabase $env:ACTION_HISTORY `
+  -HistorySnapshotSha256 $env:ACTION_SHA
+$spec | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    assert json.loads(result.stdout) == {
+        "Execute": environment["ACTION_PYTHON"],
+        "Argument": (
+            "-m insider_alerts.research.worker "
+            '--artifact-root "C:\\fixture repo\\data\\research\\artifacts" '
+            '--alpha-python "C:\\alpha\\.venv\\Scripts\\python.exe" '
+            '--alpha-script "C:\\alpha\\scripts\\capture.py" '
+            '--alpha-historical-script "C:\\alpha\\scripts\\history.py" '
+            '--option-chain-store-db "C:\\fixture repo\\data\\research\\chain.db" '
+            '--historical-pacing-db "C:\\fixture repo\\data\\research\\pacing.db" '
+            '--history-db "C:\\fixture repo\\data\\research\\history.db" '
+            f'--history-snapshot-sha256 {"a" * 64} '
+            '--error-log "C:\\fixture repo\\logs\\research-capture.err.log"'
+        ),
+        "WorkingDirectory": environment["ACTION_REPO"],
+    }
+
+
 def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     installer = (ROOT / "ops/windows/install-research-capture-task.ps1").read_text(encoding="utf-8")
 
     assert ".venv\\Scripts\\pythonw.exe" in installer
     assert '"--loop"' not in installer
     assert "capture_insider_historical_option_evidence.py" in installer
-    assert '"--option-chain-store-db' in installer
-    assert '"--historical-pacing-db' in installer
+    assert '. (Join-Path $scriptDir "research-capture-task-action.ps1")' in installer
+    assert "-ArtifactRoot $artifactRoot" in installer
+    assert "-Execute $actionSpec.Execute" in installer
+    assert "-Argument $actionSpec.Argument" in installer
+    assert "-WorkingDirectory $actionSpec.WorkingDirectory" in installer
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 15)" in installer
     assert "-MultipleInstances IgnoreNew" in installer

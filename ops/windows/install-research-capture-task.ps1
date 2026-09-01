@@ -19,6 +19,7 @@ if ($IntervalMinutes -lt 1) {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir "research-capture-task-action.ps1")
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $alphaRootResolved = (Resolve-Path $AlphaRoot).Path
 $historyDatabasePath = if ([System.IO.Path]::IsPathRooted($HistoryDatabase)) {
@@ -30,6 +31,7 @@ $historyDatabaseResolved = (Resolve-Path $historyDatabasePath).Path
 $researchRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "data\research"))
 New-Item -ItemType Directory -Path $researchRoot -Force | Out-Null
 $researchPrefix = $researchRoot.TrimEnd('\') + '\'
+$artifactRoot = [System.IO.Path]::GetFullPath((Join-Path $researchRoot "artifacts"))
 $chainStorePath = if ([System.IO.Path]::IsPathRooted($OptionChainStoreDatabase)) {
   [System.IO.Path]::GetFullPath($OptionChainStoreDatabase)
 } else {
@@ -75,6 +77,16 @@ foreach ($databasePath in @($chainStorePath, $pacingDatabasePath)) {
     throw "Research option database cannot be a reparse point: $databasePath"
   }
 }
+New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
+$artifactRootItem = Get-Item -LiteralPath $artifactRoot
+if (-not $artifactRootItem.PSIsContainer -or
+    ($artifactRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+    -not $artifactRootItem.FullName.StartsWith(
+      $researchPrefix,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+  throw "Research artifact root must be a regular directory beneath $researchRoot"
+}
 $pythonExe = Join-Path $repoRoot ".venv\Scripts\pythonw.exe"
 $validationPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $alphaPython = Join-Path $alphaRootResolved ".venv\Scripts\python.exe"
@@ -104,21 +116,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = @(
-  "-m insider_alerts.research.worker",
-  "--alpha-python `"$alphaPython`"",
-  "--alpha-script `"$alphaScript`"",
-  "--alpha-historical-script `"$alphaHistoricalScript`"",
-  "--option-chain-store-db `"$chainStorePath`"",
-  "--historical-pacing-db `"$pacingDatabasePath`"",
-  "--history-db `"$historyDatabaseResolved`"",
-  "--history-snapshot-sha256 $HistorySnapshotSha256",
-  "--error-log `"$repoRoot\logs\research-capture.err.log`""
-) -join " "
+$actionSpec = New-ResearchCaptureTaskActionSpec `
+  -PythonExe $pythonExe `
+  -RepoRoot $repoRoot `
+  -ArtifactRoot $artifactRoot `
+  -AlphaPython $alphaPython `
+  -AlphaScript $alphaScript `
+  -AlphaHistoricalScript $alphaHistoricalScript `
+  -ChainStorePath $chainStorePath `
+  -PacingDatabasePath $pacingDatabasePath `
+  -HistoryDatabase $historyDatabaseResolved `
+  -HistorySnapshotSha256 $HistorySnapshotSha256
 $action = New-ScheduledTaskAction `
-  -Execute $pythonExe `
-  -Argument $arguments `
-  -WorkingDirectory $repoRoot
+  -Execute $actionSpec.Execute `
+  -Argument $actionSpec.Argument `
+  -WorkingDirectory $actionSpec.WorkingDirectory
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $intervalTrigger = New-ScheduledTaskTrigger `
   -Once `

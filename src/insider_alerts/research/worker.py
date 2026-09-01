@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,9 +45,15 @@ def _append_error(path: Path, exc: BaseException) -> None:
         stream.write(f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n")
 
 
+def _repo_path(path: Path, *, repo_root: Path) -> Path:
+    selected = path if path.is_absolute() else repo_root / path
+    return Path(os.path.abspath(selected))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[3]
+    artifact_root = _repo_path(args.artifact_root, repo_root=repo_root)
     try:
         # Own every spawned alpha/git descendant even if its direct parent exits before timeout
         # cleanup can still address the tree by PID.
@@ -55,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         config = CaptureConfig(
             source_db=args.database_path,
             evidence_db=args.evidence_db,
-            artifact_root=args.artifact_root,
+            artifact_root=artifact_root,
             research_root=repo_root / "data" / "research",
             alpha_python=args.alpha_python,
             alpha_script=args.alpha_script,
