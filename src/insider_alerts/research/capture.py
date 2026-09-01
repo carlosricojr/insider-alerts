@@ -291,7 +291,8 @@ def _locked_artifact_directory(path: Path, *, research_root: Path) -> Iterator[P
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = (
         wintypes.LPCWSTR,
@@ -338,7 +339,7 @@ def _locked_artifact_directory(path: Path, *, research_root: Path) -> Iterator[P
                 if handle == invalid_handle:
                     raise OptionRuntimeValidationError(
                         f"artifact directory could not be pinned: {cursor}"
-                    ) from ctypes.WinError(ctypes.get_last_error())
+                    ) from ctypes_windows.WinError(ctypes_windows.get_last_error())
                 handle_value = int(handle)
                 _WINDOWS_ARTIFACT_HANDLES[key] = (handle_value, 1)
                 acquired_keys.append(key)
