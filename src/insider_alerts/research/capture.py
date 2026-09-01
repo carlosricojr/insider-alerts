@@ -280,8 +280,66 @@ def _confined_artifact_subdirectory(artifact_root: Path, name: str) -> Path:
 
 
 @contextmanager
+def _artifact_process_mutex(research_root: Path) -> Iterator[None]:
+    if os.name != "nt":
+        yield
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    ctypes_windows: Any = ctypes
+    kernel32 = ctypes_windows.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create_mutex.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait_for_single_object.restype = wintypes.DWORD
+    release_mutex = kernel32.ReleaseMutex
+    release_mutex.argtypes = (wintypes.HANDLE,)
+    release_mutex.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    root_identity = os.path.normcase(str(Path(os.path.abspath(research_root))))
+    mutex_name = f"Local\\InsiderAlertsResearchArtifacts-{sha256_bytes(root_identity.encode())}"
+    handle = create_mutex(None, False, mutex_name)
+    if not handle:
+        raise OptionRuntimeValidationError("artifact process mutex could not be created") from (
+            ctypes_windows.WinError(ctypes_windows.get_last_error())
+        )
+    acquired = False
+    try:
+        wait_result = int(wait_for_single_object(handle, 180_000))
+        if wait_result not in {0x00000000, 0x00000080}:
+            if wait_result == 0x00000102:
+                raise OptionRuntimeValidationError("artifact process mutex timed out")
+            raise OptionRuntimeValidationError("artifact process mutex wait failed") from (
+                ctypes_windows.WinError(ctypes_windows.get_last_error())
+            )
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            release_mutex(handle)
+        close_handle(handle)
+
+
+@contextmanager
 def _locked_artifact_directory(path: Path, *, research_root: Path) -> Iterator[Path]:
-    """Pin every Windows ancestor so a validated path cannot be renamed or replaced."""
+    """Serialize writers and pin ancestors so a validated path cannot be replaced."""
+
+    with _artifact_process_mutex(research_root), _locked_artifact_directory_under_mutex(
+        path, research_root=research_root
+    ) as locked:
+        yield locked
+
+
+@contextmanager
+def _locked_artifact_directory_under_mutex(
+    path: Path, *, research_root: Path
+) -> Iterator[Path]:
 
     verified = _confined_artifact_root(path, research_root=research_root)
     if os.name != "nt":
@@ -742,6 +800,8 @@ def _publish_content_addressed(
             return _publish_content_addressed_locked(locked_root, data, suffix=suffix)
     except OptionRuntimeValidationError as exc:
         raise ArtifactPublicationError(f"content-address root is invalid: {root}") from exc
+    except OSError as exc:
+        raise ArtifactPublicationError(f"content-address publication failed: {root}") from exc
 
 
 def _publish_content_addressed_locked(
@@ -2087,12 +2147,14 @@ def run_capture_once(
     now: datetime | None = None,
     worker_id: str | None = None,
 ) -> CaptureResult:
+    resolved_research_root = Path(os.path.abspath(config.research_root)).resolve(strict=True)
     config = replace(
         config,
         artifact_root=_confined_artifact_root(
             config.artifact_root,
             research_root=config.research_root,
         ),
+        research_root=resolved_research_root,
     )
     now = (now or datetime.now(UTC)).astimezone(UTC)
     worker_id = worker_id or f"{platform.node()}:{os.getpid()}"

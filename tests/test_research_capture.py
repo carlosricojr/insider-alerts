@@ -1161,7 +1161,7 @@ def test_option_publication_failure_is_persisted_as_typed_missingness(
         root: Path, data: bytes, *, suffix: str
     ) -> tuple[Path, str]:
         if root.name == "options":
-            raise capture_module.ArtifactPublicationError("simulated publication failure")
+            raise OSError("simulated publication failure")
         return original_publish_locked(root, data, suffix=suffix)
 
     monkeypatch.setattr(capture_module, "run_hidden_process", successful_process)
@@ -1668,6 +1668,45 @@ def test_artifact_root_path_is_not_part_of_scientific_configuration_hash(
     )
 
 
+def test_snapshot_publication_accepts_resolved_research_root_behind_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actual_root = tmp_path / "actual"
+    actual_root.mkdir()
+    source_db, _, decision_at = _approved_job(actual_root)
+    alias_root = tmp_path / "alias"
+    try:
+        alias_root.symlink_to(actual_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"filesystem cannot create a directory symlink: {exc}")
+    base = _config(actual_root, source_db)
+    config = replace(
+        base,
+        source_db=alias_root / "source.db",
+        evidence_db=alias_root / "evidence.db",
+        research_root=alias_root / "research",
+        artifact_root=alias_root / "research" / "artifacts",
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_capture_options",
+        lambda *_args, **_kwargs: (
+            None,
+            None,
+            None,
+            "OPTION_CAPTURE_UNAVAILABLE",
+            "fixture",
+            False,
+        ),
+    )
+
+    result = run_capture_once(config, now=decision_at + timedelta(seconds=2))
+
+    assert result.status == "completed"
+    assert result.option_status == "OPTION_CAPTURE_UNAVAILABLE"
+    assert len(list((actual_root / "research" / "artifacts" / "snapshots").glob("*.json"))) == 1
+
+
 def test_research_root_cannot_be_rebound_away_from_source_data_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2037,3 +2076,6 @@ def test_research_task_is_hidden_bounded_and_overlap_safe() -> None:
     assert "-WorkingDirectory $actionSpec.WorkingDirectory" in installer
     assert "-ExecutionTimeLimit (New-TimeSpan -Minutes 15)" in installer
     assert "-MultipleInstances IgnoreNew" in installer
+    ancestor_validation = installer.index("Research artifact ancestor cannot be a reparse point")
+    artifact_creation = installer.index("New-Item -ItemType Directory -Path $artifactRoot")
+    assert ancestor_validation < artifact_creation
