@@ -3,7 +3,7 @@
 <!-- markdownlint-disable MD013 -->
 <!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 4.0.0 -->
 <!-- CANONICAL_SOURCE: https://github.com/ospina-company/handbook/blob/main/docs/agents/coderabbit-pr-review-loop.md -->
-<!-- CANONICAL_BODY_SHA256: 8971bba05b30de7b555e26a60183a017b585359ff1a62e2c7104aa181923a7e7 -->
+<!-- CANONICAL_BODY_SHA256: e9c629a09b3810f7e18007761198e421b5eef53ce0043879ff7db1fb773034b9 -->
 <!-- markdownlint-enable MD013 -->
 
 This is the canonical workflow for any task that prepares, updates, or merges a
@@ -81,7 +81,8 @@ The classification recorded in the PR always names what actually happened:
 | `APP_REVIEW_COMPLETED_CHECK_FAILED` | App review is substantive but its check failed |
 | `APP_REVIEW_UNAVAILABLE_ADAPTIVE_LIMIT` | Rung 1: App throttled, CLI review of record |
 | `APP_REVIEW_PENDING_CLI_REVIEW_OF_RECORD` | Rung 1: CLI finished first, App still pending |
-| `APP_REVIEW_NOT_REQUESTED_CLI_REVIEW_OF_RECORD` | Rung 1: the App leg was disabled for this run |
+| `APP_REVIEW_COMPLETED_AFTER_CLI_REVIEW_OF_RECORD` | Rung 1: CLI completed before a later App review |
+| `APP_REVIEW_NOT_REQUESTED_CLI_REVIEW_OF_RECORD` | Diagnostic only (exit 20): disabled/unrequested App leg does not satisfy the concurrent race |
 | `APP_REVIEW_REFUSED_NO_FILES_CLI_REVIEW_OF_RECORD` | Rung 1: the App refused the head (no reviewable files), CLI review of record |
 | `REVIEW_RACE_DEADLINE_EXPIRED` | Budget exhausted, no review of record yet |
 | `NO_REVIEW_OF_RECORD_ON_HEAD` | No review covers this head, and no channel was proven unavailable |
@@ -293,7 +294,11 @@ to climb the ladder; never spend money to escape an adaptive limit.
    matching the App state: `APP_REVIEW_UNAVAILABLE_ADAPTIVE_LIMIT` for a
    throttle, `APP_REVIEW_PENDING_CLI_REVIEW_OF_RECORD` while the App remains
    pending, or the no-files classification for a verified refusal. This satisfies the completion contract: it is a CodeRabbit
-   review of the production diff.
+   review of the production diff. If the App completes later, retain the CLI
+   winner as `APP_REVIEW_COMPLETED_AFTER_CLI_REVIEW_OF_RECORD`; its later check
+   does not replace that review. Any observed actionable finding still blocks.
+   `--no-app` and `--no-app-request` are diagnostic options; a CLI-only run
+   without an attempted App leg does not establish merge readiness.
 
 2. **Agent-CLI review of record — last resort, reached without delay.** Only if
    both CodeRabbit channels are genuinely unavailable (App throttled *and* the
@@ -674,14 +679,20 @@ SHA-256 in a repository member/owner PR comment as its own line:
 CODERABBIT_REVIEW_OF_RECORD_SHA256: <sha256>
 ```
 
-Only exit 10 from the concurrent race licenses rung two. Append an
+Exit 10 from the concurrent race, or equivalent verified dual-unavailability
+evidence from the manual procedure, licenses rung two. Append an
 `independentReview` object to that evidence with `reviewer` (model/session),
 `independent: true`, exact `head` and `baseOid`, `completedAt`, all changed
 `reviewedFiles`, a substantive `summary`, and `findings: []` after addressing
 findings. Keep the original App/CLI availability evidence. Capacity failures do
 not license bypassing permission or policy refusals. If the App or CLI omitted
-files, an independent supplemental review of those files completes coverage;
-record the aggregate `coverage.reviewedFiles` and the supplemental review.
+files, first establish why both CodeRabbit channels cannot review those omitted
+files (for example, App throttling plus verified CLI path/binary exclusions).
+Only that documented dual-unavailability licenses independent supplemental review.
+Record the reviewer, substantive findings/resolutions and aggregate coverage in
+the manual evidence procedure; a bare `coverage.reviewedFiles` assertion cannot
+replace an omitted CodeRabbit review. The automated verifier requires the CLI's
+actual reviewed-file list to cover the diff when the CLI is the review of record.
 A timestamp, green bot status, empty review object or author assertion alone
 is never substantive review evidence.
 
