@@ -1,9 +1,9 @@
 # CodeRabbit PR Review Loop (Mandatory)
 
 <!-- markdownlint-disable MD013 -->
-<!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 3.2.7 -->
-<!-- CANONICAL_SOURCE: https://github.com/ospina-company/alpha-core/blob/main/docs/agents/coderabbit-pr-review-loop.md -->
-<!-- CANONICAL_BODY_SHA256: af7456efaf0962c8c1c63532bdb887d4f1c8807b0a9b33e41ae220142d0cdf45 -->
+<!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 4.0.0 -->
+<!-- CANONICAL_SOURCE: https://github.com/ospina-company/handbook/blob/main/docs/agents/coderabbit-pr-review-loop.md -->
+<!-- CANONICAL_BODY_SHA256: 8971bba05b30de7b555e26a60183a017b585359ff1a62e2c7104aa181923a7e7 -->
 <!-- markdownlint-enable MD013 -->
 
 This is the canonical workflow for any task that prepares, updates, or merges a
@@ -37,11 +37,18 @@ outcome, and writes a PR-ready evidence block:
 coderabbit-review-of-record <pr-number>
 ```
 
+An existing substantive review that still covers the current diff may be reused;
+do not request another review merely to obtain new timestamps. The wrapper can
+return an existing App review without invoking the CLI. A verified absent CLI,
+authentication failure or network failure is preflight unavailability, not an
+invoked review with start/finish timestamps. Reuse a recorded live same-head
+throttle/refusal rather than re-requesting it; preserve its notice and head binding.
+
 Useful flags: `--base <branch>`, `--repo OWNER/NAME`, `--repo-dir <worktree>`,
 `--deadline <seconds>` (default 900), `--check-only` (verify only, request
 nothing), `--post-evidence`, `--json`.
 
-The plan-limited pre-launch verifier requires GitHub CLI 2.50.0 or newer so its
+The readiness verifier requires GitHub CLI 2.50.0 or newer so its
 paginated JSON captures are complete and machine-parseable.
 
 Exit codes:
@@ -80,7 +87,7 @@ The classification recorded in the PR always names what actually happened:
 | `NO_REVIEW_OF_RECORD_ON_HEAD` | No review covers this head, and no channel was proven unavailable |
 | `NON_CODERABBIT_AGENT_REVIEW` | Rung 2: both channels **attempted** and verified unavailable |
 | `NO_REVIEWABLE_FILES_NON_CODERABBIT_AGENT_REVIEW` | Rung 2: both channels affirmatively refused the diff — nothing in it is reviewable by CodeRabbit |
-| `PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK` | Check-gate fallback: a private pre-launch repository cannot configure required checks on its current plan, so a tracked expected-check contract is verified against every current-head check |
+| `VERIFIED_APPLICABLE_VALIDATION` | Applicable current-head validation and substantive clean review have been verified, regardless of plan or required-check metadata availability |
 
 It writes `review-of-record.json` and `review-of-record.md` to a temp evidence
 directory (never inside the repository — the CLI would otherwise review its own
@@ -118,7 +125,7 @@ or re-asking.
 Verify a repository's copy of this document before relying on it:
 
 ```bash
-bash scripts/agents/check-review-loop-drift.sh
+check-review-loop-drift
 ```
 
 The body hash proves only that a copy was not hand-edited; a stale copy is
@@ -128,7 +135,7 @@ so exit `2` (currency unverified) must not be read as "current".
 Install or refresh it from the canonical repository:
 
 ```bash
-bash scripts/agents/install-review-of-record.sh   # in alpha-core
+bash scripts/agents/install-review-of-record.sh   # in handbook
 ```
 
 If the command is genuinely unavailable, run the ladder by hand as described
@@ -283,8 +290,9 @@ to climb the ladder; never spend money to escape an adaptive limit.
    If the CLI finishes first, it is the review of record. Address every finding,
    re-run gates, and record in the PR the reviewed range, the findings (or "no
    findings") and their resolutions, and the classification
-   `APP_REVIEW_UNAVAILABLE_ADAPTIVE_LIMIT` (App throttled → CodeRabbit CLI
-   substitute). This satisfies the completion contract: it is a CodeRabbit
+   matching the App state: `APP_REVIEW_UNAVAILABLE_ADAPTIVE_LIMIT` for a
+   throttle, `APP_REVIEW_PENDING_CLI_REVIEW_OF_RECORD` while the App remains
+   pending, or the no-files classification for a verified refusal. This satisfies the completion contract: it is a CodeRabbit
    review of the production diff.
 
 2. **Agent-CLI review of record — last resort, reached without delay.** Only if
@@ -350,6 +358,14 @@ schedule. It is not legitimate as a substitute for the review ladder.
    ```
 
    Run every manual shell block below in the same interactive shell session so the `EXIT` trap and shared variables remain active across the race, evidence capture, final gates, and cleanup. Do not paste these blocks into separate shells.
+
+   The shell capture below is the CLI-success branch of the manual procedure.
+   It is not a prerequisite for an App winner, an existing current-diff review,
+   or verified dual-provider unavailability. For those outcomes use the manual
+   evidence procedure in **Applicable validation and merge readiness**, preserving
+   the same substantive review and provider-permission boundaries. When the
+   wrapper is unavailable, equivalent verified dual-unavailability evidence
+   licenses rung two; an actual wrapper exit 10 is not an extra prerequisite.
 
    By hand, bind the App request to the captured exact head, save the request
    URL and timestamp, and start `cr review --base <integration-branch> --agent`
@@ -580,158 +596,108 @@ requested test/docs-only follow-up. **Any production-code change, however small,
 still requires a fresh completed review.** Never spend money to escape an
 adaptive limit.
 
-## Plan-limited pre-launch check fallback
+## Applicable validation and merge readiness
 
-`PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK` is a narrow check-gate classification,
-not a review bypass and not branch protection. It exists only for a private
-repository whose current GitHub plan makes required-check configuration
-unavailable during pre-launch work on a non-production integration branch.
-Manual conventions remain weaker than enforced protection, so the fallback
-must expire before the first production promotion.
+A PR is ready when the current change has a substantive, clean review of record,
+applicable validation has actually passed, and no actionable finding remains.
+This rule applies to every branch, including `main`, and to public, private and
+protected repositories. Missing required-check metadata and plan-related 403s
+are neither success evidence nor independent blockers. Never bypass enforced
+protections or existing owner authorization boundaries.
 
-The canonical verifier, not caller-supplied booleans or a hand-written evidence
-block, owns this classification:
+Use the installed handbook verifier after recording the review:
 
 ```bash
-plan-limited-prelaunch-check <pr-number> \
-  --repo OWNER/REPO \
-  --repo-dir "$PWD" \
-  --review-evidence /absolute/path/to/review-of-record.json \
-  --json
+pr-readiness-check <pr-number> --repo OWNER/REPO --repo-dir "$PWD" \
+  --review-evidence /absolute/path/to/review-of-record.json --json
 ```
 
-Install or refresh that command from a clean checkout of canonical alpha-core
-`main` with `bash scripts/agents/install-plan-limited-prelaunch.sh`. It runs
-outside the target worktree and byte-compares itself with alpha-core `main`
-before evaluating a PR. The verifier first resolves canonical `main` to an
-immutable commit OID and fetches the canonical bytes by that OID, so a moving
-ref cannot split the identity check from the evidence record and PR-authored
-verifier changes cannot authorize themselves.
+`plan-limited-prelaunch-check` remains an alias with the same arguments and
+exit contract (0 verified, 20 blocked). Its old production exclusions, expiry,
+and remediation-issue prerequisite are retired. Existing expected-check entries
+in `.github/prelaunch-check-fallback.json` remain inputs; migrate them to
+`.github/pr-validation.json` when editing that repository's validation policy.
+A legacy `allowed: ["skipped"]` never proves that a test ran.
 
-The review artifact must come from the simultaneous App/CLI
-`coderabbit-review-of-record` race. The verifier keeps the resulting review
-classification separate from `checkGateClassification`; it never relabels a
-CLI or App review as the plan fallback. Before verification, a repository
-`OWNER` or `MEMBER` pins the artifact bytes in a PR comment with the exact line
-`CODERABBIT_REVIEW_OF_RECORD_SHA256: <sha256>`. This authenticates the external
-artifact rather than trusting caller-controlled JSON fields.
+The verifier reads trusted base workflow and policy blobs and proposed blobs,
+then supplements them with branch-protection and applicable ruleset checks when
+available. It queries check runs and commit status contexts from that exact
+commit, verifies producers, and re-fetches the head after collecting checks and
+review evidence. GitHub Actions jobs are bound to workflow path/ID, run,
+check suite and current head. The latest run and attempt supersede older results
+of that workflow; a newer pending, cancelled or failed run supersedes an older
+success. A failed-jobs rerun may retain successful jobs from its prior attempt.
+A successful workflow summary alone cannot prove that every applicable job ran.
 
-Every condition below is mandatory and evaluated fail-closed by the verifier:
+Intentional base-workflow branch/path exclusions are recorded. A skipped draft
+job is incomplete validation: make the PR ready and let its ready-for-review
+run complete. Ready-for-review-only validation remains applicable after later
+head changes, even when a workflow needs an authorized dispatch or rerun to
+produce new results. Never repeat successful checks without a changed head,
+affected requirement, later adverse attempt, or other concrete cause.
 
-1. GitHub reports that the repository is private. Fresh calls to both the
-   branch-protection endpoint for the PR base and the repository-rulesets
-   endpoint must fail with HTTP 403 evidence whose GitHub message explicitly
-   says the feature requires a plan upgrade. A 404, missing permission,
-   transient error, empty ruleset, or any successful response does not qualify.
-   If protection or required-check configuration is available, configure it;
-   the fallback is categorically unavailable.
-2. The PR base equals the configured non-production integration branch. The
-   verifier rejects the default branch, `main`, `master`, every production or
-   release branch, and every production promotion.
-3. The linked remediation issue belongs to the same repository, is freshly
-   `OPEN`, and has repository `OWNER`/`MEMBER` comments containing the exact
-   lines shown below. These structured attestations reject contrary or
-   ambiguous prose, establish that the branch is non-production, and expire the
-   fallback before the first production promotion. The fallback never closes
-   that issue.
+Only applicable validation is gated. An optional integration's failure does not
+block readiness unless trusted repository policy or enforced GitHub requirements
+make it applicable. An actual required check remains required even when a
+review fallback replaces CodeRabbit's semantic review role.
 
-   ```text
-   PLAN_LIMITED_PRELAUNCH_REMEDIATION: launch-blocking-before-first-production-promotion
-   PLAN_LIMITED_PRELAUNCH_INTEGRATION_BRANCH: <branch>
-   ```
-4. `.github/prelaunch-check-fallback.json` is a repository-owned, non-empty
-   expected-check contract. The verifier reads the blob from the PR head, never
-   a mutable worktree replacement or moving local ref, by using the captured
-   immutable head SHA. It trusts the config only when its bytes equal the copy
-   at the PR base commit. For a one-time first installation or an explicit
-   later policy change, an
-   `OWNER` or `MEMBER` must put the exact marker
-   `PLAN_LIMITED_PRELAUNCH_CONFIG_SHA256: <sha256>` on the remediation issue.
-   This bootstrap pins the bytes outside the pull request; subsequent changes
-   must first land in the base or receive a new explicit pin.
-5. The verifier captures the PR head, queries check runs and commit status
-   contexts from that exact commit, and matches expected checks by name plus
-   producer identity (`app_slug` for check runs and a non-empty trusted target
-   URL prefix plus exact `creator_login` for status contexts). Each active
-   expected check must be present
-   exactly once and terminal in an explicitly permitted `success` or `skipped`
-   state. Repository-owned `when_changed` rules activate conditional checks;
-   both source and destination paths of renames are evaluated, and a matching
-   path with an absent check fails closed.
-   Status contexts come from the paginated commit-status listing, which retains
-   exact creator identities. Its latest distinct context identities are
-   count-checked against the combined status summary. Historical transitions
-   remain captured but are not mistaken for additional current contexts; a creator-less summary row can never satisfy an expected producer.
-6. The allowlist cannot hide GitHub evidence: every latest current-head check
-   run and status context is inspected, including unexpected ones. Any pending,
-   cancelled, timed-out, or failing result rejects the fallback; an unexpected
-   run is tolerated only when it concluded `success`, `skipped`, or `neutral`.
-   Immutable API IDs select the latest run within each check suite and the
-   latest status context. Distinct suites remain distinct even when an app
-   reuses a check name, so neither an older result nor a duplicate-name sibling
-   can hide a newer pending or failing result. GitHub result caps or
-   incomplete pagination reject the fallback instead of silently truncating the
-   check universe. After a fixed 15-second stability dwell, a second complete
-   same-SHA snapshot must equal the first; any check/status mutation during
-   capture requires a fresh run. The dwell duration is explicit in the output
-   and is never an adaptive-limit cooldown wait.
-7. Exactly one expected entry is the semantic CodeRabbit gate. Its evidence
-   must use the canonical review tool version, cover this repository, PR, base,
-   and exact head, show that the App leg was attempted concurrently, record
-   `waitedOnCooldown: false`, retain the exact bot identity checks enforced by
-   `coderabbit-review-of-record`, contain no unaddressed CLI findings, and show
-   zero unresolved non-outdated review threads. Canonical classification/state
-   pairs, PR-bound terminal notices, strictly parsed and ordered App/CLI
-   timestamps, and a non-empty CLI reviewed-file set drawn from the PR's
-   changed paths are mandatory; impossible hand-written combinations fail. A
-   completed App review also requires its CodeRabbit check to pass.
-8. GitHub must report the PR `MERGEABLE`. The verifier re-fetches the head after
-   collecting checks and review evidence and rejects any head, base-name, or
-   base-OID mismatch. Merge still uses `--match-head-commit` with that captured
-   head, immediately after re-confirming the integration base.
+A PR cannot silently weaken its own requirements. Any workflow or governing
+policy change needs an explicit review of the prior requirements and owner
+intent, pinned to the prior/proposed content and head. Record the verifier's
+`policyReviewDigest` on the PR in a member/owner comment containing:
 
-The output records `checkGateClassification`, the independent
-`reviewClassification`, exact head, config hash and trust source, immutable
-`canonicalVerifierOid`, `stabilityDwellSeconds`, plan-limit API evidence,
-expected/observed matrix, remediation issue, and all failures.
-Post the successful JSON plus the substantive review-of-record evidence to the
-PR before merging.
-
-A repository-owned contract uses this exact schema (names, producers, and path
-rules remain local policy, not canonical defaults):
-
-```json
-{
-  "schema_version": 1,
-  "classification": "PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK",
-  "integration_branch": "staging",
-  "expires": "before-first-production-promotion",
-  "remediation_issue": "https://github.com/OWNER/REPO/issues/NUMBER",
-  "expected_checks": [
-    {
-      "name": "Static checks",
-      "kind": "check_run",
-      "app_slug": "github-actions",
-      "allowed": ["success"]
-    },
-    {
-      "name": "Backend coverage",
-      "kind": "check_run",
-      "app_slug": "github-actions",
-      "allowed": ["success"],
-      "when_changed": ["backend/**", "shared/backend/**"]
-    },
-    {
-      "name": "Deployment",
-      "kind": "status_context",
-      "target_url_prefix": "https://deploy.example/OWNER/REPO/",
-      "creator_login": "deployment-bot[bot]",
-      "allowed": ["success"]
-    },
-    {"name": "CodeRabbit semantic review", "kind": "review_evidence"}
-  ]
-}
+```text
+PR_VALIDATION_POLICY_REVIEW: <digest>
+Prior requirements: <what ran before; changes to steps, triggers and exclusions>
+Owner intent: <authorization and why the proposed requirements meet it>
 ```
+
+The automated verifier conservatively verifies the union of prior/proposed jobs.
+For a deliberate job removal/rename, dynamic workflow expression, reusable
+workflow, or repository-specific local gate it cannot interpret, use the manual
+procedure below. An unsupported automation case is not an additional company
+policy requirement and must not create the metadata deadlock this rule corrects.
+
+Repository-owned `.github/pr-validation.json` can add `expected_checks` with
+`name`, `kind` (`check_run` or `status_context`), `app_slug` for checks, or exact
+`creator_login` and `target_url_prefix` for statuses. Optional `when_changed`
+globs narrow applicability. `job_exclusions` entries name `workflow`, `job`,
+`when_changed` and `reason`: the job is required when those paths match, excluded
+otherwise. These definitions are governed by the same prior-policy review.
+
+### Review evidence and independent fallback
+
+Keep the wrapper's existing `review-of-record.json` fields. Pin the final file's
+SHA-256 in a repository member/owner PR comment as its own line:
+
+```text
+CODERABBIT_REVIEW_OF_RECORD_SHA256: <sha256>
+```
+
+Only exit 10 from the concurrent race licenses rung two. Append an
+`independentReview` object to that evidence with `reviewer` (model/session),
+`independent: true`, exact `head` and `baseOid`, `completedAt`, all changed
+`reviewedFiles`, a substantive `summary`, and `findings: []` after addressing
+findings. Keep the original App/CLI availability evidence. Capacity failures do
+not license bypassing permission or policy refusals. If the App or CLI omitted
+files, an independent supplemental review of those files completes coverage;
+record the aggregate `coverage.reviewedFiles` and the supplemental review.
+A timestamp, green bot status, empty review object or author assertion alone
+is never substantive review evidence.
+
+### Manual verification when automation cannot represent the repository
+
+Use the same rule, never an invented waiver: read immutable prior and proposed
+workflows and repository policy, explicitly review changed requirements against
+owner intent, list applicable checks and exact producers, and capture actual
+current-head results from GitHub or authenticated local execution logs. Record
+why each intentional exclusion is inapplicable. Check newest runs/attempts;
+pending, failure, cancellation, stale results and draft skips cannot pass.
+Capture fresh review objects, comments and paginated threads; verify substantive
+review coverage and zero actionable findings. Record the commands, results,
+reviewed range and evidence links in the PR. Re-fetch the head and use
+`--match-head-commit` at merge. Unavailable required-check metadata alone does
+not require new approval. Real protection refusal is binding; never use `--admin`.
 
 ## Fresh status, SHA, Walkthrough, and thread verification
 
@@ -890,69 +856,9 @@ set -euo pipefail
 
 CHECK_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
 test "$CHECK_HEAD" = "$EVIDENCE_HEAD"
-umask 077
-CHECK_EVIDENCE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/coderabbit-checks.XXXXXX")
-chmod 700 "$CHECK_EVIDENCE_DIR"
-REQUIRED_CHECKS_JSON="$CHECK_EVIDENCE_DIR/required-checks.json"
-STATUS_PAGES_JSON="$CHECK_EVIDENCE_DIR/status-pages.json"
-# gh pr checks exits non-zero when checks merely fail or are pending; under
-# `set -euo pipefail` that would kill the pass before jq ever evaluates the
-# payload. Capture the payload and the status separately -- a parseable
-# payload is a real answer regardless of the exit code.
-checks_rc=0
-gh pr checks "$PR" --required --json name,bucket,state,workflow,link \
-  > "$REQUIRED_CHECKS_JSON" || checks_rc=$?
-cat "$REQUIRED_CHECKS_JSON"
-gh api --paginate --slurp \
-  "repos/$REPO/commits/$CHECK_HEAD/statuses?per_page=100" \
-  > "$STATUS_PAGES_JSON"
-
-# A same-named workflow check must not impersonate the CodeRabbit semantic
-# gate. Verify the newest exact CodeRabbit status context was emitted by an
-# exact bot identity before partitioning its linkless status row from CI.
-CODERABBIT_STATUS_VERIFIED=false
-if jq -e '
-  [ .[][] | select(.context == "CodeRabbit") ][0] as $status |
-  ($status != null) and
-  (($status.creator.login // "" | ascii_downcase) as $login |
-   ($login == "coderabbitai" or $login == "coderabbitai[bot]"))
-' "$STATUS_PAGES_JSON" >/dev/null; then
-  CODERABBIT_STATUS_VERIFIED=true
-fi
-
-# The gate is REQUIRED CI, so scope the query with --required: an optional
-# pending or failing check must not block the merge. Caveat: a required check
-# that has not registered with GitHub yet does not appear in this output at
-# all, so the non-empty requirement below fails closed on "nothing registered"
-# and you must confirm the expected required workflows are present in the
-# listing (compare against branch protection when in doubt).
-# CodeRabbit's own check is excluded here: on a ladder classification it is
-# legitimately absent, stale, or non-passing, and the CLASSIFICATION block
-# below is the sole owner of that gate.
-jq -e --argjson coderabbitStatusVerified "$CODERABBIT_STATUS_VERIFIED" '
-       [ .[] | select((($coderabbitStatusVerified and
-                        (.name // "") == "CodeRabbit" and
-                        (.workflow // "") == "" and
-                        (.link // "") == "") | not)) ] as $required_ci |
-       ($required_ci | length) > 0 and
-       all($required_ci[]; ((.bucket | ascii_downcase) == "pass" or
-                            (.bucket | ascii_downcase) == "skipping"))' \
-  "$REQUIRED_CHECKS_JSON"
-
-# The CodeRabbit check itself is a gate ONLY when the App is the reviewer of
-# record. On a ladder classification it is legitimately absent or stale, and
-# the ladder evidence carries the semantic gate instead.
-: "${CLASSIFICATION:?set the recorded review classification}"
-if [ "$CLASSIFICATION" = "APP_REVIEW_COMPLETED" ]; then
-  test "$CODERABBIT_STATUS_VERIFIED" = true
-  jq -e '
-    [ .[] | select((.name // "") == "CodeRabbit" and
-                    (.workflow // "") == "" and
-                    (.link // "") == "") ] as $coderabbit |
-    ($coderabbit | length) > 0 and
-    all($coderabbit[]; (.bucket | ascii_downcase) == "pass")' \
-    "$REQUIRED_CHECKS_JSON"
-fi
+# REVIEW_EVIDENCE is the absolute, member/owner-pinned JSON artifact above.
+pr-readiness-check "$PR" --repo "$REPO" --repo-dir "$PWD" \
+  --review-evidence "$REVIEW_EVIDENCE" --json
 FINAL_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
 test "$FINAL_HEAD" = "$EVIDENCE_HEAD"
 printf 'evidence and checks verified on: %s\n' "$FINAL_HEAD"
@@ -1008,12 +914,11 @@ with the completed-review evidence required above.
 
 Merge only when all applicable gates hold:
 
-- required CI is successful on the current head, or the complete
-  `PLAN_LIMITED_PRELAUNCH_CHECK_FALLBACK` evidence contract above passes for a
-  qualifying pre-launch integration branch;
+- applicable validation is successful on the current head under the evidence-based
+  rule above, including actual enforced requirements when present;
 - a completed CodeRabbit review covers the current production diff, proven by
-  SHA plus substantive review/Walkthrough text — from the GitHub App, or, when
-  the App is adaptively rate-limited, a documented **escape ladder** review
+  SHA plus substantive review/Walkthrough text — from the GitHub App or a
+  documented concurrent **escape ladder** review
   (rung 1 CodeRabbit CLI, or rung 2 agent-CLI review of record); or the strict
   test/docs adaptive-limit exception is fully documented;
 - the CodeRabbit **check** reached a terminal pass when the classification is
@@ -1024,8 +929,8 @@ Merge only when all applicable gates hold:
 - every finding from the review of record is addressed, whichever rung produced
   it. Ladder findings arrive as CLI output rather than as GitHub review threads,
   so a zero unresolved-thread count does not clear them;
-- CodeRabbit is not pending and no non-review outcome is being presented as
-  success;
+- no non-review outcome is presented as success; a live App leg does not block
+  a completed clean CLI review of record;
 - zero unresolved actionable review threads remain;
 - scope, risk, rollback, and repository-specific done criteria are satisfied;
   and
@@ -1084,7 +989,7 @@ Copies of this document must remain byte-for-byte identical. To compare a copy
 with the canonical source without triggering CI or a CodeRabbit review:
 
 ```bash
-CANONICAL_API=repos/ospina-company/alpha-core/contents
+CANONICAL_API=repos/ospina-company/handbook/contents
 CANONICAL_API=$CANONICAL_API/docs/agents/coderabbit-pr-review-loop.md
 gh api -H 'Accept: application/vnd.github.raw+json' \
   "$CANONICAL_API?ref=main" | cmp - docs/agents/coderabbit-pr-review-loop.md
