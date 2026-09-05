@@ -3,7 +3,7 @@
 <!-- markdownlint-disable MD013 -->
 <!-- CODERABBIT_REVIEW_LOOP_CANONICAL_VERSION: 4.0.0 -->
 <!-- CANONICAL_SOURCE: https://github.com/ospina-company/handbook/blob/main/docs/agents/coderabbit-pr-review-loop.md -->
-<!-- CANONICAL_BODY_SHA256: e9c629a09b3810f7e18007761198e421b5eef53ce0043879ff7db1fb773034b9 -->
+<!-- CANONICAL_BODY_SHA256: bed66960ce2c3fba641faee7314763095e7c79dd3dd7df635585bdd0ede1ab0f -->
 <!-- markdownlint-enable MD013 -->
 
 This is the canonical workflow for any task that prepares, updates, or merges a
@@ -57,14 +57,14 @@ Exit codes:
 | --- | --- | --- |
 | `0` | Review of record obtained, zero unresolved actionable threads | Proceed to merge gates |
 | `10` | Both channels **verified** unavailable — throttled/failed, or both affirmatively refused a diff with no reviewable files | Perform the rung-2 agent review yourself, now |
-| `20` | Not merge-ready: threads open, unaddressed ladder findings, a non-passing App check — or no review of record at all yet (`NO_REVIEW_OF_RECORD_ON_HEAD`, e.g. `--check-only` or an untried channel) | Address findings or run the race, then re-run |
+| `20` | Not merge-ready: threads open, unaddressed ladder findings, a non-passing App check when the App is the reviewer of record — or no review of record at all yet (`NO_REVIEW_OF_RECORD_ON_HEAD`, e.g. `--check-only` or an untried channel) | Address findings or run the race, then re-run |
 | `30` | Deadline expired with a channel still active | Re-run or raise `--deadline`; this is **not** rung 2 |
 | `1` | Usage or hard error | Read stderr; do not merge |
 
 Exhausting the time budget is not evidence that CodeRabbit is unavailable, so
 `30` never licenses a rung-2 review. Neither does a channel that was never
 tried — a `--check-only` pass or a disabled leg reports
-`NO_REVIEW_OF_RECORD_ON_HEAD` and exit `20`. Only exit `10` licenses rung 2, and
+`NO_REVIEW_OF_RECORD_ON_HEAD` and exit `20`. When using the wrapper, only exit `10` licenses rung 2, and
 it requires the App to have been **attempted and verified down** — throttled, or
 an affirmative no-reviewable-files refusal — *and* the CLI to have been
 **attempted and failed or skipped**, each for a recorded reason.
@@ -293,7 +293,7 @@ to climb the ladder; never spend money to escape an adaptive limit.
    findings") and their resolutions, and the classification
    matching the App state: `APP_REVIEW_UNAVAILABLE_ADAPTIVE_LIMIT` for a
    throttle, `APP_REVIEW_PENDING_CLI_REVIEW_OF_RECORD` while the App remains
-   pending, or the no-files classification for a verified refusal. This satisfies the completion contract: it is a CodeRabbit
+   pending, or `APP_REVIEW_REFUSED_NO_FILES_CLI_REVIEW_OF_RECORD` for a verified refusal. This satisfies the completion contract: it is a CodeRabbit
    review of the production diff. If the App completes later, retain the CLI
    winner as `APP_REVIEW_COMPLETED_AFTER_CLI_REVIEW_OF_RECORD`; its later check
    does not replace that review. Any observed actionable finding still blocks.
@@ -345,6 +345,12 @@ These are defects, not styles. Each one converts a throttle into dead time:
 
 Polling is legitimate for **required CI**, which genuinely completes on its own
 schedule. It is not legitimate as a substitute for the review ladder.
+
+For a canonical handbook policy change, verify the proposed published commit
+with `check-review-loop-drift --candidate-ref <40-character-handbook-commit>`
+and review it against the prior merged requirements and owner intent. This
+verifies candidate bytes, not installed currency. Governed copies use the
+ordinary merged-main check after rollout; candidates never authorize themselves.
 
 ## Stage 2 — open the PR without wasting review allowance
 
@@ -542,11 +548,11 @@ schedule. It is not legitimate as a substitute for the review ladder.
    reviews and can cause later pushes to spend additional allowance; prefer a
    deliberate full-review request.
 
-   This by-hand fallback is deliberately stricter than the installed command:
-   it requires the committed-only CLI leg to succeed. The installed command
-   owns first-finisher App classification and bounded cancellation. A timeout
-   or unavailable CLI in the manual path is recorded but cannot be waved
-   through merely because an App review may have appeared concurrently.
+   This CLI-success capture branch requires the committed-only CLI leg to
+   succeed. For an App winner or verified dual-provider unavailability, use
+   the other manual outcomes described in **Applicable validation and merge
+   readiness**, with equivalent current-head evidence. A timeout alone is
+   never provider unavailability.
 
    The installed command constructs a private detached worktree at the
    captured PR head and invokes `cr` only inside that isolated exact-commit
@@ -572,34 +578,14 @@ schedule. It is not legitimate as a substitute for the review ladder.
    then run the race again. Never treat silence or an older Walkthrough as the
    re-review.
 
-## Adaptive-limit exception for post-review tests/docs only
+## Reviewing follow-up changes
 
-The normal rule is a completed review on the current head. Merge without a
-redundant current-head review is allowed only when **all** of these conditions
-are proven:
-
-1. A completed CodeRabbit review exists for the commit containing the settled
-   production diff, and its SHA and Walkthrough/review evidence are recorded.
-2. Every later change was directly requested by that completed review.
-3. Every later change is limited to tests and/or documentation and cannot change
-   production behavior, runtime configuration, generated production artifacts,
-   dependencies, build or deployment behavior.
-4. The PR explicitly lists the post-review files and maps each change to the
-   requesting CodeRabbit finding.
-5. All required CI passes on the current head, and an adversarial local review
-   of the exact post-review diff finds no actionable issue.
-6. Neither CodeRabbit channel can re-review: the App posted a documented
-   adaptive review-limit message **and** rung 1 is unavailable for a recorded
-   reason. Save the exact message and URL. Do not infer a limit from silence or
-   a green check.
-
-Record the exception as `POST_REVIEW_TEST_DOCS_ADAPTIVE_LIMIT` in the PR.
-Rate-limit, quota, skipped, paused, ignored, or transport failures remain
-non-reviews and do not create a general bypass. This exception only bridges an
-already completed production-diff review to a current head containing its
-requested test/docs-only follow-up. **Any production-code change, however small,
-still requires a fresh completed review.** Never spend money to escape an
-adaptive limit.
+A review-requested test or documentation change still needs review of its
+current diff. Preserve the completed review of the unchanged production code,
+review the exact follow-up range, and record aggregate current-head coverage.
+When both CodeRabbit channels are verified unavailable, use the same independent
+fallback rule as any other change. There is no separate test/docs exemption
+from substantive review or successful applicable validation.
 
 ## Applicable validation and merge readiness
 
@@ -672,8 +658,10 @@ otherwise. These definitions are governed by the same prior-policy review.
 
 ### Review evidence and independent fallback
 
-Keep the wrapper's existing `review-of-record.json` fields. Pin the final file's
-SHA-256 in a repository member/owner PR comment as its own line:
+Keep the wrapper's existing `review-of-record.json` fields. Complete any
+`independentReview` and coverage evidence described below first. Then compute
+the SHA-256 of the final file bytes and pin it in a repository member/owner PR
+comment as its own line; do not mutate the artifact after pinning:
 
 ```text
 CODERABBIT_REVIEW_OF_RECORD_SHA256: <sha256>
@@ -853,11 +841,13 @@ matches in context; keywords are indicators, not a substitute for semantic
 inspection. When a match is an adaptive-limit notice, record it and move to the
 ladder — do not wait for the quoted cooldown.
 
-Only an App review or terminal notice created after `APP_REQUESTED_AT` is
-evidence for this race. Record `APP_REQUEST_URL`, require the App attempt and
-CLI start to be within 30 seconds, and require any completed App review or
-terminal notice to fall before the CLI review finishes. A stale bot comment on
-the same head is not evidence for the current review of record.
+For a newly requested race, record `APP_REQUEST_URL` and `APP_REQUESTED_AT`,
+require the App attempt and CLI start within 30 seconds, and bind the review or
+terminal notice to that attempt. For reused automatic evidence, record the
+original authenticated notice URL/time and verify it postdates the current
+head; no new human request is needed or permitted against a live throttle.
+A later App completion does not replace a completed clean CLI winner. An old
+notice from a superseded head is not current evidence.
 
 Bind the check query and final merge decision to the same captured head. Restart
 the entire evidence pass if any equality test fails:
@@ -927,14 +917,13 @@ Merge only when all applicable gates hold:
 
 - applicable validation is successful on the current head under the evidence-based
   rule above, including actual enforced requirements when present;
-- a completed CodeRabbit review covers the current production diff, proven by
+- a completed review of record covers the current production diff, proven by
   SHA plus substantive review/Walkthrough text — from the GitHub App or a
   documented concurrent **escape ladder** review
-  (rung 1 CodeRabbit CLI, or rung 2 agent-CLI review of record); or the strict
-  test/docs adaptive-limit exception is fully documented;
+  (rung 1 CodeRabbit CLI, or rung 2 independent agent-CLI review of record);
 - the CodeRabbit **check** reached a terminal pass when the classification is
-  `APP_REVIEW_COMPLETED`. `APP_REVIEW_COMPLETED_CHECK_NOT_TERMINAL` is not
-  merge-ready. For a ladder classification the App check is *not* a gate — it
+  `APP_REVIEW_COMPLETED`. `APP_REVIEW_COMPLETED_CHECK_NOT_TERMINAL` and
+  `APP_REVIEW_COMPLETED_CHECK_FAILED` are not merge-ready. For a ladder classification the App check is *not* a gate — it
   is legitimately absent or stale — and the ladder evidence carries the
   semantic gate instead;
 - every finding from the review of record is addressed, whichever rung produced
