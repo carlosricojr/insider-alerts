@@ -1314,6 +1314,45 @@ def test_trial_worker_keeps_diagnostics_isolated_when_candidate_runtime_is_inval
     assert payload["entry_finalizer"]["status"] == "skipped_candidate_runtime_unavailable"
 
 
+@pytest.mark.parametrize("phase", ["entry", "outcome"])
+@pytest.mark.parametrize("retryable", [True, False])
+def test_trial_worker_attributes_finalizer_failures_to_the_correct_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], phase: str, retryable: bool,
+) -> None:
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        if retryable:
+            raise TrialRuntimeRetryable("temporary_failure")
+        raise TrialRuntimeInvalid("integrity_failure")
+
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates" if phase == "entry" else "finalize_trial_outcomes",
+        fail,
+    )
+    if phase == "entry":
+        monkeypatch.setattr(
+            trial_worker, "finalize_trial_outcomes",
+            lambda *_a, **_kw: pytest.fail("outcomes must not run after entry failure"),
+        )
+    exit_code = trial_worker.main([
+        "--trial-db", str(tmp_path / "trial.db"),
+        "--diagnostics-db", str(tmp_path / "diagnostics.db"),
+        "--registry-path", str(write_draft_registry(ROOT, tmp_path)),
+        "--activation-db", str(tmp_path / "activation.db"),
+        "--error-log", str(tmp_path / "worker.err.log"),
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload[f"{phase}_finalizer"]["status"] == ("degraded" if retryable else "invalid")
+    assert payload["diagnostics"]["status"] == "idle_registry_draft"
+    assert payload["diagnostic_outcomes"]["status"] == "idle_registry_draft"
+    if phase == "outcome":
+        assert payload["entry_finalizer"]["status"] == "idle_registry_draft"
+    else:
+        assert payload["outcome_finalizer"]["status"] == "skipped_entry_finalizer_unavailable"
+
+
 def test_diagnostic_logger_failure_cannot_block_confirmatory_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

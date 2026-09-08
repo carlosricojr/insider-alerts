@@ -116,10 +116,12 @@ def main(argv: list[str] | None = None) -> int:
             _append_isolated_error(args.error_log, error)
             exit_code = 2
         else:
+            finalizer_phase = "entry"
             try:
                 finalized = finalize_pending_entry_dates(config)
-                outcomes = finalize_trial_outcomes(config)
                 finalized_payload = asdict(finalized)
+                finalizer_phase = "outcome"
+                outcomes = finalize_trial_outcomes(config)
                 outcomes_payload = asdict(outcomes)
             except (TrialRuntimeRetryable, sqlite3.OperationalError, OSError) as exc:
                 now = datetime.now(UTC)
@@ -133,8 +135,11 @@ def main(argv: list[str] | None = None) -> int:
                         evidence_seen=0,
                         unresolved_evidence=0,
                     )
-                finalized_payload = {"status": "degraded", "error": detail}
-                outcomes_payload = {"status": "skipped_entry_finalizer_unavailable"}
+                if finalizer_phase == "entry":
+                    finalized_payload = {"status": "degraded", "error": detail}
+                    outcomes_payload = {"status": "skipped_entry_finalizer_unavailable"}
+                else:
+                    outcomes_payload = {"status": "degraded", "error": detail}
                 exit_code = 2
             except Exception as exc:
                 now = datetime.now(UTC)
@@ -150,8 +155,11 @@ def main(argv: list[str] | None = None) -> int:
                         evidence_seen=0,
                         unresolved_evidence=0,
                     )
-                finalized_payload = {"status": "invalid", "error": detail}
-                outcomes_payload = {"status": "skipped_entry_finalizer_unavailable"}
+                if finalizer_phase == "entry":
+                    finalized_payload = {"status": "invalid", "error": detail}
+                    outcomes_payload = {"status": "skipped_entry_finalizer_unavailable"}
+                else:
+                    outcomes_payload = {"status": "invalid", "error": detail}
                 exit_code = 2
     try:
         diagnostics = run_diagnostics_once(diagnostic_config, now=datetime.now(UTC))

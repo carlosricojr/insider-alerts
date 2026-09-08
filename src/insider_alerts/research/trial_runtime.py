@@ -2129,7 +2129,8 @@ class TrialStore:
                 correction_id = str(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        f"{HYPOTHESIS_ID}|evidence-correction|{row['disposition_id']}|{manifest_sha256}",
+                        f"{HYPOTHESIS_ID}|evidence-correction|"
+                        f"{row['disposition_id']}|{manifest_sha256}",
                     )
                 )
                 conn.execute(
