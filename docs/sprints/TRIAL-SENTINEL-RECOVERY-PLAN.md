@@ -50,3 +50,12 @@ Preflight (2026-09-07 ET; base `80f394f7d7dd456ffbba21b3f24f846283d49964`):
   manifest custody, fault reporting, migration sequencing, and missing-entry handoff gaps.
   Safeguard fixes are complete. Updated lint, strict typing, the full suite, and ten focused
   correction/exclusion tests pass. Final independent/CodeRabbit review and deployment remain pending.
+- Independent review of the complete repair found the six core invariants safe. Its CLI error
+  envelope finding is addressed with typed catches and regression tests. Its proposed addition
+  to `activation.TRIAL_TABLES` is deferred: `activation.py` is digest-sealed by the active registry,
+  and editing it invalidates the active trial. Existing parent disposition rows already make a
+  corrected store nonempty; future activation governance belongs to a new registered trial.
+- The importer now uses the same symbol admission/normalization as the frozen base loader,
+  including its existing dot-to-dash and exchange-prefix handling. Existing candidate records and
+  ranks are immutable. The manifest path's preregistration line pointer is contextual; the
+  operative no-outcome-access correction authority is at lines 343-344.

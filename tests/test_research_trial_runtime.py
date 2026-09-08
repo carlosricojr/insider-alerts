@@ -2853,6 +2853,30 @@ def test_correction_seal_guard_handles_uri_metacharacters(tmp_path: Path) -> Non
     }
 
 
+@pytest.mark.parametrize("error_type", [ValueError, KeyError, TypeError])
+def test_correction_cli_reports_malformed_store_as_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    config, manifest_path = _base_symbol_correction_fixture(tmp_path)
+
+    def malformed(**_kwargs: Any) -> None:
+        raise error_type("malformed_record")
+
+    monkeypatch.setattr(cli, "apply_base_symbol_correction", malformed)
+    result = CliRunner().invoke(cli.app, [
+        "ops", "research-trial-correct-base-symbols",
+        "--manifest-path", str(manifest_path),
+        "--trial-db", str(config.trial_db),
+        "--evidence-db", str(config.evidence_db),
+        "--seal-db", str(config.effective_seal_db),
+        "--blindness-attestation", runtime.NO_OUTCOME_ACCESS_ATTESTATION,
+    ])
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload["status"] == "rejected"
+    assert error_type.__name__ in payload["error"]
+
+
 def test_base_symbol_correction_rejects_outcome_or_terminal_state(tmp_path: Path) -> None:
     outcome_config, outcome_manifest = _base_symbol_correction_fixture(tmp_path / "outcome")
     with sqlite3.connect(outcome_config.trial_db) as conn:

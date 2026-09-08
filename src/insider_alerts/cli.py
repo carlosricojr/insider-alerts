@@ -5107,7 +5107,9 @@ def ops_research_trial_correct_base_symbols(
             manifest_path=manifest_path,
             blindness_attestation=blindness_attestation,
         )
-    except (OSError, sqlite3.DatabaseError, TrialRuntimeInvalid) as exc:
+    except (
+        OSError, sqlite3.DatabaseError, TrialRuntimeInvalid, ValueError, KeyError, TypeError
+    ) as exc:
         typer.echo(
             json.dumps(
                 {"status": "rejected", "error": f"{type(exc).__name__}: {exc}"},
