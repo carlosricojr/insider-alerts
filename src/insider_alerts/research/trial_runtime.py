@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import rfc8785
 
+from insider_alerts.backtest.signal_study import normalize_delivered_signal_symbol
 from insider_alerts.research.activation import (
     ActivationInvalid,
     validate_deployed_registry_state,
@@ -40,6 +41,11 @@ MAX_SESSIONS = 10
 BAR_LOOKBACK_CALENDAR_DAYS = 120
 MAX_CHALLENGER_SLOTS = 20
 MAX_TRANSIENT_CLOCK_REGRESSION = timedelta(minutes=5)
+NO_OUTCOME_ACCESS_ATTESTATION = (
+    "I attest that no challenger outcome values were accessed before this correction"
+)
+BASE_SYMBOL_CORRECTION_KIND = "base_cohort_symbol_exclusion"
+BASE_SYMBOL_INVALID_REASON = "TrialRuntimeInvalid: candidate_symbol_not_supported_by_bar_feed"
 ENTRY_STATES = frozenset(
     {"enrolled", "ineligible", "overlap_suppressed", "capacity_suppressed", "missed"}
 )
@@ -542,6 +548,39 @@ class TrialStore:
                 CREATE TRIGGER IF NOT EXISTS trial_evidence_dispositions_no_delete
                 BEFORE DELETE ON trial_evidence_dispositions
                 BEGIN SELECT RAISE(ABORT, 'evidence dispositions are immutable'); END;
+
+                CREATE TABLE IF NOT EXISTS trial_evidence_disposition_corrections (
+                    sequence INTEGER NOT NULL UNIQUE,
+                    correction_id TEXT PRIMARY KEY,
+                    disposition_id TEXT NOT NULL UNIQUE,
+                    evidence_snapshot_id TEXT NOT NULL UNIQUE,
+                    evidence_record_sha256 TEXT NOT NULL UNIQUE,
+                    original_disposition_record_sha256 TEXT NOT NULL UNIQUE,
+                    from_state TEXT NOT NULL CHECK(from_state='invalid'),
+                    to_state TEXT NOT NULL CHECK(to_state='excluded'),
+                    correction_kind TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    blindness_attestation TEXT NOT NULL,
+                    corrected_at_utc TEXT NOT NULL,
+                    record_sha256 TEXT NOT NULL UNIQUE,
+                    record_json BLOB NOT NULL,
+                    FOREIGN KEY(disposition_id)
+                      REFERENCES trial_evidence_dispositions(disposition_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS trial_evidence_corrections_sequence
+                BEFORE INSERT ON trial_evidence_disposition_corrections
+                WHEN NEW.sequence<>(
+                  SELECT COALESCE(MAX(sequence),0)+1
+                  FROM trial_evidence_disposition_corrections
+                )
+                BEGIN SELECT RAISE(ABORT, 'evidence correction sequence must be gap-free'); END;
+                CREATE TRIGGER IF NOT EXISTS trial_evidence_corrections_no_update
+                BEFORE UPDATE ON trial_evidence_disposition_corrections
+                BEGIN SELECT RAISE(ABORT, 'evidence corrections are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS trial_evidence_corrections_no_delete
+                BEFORE DELETE ON trial_evidence_disposition_corrections
+                BEGIN SELECT RAISE(ABORT, 'evidence corrections are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS trial_candidates_no_delete
                 BEFORE DELETE ON trial_candidates
                 BEGIN SELECT RAISE(ABORT, 'trial candidates are immutable'); END;
@@ -1896,8 +1935,11 @@ class TrialStore:
         with contextlib.closing(self._connect()) as conn:
             row = conn.execute(
                 """
-                SELECT state FROM trial_evidence_dispositions
-                WHERE evidence_record_sha256=?
+                SELECT COALESCE(c.to_state,d.state) AS state
+                FROM trial_evidence_dispositions AS d
+                LEFT JOIN trial_evidence_disposition_corrections AS c
+                  ON c.disposition_id=d.disposition_id
+                WHERE d.evidence_record_sha256=?
                 """,
                 (evidence_record_sha256,),
             ).fetchone()
@@ -1906,9 +1948,218 @@ class TrialStore:
     def disposition_counts(self) -> dict[str, int]:
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
+                """
+                SELECT COALESCE(c.to_state,d.state) AS state,COUNT(*) AS count
+                FROM trial_evidence_dispositions AS d
+                LEFT JOIN trial_evidence_disposition_corrections AS c
+                  ON c.disposition_id=d.disposition_id
+                GROUP BY COALESCE(c.to_state,d.state)
+                """
+            ).fetchall()
+        return {str(row["state"]): int(row["count"]) for row in rows}
+
+    def raw_disposition_counts(self) -> dict[str, int]:
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute(
                 "SELECT state,COUNT(*) AS count FROM trial_evidence_dispositions GROUP BY state"
             ).fetchall()
         return {str(row["state"]): int(row["count"]) for row in rows}
+
+    @staticmethod
+    def _correction_record(
+        *,
+        disposition: sqlite3.Row,
+        reason: str,
+        manifest_sha256: str,
+        manifest_text: str,
+        blindness_attestation: str,
+        corrected_at: datetime,
+    ) -> dict[str, Any]:
+        return {
+            "contract_version": TRIAL_CONTRACT_VERSION,
+            "disposition_id": str(disposition["disposition_id"]),
+            "evidence_snapshot_id": str(disposition["evidence_snapshot_id"]),
+            "evidence_record_sha256": str(disposition["evidence_record_sha256"]),
+            "original_disposition_record_sha256": str(disposition["record_sha256"]),
+            "from_state": "invalid",
+            "to_state": "excluded",
+            "correction_kind": BASE_SYMBOL_CORRECTION_KIND,
+            "reason": reason,
+            "manifest_sha256": manifest_sha256,
+            "manifest_text": manifest_text,
+            "blindness_attestation": blindness_attestation,
+            "corrected_at_utc": _utc_text(corrected_at),
+        }
+
+    @staticmethod
+    def _verify_correction_row(row: sqlite3.Row) -> None:
+        raw = bytes(row["record_json"])
+        if _sha256(raw) != str(row["record_sha256"]):
+            raise TrialRuntimeInvalid("evidence_correction_digest_mismatch")
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            raise TrialRuntimeInvalid("evidence_correction_columns_mismatch")
+        manifest_text = record.get("manifest_text")
+        if (
+            not isinstance(manifest_text, str)
+            or _sha256(manifest_text.encode("utf-8")) != str(row["manifest_sha256"])
+        ):
+            raise TrialRuntimeInvalid("evidence_correction_manifest_mismatch")
+        columns = {
+            "contract_version": TRIAL_CONTRACT_VERSION,
+            "disposition_id": row["disposition_id"],
+            "evidence_snapshot_id": row["evidence_snapshot_id"],
+            "evidence_record_sha256": row["evidence_record_sha256"],
+            "original_disposition_record_sha256": row[
+                "original_disposition_record_sha256"
+            ],
+            "from_state": row["from_state"],
+            "to_state": row["to_state"],
+            "correction_kind": row["correction_kind"],
+            "reason": row["reason"],
+            "manifest_sha256": row["manifest_sha256"],
+            "manifest_text": manifest_text,
+            "blindness_attestation": row["blindness_attestation"],
+            "corrected_at_utc": row["corrected_at_utc"],
+        }
+        if not isinstance(record, dict) or _canonical(record) != raw or record != columns:
+            raise TrialRuntimeInvalid("evidence_correction_columns_mismatch")
+        if (
+            record["from_state"] != "invalid"
+            or record["to_state"] != "excluded"
+            or record["correction_kind"] != BASE_SYMBOL_CORRECTION_KIND
+            or record["blindness_attestation"] != NO_OUTCOME_ACCESS_ATTESTATION
+        ):
+            raise TrialRuntimeInvalid("evidence_correction_contract_invalid")
+        _require_sha256(str(record["manifest_sha256"]), "correction_manifest")
+        _require_sha256(
+            str(record["original_disposition_record_sha256"]),
+            "original_disposition_record",
+        )
+        _parse_utc(str(record["corrected_at_utc"]))
+
+    def append_base_symbol_corrections(
+        self,
+        *,
+        corrections: Sequence[Mapping[str, str]],
+        reason: str,
+        manifest_sha256: str,
+        manifest_text: str,
+        blindness_attestation: str,
+        seal_db: Path,
+        now: datetime,
+    ) -> tuple[int, dict[str, int]]:
+        """Append one atomic, outcome-blind correction batch for base-cohort sentinels."""
+
+        _require_sha256(manifest_sha256, "correction_manifest")
+        if _sha256(manifest_text.encode("utf-8")) != manifest_sha256:
+            raise TrialRuntimeInvalid("correction_manifest_digest_mismatch")
+        if blindness_attestation != NO_OUTCOME_ACCESS_ATTESTATION:
+            raise TrialRuntimeInvalid("correction_blindness_attestation_invalid")
+        if not reason.strip() or not corrections:
+            raise TrialRuntimeInvalid("correction_manifest_empty")
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if int(conn.execute("SELECT COUNT(*) FROM trial_outcomes").fetchone()[0]):
+                raise TrialRuntimeInvalid("correction_prohibited_after_outcome_materialization")
+            if int(conn.execute("SELECT COUNT(*) FROM trial_faults").fetchone()[0]):
+                raise TrialRuntimeInvalid("correction_prohibited_with_trial_faults")
+            self.validate_integrity(include_outcomes=False, _connection=conn)
+            # The terminal coordinator takes the same trial BEGIN IMMEDIATE lock before it
+            # writes the separate seal store. Checking that store while holding this lock
+            # serializes correction against both terminal-decision paths.
+            terminal_counts = _terminal_artifact_counts(seal_db)
+            if any(terminal_counts.values()):
+                raise TrialRuntimeInvalid("correction_prohibited_after_terminal_artifact")
+            inserted = 0
+            for expected in corrections:
+                row = conn.execute(
+                    """
+                    SELECT * FROM trial_evidence_dispositions
+                    WHERE evidence_record_sha256=?
+                    """,
+                    (expected["evidence_record_sha256"],),
+                ).fetchone()
+                if row is None:
+                    raise TrialRuntimeInvalid("correction_parent_disposition_missing")
+                if (
+                    str(row["evidence_snapshot_id"]) != expected["evidence_snapshot_id"]
+                    or str(row["record_sha256"])
+                    != expected["original_disposition_record_sha256"]
+                    or str(row["state"]) != "invalid"
+                    or str(row["reason"]) != BASE_SYMBOL_INVALID_REASON
+                ):
+                    raise TrialRuntimeInvalid("correction_parent_disposition_mismatch")
+                existing = conn.execute(
+                    """
+                    SELECT * FROM trial_evidence_disposition_corrections
+                    WHERE disposition_id=?
+                    """,
+                    (str(row["disposition_id"]),),
+                ).fetchone()
+                if existing is not None:
+                    self._verify_correction_row(existing)
+                    if (
+                        str(existing["manifest_sha256"]) != manifest_sha256
+                        or str(existing["reason"]) != reason
+                        or str(existing["blindness_attestation"]) != blindness_attestation
+                    ):
+                        raise TrialRuntimeInvalid("evidence_correction_conflict")
+                    continue
+                if now < _parse_utc(str(row["recorded_at_utc"])):
+                    raise TrialRuntimeInvalid("correction_clock_before_parent")
+                record = self._correction_record(
+                    disposition=row,
+                    reason=reason,
+                    manifest_sha256=manifest_sha256,
+                    manifest_text=manifest_text,
+                    blindness_attestation=blindness_attestation,
+                    corrected_at=now,
+                )
+                encoded = _canonical(record)
+                digest = _sha256(encoded)
+                sequence = int(
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(sequence),0)+1
+                        FROM trial_evidence_disposition_corrections
+                        """
+                    ).fetchone()[0]
+                )
+                correction_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{HYPOTHESIS_ID}|evidence-correction|"
+                        f"{row['disposition_id']}|{manifest_sha256}",
+                    )
+                )
+                conn.execute(
+                    """
+                    INSERT INTO trial_evidence_disposition_corrections VALUES(
+                      ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    )
+                    """,
+                    (
+                        sequence,
+                        correction_id,
+                        row["disposition_id"],
+                        row["evidence_snapshot_id"],
+                        row["evidence_record_sha256"],
+                        row["record_sha256"],
+                        "invalid",
+                        "excluded",
+                        BASE_SYMBOL_CORRECTION_KIND,
+                        reason,
+                        manifest_sha256,
+                        blindness_attestation,
+                        _utc_text(now),
+                        digest,
+                        encoded,
+                    ),
+                )
+                inserted += 1
+            self.validate_integrity(include_outcomes=False, _connection=conn)
+        return inserted, terminal_counts
 
     def fault_count(self) -> int:
         with contextlib.closing(self._connect()) as conn:
@@ -2077,8 +2328,17 @@ class TrialStore:
                 ),
             )
 
-    def validate_integrity(self, *, include_outcomes: bool = True) -> None:
-        with contextlib.closing(self._connect()) as conn:
+    def validate_integrity(
+        self,
+        *,
+        include_outcomes: bool = True,
+        _connection: sqlite3.Connection | None = None,
+    ) -> None:
+        with (
+            contextlib.nullcontext(_connection)
+            if _connection is not None
+            else contextlib.closing(self._connect())
+        ) as conn:
             rows = conn.execute("SELECT * FROM trial_candidates ORDER BY sequence").fetchall()
             candidate_count = len(rows)
             if [int(row["sequence"]) for row in rows] != list(range(1, candidate_count + 1)):
@@ -2087,6 +2347,7 @@ class TrialStore:
                 self._verify_candidate_row(row)
             tables = [
                 "trial_evidence_dispositions",
+                "trial_evidence_disposition_corrections",
                 "trial_resolutions",
                 "trial_entry_date_completions",
                 "trial_entry_date_lapses",
@@ -2106,6 +2367,26 @@ class TrialStore:
             ).fetchall()
             for row in disposition_rows:
                 self._verify_disposition_row(row)
+            correction_rows = conn.execute(
+                "SELECT * FROM trial_evidence_disposition_corrections ORDER BY sequence"
+            ).fetchall()
+            disposition_by_id = {str(row["disposition_id"]): row for row in disposition_rows}
+            for correction in correction_rows:
+                self._verify_correction_row(correction)
+                parent = disposition_by_id.get(str(correction["disposition_id"]))
+                if parent is None or (
+                    str(parent["evidence_snapshot_id"])
+                    != str(correction["evidence_snapshot_id"])
+                    or str(parent["evidence_record_sha256"])
+                    != str(correction["evidence_record_sha256"])
+                    or str(parent["record_sha256"])
+                    != str(correction["original_disposition_record_sha256"])
+                    or str(parent["state"]) != str(correction["from_state"])
+                    or str(parent["reason"]) != BASE_SYMBOL_INVALID_REASON
+                    or _parse_utc(str(correction["corrected_at_utc"]))
+                    < _parse_utc(str(parent["recorded_at_utc"]))
+                ):
+                    raise TrialRuntimeInvalid("evidence_correction_parent_mismatch")
             candidate_evidence = {str(row["evidence_record_sha256"]) for row in rows}
             disposition_evidence = {str(row["evidence_record_sha256"]) for row in disposition_rows}
             if candidate_evidence & disposition_evidence:
@@ -2357,6 +2638,11 @@ class TrialStore:
                 "evidence_dispositions": int(
                     conn.execute("SELECT COUNT(*) FROM trial_evidence_dispositions").fetchone()[0]
                 ),
+                "evidence_disposition_corrections": int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM trial_evidence_disposition_corrections"
+                    ).fetchone()[0]
+                ),
                 "resolutions": int(
                     conn.execute("SELECT COUNT(*) FROM trial_resolutions").fetchone()[0]
                 ),
@@ -2368,6 +2654,27 @@ class TrialStore:
                 ),
                 "outcomes": int(conn.execute("SELECT COUNT(*) FROM trial_outcomes").fetchone()[0]),
                 "faults": int(conn.execute("SELECT COUNT(*) FROM trial_faults").fetchone()[0]),
+            }
+            raw_disposition_counts = {
+                str(row["state"]): int(row["count"])
+                for row in conn.execute(
+                    """
+                    SELECT state,COUNT(*) AS count
+                    FROM trial_evidence_dispositions GROUP BY state
+                    """
+                )
+            }
+            effective_disposition_counts = {
+                str(row["state"]): int(row["count"])
+                for row in conn.execute(
+                    """
+                    SELECT COALESCE(c.to_state,d.state) AS state,COUNT(*) AS count
+                    FROM trial_evidence_dispositions AS d
+                    LEFT JOIN trial_evidence_disposition_corrections AS c
+                      ON c.disposition_id=d.disposition_id
+                    GROUP BY COALESCE(c.to_state,d.state)
+                    """
+                )
             }
             health = conn.execute("SELECT * FROM trial_health WHERE singleton=1").fetchone()
         try:
@@ -2385,6 +2692,8 @@ class TrialStore:
             integrity = "valid"
         return {
             **counts,
+            "raw_disposition_counts": raw_disposition_counts,
+            "effective_disposition_counts": effective_disposition_counts,
             "integrity_status": integrity,
             "health": dict(health) if health is not None else None,
         }
@@ -2469,7 +2778,13 @@ def _candidate_from_evidence(
         raise TrialRuntimeInvalid("evidence_import_clock_order_invalid")
     if now < recorded_at:
         raise EvidenceNotReady("evidence_recorded_after_runtime_clock")
-    symbol = _normalized_symbol(str(signal.get("issuer_symbol", "")))
+    raw_symbol = signal.get("issuer_symbol")
+    if not isinstance(raw_symbol, str):
+        raise TrialRuntimeInvalid("evidence_candidate_symbol_not_string")
+    delivered_symbol = normalize_delivered_signal_symbol(raw_symbol)
+    if delivered_symbol is None:
+        raise EvidenceExcluded("base_signal_symbol_excluded")
+    symbol = _normalized_symbol(delivered_symbol)
     packet_id = str(signal.get("packet_id", ""))
     accession = str(signal.get("accession_number", ""))
     snapshot_id = str(record.get("snapshot_id", ""))
@@ -2545,6 +2860,139 @@ def _ensure_bar_requests(
         bar_store.request(request)
         added += 1
     return added
+
+
+def _terminal_artifact_counts(path: Path) -> dict[str, int]:
+    if not path.is_file():
+        raise TrialRuntimeInvalid("correction_seal_store_missing")
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=30)) as conn:
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        required = {"trial_receipts", "terminal_pending", "decision_report"}
+        if not required.issubset(tables):
+            raise TrialRuntimeInvalid("correction_seal_store_schema_invalid")
+        return {
+            "receipts": int(conn.execute("SELECT COUNT(*) FROM trial_receipts").fetchone()[0]),
+            "pending": int(conn.execute("SELECT COUNT(*) FROM terminal_pending").fetchone()[0]),
+            "reports": int(conn.execute("SELECT COUNT(*) FROM decision_report").fetchone()[0]),
+        }
+
+
+def apply_base_symbol_correction(
+    *,
+    trial_db: Path,
+    evidence_db: Path,
+    seal_db: Path,
+    manifest_path: Path,
+    blindness_attestation: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Apply a reviewed, append-only correction for leaked non-base-cohort symbols."""
+
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha256 = _sha256(manifest_bytes)
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TrialRuntimeInvalid("correction_manifest_invalid_json") from exc
+    required_top_level = {
+        "schema_version",
+        "hypothesis_id",
+        "correction_kind",
+        "preregistration_authority",
+        "reason",
+        "dispositions",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != required_top_level:
+        raise TrialRuntimeInvalid("correction_manifest_shape_invalid")
+    if (
+        manifest["schema_version"] != 1
+        or manifest["hypothesis_id"] != HYPOTHESIS_ID
+        or manifest["correction_kind"] != BASE_SYMBOL_CORRECTION_KIND
+        or not isinstance(manifest["preregistration_authority"], str)
+        or not str(manifest["preregistration_authority"]).strip()
+        or not isinstance(manifest["reason"], str)
+        or not str(manifest["reason"]).strip()
+        or not isinstance(manifest["dispositions"], list)
+        or not manifest["dispositions"]
+    ):
+        raise TrialRuntimeInvalid("correction_manifest_contract_invalid")
+    required_item_fields = {
+        "accession_number",
+        "evidence_snapshot_id",
+        "evidence_record_sha256",
+        "original_disposition_record_sha256",
+        "issuer_symbol",
+    }
+    prepared: list[dict[str, str]] = []
+    seen_evidence: set[str] = set()
+    evidence_by_sha = {
+        str(record["record_sha256"]): record for record in _verified_evidence(evidence_db)
+    }
+    for item in manifest["dispositions"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != required_item_fields
+            or any(not isinstance(item[field], str) or not item[field] for field in item)
+        ):
+            raise TrialRuntimeInvalid("correction_manifest_item_invalid")
+        evidence_sha = _require_sha256(
+            item["evidence_record_sha256"], "correction_evidence_record"
+        )
+        _require_sha256(
+            item["original_disposition_record_sha256"],
+            "correction_original_disposition_record",
+        )
+        if evidence_sha in seen_evidence:
+            raise TrialRuntimeInvalid("correction_manifest_evidence_duplicated")
+        seen_evidence.add(evidence_sha)
+        evidence = evidence_by_sha.get(evidence_sha)
+        if evidence is None:
+            raise TrialRuntimeInvalid("correction_evidence_missing")
+        payload = evidence.get("payload")
+        signal = payload.get("signal") if isinstance(payload, dict) else None
+        if not isinstance(signal, dict) or (
+            evidence.get("snapshot_id") != item["evidence_snapshot_id"]
+            or evidence.get("hypothesis_id") != HYPOTHESIS_ID
+            or evidence.get("enrollment_state") != "pending_entry_selection"
+            or signal.get("accession_number") != item["accession_number"]
+            or signal.get("issuer_symbol") != item["issuer_symbol"]
+        ):
+            raise TrialRuntimeInvalid("correction_evidence_identity_mismatch")
+        if normalize_delivered_signal_symbol(item["issuer_symbol"]) is not None:
+            raise TrialRuntimeInvalid("correction_evidence_is_base_cohort_symbol")
+        prepared.append(
+            {
+                "evidence_snapshot_id": item["evidence_snapshot_id"],
+                "evidence_record_sha256": evidence_sha,
+                "original_disposition_record_sha256": item[
+                    "original_disposition_record_sha256"
+                ],
+            }
+        )
+    store = TrialStore(trial_db)
+    inserted, terminal_counts = store.append_base_symbol_corrections(
+        corrections=prepared,
+        reason=str(manifest["reason"]),
+        manifest_sha256=manifest_sha256,
+        manifest_text=manifest_bytes.decode("utf-8"),
+        blindness_attestation=blindness_attestation,
+        seal_db=seal_db,
+        now=(now or datetime.now(UTC)).astimezone(UTC),
+    )
+    effective_counts = store.disposition_counts()
+    return {
+        "status": "corrected" if inserted else "already_corrected",
+        "manifest_sha256": manifest_sha256,
+        "corrections_requested": len(prepared),
+        "corrections_appended": inserted,
+        "raw_disposition_counts": store.raw_disposition_counts(),
+        "effective_disposition_counts": effective_counts,
+        "terminal_artifact_counts": terminal_counts,
+    }
 
 
 def run_trial_once(

@@ -131,7 +131,12 @@ from insider_alerts.research.option_chain_admission import (
     capture_predecision_option_chain,
 )
 from insider_alerts.research.session_feed import session_feed_status
-from insider_alerts.research.trial_runtime import trial_runtime_status
+from insider_alerts.research.trial_runtime import (
+    NO_OUTCOME_ACCESS_ATTESTATION,
+    TrialRuntimeInvalid,
+    apply_base_symbol_correction,
+    trial_runtime_status,
+)
 from insider_alerts.review.queue import (
     DecisionValidationError,
     NotificationDeliveryProof,
@@ -5070,6 +5075,50 @@ def ops_research_trial_status(
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
     if report.get("integrity_status") != "valid":
         raise typer.Exit(code=3)
+
+
+@ops_app.command("research-trial-correct-base-symbols")
+def ops_research_trial_correct_base_symbols(
+    manifest_path: Path = typer.Option(  # noqa: B008
+        ..., "--manifest-path", exists=True, dir_okay=False
+    ),
+    trial_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/trial.db"), "--trial-db", exists=True, dir_okay=False
+    ),
+    evidence_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/evidence.db"), "--evidence-db", exists=True, dir_okay=False
+    ),
+    seal_db: Path = typer.Option(  # noqa: B008
+        Path("data/research/trial_seals.db"), "--seal-db", exists=True, dir_okay=False
+    ),
+    blindness_attestation: str = typer.Option(
+        ...,
+        "--blindness-attestation",
+        help=f"Required exact phrase: {NO_OUTCOME_ACCESS_ATTESTATION}",
+    ),
+) -> None:
+    """Append a reviewed pre-terminal correction without rewriting trial history."""
+
+    try:
+        result = apply_base_symbol_correction(
+            trial_db=trial_db,
+            evidence_db=evidence_db,
+            seal_db=seal_db,
+            manifest_path=manifest_path,
+            blindness_attestation=blindness_attestation,
+        )
+    except (
+        OSError, sqlite3.DatabaseError, TrialRuntimeInvalid, ValueError, KeyError, TypeError
+    ) as exc:
+        typer.echo(
+            json.dumps(
+                {"status": "rejected", "error": f"{type(exc).__name__}: {exc}"},
+                sort_keys=True,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=3) from exc
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
 @ops_app.command("research-diagnostics-status")

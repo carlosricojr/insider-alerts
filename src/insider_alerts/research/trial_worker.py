@@ -92,46 +92,75 @@ def main(argv: list[str] | None = None) -> int:
         registry_path=args.registry_path,
         activation_db=args.activation_db,
     )
+    exit_code = 0
+    imported_payload: dict[str, object]
+    finalized_payload: dict[str, object] = {
+        "status": "skipped_candidate_runtime_unavailable"
+    }
+    outcomes_payload: dict[str, object] = {
+        "status": "skipped_candidate_runtime_unavailable"
+    }
     try:
         imported = run_trial_once(config, now=datetime.now(UTC))
     except Exception as exc:
-        _append_error(args.error_log, exc)
-        return 2
-    if imported.status in {"degraded", "invalid"}:
-        error = RuntimeError(f"candidate runtime is {imported.status}: {imported.error}")
-        _append_error(args.error_log, error)
-        return 2
-    try:
-        finalized = finalize_pending_entry_dates(config)
-        outcomes = finalize_trial_outcomes(config)
-    except (TrialRuntimeRetryable, sqlite3.OperationalError, OSError) as exc:
-        now = datetime.now(UTC)
-        detail = f"{type(exc).__name__}: {exc}"[:2000]
-        _append_error(args.error_log, exc)
-        with contextlib.suppress(Exception):
-            TrialStore(config.trial_db).write_health(
-                now=now,
-                result="degraded",
-                error=detail,
-                evidence_seen=0,
-                unresolved_evidence=0,
-            )
-        return 2
-    except Exception as exc:
-        now = datetime.now(UTC)
-        detail = f"{type(exc).__name__}: {exc}"[:2000]
-        _append_error(args.error_log, exc)
-        with contextlib.suppress(Exception):
-            store = TrialStore(config.trial_db)
-            store.record_fault(now=now, kind="TRIAL_FINALIZER_INVALID", detail=detail)
-            store.write_health(
-                now=now,
-                result="invalid",
-                error=detail,
-                evidence_seen=0,
-                unresolved_evidence=0,
-            )
-        return 2
+        _append_isolated_error(args.error_log, exc)
+        imported_payload = {
+            "status": "invalid",
+            "error": f"{type(exc).__name__}: {exc}"[:2000],
+        }
+        exit_code = 2
+    else:
+        imported_payload = asdict(imported)
+        if imported.status in {"degraded", "invalid"}:
+            error = RuntimeError(f"candidate runtime is {imported.status}: {imported.error}")
+            _append_isolated_error(args.error_log, error)
+            exit_code = 2
+        else:
+            finalizer_phase = "entry"
+            try:
+                finalized = finalize_pending_entry_dates(config)
+                finalized_payload = asdict(finalized)
+                finalizer_phase = "outcome"
+                outcomes = finalize_trial_outcomes(config)
+                outcomes_payload = asdict(outcomes)
+            except (TrialRuntimeRetryable, sqlite3.OperationalError, OSError) as exc:
+                now = datetime.now(UTC)
+                detail = f"{type(exc).__name__}: {exc}"[:2000]
+                _append_isolated_error(args.error_log, exc)
+                with contextlib.suppress(Exception):
+                    TrialStore(config.trial_db).write_health(
+                        now=now,
+                        result="degraded",
+                        error=detail,
+                        evidence_seen=0,
+                        unresolved_evidence=0,
+                    )
+                if finalizer_phase == "entry":
+                    finalized_payload = {"status": "degraded", "error": detail}
+                    outcomes_payload = {"status": "skipped_entry_finalizer_unavailable"}
+                else:
+                    outcomes_payload = {"status": "degraded", "error": detail}
+                exit_code = 2
+            except Exception as exc:
+                now = datetime.now(UTC)
+                detail = f"{type(exc).__name__}: {exc}"[:2000]
+                _append_isolated_error(args.error_log, exc)
+                with contextlib.suppress(Exception):
+                    store = TrialStore(config.trial_db)
+                    store.record_fault(now=now, kind="TRIAL_FINALIZER_INVALID", detail=detail)
+                    store.write_health(
+                        now=now,
+                        result="invalid",
+                        error=detail,
+                        evidence_seen=0,
+                        unresolved_evidence=0,
+                    )
+                if finalizer_phase == "entry":
+                    finalized_payload = {"status": "invalid", "error": detail}
+                    outcomes_payload = {"status": "skipped_entry_finalizer_unavailable"}
+                else:
+                    outcomes_payload = {"status": "invalid", "error": detail}
+                exit_code = 2
     try:
         diagnostics = run_diagnostics_once(diagnostic_config, now=datetime.now(UTC))
     except Exception as exc:
@@ -161,15 +190,15 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "diagnostics": asdict(diagnostics),
                 "diagnostic_outcomes": asdict(diagnostic_outcomes),
-                "candidate_runtime": asdict(imported),
-                "entry_finalizer": asdict(finalized),
-                "outcome_finalizer": asdict(outcomes),
+                "candidate_runtime": imported_payload,
+                "entry_finalizer": finalized_payload,
+                "outcome_finalizer": outcomes_payload,
             },
             sort_keys=True,
             default=str,
         )
     )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
