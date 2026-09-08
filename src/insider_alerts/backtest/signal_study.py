@@ -20,6 +20,15 @@ NEW_YORK = ZoneInfo("America/New_York")
 _SEC_MISSING_TRADING_SYMBOLS = frozenset({"NONE"})
 
 
+def normalize_delivered_signal_symbol(symbol: str) -> str | None:
+    """Apply the frozen live-signal tradability boundary to an SEC symbol."""
+
+    normalized = normalize_backtest_symbol(symbol)
+    if normalized is None or normalized in _SEC_MISSING_TRADING_SYMBOLS:
+        return None
+    return normalized
+
+
 @dataclass(slots=True, frozen=True)
 class DeliveredSignal:
     packet_id: str
@@ -170,8 +179,8 @@ def load_delivered_signals(
         raw_symbol = payload.get("issuer_symbol")
         if not isinstance(raw_symbol, str):
             continue
-        symbol = normalize_backtest_symbol(raw_symbol)
-        if symbol is None or symbol in _SEC_MISSING_TRADING_SYMBOLS:
+        symbol = normalize_delivered_signal_symbol(raw_symbol)
+        if symbol is None:
             continue
         key = (str(row["accession_number"]), symbol)
         if key in seen:
@@ -248,9 +257,11 @@ def load_historical_approved_replay(
         if not isinstance(payload, dict):
             continue
         raw_symbol = payload.get("issuer_symbol")
-        symbol = normalize_backtest_symbol(raw_symbol) if isinstance(raw_symbol, str) else None
+        symbol = (
+            normalize_delivered_signal_symbol(raw_symbol) if isinstance(raw_symbol, str) else None
+        )
         score = _finite_float(payload.get("score"))
-        if symbol is None or symbol in _SEC_MISSING_TRADING_SYMBOLS or score is None:
+        if symbol is None or score is None:
             continue
         key = (str(row["accession_number"]), symbol)
         if key in seen:

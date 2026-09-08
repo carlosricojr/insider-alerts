@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "hypothesis_id": "OPP-E07-V1",
+  "correction_kind": "base_cohort_symbol_exclusion",
+  "preregistration_authority": "docs/research/OPPORTUNISTIC-PROSPECTIVE-TRIAL-2026-08-26-PREREG.md:341",
+  "reason": "SEC issuerTradingSymbol=N/A records are excluded by the frozen live-canary base-signal loader and cannot enter the challenger cohort.",
+  "dispositions": [
+    {
+      "accession_number": "0001104659-26-104354",
+      "evidence_snapshot_id": "af9df2f2-95b8-5bf0-ba40-09d19b97d7d8",
+      "evidence_record_sha256": "bc819b792b924c28f16473bfc69cfea292b1c5399acd3f51bc32ef108c7d44b8",
+      "original_disposition_record_sha256": "df4fb66ee22b048a92d03181c0e8b39781aad6ac1e511b8bbeac8e1ce42c9595",
+      "issuer_symbol": "N/A"
+    },
+    {
+      "accession_number": "0001104659-26-104355",
+      "evidence_snapshot_id": "7c178718-6384-55a4-823f-08cfbad5e379",
+      "evidence_record_sha256": "421041f40bd79f9d8b832e100f24831343bda625e7ae51e74e5f0056e11cb5a8",
+      "original_disposition_record_sha256": "da51b231fc9db29ecd2e42df0d28bca7133de6f6ee855396bdcc397ed8bfd61a",
+      "issuer_symbol": "N/A"
+    },
+    {
+      "accession_number": "0001104659-26-104356",
+      "evidence_snapshot_id": "db519891-dcd4-5152-be15-2697d84eef8e",
+      "evidence_record_sha256": "17addd16c114877eaf3b3f42321e50bbefab85bc233ac54f13a6f7b18ae1420d",
+      "original_disposition_record_sha256": "68c4656aca8e22724101967d0dda35c22bfbc8ace10df79aaf06dc642c5911c3",
+      "issuer_symbol": "N/A"
+    }
+  ]
+}

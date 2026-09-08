@@ -1266,6 +1266,54 @@ def test_trial_worker_runs_time_sensitive_confirmatory_phases_before_diagnostics
     capsys.readouterr()
 
 
+def test_trial_worker_keeps_diagnostics_isolated_when_candidate_runtime_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        trial_worker,
+        "run_trial_once",
+        lambda *_args, **_kwargs: trial_worker.TrialRuntimeResult(
+            "invalid", error="invalid evidence"
+        ),
+    )
+    monkeypatch.setattr(
+        trial_worker,
+        "finalize_pending_entry_dates",
+        lambda *_args, **_kwargs: pytest.fail("confirmatory finalizer must remain fail-closed"),
+    )
+
+    def diagnostics(*_args: Any, **_kwargs: Any) -> Any:
+        order.append("diagnostics")
+        return trial_worker.DiagnosticRunResult("healthy")
+
+    def diagnostic_outcomes(*_args: Any, **_kwargs: Any) -> Any:
+        order.append("diagnostic_outcomes")
+        return trial_worker.DiagnosticOutcomeResult("healthy")
+
+    monkeypatch.setattr(trial_worker, "run_diagnostics_once", diagnostics)
+    monkeypatch.setattr(trial_worker, "finalize_diagnostic_outcomes", diagnostic_outcomes)
+
+    exit_code = trial_worker.main(
+        [
+            "--trial-db",
+            str(tmp_path / "trial.db"),
+            "--diagnostics-db",
+            str(tmp_path / "diagnostics.db"),
+            "--error-log",
+            str(tmp_path / "worker.err.log"),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert order == ["diagnostics", "diagnostic_outcomes"]
+    assert payload["candidate_runtime"]["status"] == "invalid"
+    assert payload["entry_finalizer"]["status"] == "skipped_candidate_runtime_unavailable"
+
+
 def test_diagnostic_logger_failure_cannot_block_confirmatory_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2591,7 +2639,7 @@ def test_excluded_pre_activation_evidence_does_not_block_later_candidate(
     assert candidates[0].evidence_record_sha256 == valid["record_sha256"]
 
 
-def test_invalid_symbol_is_isolated_before_append_and_later_candidate_imports(
+def test_non_base_symbol_is_excluded_before_append_and_later_candidate_imports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2610,8 +2658,9 @@ def test_invalid_symbol_is_isolated_before_append_and_later_candidate_imports(
 
     result = run_trial_once(config, now=ACTIVATED_AT + timedelta(hours=1))
 
-    assert result.status == "invalid"
-    assert TrialStore(config.trial_db).disposition_counts() == {"invalid": 1}
+    assert result.status == "collecting"
+    assert TrialStore(config.trial_db).disposition_counts() == {"excluded": 1}
+    assert _disposition_reasons(config) == ["base_signal_symbol_excluded"]
     assert [candidate.symbol for candidate in TrialStore(config.trial_db).candidates()] == ["GOOD"]
     with sqlite3.connect(config.bar_feed_db) as conn:
         assert (
@@ -2620,6 +2669,218 @@ def test_invalid_symbol_is_isolated_before_append_and_later_candidate_imports(
                 "(SELECT symbol FROM bar_feed_requests ORDER BY symbol)"
             ).fetchone()[0]
             == "GOOD,SPY"
+        )
+
+
+def _base_symbol_correction_fixture(tmp_path: Path) -> tuple[TrialRuntimeConfig, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    config = _config(tmp_path)
+    runtime.TrialSealStore(config.effective_seal_db)
+    evidence = _install_evidence(config, symbol="N/A")
+    store = TrialStore(config.trial_db)
+    assert store.append_evidence_disposition(
+        snapshot_id=str(evidence["snapshot_id"]),
+        evidence_record_sha256=str(evidence["record_sha256"]),
+        state="invalid",
+        reason=runtime.BASE_SYMBOL_INVALID_REASON,
+        now=ACTIVATED_AT + timedelta(minutes=1),
+    )
+    with sqlite3.connect(config.trial_db) as conn:
+        disposition_sha = str(
+            conn.execute(
+                "SELECT record_sha256 FROM trial_evidence_dispositions"
+            ).fetchone()[0]
+        )
+    signal = evidence["payload"]["signal"]
+    manifest_path = tmp_path / "correction.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hypothesis_id": runtime.HYPOTHESIS_ID,
+                "correction_kind": runtime.BASE_SYMBOL_CORRECTION_KIND,
+                "preregistration_authority": "preregistration:343",
+                "reason": "The frozen base-signal loader excludes this SEC symbol.",
+                "dispositions": [
+                    {
+                        "accession_number": signal["accession_number"],
+                        "evidence_snapshot_id": evidence["snapshot_id"],
+                        "evidence_record_sha256": evidence["record_sha256"],
+                        "original_disposition_record_sha256": disposition_sha,
+                        "issuer_symbol": signal["issuer_symbol"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config, manifest_path
+
+
+def test_reviewed_base_symbol_correction_is_append_only_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    config, manifest_path = _base_symbol_correction_fixture(tmp_path)
+    store = TrialStore(config.trial_db)
+
+    first = runtime.apply_base_symbol_correction(
+        trial_db=config.trial_db,
+        evidence_db=config.evidence_db,
+        seal_db=config.effective_seal_db,
+        manifest_path=manifest_path,
+        blindness_attestation=runtime.NO_OUTCOME_ACCESS_ATTESTATION,
+        now=ACTIVATED_AT + timedelta(minutes=2),
+    )
+    second = runtime.apply_base_symbol_correction(
+        trial_db=config.trial_db,
+        evidence_db=config.evidence_db,
+        seal_db=config.effective_seal_db,
+        manifest_path=manifest_path,
+        blindness_attestation=runtime.NO_OUTCOME_ACCESS_ATTESTATION,
+        now=ACTIVATED_AT + timedelta(minutes=3),
+    )
+
+    assert first["status"] == "corrected"
+    assert first["corrections_appended"] == 1
+    assert first["raw_disposition_counts"] == {"invalid": 1}
+    assert first["effective_disposition_counts"] == {"excluded": 1}
+    assert second["status"] == "already_corrected"
+    status = store.status()
+    assert status["evidence_dispositions"] == 1
+    assert status["evidence_disposition_corrections"] == 1
+    with (
+        sqlite3.connect(config.trial_db) as conn,
+        pytest.raises(sqlite3.IntegrityError, match="immutable"),
+    ):
+        conn.execute("UPDATE trial_evidence_disposition_corrections SET reason='changed'")
+
+
+def test_base_symbol_correction_rejects_wrong_attestation_atomically(tmp_path: Path) -> None:
+    config, manifest_path = _base_symbol_correction_fixture(tmp_path)
+    store = TrialStore(config.trial_db)
+
+    with pytest.raises(TrialRuntimeInvalid, match="attestation"):
+        runtime.apply_base_symbol_correction(
+            trial_db=config.trial_db,
+            evidence_db=config.evidence_db,
+            seal_db=config.effective_seal_db,
+            manifest_path=manifest_path,
+            blindness_attestation="not attested",
+        )
+
+    assert store.disposition_counts() == {"invalid": 1}
+    assert store.status()["evidence_disposition_corrections"] == 0
+
+
+@pytest.mark.parametrize("failure", ["fault", "clock", "identity", "post_validation"])
+def test_base_symbol_correction_failures_leave_no_corrections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    config, manifest_path = _base_symbol_correction_fixture(tmp_path)
+    store = TrialStore(config.trial_db)
+    now = ACTIVATED_AT + timedelta(minutes=2)
+    expected = "correction_prohibited_with_trial_faults"
+    if failure == "fault":
+        store.record_fault(now=now, kind="TEST_FAULT", detail="unrelated failure")
+    elif failure == "clock":
+        now = ACTIVATED_AT
+        expected = "correction_clock_before_parent"
+    elif failure == "identity":
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["dispositions"][0]["accession_number"] = "wrong-accession"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        expected = "correction_evidence_identity_mismatch"
+    else:
+        original = TrialStore.validate_integrity
+
+        def fail_after_insert(self: TrialStore, **kwargs: Any) -> None:
+            original(self, **kwargs)
+            conn = kwargs.get("_connection")
+            if conn is not None and conn.execute(
+                "SELECT COUNT(*) FROM trial_evidence_disposition_corrections"
+            ).fetchone()[0]:
+                raise TrialRuntimeInvalid("injected_post_validation_failure")
+
+        monkeypatch.setattr(TrialStore, "validate_integrity", fail_after_insert)
+        expected = "injected_post_validation_failure"
+    with pytest.raises(TrialRuntimeInvalid, match=expected):
+        runtime.apply_base_symbol_correction(
+            trial_db=config.trial_db,
+            evidence_db=config.evidence_db,
+            seal_db=config.effective_seal_db,
+            manifest_path=manifest_path,
+            blindness_attestation=runtime.NO_OUTCOME_ACCESS_ATTESTATION,
+            now=now,
+        )
+    assert store.raw_disposition_counts() == {"invalid": 1}
+    assert store.status()["evidence_disposition_corrections"] == 0
+
+
+def test_correction_preserves_manifest_and_resumes_blinded_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, manifest_path = _base_symbol_correction_fixture(tmp_path)
+    _install_schedule(config)
+    monkeypatch.setattr(
+        runtime, "_validated_trial_window", lambda _config, **_kwargs: _active_window()
+    )
+    assert run_trial_once(config, now=ACTIVATED_AT + timedelta(minutes=2)).status == "invalid"
+    with sqlite3.connect(config.trial_db) as conn:
+        parent_before = conn.execute("SELECT * FROM trial_evidence_dispositions").fetchall()
+    runtime.apply_base_symbol_correction(
+        trial_db=config.trial_db,
+        evidence_db=config.evidence_db,
+        seal_db=config.effective_seal_db,
+        manifest_path=manifest_path,
+        blindness_attestation=runtime.NO_OUTCOME_ACCESS_ATTESTATION,
+        now=ACTIVATED_AT + timedelta(minutes=3),
+    )
+    assert run_trial_once(config, now=ACTIVATED_AT + timedelta(minutes=4)).status == "collecting"
+    with sqlite3.connect(config.trial_db) as conn:
+        assert conn.execute("SELECT * FROM trial_evidence_dispositions").fetchall() == parent_before
+        record = json.loads(conn.execute(
+            "SELECT record_json FROM trial_evidence_disposition_corrections"
+        ).fetchone()[0])
+    assert record["manifest_text"].encode("utf-8") == manifest_path.read_bytes()
+    assert TrialStore(config.trial_db).candidates() == []
+
+
+def test_correction_seal_guard_handles_uri_metacharacters(tmp_path: Path) -> None:
+    seal_path = tmp_path / "seals #1.db"
+    runtime.TrialSealStore(seal_path)
+    assert runtime._terminal_artifact_counts(seal_path) == {
+        "receipts": 0, "pending": 0, "reports": 0
+    }
+
+
+def test_base_symbol_correction_rejects_outcome_or_terminal_state(tmp_path: Path) -> None:
+    outcome_config, outcome_manifest = _base_symbol_correction_fixture(tmp_path / "outcome")
+    with sqlite3.connect(outcome_config.trial_db) as conn:
+        conn.execute(
+            "INSERT INTO trial_outcomes VALUES(1,'outcome','candidate',?,'a',X'7B7D')",
+            (_utc_text(ACTIVATED_AT),),
+        )
+    with pytest.raises(TrialRuntimeInvalid, match="outcome_materialization"):
+        runtime.apply_base_symbol_correction(
+            trial_db=outcome_config.trial_db,
+            evidence_db=outcome_config.evidence_db,
+            seal_db=outcome_config.effective_seal_db,
+            manifest_path=outcome_manifest,
+            blindness_attestation=runtime.NO_OUTCOME_ACCESS_ATTESTATION,
+        )
+
+    terminal_config, terminal_manifest = _base_symbol_correction_fixture(tmp_path / "terminal")
+    with sqlite3.connect(terminal_config.effective_seal_db) as conn:
+        conn.execute(
+            "INSERT INTO trial_receipts VALUES('terminal_seal',X'7B7D','terminal-receipt')"
+        )
+    with pytest.raises(TrialRuntimeInvalid, match="terminal_artifact"):
+        runtime.apply_base_symbol_correction(
+            trial_db=terminal_config.trial_db,
+            evidence_db=terminal_config.evidence_db,
+            seal_db=terminal_config.effective_seal_db,
+            manifest_path=terminal_manifest,
+            blindness_attestation=runtime.NO_OUTCOME_ACCESS_ATTESTATION,
         )
 
 
