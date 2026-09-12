@@ -18,6 +18,7 @@ from insider_alerts.execution.canary import (
     CanaryRunner,
     CanaryStore,
     CommissionPreview,
+    CycleResult,
     broker_token,
     deterministic_rank,
     eligibility,
@@ -40,6 +41,72 @@ def _signal(signal_at: datetime) -> DeliveredSignal:
         score=0.9,
         rationale={},
     )
+
+
+def test_calendar_expiry_blocks_entries_but_retains_position_management(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = FakeBroker([], [], commission=0.35)
+    monkeypatch.setattr(
+        broker,
+        "calendar_gate",
+        lambda now, for_entry=False: (
+            "calendar_fallback_entry_approval_expired" if for_entry else None
+        ),
+        raising=False,
+    )
+    runner = CanaryRunner(
+        CanaryConfig(source_db=str(tmp_path / "source.db"), ledger_db=str(tmp_path / "live.db")),
+        broker,
+    )
+    calls: list[str] = []
+
+    async def reconcile(*args: object, **kwargs: object) -> tuple[int, int]:
+        calls.append("reconcile")
+        return (0, 0)
+
+    async def exits(*args: object, **kwargs: object) -> int:
+        calls.append("exits")
+        return 1
+
+    async def entries(*args: object, **kwargs: object) -> int:
+        pytest.fail("expired fallback must never attempt an entry")
+
+    monkeypatch.setattr(runner, "_reconcile_orders", reconcile)
+    monkeypatch.setattr(runner, "_submit_due_time_exits", exits)
+    monkeypatch.setattr(runner, "_submit_due_entries", entries)
+    result = asyncio.run(
+        runner._run_live(
+            CycleResult(),
+            [],
+            datetime(2026, 10, 1, 19, 30, tzinfo=UTC),
+            enforce_wall_clock=False,
+        )
+    )
+    assert calls == ["reconcile", "exits"]
+    assert result.live_submitted == 0
+    assert result.live_gate == "calendar_fallback_entry_approval_expired;time_exits=1"
+
+
+def test_calendar_failure_precedes_discovery_and_orders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = FakeBroker([], [], commission=0.35)
+    runner = CanaryRunner(
+        CanaryConfig(source_db=str(tmp_path / "source.db"), ledger_db=str(tmp_path / "live.db")),
+        broker,
+    )
+
+    async def failed_sessions(*args: object, **kwargs: object) -> list[date]:
+        raise RuntimeError("CALENDAR_BROKER_HOURS_DISAGREEMENT")
+
+    monkeypatch.setattr(broker, "sessions", failed_sessions)
+    with pytest.raises(RuntimeError, match="DISAGREEMENT"):
+        asyncio.run(runner.cycle(datetime(2026, 9, 14, 13, 18, tzinfo=UTC)))
+    assert broker.submitted == []
+    assert runner.store.rows() == []
 
 
 def _bars(end: date, *, close: float = 10.0, volume: float = 100_000.0) -> list[DailyBar]:

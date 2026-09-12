@@ -523,6 +523,7 @@ class CanaryRunner:
                 "runtime_started_utc": self.runtime_started_at.isoformat(),
                 "runtime_source_fingerprint": self.runtime_fingerprint,
                 "last_cycle_started_utc": now.isoformat(),
+                "schedule_evidence": "",
             },
             now=now,
         )
@@ -530,6 +531,12 @@ class CanaryRunner:
             activation = self.store.activation(now)
             await self.broker.connect(readonly=not self.config.live_armed)
             sessions = await self.broker.sessions(around=now, count=120)
+            schedule_evidence = getattr(self.broker, "schedule_evidence", None)
+            if isinstance(schedule_evidence, dict):
+                self.store.set_metadata(
+                    {"schedule_evidence": json.dumps(schedule_evidence, sort_keys=True)},
+                    now=datetime.now(UTC),
+                )
             result = await self._discover(activation, sessions, now)
             shadow_opened, shadow_closed = await self._settle_shadow(sessions, now)
             result = CycleResult(
@@ -724,6 +731,7 @@ class CanaryRunner:
         *,
         enforce_wall_clock: bool,
     ) -> CycleResult:
+        calendar_gate = getattr(self.broker, "calendar_gate", None)
         account = await self.broker.account_snapshot()
         broker_orders = await self.broker.orders()
         self._adopt_broker_orders(broker_orders)
@@ -733,6 +741,8 @@ class CanaryRunner:
         )
         timed_exits = await self._submit_due_time_exits(now)
         submitted = 0
+        if gate == "account_ready" and callable(calendar_gate):
+            gate = calendar_gate(now, for_entry=True) or gate
         if gate == "account_ready":
             submitted = await self._submit_due_entries(
                 account,
