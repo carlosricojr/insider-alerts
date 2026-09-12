@@ -8,6 +8,16 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from insider_alerts.backtest.models import DailyBar
+from insider_alerts.execution.calendar import (
+    CALENDAR_SHA256,
+    FALLBACK_ENTRY_EXPIRY,
+    NEW_YORK,
+    SOURCE,
+    bounds,
+    calendar_dates,
+    validate_contract_hours,
+    validate_native_schedule,
+)
 from insider_alerts.execution.canary import (
     AccountSnapshot,
     BrokerOrder,
@@ -22,6 +32,7 @@ __all__ = ["IbkrBroker", "IbkrExecutionError"]
 
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _OPEN_ORDERS_TIMEOUT_SECONDS = 10.0
+_SCHEDULE_TIMEOUT_SECONDS = 5.0
 
 
 class IbkrBroker:
@@ -42,6 +53,8 @@ class IbkrBroker:
         self._errors: deque[tuple[int, int, str]] = deque(maxlen=100)
         self._all_open_trades: list[Any] = []
         self._all_orders_checked_at = 0.0
+        self._allow_calendar_fallback = False
+        self.schedule_evidence: dict[str, str] = {}
 
     async def connect(self, *, readonly: bool) -> None:
         if self.ib is not None and self.ib.isConnected():
@@ -49,6 +62,7 @@ class IbkrBroker:
         from ib_async import IB
 
         self.ib = IB()
+        self._allow_calendar_fallback = not readonly
         self.ib.errorEvent += self._on_error
         self._errors.clear()
         try:
@@ -101,6 +115,8 @@ class IbkrBroker:
         self._all_open_trades = []
         self._all_orders_checked_at = 0.0
         self._errors.clear()
+        self._allow_calendar_fallback = False
+        self.schedule_evidence = {}
 
     def _on_error(self, req_id: int, code: int, message: str, contract: Any) -> None:
         if code not in {2104, 2106, 2107, 2108, 2158}:
@@ -135,14 +151,104 @@ class IbkrBroker:
         return contract
 
     async def sessions(self, *, around: datetime, count: int = 90) -> list[date]:
-        contract = await self._contract("SPY")
-        schedule = await self.ib.reqHistoricalScheduleAsync(
-            contract,
-            count,
-            around.astimezone(UTC) + timedelta(days=45),
-            True,
-        )
-        return sorted({date.fromisoformat(str(item.refDate)) for item in schedule.sessions})
+        from ib_async import RequestError
+
+        self.schedule_evidence = {}
+        request_ib = self.ib
+        previous = bool(request_ib.RaiseRequestErrors)
+        reason = ""
+        try:
+            contract = await asyncio.wait_for(self._contract("SPY"), _SCHEDULE_TIMEOUT_SECONDS)
+            self.ib.RaiseRequestErrors = True
+            try:
+                schedule = await asyncio.wait_for(
+                    self.ib.reqHistoricalScheduleAsync(
+                        contract, count, around.astimezone(UTC) + timedelta(days=45), True
+                    ),
+                    _SCHEDULE_TIMEOUT_SECONDS,
+                )
+            except RequestError as exc:
+                if exc.code != 162 or "No data of type EODChart" not in str(exc):
+                    raise IbkrExecutionError("CALENDAR_SCHEDULE_REQUEST_FAILED") from exc
+                reason = "IBKR_162_EODCHART_UNAVAILABLE"
+                schedule = None
+            if isinstance(schedule, list) and not schedule:
+                reason = "IBKR_EMPTY_SCHEDULE"
+                schedule = None
+            if schedule is None:
+                if not reason or not self._allow_calendar_fallback:
+                    raise IbkrExecutionError("CALENDAR_FALLBACK_NOT_AUTHORIZED")
+                source = SOURCE
+                expected = calendar_dates(around, count)
+                details = await asyncio.wait_for(
+                    self.ib.reqContractDetailsAsync(contract), _SCHEDULE_TIMEOUT_SECONDS
+                )
+                receipt = validate_contract_hours(details, contract, around)
+            else:
+                expected = validate_native_schedule(schedule)
+                today = around.astimezone(NEW_YORK).date()
+                end = today + timedelta(days=45)
+                start = end - timedelta(days=count - 1)
+                known = {
+                    day
+                    for offset in range(count)
+                    if (day := start + timedelta(days=offset)).year == 2026 and bounds(day)
+                }
+                if {day for day in expected if day.year == 2026} != known:
+                    raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
+                if (
+                    sum(day > today for day in expected) < 10
+                    or sum(day < today for day in expected) < 20
+                ):
+                    raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
+                source = "IBKR-historical-schedule"
+                receipt = {"validated_at_utc": around.astimezone(UTC).isoformat()}
+            receipt.update(
+                source=source,
+                fallback_reason=reason,
+                calendar_sha256=CALENDAR_SHA256,
+                entry_expiry_et=str(FALLBACK_ENTRY_EXPIRY),
+                first_session=str(expected[0]),
+                last_session=str(expected[-1]),
+                today_open=str(around.astimezone(NEW_YORK).date() in expected),
+            )
+            self.schedule_evidence = receipt
+            return expected
+        except TimeoutError as exc:
+            # wait_for cancels the future, not the IB request. A new connection
+            # owns the next attempt, so late replies cannot leak into fallback.
+            self.disconnect()
+            raise IbkrExecutionError("CALENDAR_REQUEST_TIMEOUT_CONNECTION_RESET") from exc
+        except asyncio.CancelledError:
+            self.disconnect()
+            raise
+        except RequestError as exc:
+            raise IbkrExecutionError("CALENDAR_CONTRACT_DETAILS_REQUEST_FAILED") from exc
+        finally:
+            request_ib.RaiseRequestErrors = previous
+
+    def calendar_gate(self, now: datetime, *, for_entry: bool = False) -> str | None:
+        """Expiry blocks new risk only; existing holdings keep reconciliation and exits."""
+        if not self._allow_calendar_fallback or not for_entry:
+            return None
+        receipt = self.schedule_evidence
+        if not receipt:
+            return "calendar_validation_missing"
+        validated = datetime.fromisoformat(receipt["validated_at_utc"])
+        if (
+            not 0 <= (now - validated).total_seconds() <= 60
+            or now.astimezone(NEW_YORK).date() != validated.astimezone(NEW_YORK).date()
+        ):
+            return "calendar_validation_stale"
+        if (
+            for_entry
+            and receipt["source"] == SOURCE
+            and now.astimezone(NEW_YORK).date() >= FALLBACK_ENTRY_EXPIRY
+        ):
+            return "calendar_fallback_entry_approval_expired"
+        if receipt.get("today_open") != "True":
+            return "calendar_market_closed"
+        return None
 
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]:
         contract = await self._contract(symbol)
@@ -334,9 +440,11 @@ class IbkrBroker:
         commission_error = (
             ""
             if is_valid
-            else "invalid IBKR commission preview for preflight"
-            if has_currency
-            else "IBKR commission preview missing currency"
+            else (
+                "invalid IBKR commission preview for preflight"
+                if has_currency
+                else "IBKR commission preview missing currency"
+            )
         )
         return CommissionPreview(
             commission=commission,
@@ -350,6 +458,9 @@ class IbkrBroker:
         )
 
     async def submit_market_on_open(self, symbol: str, quantity: int, order_ref: str) -> int:
+        calendar_error = self.calendar_gate(datetime.now(UTC), for_entry=True)
+        if calendar_error is not None:
+            raise IbkrExecutionError(calendar_error)
         from ib_async import MarketOrder
 
         existing = self._existing_trade(order_ref)
@@ -364,6 +475,9 @@ class IbkrBroker:
             orderRef=order_ref,
             transmit=True,
         )
+        calendar_error = self.calendar_gate(datetime.now(UTC), for_entry=True)
+        if calendar_error is not None:
+            raise IbkrExecutionError(calendar_error)
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(0.5)
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
