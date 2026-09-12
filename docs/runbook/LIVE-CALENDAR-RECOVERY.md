@@ -31,6 +31,8 @@ Qualification, historical schedule, and contract-details requests have five-seco
 The last successful schedule receipt is stored in live metadata `schedule_evidence`, containing
 source, fallback reason, normalized calendar hash, hours hash/coverage, validation time, and returned
 session horizon. It is cleared before each attempt so a failed cycle cannot present stale success.
+Native responses must contain every independently known session in the requested 2026 overlap,
+as well as enough past and future coverage; aggregate counts cannot substitute for completeness.
 New buys recheck same-New-York-date freshness (at most 60 seconds, no future timestamps) immediately
 before submission. Closed dates cannot admit buys. Existing broker safety checks remain required.
 
@@ -46,6 +48,9 @@ disagreement or acquisition failure still fails the cycle closed and must be inv
 recorded server-held GTC protective orders are not cancelled. The fallback's returned horizon is
 explicitly capped at December 31, 2026, so crossing the +45-day projection into 2027 does not
 prematurely stop management. Valid native IBKR schedules are not restricted to fallback-table years.
+At that boundary, beyond-2026 hours are labeled unvalidated and excluded from returned coverage;
+current-year agreement is still mandatory, and fallback new entries remain expired. Fallback is
+unavailable once the current date itself enters 2027; no unverified next-year calendar is inferred.
 
 The last authorized September entries reach session ten in October, ahead of early-close season.
 Existing 15:30 timed-exit submission and 15:45 MOC cutoff settings are unchanged. Extending fallback

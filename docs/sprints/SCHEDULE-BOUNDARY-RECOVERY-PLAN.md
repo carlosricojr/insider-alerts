@@ -38,6 +38,10 @@ Independent adversarial review identified four issues, addressed before final re
 validation no longer blocks management; fallback-year bounds do not block valid native schedules;
 timeout/cancellation resets the live connection rather than leaving unanswered requests; broker
 request failures use typed retryable operational errors. Focused regressions cover each case.
+Exact-head review of `01d8af0868e4e6c1feeca083e131269f907f9109` found two further edge cases:
+missing interior native sessions and year-crossing contract-hours validation. Corrections now
+check the complete known 2026 request overlap and explicitly exclude unvalidated future-year
+hours from the management-only fallback receipt. New broker-path regressions pass.
 
 Live read-only preflight passed September 12: explicit 162 fallback, fresh SPY liquidHours agreement,
 correct September 14–25 next-ten-session horizon. No ledger or order methods invoked.

@@ -106,6 +106,12 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
     if not isinstance(text, str) or not text or len(text) > 4096:
         raise IbkrExecutionError("CALENDAR_LIQUID_HOURS_UNAVAILABLE")
     observed: dict[date, tuple[datetime, datetime] | None] = {}
+    unvalidated: list[str] = []
+    all_days: set[date] = set()
+    today = around.astimezone(NEW_YORK).date()
+    coverage_end = date(2026, 12, 31)
+    if today.year != 2026:
+        raise IbkrExecutionError("CALENDAR_UNSUPPORTED_YEAR")
     try:
         for entry in text.split(";"):
             if re.fullmatch(r"\d{8}:(?:CLOSED|\d{4}-\d{8}:\d{4})", entry) is None:
@@ -114,8 +120,9 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
             day = datetime.strptime(day_text, "%Y%m%d").date()
             if abs((day - around.astimezone(NEW_YORK).date()).days) > 14:
                 raise ValueError("hours outside bounded observation window")
-            if day in observed:
+            if day in all_days:
                 raise ValueError("duplicate date")
+            all_days.add(day)
             if hours == "CLOSED":
                 actual_bounds = None
             else:
@@ -123,20 +130,25 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
                 opens = datetime.strptime(start_text, "%Y%m%d:%H%M").replace(tzinfo=NEW_YORK)
                 closes = datetime.strptime(end_text, "%Y%m%d:%H%M").replace(tzinfo=NEW_YORK)
                 actual_bounds = (opens, closes)
+            if day > coverage_end and FALLBACK_ENTRY_EXPIRY <= today <= coverage_end:
+                # No new fallback entries can be admitted here. Preserve current-year
+                # management, but do not claim to validate or return next-year dates.
+                unvalidated.append(str(day))
+                continue
             if actual_bounds != bounds(day):
                 raise IbkrExecutionError(f"CALENDAR_BROKER_HOURS_DISAGREEMENT:{day}")
             observed[day] = actual_bounds
     except (ValueError, TypeError) as exc:
         raise IbkrExecutionError("CALENDAR_MALFORMED_LIQUID_HOURS") from exc
-    today = around.astimezone(NEW_YORK).date()
     next_open = today
-    while bounds(next_open) is None:
+    while next_open <= coverage_end and bounds(next_open) is None:
         next_open += timedelta(days=1)
     # On an open day require the following open date too, not just today's stale hours.
     if next_open == today:
         next_open += timedelta(days=1)
-        while bounds(next_open) is None:
+        while next_open <= coverage_end and bounds(next_open) is None:
             next_open += timedelta(days=1)
+    next_open = min(next_open, coverage_end)
     required = {today + timedelta(days=i) for i in range((next_open - today).days + 1)}
     if not required.issubset(observed):
         raise IbkrExecutionError("CALENDAR_BROKER_HOURS_STALE_OR_INCOMPLETE")
@@ -145,6 +157,7 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
         "hours_first_date": str(min(observed)),
         "hours_last_date": str(max(observed)),
         "validated_at_utc": around.astimezone(UTC).isoformat(),
+        "unvalidated_future_dates": ",".join(unvalidated),
     }
 
 

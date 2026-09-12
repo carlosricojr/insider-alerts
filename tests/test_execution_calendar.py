@@ -387,3 +387,27 @@ def test_contract_details_request_error_is_typed() -> None:
         asyncio.run(value.sessions(around=NOW, count=120))
     assert fake.RaiseRequestErrors is False
     assert value.schedule_evidence == {}
+
+
+def test_native_interior_gap_rejected_through_broker() -> None:
+    schedule = native()
+    schedule.sessions = [row for row in schedule.sessions if row.refDate != "20260915"]
+    value = broker(FakeIb(schedule))
+    with pytest.raises(IbkrExecutionError, match="COVERAGE_MISMATCH"):
+        asyncio.run(value.sessions(around=NOW, count=120))
+    assert value.schedule_evidence == {}
+
+
+def test_year_end_hours_preserve_bounded_management_only() -> None:
+    now = datetime(2026, 12, 31, 15, tzinfo=UTC)
+    hours = "20261231:0930-20261231:1600;20270101:CLOSED;20270102:CLOSED"
+    value = broker(FakeIb([], hours))
+    dates = asyncio.run(value.sessions(around=now, count=120))
+    assert dates[-1] == date(2026, 12, 31)
+    assert value.calendar_gate(now) is None
+    assert value.calendar_gate(now, for_entry=True) == "calendar_fallback_entry_approval_expired"
+    assert value.schedule_evidence["unvalidated_future_dates"] == "2027-01-01,2027-01-02"
+    assert value.schedule_evidence["hours_last_date"] == "2026-12-31"
+    bad = broker(FakeIb([], hours.replace("20261231:1600", "20261231:1300")))
+    with pytest.raises(IbkrExecutionError, match="DISAGREEMENT"):
+        asyncio.run(bad.sessions(around=now, count=120))

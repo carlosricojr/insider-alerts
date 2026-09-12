@@ -13,6 +13,7 @@ from insider_alerts.execution.calendar import (
     FALLBACK_ENTRY_EXPIRY,
     NEW_YORK,
     SOURCE,
+    bounds,
     calendar_dates,
     validate_contract_hours,
     validate_native_schedule,
@@ -186,8 +187,17 @@ class IbkrBroker:
             else:
                 expected = validate_native_schedule(schedule)
                 today = around.astimezone(NEW_YORK).date()
+                end = today + timedelta(days=45)
+                start = end - timedelta(days=count - 1)
+                known = {
+                    day
+                    for offset in range(count)
+                    if (day := start + timedelta(days=offset)).year == 2026 and bounds(day)
+                }
+                if {day for day in expected if day.year == 2026} != known:
+                    raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
                 if (
-                    sum(day >= today for day in expected) < 10
+                    sum(day > today for day in expected) < 10
                     or sum(day < today for day in expected) < 20
                 ):
                     raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
