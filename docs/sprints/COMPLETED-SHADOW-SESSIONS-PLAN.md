@@ -30,7 +30,7 @@ Rollback: stop/restart hidden worker using reviewed prior commit only with an ex
 decision; do not delete audit artifacts or rewrite shadow history. Prior revision reintroduces
 premature results, so forward repair is preferred. No strategy/capital promotion is authorized.
 
-Handoff: implementation complete; 53 focused tests, lint and strict typing passed. Full suite,
+Handoff: implementation complete; 54 focused tests, lint and strict typing passed. Full suite,
 independent review, CodeRabbit review-of-record and deployment verification are release gates;
 exact-head evidence and final installed revision will be recorded on the PR without modifying
 this frozen review diff. No source changes in deployment checkout before reviewed merge.
