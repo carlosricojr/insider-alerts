@@ -235,6 +235,10 @@ def test_status_report_exposes_current_runtime_revision(tmp_path: Path) -> None:
     assert report["runtime_source_fingerprint"] == fingerprint
     assert report["current_source_fingerprint"] == fingerprint
     assert report["source_revision_current"] is True
+    assert report["shadow_integrity"]["closed_records"] == 0
+    assert report["shadow_integrity"]["classifications"] == {}
+    assert report["shadow_integrity"]["portfolio_performance_validated"] is False
+    assert "not validated profit evidence" in report["shadow_integrity"]["warning"]
 
 
 def test_shadow_trade_records_configured_stop_and_target_levels(tmp_path: Path) -> None:

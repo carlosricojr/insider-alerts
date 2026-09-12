@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
 from insider_alerts.execution.errors import ContractQualificationError
-from insider_alerts.execution.shadow_audit import summary as shadow_integrity_summary
 from insider_alerts.strategy.e07 import (
     deterministic_rank,
     eligibility,
@@ -1393,6 +1392,9 @@ class CanaryRunner:
 
 
 def status_report(ledger_db: str) -> dict[str, Any]:
+    # Keep the standalone audit module out of package initialization and the live worker path.
+    from insider_alerts.execution.shadow_audit import summary as shadow_integrity_summary
+
     store = CanaryStore(ledger_db)
     with store.connect() as conn:
         activation = conn.execute(

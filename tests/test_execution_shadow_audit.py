@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -125,3 +127,22 @@ def test_cli_and_failed_publication_are_order_incapable(
     with pytest.raises(OSError, match="refused"):
         publish_report({"new": "record"}, output)
     assert len(list(output.iterdir())) == 1
+
+
+def test_standalone_module_does_not_preimport_itself() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::RuntimeWarning",
+            "-m",
+            "insider_alerts.execution.shadow_audit",
+            "--help",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert "--ledger" in result.stdout
+    assert "found in sys.modules" not in result.stderr
