@@ -652,11 +652,12 @@ class CanaryRunner:
         sessions: Sequence[date],
         now: datetime,
     ) -> tuple[int, int]:
-        """Materialize the preregistered daily-bar shadow result once bars exist.
+        """Materialize outcomes only from prior New York calendar days.
 
-        The row remains queued until either a stop/target or the tenth-session close can be
-        observed. This avoids using incomplete intraday bars and exactly matches the research
-        convention that same-day stop+target collisions are charged to the stop.
+        IBKR includes the unfinished current daily bar. Even after the scheduled close we
+        defer that day's bar until the next local day, avoiding finalization races and keeping
+        daily-bar stop-first collisions intact. Economic exit dates do not change. This filter
+        belongs here, not in the broker adapter shared by live discovery or the research kernel.
         """
 
         opened = closed = 0
@@ -695,7 +696,10 @@ class CanaryRunner:
                     self.store.update(str(row["packet_id"]), shadow_state="overlap_suppressed")
                     continue
                 bars = await self.broker.daily_bars(symbol)
-                evaluation = evaluate_shadow(self.config, bars, session)
+                completed = [
+                    bar for bar in bars if bar.trade_date < now.astimezone(NEW_YORK).date()
+                ]
+                evaluation = evaluate_shadow(self.config, completed, session)
                 if evaluation.entry_bar is None:
                     continue
                 if row["shadow_state"] == "queued":
@@ -1388,6 +1392,9 @@ class CanaryRunner:
 
 
 def status_report(ledger_db: str) -> dict[str, Any]:
+    # Keep the standalone audit module out of package initialization and the live worker path.
+    from insider_alerts.execution.shadow_audit import summary as shadow_integrity_summary
+
     store = CanaryStore(ledger_db)
     with store.connect() as conn:
         activation = conn.execute(
@@ -1404,6 +1411,9 @@ def status_report(ledger_db: str) -> dict[str, Any]:
             )
         }
         shadow_count = int(conn.execute("SELECT COUNT(*) FROM shadow_trades").fetchone()[0])
+        shadow_integrity = shadow_integrity_summary(
+            [dict(row) for row in conn.execute("SELECT * FROM shadow_trades")]
+        )
         recent_events = [
             dict(row)
             for row in conn.execute(
@@ -1425,5 +1435,6 @@ def status_report(ledger_db: str) -> dict[str, Any]:
         "source_revision_current": runtime_fingerprint == current_fingerprint,
         "live_states": candidate_counts,
         "closed_shadow_trades": shadow_count,
+        "shadow_integrity": shadow_integrity,
         "recent_events": recent_events,
     }
