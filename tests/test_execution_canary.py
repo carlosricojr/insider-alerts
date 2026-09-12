@@ -122,6 +122,88 @@ def _bars(end: date, *, close: float = 10.0, volume: float = 100_000.0) -> list[
     ]
 
 
+def _ghost_runner(tmp_path: Path, bars: list[DailyBar]) -> tuple[CanaryRunner, FakeBroker]:
+    broker = FakeBroker([bar.trade_date for bar in bars], bars, commission=0.35)
+    runner = CanaryRunner(
+        CanaryConfig(source_db="unused", ledger_db=str(tmp_path / "ghost.db")), broker
+    )
+    signal_at = datetime.combine(bars[0].trade_date, datetime.min.time(), UTC)
+    runner.store.insert_candidate(
+        _signal(signal_at),
+        session=bars[0].trade_date,
+        rank="rank",
+        is_eligible=True,
+        reason="eligible",
+        prior_close=10,
+        median_dollar_volume=1_000_000,
+        quantity=20,
+        now=signal_at,
+    )
+    return runner, broker
+
+
+def test_ghost_tenth_bar_waits_for_next_new_york_day(tmp_path: Path) -> None:
+    bars = _bars(date(2026, 9, 3))[-10:]
+    # A future bar would also be a spurious barrier if allowed through.
+    future = DailyBar("TEST", date(2026, 9, 4), 10, 20, 1, 12, 100_000)
+    runner, broker = _ghost_runner(tmp_path, [*bars, future])
+    before = runner.store.rows()[0]["live_state"]
+    for clock in (
+        datetime(2026, 9, 3, 13, 30, tzinfo=UTC),
+        datetime(2026, 9, 3, 20, 1, tzinfo=UTC),
+        datetime(2026, 9, 4, 3, 59, tzinfo=UTC),  # still September 3 in NY
+    ):
+        assert asyncio.run(runner._settle_shadow([], clock))[1] == 0
+        assert runner.store.rows()[0]["shadow_state"] == "open"
+    assert asyncio.run(runner._settle_shadow([], datetime(2026, 9, 4, 4, tzinfo=UTC)))[1] == 1
+    with runner.store.connect() as conn:
+        row = conn.execute("SELECT * FROM shadow_trades").fetchone()
+        assert row["exit_session"] == "2026-09-03"
+        assert row["exit_reason"] == "time"
+        assert row["exit_price"] == 10
+    assert runner.store.rows()[0]["live_state"] == before
+    assert broker.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "day", "same_day", "next_day"),
+    [
+        (
+            date(2026, 8, 21),
+            date(2026, 8, 24),
+            datetime(2026, 8, 24, 15, tzinfo=UTC),
+            datetime(2026, 8, 25, 4, tzinfo=UTC),
+        ),
+        # Thanksgiving early close: even after 13:00 ET the bar waits until next local day.
+        (
+            date(2026, 11, 25),
+            date(2026, 11, 27),
+            datetime(2026, 11, 27, 19, tzinfo=UTC),
+            datetime(2026, 11, 28, 5, tzinfo=UTC),
+        ),
+    ],
+)
+def test_ghost_does_not_lock_in_early_target_before_late_stop(
+    tmp_path: Path,
+    entry: date,
+    day: date,
+    same_day: datetime,
+    next_day: datetime,
+) -> None:
+    first = DailyBar("TEST", entry, 10, 10.2, 9.8, 10, 100_000)
+    early = DailyBar("TEST", day, 10, 11.2, 9.8, 11, 100_000)
+    runner, broker = _ghost_runner(tmp_path, [first, early])
+    assert asyncio.run(runner._settle_shadow([], same_day))[1] == 0
+    # The completed bar later shows both barriers; frozen stop-first semantics must win.
+    broker.bar_values = [first, DailyBar("TEST", day, 10, 11.2, 8.8, 9, 100_000)]
+    assert asyncio.run(runner._settle_shadow([], next_day))[1] == 1
+    with runner.store.connect() as conn:
+        row = conn.execute("SELECT exit_reason,exit_session FROM shadow_trades").fetchone()
+    assert row["exit_reason"] == "stop_and_target_same_day_stop_assumed"
+    assert row["exit_session"] == day.isoformat()
+    assert broker.submitted == []
+
+
 def test_runtime_source_fingerprint_detects_source_changes(tmp_path: Path) -> None:
     source = tmp_path / "module.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
