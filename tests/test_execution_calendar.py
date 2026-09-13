@@ -21,7 +21,7 @@ from insider_alerts.research.ibkr_bar_source import IbkrHistoricalBarSource
 
 NOW = datetime(2026, 9, 12, 19, 32, tzinfo=UTC)
 CONTRACT = SimpleNamespace(conId=756733, symbol="SPY", secType="STK", currency="USD")
-HOURS = "20260912:CLOSED;20260913:CLOSED;20260914:0930-20260914:1600;" "20260915:0930-20260915:1600"
+HOURS = "20260912:CLOSED;20260913:CLOSED;20260914:0930-20260914:1600;20260915:0930-20260915:1600"
 
 
 def details(hours: str = HOURS) -> list[SimpleNamespace]:
@@ -411,3 +411,142 @@ def test_year_end_hours_preserve_bounded_management_only() -> None:
     bad = broker(FakeIb([], hours.replace("20261231:1600", "20261231:1300")))
     with pytest.raises(IbkrExecutionError, match="DISAGREEMENT"):
         asyncio.run(bad.sessions(around=now, count=120))
+
+
+def schedule_for_dates(days: list[date]) -> SimpleNamespace:
+    rows = []
+    for day in days:
+        if day.year == 2026:
+            session = bounds(day)
+            assert session is not None
+            opening, closing = session
+        else:
+            opening = datetime.combine(day, datetime.min.time()).replace(hour=9, minute=30)
+            closing = opening.replace(hour=16, minute=0)
+        rows.append(
+            SimpleNamespace(
+                refDate=day.strftime("%Y%m%d"),
+                startDateTime=opening.strftime("%Y%m%d-%H:%M:%S"),
+                endDateTime=closing.strftime("%Y%m%d-%H:%M:%S"),
+            )
+        )
+    return SimpleNamespace(timeZone="US/Eastern", sessions=rows)
+
+
+def open_dates(start: date, end: date) -> list[date]:
+    return [
+        day
+        for offset in range((end - start).days + 1)
+        if (day := start + timedelta(days=offset)).weekday() < 5
+        and (day.year != 2026 or bounds(day) is not None)
+    ]
+
+
+@pytest.mark.parametrize(
+    "around",
+    [
+        datetime(2026, 9, 13, 21, 49, tzinfo=UTC),
+        datetime(2026, 9, 14, 0, 30, tzinfo=UTC),  # Still September 13 in New York.
+        datetime(2026, 2, 15, 12, tzinfo=UTC),  # 2025/2026 window.
+        datetime(2026, 12, 1, 12, tzinfo=UTC),  # 2026/2027 window.
+    ],
+)
+def test_native_validates_then_bounds_response(around: datetime) -> None:
+    from insider_alerts.execution.calendar import NEW_YORK
+
+    end = around.astimezone(NEW_YORK).date() + timedelta(days=45)
+    start = end - timedelta(days=119)
+    expected = open_dates(start, end)
+    fake = FakeIb(
+        schedule_for_dates(open_dates(start - timedelta(days=60), end + timedelta(days=20)))
+    )
+    value = broker(fake)
+    assert asyncio.run(value.sessions(around=around, count=120)) == expected
+    assert value.schedule_evidence["first_session"] == str(expected[0])
+    assert value.schedule_evidence["last_session"] == str(expected[-1])
+    assert value.schedule_evidence["source"] == "IBKR-historical-schedule"
+    assert fake.details_requested == 0
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize("missing", ["2026-07-01", "2026-09-15", "2026-10-28"])
+def test_native_extras_do_not_hide_missing_requested_date(missing: str) -> None:
+    days = open_dates(date(2026, 5, 8), date(2026, 11, 10))
+    days.remove(date.fromisoformat(missing))
+    fake = FakeIb(schedule_for_dates(days))
+    value = broker(fake)
+    value.schedule_evidence = {"source": "stale"}
+    with pytest.raises(IbkrExecutionError, match="COVERAGE_MISMATCH"):
+        asyncio.run(value.sessions(around=NOW + timedelta(days=1), count=120))
+    assert value.schedule_evidence == {}
+    assert fake.details_requested == 0
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize("mode", ["duplicate", "hours", "holiday", "weekend", "malformed", "zone"])
+def test_native_invalid_out_of_window_rows_still_fail_closed(mode: str) -> None:
+    response = schedule_for_dates(open_dates(date(2026, 5, 8), date(2026, 11, 10)))
+    if mode == "duplicate":
+        response.sessions.append(response.sessions[0])
+    elif mode == "hours":
+        response.sessions[0].endDateTime = "20260508-13:00:00"
+    elif mode in {"holiday", "weekend"}:
+        day = "20260525" if mode == "holiday" else "20260509"
+        response.sessions.append(
+            SimpleNamespace(
+                refDate=day, startDateTime=f"{day}-09:30:00", endDateTime=f"{day}-16:00:00"
+            )
+        )
+    elif mode == "malformed":
+        response.sessions.append(object())
+    else:
+        response.timeZone = "UTC"
+    fake = FakeIb(response)
+    value = broker(fake)
+    with pytest.raises(IbkrExecutionError):
+        asyncio.run(value.sessions(around=NOW, count=120))
+    assert value.schedule_evidence == {}
+    assert fake.details_requested == 0
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize(
+    "past,future,passes", [(19, 10, False), (20, 9, False), (20, 10, True), (0, 0, False)]
+)
+def test_native_horizon_minimums_use_only_bounded_dates(
+    past: int, future: int, passes: bool
+) -> None:
+    # Outside the published calendar year, isolate the unchanged minimum-count gates.
+    around = datetime(2027, 4, 15, 12, tzinfo=UTC)
+    end = around.date() + timedelta(days=45)
+    start = end - timedelta(days=119)
+    before = open_dates(start, around.date() - timedelta(days=1))[:past]
+    after = open_dates(around.date() + timedelta(days=1), end)[:future]
+    extras = open_dates(start - timedelta(days=60), start - timedelta(days=1))
+    extras += open_dates(end + timedelta(days=1), end + timedelta(days=60))
+    fake = FakeIb(schedule_for_dates(extras + before + after))
+    value = broker(fake)
+    if passes:
+        assert asyncio.run(value.sessions(around=around, count=120)) == sorted(before + after)
+    else:
+        with pytest.raises(IbkrExecutionError, match="COVERAGE_MISMATCH"):
+            asyncio.run(value.sessions(around=around, count=120))
+        assert value.schedule_evidence == {}
+    assert fake.details_requested == 0
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize("count", [True, False, 0, 59, 366, 120.5, "120"])
+def test_native_invalid_count_rejected_before_broker_access(count: object) -> None:
+    value = IbkrBroker(host="localhost", port=4001, client_id=1)
+    value.schedule_evidence = {"source": "stale"}
+    with pytest.raises(IbkrExecutionError, match="INVALID_REQUEST"):
+        asyncio.run(value.sessions(around=NOW, count=count))  # type: ignore[arg-type]
+    assert value.schedule_evidence == {}
+
+
+def test_native_naive_clock_rejected_before_broker_access() -> None:
+    value = IbkrBroker(host="localhost", port=4001, client_id=1)
+    with pytest.raises(IbkrExecutionError, match="INVALID_REQUEST"):
+        asyncio.run(value.sessions(around=NOW.replace(tzinfo=None), count=120))
+    assert value.schedule_evidence == {}
