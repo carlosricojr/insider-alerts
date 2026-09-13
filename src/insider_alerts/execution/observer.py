@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import stat
+import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -112,13 +114,16 @@ class Journal:
         utc(now)
         path = safe_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive file creation: activation never resets or reuses an existing store.
-        with path.open("xb"):
-            pass
-        with closing(sqlite3.connect(path)) as conn:
-            conn.executescript(
-                """
-                PRAGMA journal_mode=WAL;
+        if path.exists():
+            raise FileExistsError("observer already activated")
+        descriptor, name = tempfile.mkstemp(prefix=".activation-", suffix=".db", dir=path.parent)
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            with closing(sqlite3.connect(temporary)) as conn:
+                conn.executescript(
+                    """
+                PRAGMA journal_mode=DELETE;
                 CREATE TABLE records (
                     sequence INTEGER PRIMARY KEY,
                     kind TEXT NOT NULL,
@@ -131,23 +136,35 @@ class Journal:
                     BEGIN SELECT RAISE(ABORT, 'append only'); END;
                 CREATE TRIGGER records_no_delete BEFORE DELETE ON records
                     BEGIN SELECT RAISE(ABORT, 'append only'); END;
-            """
+                """
+                )
+            journal = cls(temporary)
+            journal.append(
+                "activation",
+                "singleton",
+                {
+                    "start": utc(start),
+                    "revision": revision,
+                    "window_calendar_days": WINDOW_DAYS,
+                    "scope": "canary_ledger_candidates_only",
+                    "profit_reporting": False,
+                    "session_completion_proof": "unavailable_not_required_for_raw_capture",
+                },
+                now=now,
             )
-        journal = cls(path)
-        journal.append(
-            "activation",
-            "singleton",
-            {
-                "start": utc(start),
-                "revision": revision,
-                "window_calendar_days": WINDOW_DAYS,
-                "scope": "canary_ledger_candidates_only",
-                "profit_reporting": False,
-                "session_completion_proof": "unavailable_not_required_for_raw_capture",
-            },
-            now=now,
-        )
-        return journal
+            journal.validate()
+            # DELETE journaling plus closed connections leaves no WAL to publish/checkpoint.
+            with temporary.open("r+b") as stream:
+                os.fsync(stream.fileno())
+            if os.name == "nt":
+                os.rename(temporary, path)  # Windows rename atomically refuses an existing target.
+            else:
+                os.link(temporary, path)  # POSIX rename would replace; link refuses instead.
+        finally:
+            temporary.unlink(missing_ok=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                Path(str(temporary) + suffix).unlink(missing_ok=True)
+        return cls(path)
 
     def records(self, kind: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -477,7 +494,12 @@ async def run_once(
                 except Exception as exc:
                     result.update(result="market_data_unavailable", error_type=type(exc).__name__)
                 finally:
-                    source.disconnect()
+                    try:
+                        source.disconnect()
+                    except Exception as exc:
+                        result.update(
+                            result="market_data_unavailable", cleanup_error_type=type(exc).__name__
+                        )
                 journal.append(
                     "poll",
                     symbol,
@@ -488,6 +510,7 @@ async def run_once(
                         rejected=rejected,
                         accepted_bar_content_hashes=accepted_hashes,
                         error_type=result.get("error_type"),
+                        cleanup_error_type=result.get("cleanup_error_type"),
                         session_coverage_proven=False,
                     ),
                     now=clock(),

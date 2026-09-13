@@ -105,6 +105,40 @@ def test_activation_exclusive_and_future(tmp_path: Path) -> None:
     assert path.read_bytes() == original
 
 
+@pytest.mark.parametrize("stage", ["append", "validate", "fsync"])
+def test_activation_failure_never_publishes_and_can_retry(
+    tmp_path: Path, monkeypatch, stage: str
+) -> None:
+    path = tmp_path / "evidence.db"
+
+    def failure(*args, **kwargs):
+        assert not path.exists()
+        raise OSError("injected activation failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(obs.os if stage == "fsync" else obs.Journal, stage, failure)
+        with pytest.raises(OSError, match="injected"):
+            obs.Journal.activate(path, start=START, now=START - timedelta(hours=3), revision="a")
+    assert not list(tmp_path.iterdir())
+    obs.Journal.activate(path, start=START, now=START - timedelta(hours=3), revision="a").validate()
+
+
+def test_activation_publication_race_never_overwrites(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "evidence.db"
+    operation = "rename" if os.name == "nt" else "link"
+    original = getattr(obs.os, operation)
+
+    def collision(source, target):
+        Path(target).write_bytes(b"concurrently published")
+        original(source, target)
+
+    monkeypatch.setattr(obs.os, operation, collision)
+    with pytest.raises(FileExistsError):
+        obs.Journal.activate(path, start=START, now=START - timedelta(hours=3), revision="a")
+    assert path.read_bytes() == b"concurrently published"
+    assert list(tmp_path.iterdir()) == [path]
+
+
 def test_readonly_source_and_no_outcome_columns(tmp_path: Path) -> None:
     path = source_db(tmp_path / "source.db", [candidate()])
     before = path.read_bytes()
@@ -247,6 +281,27 @@ def test_empty_data_not_success_and_failure_retry_paced(
         == "market_data_unavailable"
     )
     assert not source.connected
+
+
+@pytest.mark.parametrize("primary_failure", [False, True])
+def test_disconnect_failure_keeps_poll_and_cycle_receipts(
+    journal: obs.Journal, tmp_path: Path, primary_failure: bool
+) -> None:
+    path = source_db(tmp_path / "source.db", [candidate()])
+
+    class BrokenCleanup(Source):
+        def disconnect(self) -> None:
+            super().disconnect()
+            raise RuntimeError("cleanup failed")
+
+    source = BrokenCleanup((bar(),))
+    source.failure = primary_failure
+    assert run(journal, path, source)["result"] == "market_data_unavailable"
+    poll = journal.records("poll")[0]["payload"]
+    assert poll["cleanup_error_type"] == "RuntimeError"
+    assert poll["error_type"] == ("TimeoutError" if primary_failure else None)
+    assert journal.records("cycle")[-1]["payload"]["cleanup_error_type"] == "RuntimeError"
+    journal.validate()
 
 
 def test_persisted_crash_attempt_and_fairness(journal: obs.Journal, tmp_path: Path) -> None:
@@ -401,6 +456,23 @@ def test_capture_window_uses_local_dates_across_dst(journal: obs.Journal, tmp_pa
     source = Source((bar(day=date(2026, 11, 15)),))
     assert run(journal, path, source, at)["result"] == "received"
     assert journal.records("attempt")[0]["payload"]["through_date"] == "2026-11-15"
+
+
+def test_capture_window_spring_dst_does_not_extend_one_day(tmp_path: Path) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    journal = obs.Journal.activate(
+        tmp_path / "evidence.db", start=start, now=start - timedelta(hours=3), revision="a"
+    )
+    signal = datetime(2026, 2, 1, 23, 30, tzinfo=obs.NY)
+    path = source_db(
+        tmp_path / "source.db", [candidate(signal_at=obs.utc(signal), created_at=obs.utc(signal))]
+    )
+    source = Source((bar(day=date(2026, 3, 18)), bar(day=date(2026, 3, 19))))
+    assert (
+        run(journal, path, source, datetime(2026, 3, 19, 7, tzinfo=obs.NY))["result"] == "received"
+    )
+    assert journal.records("attempt")[0]["payload"]["through_date"] == "2026-03-18"
+    assert [r["payload"]["date"] for r in journal.records("bar")] == ["2026-03-18"]
 
 
 def test_cli_help_no_runpy_warning() -> None:

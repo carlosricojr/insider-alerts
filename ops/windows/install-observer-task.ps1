@@ -14,10 +14,16 @@ if ((Resolve-Path $canary.Actions.WorkingDirectory).Path -ne $repoRoot) {
 }
 Push-Location $repoRoot
 try {
+  git fetch --quiet origin main
+  if ($LASTEXITCODE -ne 0) { throw "Could not refresh origin/main; installation refused." }
   $branch = git branch --show-current
+  if ($LASTEXITCODE -ne 0) { throw "Could not read checkout branch." }
   $head = git rev-parse HEAD
+  if ($LASTEXITCODE -ne 0) { throw "Could not read checkout revision." }
   $remote = git rev-parse origin/main
+  if ($LASTEXITCODE -ne 0) { throw "Could not read refreshed origin/main." }
   $dirty = git status --porcelain
+  if ($LASTEXITCODE -ne 0) { throw "Could not verify clean checkout." }
   if ($branch -ne "main" -or $head -ne $remote -or $dirty) {
     throw "Deployment checkout must be clean main == origin/main."
   }

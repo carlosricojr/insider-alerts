@@ -15,7 +15,12 @@ request planning retains the first candidate identity rather than silently adopt
 `data/observer/evidence.db` contains RFC8785/SHA256 chained, append-only records. Source reads
 close before output writes/network I/O. `worker-lock.db` is only an OS-released SQLite writer
 lock, held across the invocation; durable attempts in the evidence journal preserve pacing after
-crashes. A failed activation is not reset automatically. Preserve evidence through any rollback.
+crashes. Activation is built and validated in a temporary sibling, then atomically published
+without replacing an existing store. Ordinary failures remove only that temporary attempt;
+an interrupted unpublished staging file is not active evidence. Preserve published evidence
+through any rollback. On POSIX, a crash between publication by hard link and staging unlink
+requires inspection/removal of the matching staging link before the hard-link safety gate permits
+use; production Windows uses an atomic non-replacing rename and has no two-link interval.
 
 The hidden one-shot worker runs every five minutes while the Windows user is logged in. Candidate
 capture runs at each invocation; market requests run only 18:00-08:00 America/New_York, serially,
@@ -57,7 +62,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ops/windows/install-observer
 uv run python -m insider_alerts.execution.observer_worker --status
 ```
 
-Activation creates an exclusive new file; existing stores are never reset. The installer refuses
+Activation publishes an exclusive new file; existing stores are never reset. The installer fetches
+remote main before checking equality and refuses installation on fetch/git failures. It refuses
 to overwrite an existing task. It registers direct `pythonw.exe`, hidden, limited interactive
 principal, logon plus five-minute triggers, IgnoreNew, and a three-minute execution limit. Worker
 git probes use Windows no-window flags and process-tree ownership. It does not create a daemon.
