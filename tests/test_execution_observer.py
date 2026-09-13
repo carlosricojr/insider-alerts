@@ -473,6 +473,8 @@ def test_capture_window_spring_dst_does_not_extend_one_day(tmp_path: Path) -> No
     )
     assert journal.records("attempt")[0]["payload"]["through_date"] == "2026-03-18"
     assert [r["payload"]["date"] for r in journal.records("bar")] == ["2026-03-18"]
+    assert run(journal, path, source, datetime(2026, 3, 20, 7, tzinfo=obs.NY))["result"] == "idle"
+    assert source.calls == ["ABC"]
 
 
 def test_cli_help_no_runpy_warning() -> None:
