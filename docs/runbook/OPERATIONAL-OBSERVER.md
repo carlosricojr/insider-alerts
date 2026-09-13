@@ -21,7 +21,8 @@ The hidden one-shot worker runs every five minutes while the Windows user is log
 capture runs at each invocation; market requests run only 18:00-08:00 America/New_York, serially,
 one symbol per invocation, at least five minutes apart, with least-recent-attempt fairness. A
 successful symbol poll is not repeated on the same local date. This bounds additional load to
-at most 168 attempts per complete off-hours window; it is not a guarantee that all symbols will
+normally 168 attempts per complete off-hours window (180 across the fall DST clock change);
+it is not a guarantee that all symbols will
 be serviced daily. Existing live/research clients have their own traffic. IBKR still applies
 [soft throttling to historical requests](https://interactivebrokers.github.io/tws-api/historical_limitations.html).
 

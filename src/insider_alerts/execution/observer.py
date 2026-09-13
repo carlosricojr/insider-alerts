@@ -10,7 +10,7 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -350,15 +350,15 @@ async def run_once(
         first: dict[str, dict[str, Any]] = {}
         for record in journal.records("candidate"):
             first.setdefault(record["entity"], record["payload"])
-        windows: dict[str, tuple[datetime, datetime]] = {}
+        windows: dict[str, tuple[date, date]] = {}
         for row in first.values():
-            signal = parse(row["signal_at"])
+            signal = parse(row["signal_at"]).astimezone(NY).date()
             end = signal + timedelta(days=WINDOW_DAYS)
             symbol = row["symbol"]
             if (
                 not valid_symbol(symbol)
-                or signal.astimezone(NY).date() >= local.date()
-                or local.date() > end.astimezone(NY).date() + timedelta(days=1)
+                or signal >= local.date()
+                or local.date() > end + timedelta(days=1)
             ):
                 continue
             old = windows.get(symbol)
@@ -381,8 +381,8 @@ async def run_once(
             if 8 <= requested.astimezone(NY).hour < 18:
                 result["result"] = "off_hours_only"
             else:
-                start_date = first_at.astimezone(NY).date()
-                end_date = min(through_at.astimezone(NY).date(), request_date - timedelta(days=1))
+                start_date = first_at
+                end_date = min(through_at, request_date - timedelta(days=1))
                 attempt = {
                     "start_date": start_date.isoformat(),
                     "through_date": end_date.isoformat(),

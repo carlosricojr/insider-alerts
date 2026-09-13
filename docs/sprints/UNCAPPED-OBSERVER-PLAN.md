@@ -33,8 +33,9 @@ broker reconciliation, hidden observer task/process and clean synced main. Activ
 after deployment at least two hours ahead. Blinded heartbeat/coverage are the only outputs.
 
 Rollback: disable only the observer task; retain all evidence. No live policy rollback needed.
-Handoff: implementation and 37 focused tests complete; independent review found and
+Handoff: implementation and 38 focused tests complete; independent review found and
 prompted fixes for source cycle-clock semantics and cutoff cancellation during qualification.
+A local-date regression also protects the 45-calendar-day window across the fall DST change.
 Full final gates, exact-head review, merge and verified deployment remain required.
 Profit analysis requires a separately authorized fresh-sample
 preregistration and execution/cash assumptions; this release cannot promise recoverable profit.

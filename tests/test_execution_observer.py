@@ -391,6 +391,18 @@ def test_signal_arriving_during_canary_cycle_is_preserved(journal: obs.Journal) 
     assert not journal.records("candidate_missing")
 
 
+def test_capture_window_uses_local_dates_across_dst(journal: obs.Journal, tmp_path: Path) -> None:
+    signal = datetime(2026, 10, 1, 0, 30, tzinfo=obs.NY)
+    path = source_db(
+        tmp_path / "source.db", [candidate(signal_at=obs.utc(signal), created_at=obs.utc(signal))]
+    )
+    # 45 local calendar days ends Nov15, not Nov14 after subtracting the DST hour.
+    at = datetime(2026, 11, 16, 7, 0, tzinfo=obs.NY)
+    source = Source((bar(day=date(2026, 11, 15)),))
+    assert run(journal, path, source, at)["result"] == "received"
+    assert journal.records("attempt")[0]["payload"]["through_date"] == "2026-11-15"
+
+
 def test_cli_help_no_runpy_warning() -> None:
     result = subprocess.run(
         [
