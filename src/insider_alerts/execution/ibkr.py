@@ -154,6 +154,15 @@ class IbkrBroker:
         from ib_async import RequestError
 
         self.schedule_evidence = {}
+        if (
+            not isinstance(around, datetime)
+            or around.tzinfo is None
+            or around.utcoffset() is None
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 60 <= count <= 365
+        ):
+            raise IbkrExecutionError("CALENDAR_INVALID_REQUEST")
         request_ib = self.ib
         previous = bool(request_ib.RaiseRequestErrors)
         reason = ""
@@ -189,6 +198,10 @@ class IbkrBroker:
                 today = around.astimezone(NEW_YORK).date()
                 end = today + timedelta(days=45)
                 start = end - timedelta(days=count - 1)
+                # IBKR can return a wider schedule than the requested date window.
+                # Validate ALL rows above (including extras), then enforce coverage
+                # and horizon minimums only within the window consumers requested.
+                expected = [day for day in expected if start <= day <= end]
                 known = {
                     day
                     for offset in range(count)
