@@ -545,8 +545,10 @@ def test_native_invalid_count_rejected_before_broker_access(count: object) -> No
     assert value.schedule_evidence == {}
 
 
-def test_native_naive_clock_rejected_before_broker_access() -> None:
+@pytest.mark.parametrize("around", [NOW.replace(tzinfo=None), None, NOW.date(), NOW.isoformat()])
+def test_native_invalid_clock_rejected_before_broker_access(around: object) -> None:
     value = IbkrBroker(host="localhost", port=4001, client_id=1)
+    value.schedule_evidence = {"source": "stale"}
     with pytest.raises(IbkrExecutionError, match="INVALID_REQUEST"):
-        asyncio.run(value.sessions(around=NOW.replace(tzinfo=None), count=120))
+        asyncio.run(value.sessions(around=around, count=120))  # type: ignore[arg-type]
     assert value.schedule_evidence == {}

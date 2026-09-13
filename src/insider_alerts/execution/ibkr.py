@@ -155,7 +155,8 @@ class IbkrBroker:
 
         self.schedule_evidence = {}
         if (
-            around.tzinfo is None
+            not isinstance(around, datetime)
+            or around.tzinfo is None
             or around.utcoffset() is None
             or isinstance(count, bool)
             or not isinstance(count, int)

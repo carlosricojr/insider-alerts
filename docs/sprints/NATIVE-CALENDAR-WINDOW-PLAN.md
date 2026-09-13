@@ -18,7 +18,7 @@ only that result and use its dates in the receipt. Invalid or duplicate extras,
 missing in-window dates and malformed responses remain fail-closed, without
 fallback. Keep existing non-2026 validation semantics; no new calendar authority.
 The design challenge also identified a native-path input-validation gap: reject
-naive clocks and non-integer/bool/out-of-range counts before broker access,
+non-datetime/naive clocks and non-integer/bool/out-of-range counts before broker access,
 using the existing 60..365 range without the fallback's year restriction.
 
 Constraints: isolated worktree only; no research registry/evidence changes,
@@ -39,6 +39,7 @@ observer heartbeat and clean synced main after deployment.
 Rollback: revert the scoped commit through the same reviewed workflow if needed;
 do not bypass the calendar gate, reset ledgers or remove protective orders.
 Handoff: independent design challenge complete; implementation and focused
-calendar/broker tests pass (96 cases). Full gates, adversarial/exact-head review,
+calendar/broker tests pass (99 cases). CodeRabbit identified a missing datetime
+shape guard; the guard and regression cases were added. Full gates, final exact-head review,
 merge and verified deployment remain required. Deployment evidence belongs in
 the PR handoff so this plan does not assert unperformed production checks.
