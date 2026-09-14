@@ -4,7 +4,7 @@ import asyncio
 import math
 import sys
 from collections import deque
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
 from insider_alerts.backtest.models import DailyBar
@@ -163,6 +163,12 @@ class IbkrBroker:
             or not 60 <= count <= 365
         ):
             raise IbkrExecutionError("CALENDAR_INVALID_REQUEST")
+        today = around.astimezone(NEW_YORK).date()
+        end = today + timedelta(days=45)
+        # Coverage includes the whole final NY date, even before today's open.
+        # Resolve the target date's zone offset rather than carrying UTC time
+        # across midnight or a DST transition.
+        endpoint = datetime.combine(end, time(23, 59, 59), NEW_YORK).astimezone(UTC)
         request_ib = self.ib
         previous = bool(request_ib.RaiseRequestErrors)
         reason = ""
@@ -172,7 +178,7 @@ class IbkrBroker:
             try:
                 schedule = await asyncio.wait_for(
                     self.ib.reqHistoricalScheduleAsync(
-                        contract, count, around.astimezone(UTC) + timedelta(days=45), True
+                        contract, count, endpoint, True
                     ),
                     _SCHEDULE_TIMEOUT_SECONDS,
                 )
@@ -195,8 +201,6 @@ class IbkrBroker:
                 receipt = validate_contract_hours(details, contract, around)
             else:
                 expected = validate_native_schedule(schedule)
-                today = around.astimezone(NEW_YORK).date()
-                end = today + timedelta(days=45)
                 start = end - timedelta(days=count - 1)
                 # IBKR can return a wider schedule than the requested date window.
                 # Validate ALL rows above (including extras), then enforce coverage
