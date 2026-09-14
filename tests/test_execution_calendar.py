@@ -9,6 +9,7 @@ from ib_async import RequestError
 
 from insider_alerts.execution.calendar import (
     CALENDAR_SHA256,
+    NEW_YORK,
     SOURCE,
     bounds,
     calendar_dates,
@@ -552,3 +553,86 @@ def test_native_invalid_clock_rejected_before_broker_access(around: object) -> N
     with pytest.raises(IbkrExecutionError, match="INVALID_REQUEST"):
         asyncio.run(value.sessions(around=around, count=120))  # type: ignore[arg-type]
     assert value.schedule_evidence == {}
+
+
+class EndpointSensitiveIb(FakeIb):
+    """Model the observed omission when a session opens after the endpoint."""
+
+    def __init__(self, response: SimpleNamespace) -> None:
+        super().__init__(response)
+        self.endpoints: list[datetime] = []
+
+    async def reqHistoricalScheduleAsync(self, *args: object) -> object:
+        assert args[0] is CONTRACT
+        assert args[1] == 120
+        assert args[3] is True
+        endpoint = args[2]
+        assert isinstance(endpoint, datetime)
+        self.endpoints.append(endpoint)
+        response = await super().reqHistoricalScheduleAsync(*args)
+        assert isinstance(response, SimpleNamespace)
+        return SimpleNamespace(
+            timeZone=response.timeZone,
+            sessions=[
+                row
+                for row in response.sessions
+                if datetime.strptime(row.startDateTime, "%Y%m%d-%H:%M:%S").replace(tzinfo=NEW_YORK)
+                <= endpoint
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "around_text,endpoint_text",
+    [
+        ("2026-09-14T00:00:00-04:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-14T08:00:00-04:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-14T09:29:59-04:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-14T09:30:00-04:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-14T10:00:00-04:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-15T00:30:00+00:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-14T23:59:59-04:00", "2026-10-30T03:59:59+00:00"),
+        ("2026-09-15T00:00:00-04:00", "2026-10-31T03:59:59+00:00"),
+        ("2026-09-18T00:00:00-04:00", "2026-11-03T04:59:59+00:00"),
+        ("2026-01-25T00:00:00-05:00", "2026-03-12T03:59:59+00:00"),
+        ("2026-10-13T00:00:00-04:00", "2026-11-28T04:59:59+00:00"),
+        ("2026-11-09T00:00:00-05:00", "2026-12-25T04:59:59+00:00"),
+        ("2026-09-17T00:00:00-04:00", "2026-11-02T04:59:59+00:00"),
+        ("2026-10-12T00:00:00-04:00", "2026-11-27T04:59:59+00:00"),
+        ("2026-11-17T00:00:00-05:00", "2027-01-02T04:59:59+00:00"),
+        ("2028-01-15T00:00:00-05:00", "2028-03-01T04:59:59+00:00"),  # Ends Feb 29.
+        ("2028-02-29T00:00:00-05:00", "2028-04-15T03:59:59+00:00"),  # Starts Feb 29.
+        ("2027-01-15T00:00:00-05:00", "2027-03-02T04:59:59+00:00"),  # Non-leap.
+        ("2100-01-15T00:00:00-05:00", "2100-03-02T04:59:59+00:00"),  # Century non-leap.
+    ],
+)
+def test_native_endpoint_covers_entire_target_ny_date(around_text: str, endpoint_text: str) -> None:
+    around = datetime.fromisoformat(around_text)
+    end = around.astimezone(NEW_YORK).date() + timedelta(days=45)
+    start = end - timedelta(days=119)
+    expected = open_dates(start, end)
+    fake = EndpointSensitiveIb(
+        schedule_for_dates(open_dates(start - timedelta(days=60), end + timedelta(days=10)))
+    )
+    value = broker(fake)
+    assert asyncio.run(value.sessions(around=around, count=120)) == expected
+    assert fake.endpoints == [datetime.fromisoformat(endpoint_text)]
+    assert fake.endpoints[0].tzinfo is UTC
+    assert value.schedule_evidence["last_session"] == str(expected[-1])
+    assert value.schedule_evidence["validated_at_utc"] == around.astimezone(UTC).isoformat()
+    assert fake.RaiseRequestErrors is False
+    assert fake.details_requested == 0
+
+
+def test_end_of_day_request_does_not_excuse_missing_final_session() -> None:
+    around = datetime(2026, 9, 14, 0, tzinfo=NEW_YORK)
+    days = open_dates(date(2026, 5, 8), date(2026, 11, 10))
+    days.remove(date(2026, 10, 29))
+    fake = EndpointSensitiveIb(schedule_for_dates(days))
+    value = broker(fake)
+    value.schedule_evidence = {"source": "stale"}
+    with pytest.raises(IbkrExecutionError, match="COVERAGE_MISMATCH"):
+        asyncio.run(value.sessions(around=around, count=120))
+    assert value.schedule_evidence == {}
+    assert fake.details_requested == 0
+    assert fake.RaiseRequestErrors is False
