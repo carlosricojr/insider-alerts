@@ -37,6 +37,124 @@ def _mk_broker() -> IbkrBroker:
     return broker
 
 
+@pytest.mark.parametrize(
+    "status", ["Inactive", "Cancelled", "ApiCancelled", "Submitted", "ValidationError", "Filled"]
+)
+def test_moc_diagnostics_preserve_submission_behavior(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    broker = _mk_broker()
+    orders: list[ib_async.Order] = []
+    sleeps: list[float] = []
+    broker.ib.trades = lambda: []
+
+    def place_order(contract: str, order: ib_async.Order) -> _State:
+        assert contract == "TEST"
+        orders.append(order)
+        order.orderId = 42
+        broker._on_error(-1, 1100, "connection error must not appear", None)
+        broker._on_error(43, 201, "other order must not appear", None)
+        broker._on_error(42, 2104, "farm message must not appear", None)
+        broker._on_error(42, 201, "Rejected for ACCT: reason from broker", None)
+        return _State(order=order, orderStatus=_State(status=status))
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    broker.ib.placeOrder = place_order
+    monkeypatch.setattr(ibkr_module.asyncio, "sleep", sleep)
+    call = broker.submit_market_on_close("TEST", 7, oca_group="exit-group", order_ref="ref")
+    if status in {"Inactive", "Cancelled", "ApiCancelled"}:
+        with pytest.raises(IbkrExecutionError) as captured:
+            asyncio.run(call)
+        assert str(captured.value) == (
+            f"IBKR rejected market-on-close for TEST: order_id=42 status={status}; "
+            "code=201 message=Rejected for [account]: reason from broker"
+        )
+    else:
+        assert asyncio.run(call) == 42
+    assert sleeps == [0.5]
+    assert len(orders) == 1
+    order = orders[0]
+    assert (order.action, order.totalQuantity, order.orderType, order.tif) == (
+        "SELL",
+        7,
+        "MOC",
+        "DAY",
+    )
+    assert (order.account, order.ocaGroup, order.ocaType, order.orderRef, order.transmit) == (
+        "ACCT",
+        "exit-group",
+        1,
+        "ref",
+        True,
+    )
+
+
+def test_moc_existing_order_returns_without_resubmission() -> None:
+    broker = _mk_broker()
+    broker.ib.trades = lambda: [
+        _State(order=_State(orderRef="ref", orderId=42), orderStatus=_State(status="Submitted"))
+    ]
+    assert (
+        asyncio.run(
+            broker.submit_market_on_close("TEST", 7, oca_group="exit-group", order_ref="ref")
+        )
+        == 42
+    )
+
+
+def test_moc_diagnostics_missing_and_malformed_evidence() -> None:
+    broker = _mk_broker()
+    assert broker._moc_rejection_detail(42, "ACCT", "Inactive") == (
+        "order_id=42 status=Inactive; no broker error recorded"
+    )
+    # Unexpected payloads must not stringify arbitrary objects or mask the rejection.
+    broker._errors.append((42, object(), object()))  # type: ignore[arg-type]
+    assert broker._moc_rejection_detail(42, "ACCT", "Inactive") == (
+        "order_id=42 status=Inactive; code=unknown message=broker message unavailable"
+    )
+
+
+def test_moc_diagnostics_redact_before_truncation_and_bound_output() -> None:
+    broker = _mk_broker()
+    broker.configured_account = "configured-account"
+    broker._on_error(42, 200, "old error not included", None)
+    message = (
+        "ACCT configured-account U1234567 DU1234567 DF1234567 F1234567 "
+        "U123\n4567\x00\r\t\u202e" + "x" * 175 + "U7654321 " + "x" * 2000
+    )
+    for code in (201, 202, 203):
+        broker._on_error(42, code, message, None)
+    detail = broker._moc_rejection_detail(42, "ACCT", "Inactive")
+    assert "old error" not in detail
+    assert detail.count("code=") == 3
+    assert all(f"code={code}" in detail for code in (201, 202, 203))
+    assert "[account]" in detail
+    assert all(
+        value not in detail
+        for value in (
+            "ACCT",
+            "configured-account",
+            "1234567",
+            "7654321",
+            "U765",
+            "\n",
+            "\x00",
+            "\r",
+            "\t",
+            "\u202e",
+        )
+    )
+    assert len(detail) < 850
+    # Deliberately straddle the raw-text cutoff: truncation first would leak "U7".
+    broker._errors.clear()
+    broker._on_error(42, 201, "x" * 238 + "U7654321", None)
+    detail = broker._moc_rejection_detail(42, "ACCT", "Inactive")
+    assert "U7" not in detail
+    assert "message=" + "x" * 238 + "[a..." in detail
+
+
 def test_unqualified_contract_uses_terminal_contract_error() -> None:
     broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
 
