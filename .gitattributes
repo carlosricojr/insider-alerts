@@ -1,0 +1,2 @@
+# The canonical review pointer is verified byte-for-byte, including on Windows.
+docs/agents/coderabbit-pr-review-loop.md text eol=lf
