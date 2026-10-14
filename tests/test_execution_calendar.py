@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from insider_alerts.execution.calendar import (
     bounds,
     calendar_dates,
     validate_contract_hours,
+    validate_future_projection_recovery,
     validate_native_schedule,
 )
 from insider_alerts.execution.errors import IbkrExecutionError
@@ -636,3 +638,243 @@ def test_end_of_day_request_does_not_excuse_missing_final_session() -> None:
     assert value.schedule_evidence == {}
     assert fake.details_requested == 0
     assert fake.RaiseRequestErrors is False
+
+
+PROJECTION_NOW = datetime(2026, 10, 14, 18, 45, tzinfo=UTC)
+PROJECTION_HOURS = (
+    "20261014:0930-20261014:1600;20261015:0930-20261015:1600;"
+    "20261016:0930-20261016:1600;20261017:CLOSED;20261018:CLOSED;"
+    "20261019:0930-20261019:1600"
+)
+
+
+def projected_schedule(
+    around: datetime = PROJECTION_NOW,
+    projected_days: tuple[date, ...] = (date(2026, 11, 26), date(2026, 11, 27)),
+) -> SimpleNamespace:
+    # Model the observed Oct 14 response, not a claim of a historical snapshot.
+    end = around.astimezone(NEW_YORK).date() + timedelta(days=45)
+    response = schedule_for_dates(open_dates(end - timedelta(days=119), end))
+    for day in projected_days:
+        day_text = day.strftime("%Y%m%d")
+        row = next((row for row in response.sessions if row.refDate == day_text), None)
+        if row is None:
+            response.sessions.append(SimpleNamespace(
+                refDate=day_text, startDateTime=f"{day_text}-09:30:00",
+                endDateTime=f"{day_text}-16:00:00",
+            ))
+        else:
+            row.endDateTime = f"{day_text}-16:00:00"
+    return response
+
+
+def test_future_projection_uses_verified_management_fallback_only() -> None:
+    response = projected_schedule()
+    with pytest.raises(IbkrExecutionError, match="DISAGREEMENT"):
+        validate_native_schedule(response)
+    fake = FakeIb(response, PROJECTION_HOURS)
+    value = broker(fake)
+    expected = calendar_dates(PROJECTION_NOW, 120)
+    assert asyncio.run(value.sessions(around=PROJECTION_NOW, count=120)) == expected
+    assert date(2026, 11, 26) not in expected
+    assert fake.details_requested == 1
+    receipt = value.schedule_evidence
+    assert receipt["source"] == SOURCE
+    assert receipt["fallback_reason"] == "IBKR_NATIVE_FUTURE_PROJECTION_REJECTED"
+    assert receipt["native_rejected_future_dates"] == "2026-11-26,2026-11-27"
+    assert "HOLIDAY_PROJECTED_OPEN" in receipt["native_contradiction_kinds"]
+    assert "EARLY_CLOSE_PROJECTED_REGULAR" in receipt["native_contradiction_kinds"]
+    assert len(receipt["native_schedule_sha256"]) == 64
+    assert int(receipt["native_past_sessions_validated"]) >= 20
+    assert value.calendar_gate(PROJECTION_NOW) is None
+    assert value.calendar_gate(PROJECTION_NOW, for_entry=True) == (
+        "calendar_fallback_entry_approval_expired"
+    )
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize("kind", ["holiday", "early_close"])
+def test_each_allowlisted_future_projection_recovers_independently(kind: str) -> None:
+    response = projected_schedule()
+    if kind == "holiday":
+        next(row for row in response.sessions if row.refDate == "20261127").endDateTime = (
+            "20261127-13:00:00"
+        )
+    else:
+        response.sessions = [row for row in response.sessions if row.refDate != "20261126"]
+    value = broker(FakeIb(response, PROJECTION_HOURS))
+    assert asyncio.run(value.sessions(around=PROJECTION_NOW, count=120)) == calendar_dates(
+        PROJECTION_NOW, 120
+    )
+    assert value.schedule_evidence["native_rejected_future_dates"] == (
+        "2026-11-26" if kind == "holiday" else "2026-11-27"
+    )
+
+
+@pytest.mark.parametrize("armed,around", [
+    (False, PROJECTION_NOW),
+    (True, datetime(2026, 9, 30, 18, tzinfo=UTC)),
+    (True, datetime(2027, 1, 1, 18, tzinfo=UTC)),
+    (True, datetime(2026, 11, 26, 18, tzinfo=UTC)),
+    (True, datetime(2026, 11, 27, 18, tzinfo=UTC)),
+])
+def test_projection_recovery_authorization_and_date_boundaries(
+    armed: bool, around: datetime,
+) -> None:
+    response = projected_schedule(around)
+    if armed:
+        error = "NOT_AUTHORIZED" if around.year != 2026 or around.month < 10 else "NOT_ELIGIBLE"
+        with pytest.raises(IbkrExecutionError, match=error):
+            validate_future_projection_recovery(response, around, 120)
+    fake = FakeIb(response, PROJECTION_HOURS)
+    value = broker(fake, armed=armed)
+    with pytest.raises(IbkrExecutionError):
+        asyncio.run(value.sessions(around=around, count=120))
+    assert fake.details_requested == 0
+    assert value.schedule_evidence == {}
+    assert fake.RaiseRequestErrors is False
+
+
+def test_december_projection_caps_known_year_without_inventing_2027_holidays() -> None:
+    around = datetime(2026, 12, 1, 18, tzinfo=UTC)
+    response = projected_schedule(around, (date(2026, 12, 24), date(2026, 12, 25)))
+    assert any(row.refDate.startswith("2027") for row in response.sessions)
+    hours = "20261201:0930-20261201:1600;20261202:0930-20261202:1600"
+    value = broker(FakeIb(response, hours))
+    days = asyncio.run(value.sessions(around=around, count=120))
+    assert days == calendar_dates(around, 120)
+    assert days[-1] == date(2026, 12, 31)
+    assert date(2026, 12, 25) not in days
+    assert value.schedule_evidence["native_rejected_future_dates"] == "2026-12-24,2026-12-25"
+    assert value.calendar_gate(around, for_entry=True) == "calendar_fallback_entry_approval_expired"
+
+
+@pytest.mark.parametrize("mode", [
+    "past_holiday", "today", "regular_early", "holiday_half_day", "missing_past",
+    "missing_today", "missing_future", "duplicate", "zone", "malformed", "weekend",
+    "outside_window_bad_hours",
+])
+def test_projection_recovery_cannot_mask_other_schedule_failures(mode: str) -> None:
+    response = projected_schedule()
+    if mode in {"past_holiday", "weekend", "outside_window_bad_hours"}:
+        day = {"past_holiday": "20260907", "weekend": "20261017",
+               "outside_window_bad_hours": "20260730"}[mode]
+        closing = "13:00:00" if mode == "outside_window_bad_hours" else "16:00:00"
+        response.sessions.append(SimpleNamespace(
+            refDate=day, startDateTime=f"{day}-09:30:00", endDateTime=f"{day}-{closing}"
+        ))
+    elif mode in {"today", "regular_early", "holiday_half_day"}:
+        day = {"today": "20261014", "regular_early": "20261125",
+               "holiday_half_day": "20261126"}[mode]
+        next(row for row in response.sessions if row.refDate == day).endDateTime = (
+            f"{day}-13:00:00"
+        )
+    elif mode.startswith("missing_"):
+        day = {"missing_past": "20261013", "missing_today": "20261014",
+               "missing_future": "20261125"}[mode]
+        response.sessions = [row for row in response.sessions if row.refDate != day]
+    elif mode == "duplicate":
+        response.sessions.append(response.sessions[0])
+    elif mode == "zone":
+        response.timeZone = "UTC"
+    else:
+        response.sessions.append(object())
+    fake = FakeIb(response, PROJECTION_HOURS)
+    value = broker(fake)
+    with pytest.raises(IbkrExecutionError):
+        asyncio.run(value.sessions(around=PROJECTION_NOW, count=120))
+    assert value.schedule_evidence == {}
+    assert fake.details_requested == 0
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize("hours", [
+    PROJECTION_HOURS.replace("0930", "0931"),
+    "20261014:0930-20261014:1600",  # next session absent
+    "20261013:0930-20261013:1600",  # stale coverage
+])
+def test_projection_recovery_still_requires_fresh_exact_contract_hours(hours: str) -> None:
+    fake = FakeIb(projected_schedule(), hours)
+    value = broker(fake)
+    with pytest.raises(IbkrExecutionError):
+        asyncio.run(value.sessions(around=PROJECTION_NOW, count=120))
+    assert fake.details_requested == 1
+    assert value.schedule_evidence == {}
+    assert fake.RaiseRequestErrors is False
+
+
+def test_projection_recovery_timeout_clears_evidence_and_resets_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import insider_alerts.execution.ibkr as module
+
+    class HungDetails(FakeIb):
+        async def reqContractDetailsAsync(self, *args: object) -> object:
+            await asyncio.sleep(60)
+            return None
+
+    monkeypatch.setattr(module, "_SCHEDULE_TIMEOUT_SECONDS", 0.001)
+    fake = HungDetails(projected_schedule())
+    value = broker(fake)
+    value.schedule_evidence = {"source": "previous success"}
+    with pytest.raises(IbkrExecutionError, match="TIMEOUT_CONNECTION_RESET"):
+        asyncio.run(value.sessions(around=PROJECTION_NOW, count=120))
+    assert value.schedule_evidence == {}
+    assert value.ib is None
+    assert fake.connected is False
+    assert fake.RaiseRequestErrors is False
+
+
+def test_projection_recovery_requires_twenty_past_sessions_and_actual_disagreement() -> None:
+    with pytest.raises(IbkrExecutionError, match="COVERAGE_MISMATCH"):
+        validate_future_projection_recovery(projected_schedule(), PROJECTION_NOW, 60)
+    valid = schedule_for_dates(calendar_dates(PROJECTION_NOW, 120))
+    with pytest.raises(IbkrExecutionError, match="NOT_ELIGIBLE"):
+        validate_future_projection_recovery(valid, PROJECTION_NOW, 120)
+
+
+def test_projection_recovery_full_cycle_keeps_protection_and_submits_overdue_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from insider_alerts.execution.canary import AccountSnapshot, BrokerOrder, broker_token
+    from tests.test_execution_canary_adversarial import _runner, _signal
+
+    runner, live_broker = _runner(tmp_path, monkeypatch, PROJECTION_NOW)
+    token = broker_token("crash-test-packet")
+    runner.store.insert_candidate(
+        _signal(PROJECTION_NOW), session=date(2026, 10, 1), rank="test",
+        is_eligible=True, reason="eligible", prior_close=10, median_dollar_volume=1_000_000,
+        quantity=20, now=PROJECTION_NOW,
+    )
+    runner.store.update(
+        "crash-test-packet", live_state="open", live_quantity=20, live_entry_price=10,
+        live_entry_commission=0.35, live_exit_session="2026-10-13",
+        oca_group=f"IA-E07-{token}-EXIT", target_order_id=201, stop_order_id=202,
+    )
+    live_broker.snapshot = AccountSnapshot("ACCOUNT", 500, 300, 300, {"TEST": 20}, 2)
+    live_broker.order_values = [
+        BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Submitted", 0, 20, 0),
+        BrokerOrder(202, f"IA-E07-{token}-STOP", "TEST", "stop", "Submitted", 0, 20, 0),
+    ]
+    adapter = broker(FakeIb(projected_schedule(), PROJECTION_HOURS))
+
+    async def sessions(*, around: datetime, count: int = 90) -> list[date]:
+        result = await adapter.sessions(around=around, count=count)
+        live_broker.schedule_evidence = adapter.schedule_evidence  # type: ignore[attr-defined]
+        return result
+
+    async def forbidden_entries(*args: object, **kwargs: object) -> int:
+        pytest.fail("projection recovery must not attempt new buys")
+
+    monkeypatch.setattr(live_broker, "sessions", sessions)
+    monkeypatch.setattr(live_broker, "calendar_gate", adapter.calendar_gate, raising=False)
+    monkeypatch.setattr(runner, "_submit_due_entries", forbidden_entries)
+    result = asyncio.run(runner.cycle(PROJECTION_NOW))
+    assert result.live_gate == "calendar_fallback_entry_approval_expired;time_exits=1"
+    assert live_broker.market_exits == [("TEST", 20, f"IA-E07-{token}-EXIT")]
+    assert live_broker.cancelled_orders == []
+    assert live_broker.entry_calls == 0
+    row = runner.store.rows()[0]
+    assert row["live_state"] == "closing"
+    assert row["timed_exit_order_id"] == 204
+    assert row["live_exit_session"] == "2026-10-13"
