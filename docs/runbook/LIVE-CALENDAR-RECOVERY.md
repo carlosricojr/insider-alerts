@@ -1,4 +1,4 @@
-# Live calendar recovery — September 2026
+# Live calendar recovery — September/October 2026
 
 Scope: the E07/F00 operational canary, including its existing operational shadow book.
 Not a research calendar source, trial correction, new hypothesis, or order-policy change.
@@ -7,9 +7,10 @@ rewritten or replayed by this implementation. Dependencies and frozen registry/p
 
 ## Authority
 
-Prefer a valid IBKR historical SPY schedule. The live fallback is permitted only on error 162
-containing `No data of type EODChart`, or an empty-list schedule response. Other errors,
-malformed successes, and schedule/calendar disagreements fail closed. Timeout/cancellation resets
+Prefer a valid IBKR historical SPY schedule. The live fallback is permitted on error 162
+containing `No data of type EODChart`, an empty-list schedule response, or the narrowly validated
+management-only future-projection recovery described below. Other errors,
+malformed successes, and other schedule/calendar disagreements fail closed. Timeout/cancellation resets
 the live connection; it never uses fallback on a connection with an unanswered request.
 
 Fallback table: official [NYSE cash-equity calendar](https://www.nyse.com/trade/hours-calendars),
@@ -38,13 +39,33 @@ before submission. Closed dates cannot admit buys. Existing broker safety checks
 
 ## Expiry and existing holdings
 
+The October 14, 2026 recovery request authorizes restoring existing-position management
+when IBKR projects full regular sessions on future published holidays or early-close dates.
+This exception requires live-armed mode and a current date from October 1 through December 31,
+2026. Every returned row must pass structural validation; all contradictions must be those
+two shapes on strictly future 2026 dates. Every requested published session must still be
+present (past AND future), with at least 20 validated past sessions. Past/current disagreement,
+missing sessions, malformed or duplicate rows, wrong zones and other hour errors still reject.
+Fresh strict contract-hours agreement is required exactly as for the original fallback.
+
+The receipt identifies `IBKR_NATIVE_FUTURE_PROJECTION_REJECTED`, rejected dates/kinds,
+normalized native-response SHA-256, and validated past count. Returned sessions come from
+the published calendar, not a silently repaired broker observation. New buys remain blocked
+by the existing expired fallback approval. Discovery/shadow/research paths and order behavior
+are unchanged. Recovery permits the existing worker to submit overdue exits; it does not
+place a separate manual trade. The implementation plan is
+[Future calendar management](../sprints/FUTURE-CALENDAR-MANAGEMENT-PLAN.md).
+The existing operational shadow book may settle using this same fallback; this does not
+repair or promote the separate frozen research trial.
+
 Fallback **new entry** approval expires October 1, 2026, 00:00 New York. It is not automatically
 renewed. The operator must review on September 22, before expiry, including open positions and the
 continued need for fallback. No new scheduled task was created by this change.
 
 After expiry, reconciliation, protective repair, and existing timed exits continue when calendar
 acquisition succeeds; freshness/expiry entry gates do not stop those management steps. A calendar
-disagreement or acquisition failure still fails the cycle closed and must be investigated promptly;
+disagreement outside the narrow recovery above or acquisition failure still fails the cycle closed
+and must be investigated promptly;
 recorded server-held GTC protective orders are not cancelled. The fallback's returned horizon is
 explicitly capped at December 31, 2026, so crossing the +45-day projection into 2027 does not
 prematurely stop management. Valid native IBKR schedules are not restricted to fallback-table years.

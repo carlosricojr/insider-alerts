@@ -16,6 +16,7 @@ from insider_alerts.execution.calendar import (
     bounds,
     calendar_dates,
     validate_contract_hours,
+    validate_future_projection_recovery,
     validate_native_schedule,
 )
 from insider_alerts.execution.canary import (
@@ -172,6 +173,7 @@ class IbkrBroker:
         request_ib = self.ib
         previous = bool(request_ib.RaiseRequestErrors)
         reason = ""
+        projection_receipt: dict[str, str] = {}
         try:
             contract = await asyncio.wait_for(self._contract("SPY"), _SCHEDULE_TIMEOUT_SECONDS)
             self.ib.RaiseRequestErrors = True
@@ -190,6 +192,25 @@ class IbkrBroker:
             if isinstance(schedule, list) and not schedule:
                 reason = "IBKR_EMPTY_SCHEDULE"
                 schedule = None
+            native_dates: list[date] = []
+            if schedule is not None:
+                try:
+                    native_dates = validate_native_schedule(schedule)
+                except IbkrExecutionError as native_error:
+                    if not self._allow_calendar_fallback:
+                        raise
+                    try:
+                        projection_receipt = validate_future_projection_recovery(
+                            schedule, around, count
+                        )
+                    except IbkrExecutionError as recovery_error:
+                        # Recovery eligibility is data-driven, not error-string matching.
+                        # Retain the native reason AND why management recovery failed.
+                        raise IbkrExecutionError(
+                            f"{native_error}; projection_recovery_rejected={recovery_error}"
+                        ) from native_error
+                    reason = "IBKR_NATIVE_FUTURE_PROJECTION_REJECTED"
+                    schedule = None
             if schedule is None:
                 if not reason or not self._allow_calendar_fallback:
                     raise IbkrExecutionError("CALENDAR_FALLBACK_NOT_AUTHORIZED")
@@ -199,8 +220,9 @@ class IbkrBroker:
                     self.ib.reqContractDetailsAsync(contract), _SCHEDULE_TIMEOUT_SECONDS
                 )
                 receipt = validate_contract_hours(details, contract, around)
+                receipt.update(projection_receipt)
             else:
-                expected = validate_native_schedule(schedule)
+                expected = native_dates
                 start = end - timedelta(days=count - 1)
                 # IBKR can return a wider schedule than the requested date window.
                 # Validate ALL rows above (including extras), then enforce coverage

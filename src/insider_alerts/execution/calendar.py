@@ -161,13 +161,15 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
     }
 
 
-def validate_native_schedule(schedule: Any, expected: list[date] | None = None) -> list[date]:
+def parse_native_schedule(schedule: Any) -> list[tuple[date, datetime, datetime]]:
+    """Validate every row's structure, including extras outside the request window."""
     if getattr(schedule, "timeZone", None) not in {"US/Eastern", "America/New_York"}:
         raise IbkrExecutionError("CALENDAR_SCHEDULE_ZONE_INVALID")
     rows = getattr(schedule, "sessions", None)
     if not isinstance(rows, list) or not rows:
         raise IbkrExecutionError("CALENDAR_SCHEDULE_MALFORMED")
-    found: list[date] = []
+    found: set[date] = set()
+    parsed: list[tuple[date, datetime, datetime]] = []
     try:
         for row in rows:
             day = datetime.strptime(str(row.refDate), "%Y%m%d").date()
@@ -183,13 +185,84 @@ def validate_native_schedule(schedule: Any, expected: list[date] | None = None) 
                 or closes.date() != day
                 or opens.time() != time(9, 30)
                 or closes.time() not in {time(13), time(16)}
-                or (day.year == 2026 and bounds(day) != (opens, closes))
                 or day in found
             ):
                 raise IbkrExecutionError(f"CALENDAR_SCHEDULE_DISAGREEMENT:{day}")
-            found.append(day)
+            found.add(day)
+            parsed.append((day, opens, closes))
     except (AttributeError, ValueError, TypeError) as exc:
         raise IbkrExecutionError("CALENDAR_SCHEDULE_MALFORMED") from exc
-    if expected is not None and sorted(found) != expected:
+    return parsed
+
+
+def native_contradictions(
+    rows: list[tuple[date, datetime, datetime]],
+) -> dict[date, str]:
+    """Classify known-calendar disagreements; do not treat them as valid sessions."""
+    disagreements: dict[date, str] = {}
+    for day, opens, closes in rows:
+        if day.year != 2026 or bounds(day) == (opens, closes):
+            continue
+        kind = "OTHER"
+        if day in HOLIDAYS and closes.time() == time(16):
+            kind = "HOLIDAY_PROJECTED_OPEN"
+        elif day in EARLY_CLOSES and closes.time() == time(16):
+            kind = "EARLY_CLOSE_PROJECTED_REGULAR"
+        disagreements[day] = kind
+    return disagreements
+
+
+def validate_native_schedule(schedule: Any, expected: list[date] | None = None) -> list[date]:
+    rows = parse_native_schedule(schedule)
+    disagreements = native_contradictions(rows)
+    if disagreements:
+        raise IbkrExecutionError(f"CALENDAR_SCHEDULE_DISAGREEMENT:{next(iter(disagreements))}")
+    found = sorted(day for day, _, _ in rows)
+    if expected is not None and found != expected:
         raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
-    return sorted(found)
+    return found
+
+
+def validate_future_projection_recovery(
+    schedule: Any, around: datetime, count: int,
+) -> dict[str, str]:
+    """Reject a narrowly classified future projection; never authorize new risk.
+
+    The caller must separately require live authorization and fresh contract hours.
+    All published requested sessions must still exist, and all non-projected rows
+    retain native validation. Returned evidence describes rejected data, not a
+    corrected historical observation. Only the pinned 2026 calendar is used.
+    """
+    today = around.astimezone(NEW_YORK).date()
+    # Couple recovery authorization to entry expiry: this path must never create
+    # a published-calendar receipt during an interval that could authorize buys.
+    if not FALLBACK_ENTRY_EXPIRY <= today <= date(2026, 12, 31):
+        raise IbkrExecutionError("CALENDAR_PROJECTION_RECOVERY_NOT_AUTHORIZED")
+    expected = calendar_dates(around, count)
+    rows = parse_native_schedule(schedule)
+    disagreements = native_contradictions(rows)
+    allowed = {"HOLIDAY_PROJECTED_OPEN", "EARLY_CLOSE_PROJECTED_REGULAR"}
+    if not disagreements or any(
+        day <= today or kind not in allowed for day, kind in disagreements.items()
+    ):
+        raise IbkrExecutionError("CALENDAR_PROJECTION_RECOVERY_NOT_ELIGIBLE")
+    found = {day for day, _, _ in rows}
+    past_count = sum(day < today for day in expected)
+    if not set(expected).issubset(found) or past_count < 20:
+        raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
+    payload = {
+        "zone": schedule.timeZone,
+        "sessions": [
+            (str(day), opens.isoformat(), closes.isoformat()) for day, opens, closes in rows
+        ],
+    }
+    return {
+        "native_rejected_future_dates": ",".join(str(day) for day in sorted(disagreements)),
+        "native_contradiction_kinds": json.dumps(
+            {str(day): kind for day, kind in sorted(disagreements.items())}, sort_keys=True
+        ),
+        "native_schedule_sha256": hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "native_past_sessions_validated": str(past_count),
+    }
