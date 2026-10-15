@@ -10,11 +10,16 @@ from typing import Any, Literal
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.execution.calendar import (
     CALENDAR_SHA256,
+    ENTRY_HORIZON_LIMIT,
+    ENTRY_RENEWAL_START,
     FALLBACK_ENTRY_EXPIRY,
+    MANAGEMENT_RECOVERY_START,
     NEW_YORK,
     SOURCE,
     bounds,
     calendar_dates,
+    entry_approval,
+    parse_native_schedule,
     validate_contract_hours,
     validate_future_projection_recovery,
     validate_native_schedule,
@@ -221,6 +226,10 @@ class IbkrBroker:
                 )
                 receipt = validate_contract_hours(details, contract, around)
                 receipt.update(projection_receipt)
+                today_bounds = bounds(today)
+                entry_basis = (
+                    "projection_rejected" if projection_receipt else "fallback_unavailable"
+                )
             else:
                 expected = native_dates
                 start = end - timedelta(days=count - 1)
@@ -242,11 +251,26 @@ class IbkrBroker:
                     raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
                 source = "IBKR-historical-schedule"
                 receipt = {"validated_at_utc": around.astimezone(UTC).isoformat()}
+                today_bounds = next(
+                    ((opens, closes) for day, opens, closes in parse_native_schedule(schedule)
+                     if day == today), None,
+                )
+                entry_basis = "native"
+            future = [day for day in expected if today <= day <= ENTRY_HORIZON_LIMIT]
+            approval = entry_approval(today)
             receipt.update(
                 source=source,
                 fallback_reason=reason,
                 calendar_sha256=CALENDAR_SHA256,
-                entry_expiry_et=str(FALLBACK_ENTRY_EXPIRY),
+                entry_expiry_et=str(
+                    MANAGEMENT_RECOVERY_START if today < ENTRY_RENEWAL_START
+                    else FALLBACK_ENTRY_EXPIRY
+                ),
+                entry_approval_id=approval or "",
+                entry_basis=entry_basis,
+                entry_horizon_exit=str(future[9]) if len(future) >= 10 and today in future else "",
+                today_open_et=today_bounds[0].isoformat() if today_bounds else "",
+                today_close_et=today_bounds[1].isoformat() if today_bounds else "",
                 first_session=str(expected[0]),
                 last_session=str(expected[-1]),
                 today_open=str(around.astimezone(NEW_YORK).date() in expected),
@@ -282,12 +306,45 @@ class IbkrBroker:
         if (
             for_entry
             and receipt["source"] == SOURCE
-            and now.astimezone(NEW_YORK).date() >= FALLBACK_ENTRY_EXPIRY
+            and entry_approval(now.astimezone(NEW_YORK).date()) is None
         ):
             return "calendar_fallback_entry_approval_expired"
         if receipt.get("today_open") != "True":
             return "calendar_market_closed"
+        if not receipt.get("entry_horizon_exit"):
+            return "calendar_entry_horizon_incomplete"
         return None
+
+    def session_bounds(self, now: datetime) -> tuple[datetime, datetime] | None:
+        """Validated same-day bounds for management, independent of entry expiry.
+
+        No guessed regular close and no entry-only 60-second age limit: discovery
+        may take longer, but cannot turn yesterday's receipt into today's clock.
+        """
+        receipt = self.schedule_evidence
+        try:
+            validated = datetime.fromisoformat(receipt["validated_at_utc"])
+            opens = datetime.fromisoformat(receipt["today_open_et"])
+            closes = datetime.fromisoformat(receipt["today_close_et"])
+            today = now.astimezone(NEW_YORK).date()
+            if (
+                now.tzinfo is None
+                or any(item.tzinfo is None for item in (validated, opens, closes))
+                or validated > now or validated.astimezone(NEW_YORK).date() != today
+                or opens.astimezone(NEW_YORK).date() != today
+                or closes.astimezone(NEW_YORK).date() != today
+                or receipt.get("today_open") != "True" or not opens < closes
+            ):
+                return None
+            return opens, closes
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    def _check_exit_window(self, window: tuple[datetime, datetime]) -> None:
+        now = datetime.now(UTC)
+        session = self.session_bounds(now)
+        if session is None or not session[0] <= window[0] <= now < window[1] <= session[1]:
+            raise IbkrExecutionError("CALENDAR_EXIT_DISPATCH_WINDOW_MISSED")
 
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]:
         contract = await self._contract(symbol)
@@ -589,6 +646,7 @@ class IbkrBroker:
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime],
     ) -> int:
         from ib_async import MarketOrder
 
@@ -607,6 +665,7 @@ class IbkrBroker:
             transmit=True,
         )
         order.orderType = "MOC"
+        self._check_exit_window(dispatch_window)
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(0.5)
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
@@ -620,6 +679,7 @@ class IbkrBroker:
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime] | None = None,
     ) -> int:
         from ib_async import MarketOrder
 
@@ -638,6 +698,8 @@ class IbkrBroker:
             outsideRth=False,
             transmit=True,
         )
+        if dispatch_window is not None:
+            self._check_exit_window(dispatch_window)
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(0.5)
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:

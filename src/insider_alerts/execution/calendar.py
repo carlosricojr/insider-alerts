@@ -19,7 +19,21 @@ from insider_alerts.execution.errors import IbkrExecutionError
 NEW_YORK = ZoneInfo("America/New_York")
 SOURCE = "NYSE-published-2026-v1"
 SOURCE_PDF_SHA256 = "70f5577eb43e60a9dbbecaae3cec23d0f02028c05c7f175013bb3e97816d394f"
-FALLBACK_ENTRY_EXPIRY = date(2026, 10, 1)
+MANAGEMENT_RECOVERY_START = date(2026, 10, 1)
+ENTRY_RENEWAL_START = date(2026, 10, 15)
+FALLBACK_ENTRY_EXPIRY = date(2027, 1, 1)
+ENTRY_HORIZON_LIMIT = date(2026, 12, 31)
+
+
+def entry_approval(day: date) -> str | None:
+    """Explicit half-open approvals; never retroactively fill the October gap."""
+    if day < MANAGEMENT_RECOVERY_START:
+        return "original-2026-09"
+    if ENTRY_RENEWAL_START <= day < FALLBACK_ENTRY_EXPIRY:
+        return "renewal-2026-10-15"
+    return None
+
+
 HOLIDAYS = frozenset(
     date.fromisoformat(value)
     for value in (
@@ -73,9 +87,8 @@ def calendar_dates(around: datetime, count: int) -> list[date]:
     today = around.astimezone(NEW_YORK).date()
     if today.year != 2026 or start.year != 2026:
         raise IbkrExecutionError("CALENDAR_UNSUPPORTED_RANGE")
-    # After entry approval expiry this is management-only. Advertise the bounded
-    # returned horizon rather than disabling existing-position management when
-    # the requested +45-day projection crosses the published year's boundary.
+    # Bound the published horizon independently of entry authorization. Entry
+    # gates require the entire holding period; management may use a shorter tail.
     end = min(end, date(2026, 12, 31))
     count = (end - start).days + 1
     return [day for offset in range(count) if bounds(day := start + timedelta(days=offset))]
@@ -130,9 +143,9 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
                 opens = datetime.strptime(start_text, "%Y%m%d:%H%M").replace(tzinfo=NEW_YORK)
                 closes = datetime.strptime(end_text, "%Y%m%d:%H%M").replace(tzinfo=NEW_YORK)
                 actual_bounds = (opens, closes)
-            if day > coverage_end and FALLBACK_ENTRY_EXPIRY <= today <= coverage_end:
-                # No new fallback entries can be admitted here. Preserve current-year
-                # management, but do not claim to validate or return next-year dates.
+            if day > coverage_end and MANAGEMENT_RECOVERY_START <= today <= coverage_end:
+                # Preserve current-year management, but do not claim to validate
+                # next-year dates. The independent holding-horizon gate blocks buys.
                 unvalidated.append(str(day))
                 continue
             if actual_bounds != bounds(day):
@@ -226,7 +239,7 @@ def validate_native_schedule(schedule: Any, expected: list[date] | None = None) 
 def validate_future_projection_recovery(
     schedule: Any, around: datetime, count: int,
 ) -> dict[str, str]:
-    """Reject a narrowly classified future projection; never authorize new risk.
+    """Reject a narrowly classified future projection, not the published calendar.
 
     The caller must separately require live authorization and fresh contract hours.
     All published requested sessions must still exist, and all non-projected rows
@@ -234,9 +247,9 @@ def validate_future_projection_recovery(
     corrected historical observation. Only the pinned 2026 calendar is used.
     """
     today = around.astimezone(NEW_YORK).date()
-    # Couple recovery authorization to entry expiry: this path must never create
-    # a published-calendar receipt during an interval that could authorize buys.
-    if not FALLBACK_ENTRY_EXPIRY <= today <= date(2026, 12, 31):
+    # Management authority survives entry expiry. Entry approval is separately
+    # evaluated by the broker gate, including the explicit October renewal.
+    if not MANAGEMENT_RECOVERY_START <= today <= date(2026, 12, 31):
         raise IbkrExecutionError("CALENDAR_PROJECTION_RECOVERY_NOT_AUTHORIZED")
     expected = calendar_dates(around, count)
     rows = parse_native_schedule(schedule)

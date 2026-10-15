@@ -256,6 +256,7 @@ def test_freshness_expiry_and_management_continuity() -> None:
     value = broker(FakeIb([]))
     asyncio.run(value.sessions(around=NOW, count=120))
     value.schedule_evidence["today_open"] = "True"
+    value.schedule_evidence["entry_horizon_exit"] = "2026-09-25"  # isolate receipt age/approval
     assert value.calendar_gate(NOW + timedelta(seconds=60), for_entry=True) is None
     assert (
         value.calendar_gate(NOW + timedelta(seconds=61), for_entry=True)
@@ -408,7 +409,7 @@ def test_year_end_hours_preserve_bounded_management_only() -> None:
     dates = asyncio.run(value.sessions(around=now, count=120))
     assert dates[-1] == date(2026, 12, 31)
     assert value.calendar_gate(now) is None
-    assert value.calendar_gate(now, for_entry=True) == "calendar_fallback_entry_approval_expired"
+    assert value.calendar_gate(now, for_entry=True) == "calendar_entry_horizon_incomplete"
     assert value.schedule_evidence["unvalidated_future_dates"] == "2027-01-01,2027-01-02"
     assert value.schedule_evidence["hours_last_date"] == "2026-12-31"
     bad = broker(FakeIb([], hours.replace("20261231:1600", "20261231:1300")))
@@ -746,7 +747,7 @@ def test_december_projection_caps_known_year_without_inventing_2027_holidays() -
     assert days[-1] == date(2026, 12, 31)
     assert date(2026, 12, 25) not in days
     assert value.schedule_evidence["native_rejected_future_dates"] == "2026-12-24,2026-12-25"
-    assert value.calendar_gate(around, for_entry=True) == "calendar_fallback_entry_approval_expired"
+    assert value.calendar_gate(around, for_entry=True) is None
 
 
 @pytest.mark.parametrize("mode", [

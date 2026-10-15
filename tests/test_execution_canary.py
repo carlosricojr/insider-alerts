@@ -304,6 +304,10 @@ class FakeBroker:
     async def sessions(self, *, around: datetime, count: int = 90) -> list[date]:
         return self.session_values
 
+    def session_bounds(self, now: datetime) -> tuple[datetime, datetime] | None:
+        from insider_alerts.execution.calendar import NEW_YORK, bounds
+        return bounds(now.astimezone(NEW_YORK).date())
+
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]:
         return [
             DailyBar(symbol, bar.trade_date, bar.open, bar.high, bar.low, bar.close, bar.volume)
@@ -340,6 +344,7 @@ class FakeBroker:
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime],
     ) -> int:
         self.timed_exits.append((symbol, quantity, oca_group))
         return 203
@@ -351,6 +356,7 @@ class FakeBroker:
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime] | None = None,
     ) -> int:
         self.market_exits.append((symbol, quantity, oca_group))
         return 204
