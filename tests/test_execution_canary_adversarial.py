@@ -71,6 +71,10 @@ class HostileBroker:
     async def sessions(self, *, around: datetime, count: int = 90) -> list[date]:
         return self.session_values
 
+    def session_bounds(self, now: datetime) -> tuple[datetime, datetime] | None:
+        from insider_alerts.execution.calendar import NEW_YORK, bounds
+        return bounds(now.astimezone(NEW_YORK).date())
+
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]:
         error = self.daily_bar_errors.get(symbol)
         if error is not None:
@@ -115,6 +119,7 @@ class HostileBroker:
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime],
     ) -> int:
         self.moc_calls += 1
         order_id = 202 + self.moc_calls
@@ -142,6 +147,7 @@ class HostileBroker:
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime] | None = None,
     ) -> int:
         self.market_exits.append((symbol, quantity, oca_group))
         return 204
@@ -278,6 +284,18 @@ def test_crash_after_entry_acceptance_does_not_duplicate_order(
     row = runner.store.rows()[0]
     assert row["live_state"] == "submitted"
     assert row["parent_order_id"] == 101
+    planned_exit = row["live_exit_session"]
+    assert planned_exit == str(broker.session_values[9])
+    token = broker_token("crash-test-packet")
+    broker.snapshot = AccountSnapshot("ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 20}, 0)
+    broker.order_values = [
+        BrokerOrder(101, f"IA-E07-{token}-ENTRY", "TEST", "entry", "Filled", 20, 0, 10)
+    ]
+    broker.session_values = broker.session_values[1:]  # recovery must not move the stored date
+    asyncio.run(runner.cycle(now + timedelta(minutes=12)))
+    assert broker.protected
+    assert runner.store.rows()[0]["live_state"] == "open"
+    assert runner.store.rows()[0]["live_exit_session"] == planned_exit
 
 
 def test_restart_recovers_broker_position_when_fill_trade_is_missing(

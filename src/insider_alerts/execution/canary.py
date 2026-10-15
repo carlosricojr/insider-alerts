@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
+from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT
 from insider_alerts.execution.errors import ContractQualificationError
 from insider_alerts.strategy.e07 import (
     deterministic_rank,
@@ -61,6 +62,11 @@ class CanaryConfig:
     def __post_init__(self) -> None:
         if self.invalid_commission_handling not in {"fallback_to_cap", "reject"}:
             raise ValueError("invalid_commission_handling must be 'fallback_to_cap' or 'reject'")
+        if not (
+            time(12, 30) <= self.timed_exit_submission_time
+            < self.moc_submission_deadline < time(16)
+        ):
+            raise ValueError("timed exit references must be ordered within the regular session")
 
     @property
     def live_armed(self) -> bool:
@@ -123,6 +129,8 @@ class CanaryBroker(Protocol):
 
     async def sessions(self, *, around: datetime, count: int = 90) -> list[date]: ...
 
+    def session_bounds(self, now: datetime) -> tuple[datetime, datetime] | None: ...
+
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]: ...
 
     async def account_snapshot(self) -> AccountSnapshot: ...
@@ -149,6 +157,7 @@ class CanaryBroker(Protocol):
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime],
     ) -> int: ...
 
     async def submit_market_exit(
@@ -158,6 +167,7 @@ class CanaryBroker(Protocol):
         *,
         oca_group: str,
         order_ref: str,
+        dispatch_window: tuple[datetime, datetime] | None = None,
     ) -> int: ...
 
     async def cancel_order(self, order_id: int) -> None: ...
@@ -743,14 +753,19 @@ class CanaryRunner:
         live_opened, live_closed = await self._reconcile_orders(
             broker_orders, sessions, account, now
         )
-        timed_exits = await self._submit_due_time_exits(now)
+        timed_exits = await self._submit_due_time_exits(now, enforce_wall_clock=enforce_wall_clock)
         submitted = 0
         if gate == "account_ready" and callable(calendar_gate):
             gate = calendar_gate(now, for_entry=True) or gate
+        if gate == "account_ready" and self.store.rows(
+            "live_state IN ('open','closing') AND live_exit_session IS NULL"
+        ):
+            gate = "live_exit_horizon_missing"
         if gate == "account_ready":
             submitted = await self._submit_due_entries(
                 account,
                 now,
+                sessions=sessions,
                 enforce_wall_clock=enforce_wall_clock,
             )
         else:
@@ -862,6 +877,7 @@ class CanaryRunner:
         account: AccountSnapshot,
         now: datetime,
         *,
+        sessions: Sequence[date],
         enforce_wall_clock: bool,
     ) -> int:
         local = now.astimezone(NEW_YORK)
@@ -880,6 +896,12 @@ class CanaryRunner:
             < self.config.entry_submission_deadline
         ):
             return 0
+        horizon = [day for day in sessions if local.date() <= day <= ENTRY_HORIZON_LIMIT]
+        if local.date() not in horizon or len(horizon) < self.config.max_sessions:
+            self.store.event("live_gate_blocked", level="warning",
+                             reason="calendar_entry_horizon_incomplete")
+            return 0
+        planned_exit = horizon[self.config.max_sessions - 1]
         today = local.date().isoformat()
         active = self.store.rows("live_state IN ('submitted','open','closing')")
         capacity = max(0, self.config.max_live_slots - len(active))
@@ -990,9 +1012,11 @@ class CanaryRunner:
             token = broker_token(str(row["packet_id"]))
             order_ref = f"IA-E07-{token}-ENTRY"
             if enforce_wall_clock:
-                send_time = datetime.now(NEW_YORK).time()
+                send_now = datetime.now(NEW_YORK)
+                send_time = send_now.time()
                 if not (
-                    self.config.entry_submission_start
+                    send_now.date() == local.date()
+                    and self.config.entry_submission_start
                     <= send_time
                     < self.config.entry_submission_deadline
                 ):
@@ -1008,6 +1032,9 @@ class CanaryRunner:
                             observed_time=send_time.isoformat(),
                         )
                     break
+            # Persist before broker submission so crash adoption retains the
+            # validated tenth session. Protection must never silently move it.
+            self.store.update(str(row["packet_id"]), live_exit_session=planned_exit.isoformat())
             order_id = await self.broker.submit_market_on_open(
                 str(row["symbol"]), quantity, order_ref
             )
@@ -1029,6 +1056,7 @@ class CanaryRunner:
                 ),
                 min_commission=preview.min_commission,
                 max_commission=preview.max_commission,
+                planned_exit_session=planned_exit.isoformat(),
             )
             settled_available -= required_cash
             submitted += 1
@@ -1320,11 +1348,19 @@ class CanaryRunner:
         )
         entry_day = date.fromisoformat(str(row["entry_session"]))
         future = [session for session in sessions if session >= entry_day]
-        exit_session = (
+        computed_exit = (
             future[self.config.max_sessions - 1]
             if len(future) >= self.config.max_sessions
             else None
         )
+        stored_exit = row["live_exit_session"]
+        exit_session = date.fromisoformat(str(stored_exit)) if stored_exit else computed_exit
+        if stored_exit and computed_exit != exit_session:
+            self.store.event("live_exit_horizon_disagreement", packet_id=str(row["packet_id"]),
+                             level="critical", stored=str(stored_exit), computed=str(computed_exit))
+        if exit_session is None:
+            self.store.event("live_exit_horizon_missing", packet_id=str(row["packet_id"]),
+                             level="critical")
         self.store.update(
             str(row["packet_id"]),
             live_state="open",
@@ -1348,18 +1384,44 @@ class CanaryRunner:
             recovery=recovery,
         )
 
-    async def _submit_due_time_exits(self, now: datetime) -> int:
+    async def _submit_due_time_exits(
+        self, now: datetime, *, enforce_wall_clock: bool = False,
+    ) -> int:
         local = now.astimezone(NEW_YORK)
         count = 0
         for row in self.store.rows(
             "live_state='open' AND live_exit_session<=? AND timed_exit_order_id IS NULL",
             (local.date().isoformat(),),
         ):
+            send_now = datetime.now(UTC) if enforce_wall_clock else now
+            local = send_now.astimezone(NEW_YORK)
             due_date = date.fromisoformat(str(row["live_exit_session"]))
             is_overdue = due_date < local.date()
-            after_moc_cutoff = local.time() >= self.config.moc_submission_deadline
-            if not is_overdue and local.time() < self.config.timed_exit_submission_time:
-                continue
+            dispatch_window = None
+            after_moc_cutoff = False
+            if not is_overdue:
+                session = self.broker.session_bounds(send_now)
+                if session is None:
+                    self.store.event("timed_exit_calendar_unavailable", level="critical",
+                                     packet_id=str(row["packet_id"]))
+                    continue
+                opens, closes = session
+                if not opens <= send_now < closes:
+                    continue
+                # Config times are regular-day references. Their leads remain
+                # unchanged on early closes; existing overdue recovery is separate.
+                regular_close = datetime.combine(local.date(), time(16), NEW_YORK)
+                submit_at = closes - (regular_close - datetime.combine(
+                    local.date(), self.config.timed_exit_submission_time, NEW_YORK,
+                ))
+                cutoff = closes - (regular_close - datetime.combine(
+                    local.date(), self.config.moc_submission_deadline, NEW_YORK,
+                ))
+                if send_now < submit_at:
+                    continue
+                after_moc_cutoff = send_now >= cutoff
+                dispatch_window = (cutoff if after_moc_cutoff else submit_at,
+                                   closes if after_moc_cutoff else cutoff)
             token = broker_token(str(row["packet_id"]))
             if is_overdue or after_moc_cutoff:
                 order_id = await self.broker.submit_market_exit(
@@ -1367,14 +1429,17 @@ class CanaryRunner:
                     int(row["live_quantity"]),
                     oca_group=str(row["oca_group"]),
                     order_ref=f"IA-E07-{token}-OVERDUE",
+                    dispatch_window=dispatch_window,
                 )
                 event_type = "overdue_market_exit_submitted"
             else:
+                assert dispatch_window is not None
                 order_id = await self.broker.submit_market_on_close(
                     str(row["symbol"]),
                     int(row["live_quantity"]),
                     oca_group=str(row["oca_group"]),
                     order_ref=f"IA-E07-{token}-TIME",
+                    dispatch_window=dispatch_window,
                 )
                 event_type = "timed_exit_submitted"
             self.store.update(
