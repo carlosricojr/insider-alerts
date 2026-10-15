@@ -762,6 +762,11 @@ class CanaryRunner:
         ):
             gate = "live_exit_horizon_missing"
         if gate == "account_ready":
+            today = now.astimezone(NEW_YORK).date()
+            horizon = [day for day in sessions if today <= day <= ENTRY_HORIZON_LIMIT]
+            if today not in horizon or len(horizon) < self.config.max_sessions:
+                gate = "calendar_entry_horizon_incomplete"
+        if gate == "account_ready":
             submitted = await self._submit_due_entries(
                 account,
                 now,
@@ -1402,10 +1407,25 @@ class CanaryRunner:
             if not is_overdue:
                 session = self.broker.session_bounds(send_now)
                 if session is None:
-                    self.store.event("timed_exit_calendar_unavailable", level="critical",
+                    self.store.event("timed_exit_calendar_unavailable", level="warning",
                                      packet_id=str(row["packet_id"]))
                     continue
                 opens, closes = session
+                if send_now >= closes:
+                    # One durable warning per position, including after restart;
+                    # the unchanged overdue recovery takes over on the next date.
+                    with self.store.connect() as connection:
+                        recorded = connection.execute(
+                            "SELECT 1 FROM events WHERE packet_id=? "
+                            "AND event_type='timed_exit_window_missed' LIMIT 1",
+                            (str(row["packet_id"]),),
+                        ).fetchone()
+                    if recorded is None:
+                        self.store.event(
+                            "timed_exit_window_missed", level="warning",
+                            packet_id=str(row["packet_id"]), close=closes.isoformat(),
+                            observed_at=send_now.isoformat(),
+                        )
                 if not opens <= send_now < closes:
                     continue
                 # Config times are regular-day references. Their leads remain

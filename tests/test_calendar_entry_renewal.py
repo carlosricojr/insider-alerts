@@ -346,7 +346,7 @@ def test_missing_same_session_bounds_records_reason_without_exit(
     with runner.store.connect() as connection:
         assert connection.execute(
             "select level from events where event_type='timed_exit_calendar_unavailable'"
-        ).fetchone()[0] == "critical"
+        ).fetchone()[0] == "warning"
 
 
 def test_entry_send_cannot_cross_new_york_date(
@@ -372,6 +372,46 @@ def test_entry_send_cannot_cross_new_york_date(
         assert connection.execute(
             "select count(*) from events where event_type='entry_send_boundary_missed'"
         ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("kind", ["fallback", "projection"])
+@pytest.mark.parametrize("day", [14, 15])
+def test_adapter_renewal_boundary_preserves_unapproved_gap(kind: str, day: int) -> None:
+    now = datetime(2026, 10, day, 13, 18, tzinfo=UTC)
+    adapter = adapter_at(now, kind)
+    assert adapter.calendar_gate(now, for_entry=True) == (
+        "calendar_fallback_entry_approval_expired" if day == 14 else None
+    )
+    assert adapter.session_bounds(now) == bounds(now.date())
+
+
+def test_runner_horizon_block_is_visible_in_cycle_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 10, 15, 13, 18, tzinfo=UTC)
+    runner, fake = _runner(tmp_path, monkeypatch, now)
+    result = asyncio.run(runner._run_live(
+        CycleResult(), [now.date()], now, enforce_wall_clock=False,
+    ))
+    assert result.live_gate == "calendar_entry_horizon_incomplete;time_exits=0"
+    assert fake.entry_calls == 0
+
+
+def test_missed_close_is_reported_once_even_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from insider_alerts.execution.canary import CanaryRunner
+    now = datetime(2026, 11, 27, 13, 0, tzinfo=NEW_YORK)
+    runner, fake = due_position(tmp_path, monkeypatch, now)
+    assert asyncio.run(runner._submit_due_time_exits(now)) == 0
+    restarted = CanaryRunner(runner.config, fake)
+    assert asyncio.run(restarted._submit_due_time_exits(now + timedelta(seconds=15))) == 0
+    with runner.store.connect() as connection:
+        assert connection.execute(
+            "select count(*) from events where event_type='timed_exit_window_missed'"
+        ).fetchone()[0] == 1
+    assert fake.moc_calls == 0
+    assert fake.market_exits == []
 
 
 @pytest.mark.parametrize("kind", ["moc", "market"])

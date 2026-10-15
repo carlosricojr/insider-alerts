@@ -71,7 +71,9 @@ Recovery authority is independently fixed at October 1-December 31; renewing or 
 entry permission cannot disable management recovery.
 
 Both native and fallback entries require the entire ten-session holding period inside
-cross-validated 2026 coverage. December 17 is the last possible 2026 entry (session ten:
+the published 2026 calendar. Native rows are compared against that table; fallback
+contract hours independently corroborate today and the next open session, not the
+entire future holding period. December 17 is the last possible 2026 entry (session ten:
 December 31); December 18 and later fail `calendar_entry_horizon_incomplete`, even if
 native IBKR supplies plausible but independently unverified 2027 rows. A separate calendar
 review is required before extending coverage. Review by December 10; no new task is created.
@@ -112,6 +114,10 @@ before open or at/after close. Each row uses the actual dispatch clock and the a
 windowed orders again after contract lookup. A boundary crossed during lookup fails the cycle
 closed with `CALENDAR_EXIT_DISPATCH_WINDOW_MISSED`: remaining rows/entries are deferred,
 `last_cycle_error` is recorded, and the next cycle retries. No manual trade is added.
+If the same-session exit remains unsent after close, one durable warning per position
+records the missed window; the unchanged overdue path takes over on the next date.
+Missing same-day bounds record a warning (including a cycle that crosses midnight),
+not a false critical calendar outage. Acquisition errors still fail the cycle closed.
 OCA groups, stop-first protection, order references, quantities, emergency quantity-repair exits,
 and already stored exit dates remain unchanged. Network latency or halts can still prevent a fill.
 

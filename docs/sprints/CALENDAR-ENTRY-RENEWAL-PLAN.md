@@ -41,11 +41,16 @@ Deploy only clean synced main from reviewed merged origin/main after resolving t
 hidden scheduled task. Verify source fingerprint, fresh cycles, no cycle error,
 entry gate, broker reconciliation/protection and task/process invisibility. Never
 invoke live order methods in preflight. Rollback via reviewed revert, no ledger
-rewrite. Status: implementation and full local gate passed; independent reviews
-completed and refinements under final verification. Read-only IBKR preflight at
+rewrite. Status: implementation complete; merge/deployment require exact-head gates
+and review evidence, with final handoff recorded in the PR. Full local gates passed
+before the final review refinements and must pass again on the release head.
+Read-only IBKR preflight at
 2026-10-15T19:21:28Z cleared the candidate entry gate, validated 52 past sessions,
 and retained FUL's quantity-matched stop/target. No order methods were called.
 Review refinements: retain overdue behavior rather than expand authorization;
 validate custom references for shortest sessions; assert exact dispatch windows,
 NY-date rollover, crash/adoption and missing-horizon reasons. Window misses remain
 explicit cycle errors, not silent successes. Final deployment evidence belongs in PR.
+Final review refinements add one durable missed-close warning, downgrade expected
+midnight missing-bounds warnings, expose runner horizon rejection in cycle status,
+and distinguish published future coverage from near-term broker corroboration.
