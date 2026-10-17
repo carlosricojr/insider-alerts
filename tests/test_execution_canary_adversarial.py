@@ -20,7 +20,7 @@ from insider_alerts.execution.canary import (
     CommissionPreview,
     broker_token,
 )
-from insider_alerts.execution.errors import ContractQualificationError
+from insider_alerts.execution.errors import ContractQualificationError, IbkrExecutionError
 
 
 def _signal(now: datetime) -> DeliveredSignal:
@@ -567,6 +567,38 @@ def test_crash_after_moc_acceptance_adopts_exit_without_duplicate(
     row = runner.store.rows()[0]
     assert row["live_state"] == "closing"
     assert row["timed_exit_order_id"] == 203
+
+
+def test_moc_rejection_leaves_exit_retryable_and_preserves_cutoff_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    asyncio.run(runner.cycle(now))
+    runner.store.update(
+        "crash-test-packet",
+        live_state="open",
+        live_quantity=20,
+        live_exit_session=now.date().isoformat(),
+        oca_group=f"IA-E07-{broker_token('crash-test-packet')}-EXIT",
+    )
+
+    async def reject(*args: object, **kwargs: object) -> int:
+        raise IbkrExecutionError(
+            "IBKR rejected market-on-close for TEST: order_id=42 status=Cancelled; "
+            "code=201 message=broker reason"
+        )
+
+    monkeypatch.setattr(broker, "submit_market_on_close", reject)
+    with pytest.raises(IbkrExecutionError, match="code=201"):
+        asyncio.run(runner._submit_due_time_exits(datetime(2026, 1, 5, 20, 31, tzinfo=UTC)))
+    row = runner.store.rows()[0]
+    assert row["live_state"] == "open"
+    assert row["timed_exit_order_id"] is None
+    assert broker.market_exits == []
+    assert asyncio.run(runner._submit_due_time_exits(datetime(2026, 1, 5, 20, 45, tzinfo=UTC))) == 1
+    assert broker.market_exits == [("TEST", 20, f"IA-E07-{broker_token('crash-test-packet')}-EXIT")]
+    assert runner.store.rows()[0]["live_state"] == "closing"
 
 
 def test_missing_protective_orders_are_recreated_while_position_exists(
