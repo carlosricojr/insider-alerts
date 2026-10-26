@@ -118,6 +118,7 @@ class CommissioningSource:
         ib = self.factory() if self.factory else IB()
         req_id: int | None = None
         future: Any = None
+        dispatched = False
 
         def on_notice(request_id: int, code: int, message: str, *extra: Any) -> None:
             if len(result["notices"]) < 100:
@@ -218,7 +219,10 @@ class CommissioningSource:
                 raise TimeoutError("acquisition window ended")
             req_id = ib.client.getReqId()
             future = ib.wrapper.startReq(req_id, contract)
+            if self.budget() <= 0:
+                raise TimeoutError("acquisition window ended before dispatch")
             result["client_dispatch_at"] = timestamp(self.clock())
+            dispatched = True
             ib.client.reqHistoricalData(
                 req_id,
                 contract,
@@ -277,7 +281,11 @@ class CommissioningSource:
             cleanup_errors = []
             try:
                 if req_id is not None:
-                    if future is not None and (future.cancelled() or not future.done()):
+                    if (
+                        dispatched
+                        and future is not None
+                        and (future.cancelled() or not future.done())
+                    ):
                         ib.client.cancelHistoricalData(req_id)
                     # Clear locally cancelled requests even if the server never
                     # sends a terminal callback. This connection is never shared.

@@ -154,7 +154,7 @@ def manifest(
         "stage_rule": (
             "R1_history_R2_full_horizon_R3_after_later_exchange_close_first_complete_receipts"
         ),
-        "benchmark_rule": "SPY_R1_R2_W19_R3_later_close_and_completed_schedule_each_W1_through_W20",
+        "benchmark_rule": "SPY_R1_checkpoint_W10_R2_W19_R3_later_close_schedule_W1_through_W20",
         "source_client_id": 179,
         "commissioning_excluded_from_confirmatory_samples": True,
         "strategy_trial_ready": False,
@@ -195,7 +195,7 @@ def admit(
         "reason": None,
         "symbol_valid": valid_symbol(row.get("symbol")),
         "first_observed_at": timestamp(first_observed_at),
-        "contemporaneous_custody": False,
+        "observed_before_decision": False,
         "historical_issuer_identity_verified": False,
     }
     try:
@@ -222,7 +222,7 @@ def admit(
             entry_session=str(entry),
             recorded_entry_agrees=row.get("entry_session") == str(entry),
             decision_cutoff=timestamp(cutoff),
-            contemporaneous_custody=first_observed_at < cutoff,
+            observed_before_decision=first_observed_at < cutoff,
         )
         result.update(
             history_dates=[str(day) for day in history_dates(version, signal)],

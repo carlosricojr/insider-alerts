@@ -142,7 +142,7 @@ def test_invalid_symbol_and_late_observation_stay_in_original_denominator():
     assert result["reason"] == "invalid_symbol"
     assert result["entry_session"] == "2026-10-27"
     assert not result["recorded_entry_agrees"]
-    assert not result["contemporaneous_custody"]
+    assert not result["observed_before_decision"]
     assert len(result["history_dates"]) == 20 and len(result["horizon_dates"]) == 10
     assert result["stability_session"] == "2026-11-10"
 
@@ -188,5 +188,6 @@ def test_cutoff_is_0920_not_auction_open():
     for minute, timely in ((19, True), (20, False), (29, False)):
         at = datetime.combine(date(2026, 10, 27), time(9, minute), cal.NY)
         assert (
-            admit(row, frozen(), VERSION, first_observed_at=at)["contemporaneous_custody"] == timely
+            admit(row, frozen(), VERSION, first_observed_at=at)["observed_before_decision"]
+            == timely
         )

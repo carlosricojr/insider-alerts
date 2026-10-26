@@ -163,8 +163,9 @@ per-date receipt validation and deterministic planner are implemented locally.
 Focused tests cover source failures, original-contract history, immutable custody,
 concurrency/corruption, cutoff/DST/holiday/leap dates, source revisions, request
 pacing, retry recovery, range merging and fixed first-receipt stability comparisons.
-No worker, activation, PR or deployment exists yet. Full gates and independent
-adversarial review are still required for the complete worker/installer diff.
+The hidden worker, installer and descriptive status command are implemented locally.
+No activation, PR or deployment exists yet. Full gates and independent adversarial
+review are still required for the complete worker/installer diff.
 
 Primary source semantics:
 https://www.interactivebrokers.com/docs/tws-api/doc/md/historical-bars
@@ -191,7 +192,7 @@ corrected feature or silently move the denominator. Report acquisition, custody,
 canary agreement and admission as separate descriptive counts, not one overloaded
 completeness flag. Unassignable rows and invalid symbols remain explicit.
 
-Worker design still to implement/review: explicit activation creates the isolated
+Implemented worker design: explicit activation creates the isolated
 calendar and commissioning journals; default execution cannot initialize them.
 Bind the reviewed implementation files (including pure shared dependencies), source
 ledger path/file identity and archived hours bytes at activation. Compare the
@@ -225,34 +226,33 @@ and required the following corrections:
   not contaminate the fresh window's unassignable count. Source path/device/inode
   are bound and replacement is rejected. Custody polls include runtime context.
   One mixed completeness flag was removed in favor of separate descriptive axes.
-- B3 remains worker work: load the originally bound calendar by digest, never by
+- B3 implemented: load the originally bound calendar by digest, never by
   latest position. Compare the latest known descendant separately over the full
   history/enrollment/horizon span, flag affected cases, never rebind or stop custody
   merely because a later notice exists.
-- B5 remains worker work: verify implementation digest over all commissioning
+- B5 implemented: verify implementation digest over all commissioning
   modules, imported shared helpers, calendar, frozen control definitions and lock
   file/runtime dependency versions. An actual implementation change ends this run;
   recovery needs a new future activation, never a silent continuation. Activation
   requires clean local main equal to freshly fetched origin/main.
-- B6 remains worker work: the first network-locked post-deadline invocation writes
+- B6 implemented: the first network-locked post-deadline invocation writes
   an idempotent seal with actual seal time, report digest and prior watermark.
   Interim reports never masquerade as final. Late responses remain outside the
   fixed deadline even when the PC was off at sealing time.
 
-Finish status dimensions: five-minute-resolution custody continuity, SDK/server
+Implemented status dimensions: five-minute-resolution custody continuity, SDK/server
 and farm notices, attempts by overnight window, reasons for missing dates, pin
-source receipt/symbol drift, and calendar contradictions. Add the proposed frozen
+source receipt/symbol drift, and calendar contradictions. Added the frozen
 SPY W10 checkpoint (one extra request) and actual per-date observation lags; do not
 assume differing bar observation times have harmless corporate-action semantics.
-Runtime tests must cover simultaneous custody/network callers, crash/restart,
+Runtime tests cover simultaneous custody/network callers, hard process exit/restart,
 overnight outage recovery, client 326, source/code replacement, latest-calendar
 notices, typed clock-regression status, and late/idempotent sealing. No new design
 permission is needed: the remaining worker design has been challenged read-only.
 
-Before release, clarify the timestamp labels: the current admission flag named
-`contemporaneous_custody` compares source observation with 09:20, not SQLite commit.
-Rename it to `observed_before_decision`, expose journal construction separately,
-and retain the requirement that a future trial bind its own pre-cutoff read. A
+Timestamp labels corrected: `observed_before_decision` compares source observation
+with 09:20, not SQLite commit. Journal construction is exposed separately, and a
+future trial must bind its own pre-cutoff read. A
 source observation before cutoff does not prove durability before cutoff.
 
 Intermediate core verification: `uv run ruff check .`, `uv run mypy src` (77 source
@@ -281,7 +281,16 @@ Final status replays that fixed prefix/as-of and verifies the digest, then adds
 seal metadata. Do not recalculate a different terminal report at each later status
 time. An identical sealing retry is read-only/idempotent; no writes follow a seal.
 
-Next: implement worker/installer and the listed integration/fault tests, then full
-gates, independent adversarial review and canonical PR. This is one complete
+The end-to-end synthetic W1-through-W20 run acquired both first and last enrollment
+cases, all benchmark stages and completed schedules, then sealed a reproducible
+report. Hard process termination releases the network lock without losing its
+durable attempt; client-326 failures remain retryable past six failures. Windows
+installer tests exercise the real script with OS effects mocked, checking hidden
+pythonw, parallel one-minute triggers, two-minute termination, source verification,
+and refusal of foreign tasks/noncanonical checkouts. Windows CI includes these
+new boundaries. No real scheduled task was created by tests.
+
+Next: finish full gates, independent adversarial review and canonical PR, then
+deploy and activate a genuinely future window. This is one complete
 commissioning release; do not ship another unused prerequisite-only release.
 Nothing in this worktree is deployed or activated; the goal remains unachieved.

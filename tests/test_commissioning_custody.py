@@ -61,7 +61,7 @@ def test_snapshot_readonly_projection_and_context_is_not_row_producer(setup):
     row = journal.records()[1]["payload"]
     assert row["producer_attribution"] == "unknown"
     assert row["first_observed_at"] == "2026-10-27T13:00:00.000000Z"
-    assert row["admission"]["contemporaneous_custody"]
+    assert row["admission"]["observed_before_decision"]
 
 
 def test_revisions_do_not_backdate_corrected_features_or_rewindow_membership(setup):

@@ -139,6 +139,12 @@ class Evidence:
             None,
         )
         selected = complete or latest
+        lags = {}
+        if selected and selected["response_at"]:
+            for day in job.dates:
+                close = self.version.day(date.fromisoformat(day)).closes_at
+                if close and covers(selected, [day], schedule=job.schedule):
+                    lags[day] = (parse(selected["response_at"]) - close).total_seconds()
         return {
             "ready_at": timestamp(job.ready),
             "attempts": len(self.attempts_for(job)),
@@ -150,6 +156,7 @@ class Evidence:
                 for day in job.dates
             },
             "diagnostic_receipt_sha256": selected["receipt_sha256"] if selected else None,
+            "receipt_lag_after_session_close_seconds": lags,
         }
 
     def stages(
@@ -199,10 +206,12 @@ class Evidence:
 
     def jobs_and_report(self) -> tuple[list[Job], dict[str, Any]]:
         cases: dict[str, dict[str, Any]] = {}
+        constructed_at: dict[str, str] = {}
         revision_counts: dict[str, int] = {}
         for record in self.records:
             if record["kind"] == "custody":
                 cases.setdefault(record["entity"], record["payload"])
+                constructed_at.setdefault(record["entity"], record["recorded_at"])
                 revision_counts[record["entity"]] = revision_counts.get(record["entity"], 0) + 1
         jobs: list[Job] = []
         summaries = []
@@ -238,7 +247,13 @@ class Evidence:
                     "case_id": entity,
                     "symbol": payload["row"]["symbol"],
                     "admission_reason": admission["reason"],
-                    "timely_custody": admission["contemporaneous_custody"],
+                    "source_observed_before_decision": admission["observed_before_decision"],
+                    "first_journal_record_constructed_at": constructed_at[entity],
+                    "journal_record_constructed_before_decision": bool(
+                        admission.get("decision_cutoff")
+                        and parse(constructed_at[entity]) < parse(admission["decision_cutoff"])
+                    ),
+                    "precutoff_durable_read_verified": False,
                     "recorded_entry_agrees": admission.get("recorded_entry_agrees", False),
                     "source_fields_revised": revision_counts[entity] > 1,
                     "source_validation_errors": payload["source_validation_errors"],
@@ -268,6 +283,17 @@ class Evidence:
             ),
         )
         jobs.extend(benchmark_jobs)
+        checkpoint = Job(
+            "benchmark:SPY",
+            "CHECKPOINT:W10",
+            "SPY",
+            tuple(history + horizon[:10]),
+            parse(self.frozen["sessions"][9]["close"]),
+            self.deadline,
+            self.pin("benchmark:SPY"),
+        )
+        jobs.append(checkpoint)
+        benchmark["W10_checkpoint"] = self.details(checkpoint)
         schedules = []
         for item in self.frozen["sessions"]:
             through = item["date"]
@@ -335,8 +361,16 @@ class Evidence:
             )
         }
         report["custody_counts"] = {
-            "timely": sum(case["timely_custody"] for case in summaries),
-            "late": sum(not case["timely_custody"] for case in summaries),
+            "source_observed_before_decision": sum(
+                case["source_observed_before_decision"] for case in summaries
+            ),
+            "source_observed_after_decision": sum(
+                not case["source_observed_before_decision"] for case in summaries
+            ),
+            "journal_constructed_before_decision": sum(
+                case["journal_record_constructed_before_decision"] for case in summaries
+            ),
+            "precutoff_durable_read_verified": 0,
         }
         report["canary_agreement_counts"] = {
             "entry_agrees": sum(case["recorded_entry_agrees"] for case in summaries),

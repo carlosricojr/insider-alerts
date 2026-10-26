@@ -31,7 +31,7 @@ async def exercise(
     symbol: str = "SPY",
     schedule: bool = False,
     pending: bool = False,
-    budget: float = 1,
+    budget: Any = 1,
     connect_error: Exception | None = None,
     clock: Any = lambda: NOW,
     disconnect_error: bool = False,
@@ -82,7 +82,9 @@ async def exercise(
 
     monkeypatch.setattr(ib.client, "reqHistoricalData", dispatch)
     monkeypatch.setattr(ib, "disconnect", disconnect)
-    source = CommissioningSource(clock=clock, budget=lambda: budget, factory=lambda: ib)
+    source = CommissioningSource(
+        clock=clock, budget=budget if callable(budget) else lambda: budget, factory=lambda: ib
+    )
     result = await source.acquire(
         symbol, start=date(2026, 9, 15), end=END, expected_conid=conid, schedule=schedule
     )
@@ -101,6 +103,14 @@ def test_history_identity_clocks_and_no_account_sync(monkeypatch: pytest.MonkeyP
     args = state["dispatch"][0]
     assert args[4:] == ("1 day", "TRADES", True, 2, False, [])
     assert not state["cancel"] and state["disconnected"] == 1
+    assert not ib.wrapper._futures and not ib.wrapper._results
+
+
+def test_budget_expiring_immediately_before_dispatch_sends_no_request_or_cancel(monkeypatch):
+    remaining = iter([1, 1, 1, 0])
+    result, state, ib = asyncio.run(exercise(monkeypatch, budget=lambda: next(remaining)))
+    assert result["result"] == "timeout" and result["client_dispatch_at"] is None
+    assert not state["dispatch"] and not state["cancel"]
     assert not ib.wrapper._futures and not ib.wrapper._results
 
 

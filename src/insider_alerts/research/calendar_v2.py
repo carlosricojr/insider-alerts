@@ -1,7 +1,7 @@
-"""Isolated, versioned NYSE baseline for a future trial; never enrollment authority.
+"""Versioned NYSE baseline for acquisition commissioning; never trial-readiness proof.
 
-No existing research or execution consumer imports this module. Annual facts do
-not prove operational freshness or the absence of extraordinary closures.
+Live and frozen V1 consumers do not import this module. Annual facts do not prove
+operational freshness or the absence of extraordinary closures.
 """
 
 from __future__ import annotations
