@@ -194,10 +194,11 @@ completeness flag. Unassignable rows and invalid symbols remain explicit.
 
 Implemented worker design: explicit activation creates the isolated
 calendar and commissioning journals; default execution cannot initialize them.
-Bind the reviewed implementation files (including pure shared dependencies), source
-ledger path/file identity and archived hours bytes at activation. Compare the
-implementation digest on every run, allowing unrelated reviewed main commits but
-stopping both custody and acquisition if its actual code changes. A separate one-minute custody lock
+Bind the whole Python package, project/lock files, source archives and runtime
+versions, plus source ledger path/file identity at activation. Compare the
+implementation digest on every run; any change to bound material stops custody
+and acquisition. Only changes outside that set, such as other documentation, can
+leave the run active. A separate one-minute custody lock
 and network lock are released by the OS on process death. Both are nonblocking;
 custody commits before network work, with no live ledger connection held. A durable
 attempt precedes broker I/O. Network time is capped at 50 seconds and the earlier
@@ -300,5 +301,8 @@ Independent read-only reviews of `212a23a` (Claude sessions
 outside-window observations, prioritize reachable deadlines over expired backlog,
 bind the sealed calendar prefix against later/backdated notices, hash the whole
 Python package, and make both CI jobs install and execute the frozen uv environment.
-Regression tests cover each behavioral correction. Full local gates had passed
-before these findings; rerun them and review the corrected exact head before PR.
+Regression tests cover each behavioral correction. Full Ruff, strict MyPy (79
+files) and Pytest passed at `8fbfc4c`. Both reviewers inspected all 25 changed
+files and confirmed all five corrections. Their remaining stale comment and
+contradictory implementation-binding prose are corrected without behavior changes.
+Canonical PR review, CI, deployment and future activation remain next.

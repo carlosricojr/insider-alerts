@@ -429,7 +429,8 @@ class Evidence:
             for attempt in attempts[-4:]
         )
         # Reserve at most one in five attempts for the benchmark while candidate
-        # work is eligible. Fresh jobs precede retries; then earliest deadline.
+        # work is eligible. Unexpired deadlines precede expired ones, then fresh
+        # jobs precede retries; then earliest deadline.
         eligible.sort(
             key=lambda pair: (
                 (pair[0].owner.startswith("benchmark:") == recent_benchmark),
