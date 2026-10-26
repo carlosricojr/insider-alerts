@@ -1,0 +1,13 @@
+{
+  "source_url": "https://www.nyse.com/markets/hours-calendars",
+  "retrieved_file_completed_at_utc": "2026-10-26T20:23:48.162482Z",
+  "observation_clock_source": "local file completion timestamp from this curl retrieval",
+  "published_at_utc": null,
+  "published_at_missing_reason": "page does not supply an authoritative publication timestamp",
+  "artifact": "nyse-hours-2026-10-26.html",
+  "sha256": "3960e64cd7c9581c2e7a6d3f602342344eba1fac7b7476d51ddabb32b343fe11",
+  "bytes": 134492,
+  "scope": "published core equity session hours; not operational freshness or extraordinary-closure authority",
+  "interpretation": "09:30 through 16:00 America/New_York for core equity sessions; holiday and early-close dates remain bound to the separately archived 2026-2028 announcement",
+  "historical_possession_claimed": false
+}
