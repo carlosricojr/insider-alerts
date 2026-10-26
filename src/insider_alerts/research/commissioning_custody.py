@@ -131,8 +131,6 @@ def capture(journal: Journal, version: calendar.Version, observed: dict[str, Any
             admission = dict(admission, membership="preexisting", reason="observed_before_boundary")
         membership = admission["membership"]
         counts[membership] = counts.get(membership, 0) + 1
-        if membership == "outside" and old is None:
-            continue
         if old and old["payload"]["row"] == row:
             continue
         producer = "unknown"

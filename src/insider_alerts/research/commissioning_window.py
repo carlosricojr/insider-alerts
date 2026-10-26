@@ -150,7 +150,9 @@ def manifest(
         "maximum_attempts_per_job": None,
         "retry_rule": "until_fixed_deadline_content_backoff_300_times_2_to_n_minus_1_cap_21600",
         "infrastructure_retry_rule": "global_300_times_2_to_n_minus_1_cap_1800_no_job_exhaustion",
-        "request_priority": "benchmark_reserved_one_in_five_then_fresh_jobs_then_earliest_deadline",
+        "request_priority": (
+            "benchmark_one_in_five_then_unexpired_deadlines_then_fresh_then_earliest"
+        ),
         "stage_rule": (
             "R1_history_R2_full_horizon_R3_after_later_exchange_close_first_complete_receipts"
         ),

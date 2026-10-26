@@ -147,3 +147,21 @@ def test_replaced_source_file_is_not_silently_accepted(tmp_path, setup):
     replacement.replace(source)
     with pytest.raises(ValueError, match="source ledger identity"):
         capture(journal, VERSION, snapshot(source, clock=lambda: clock[0]))
+
+
+def test_outside_row_cannot_enter_window_through_later_revision(setup):
+    source, journal, clock = setup
+    with closing(sqlite3.connect(source)) as conn, conn:
+        conn.execute("UPDATE candidates SET signal_at='2026-10-27T09:00:00Z'")
+    assert capture(journal, VERSION, snapshot(source, clock=lambda: clock[0])) == 1
+    first = journal.records()[1]
+    assert first["payload"]["admission"]["membership"] == "outside"
+    clock[0] += timedelta(minutes=1)
+    with closing(sqlite3.connect(source)) as conn, conn:
+        conn.execute("UPDATE candidates SET signal_at='2026-10-27T12:00:00Z'")
+    assert capture(journal, VERSION, snapshot(source, clock=lambda: clock[0])) == 1
+    current = next(r for r in reversed(journal.records()) if r["kind"] == "custody")
+    assert current["supersedes"] == first["sha256"]
+    assert current["payload"]["admission"]["membership"] == "outside"
+    assert current["payload"]["revision_admission"]["membership"] == "admitted"
+    assert current["payload"]["source_fields_changed"]

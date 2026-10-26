@@ -325,6 +325,9 @@ class Evidence:
                 payload["admission"]["membership"] == "preexisting" for payload in cases.values()
             ),
             "unassignable_records": unassignable,
+            "outside_records": sum(
+                payload["admission"]["membership"] == "outside" for payload in cases.values()
+            ),
             "cases": summaries,
             "benchmark": benchmark,
             "schedule_coverage": schedules,
@@ -430,6 +433,7 @@ class Evidence:
         eligible.sort(
             key=lambda pair: (
                 (pair[0].owner.startswith("benchmark:") == recent_benchmark),
+                pair[0].deadline <= self.now,
                 pair[1] > 0,
                 pair[0].deadline,
                 pair[0].ready,

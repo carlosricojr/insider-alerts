@@ -43,6 +43,8 @@ attempts. An interrupted attempt remains recorded and cannot defeat pacing.
 Infrastructure outages use global backoff up to 30 minutes; content gaps use
 per-job backoff up to six hours. Retries stop at the fixed recovery deadline,
 not after an arbitrary number of logouts or failed responses.
+Within the bounded benchmark reservation, reachable deadlines precede expired
+backlog, then fresh requests precede retries. This ordering uses no outcomes.
 
 ## What is frozen
 
@@ -52,6 +54,8 @@ horizon. Late observations keep their original window. Invalid symbols and unkno
 admissions remain counted. Preexisting records are separately inventoried, including
 old malformed timestamps. Revisions preserve both the original admission and the
 actual later observation; they never make a corrected feature contemporaneous.
+First observations outside the window are also retained, so a later correction
+cannot silently admit a previously excluded record.
 
 R1 acquires history. R2 follows the full horizon. R3 follows a later exchange close
 than the first complete R2 receipt. The first complete R2/R3 pair is fixed, including
@@ -86,10 +90,11 @@ contradictions are reported without rewriting admission or historical bindings.
   `strategy_trial_ready` is always false in this collector.
 
 After the deadline, the first invocation holding both locks appends an immutable
-seal with the actual record-construction time, report as-of clock, report digest
-and prior sequence/hash watermark. The PC may have been off at the deadline;
+seal with the actual record-construction time, report as-of clock, report digest,
+prior sequence/hash watermark and calendar sequence/hash. The PC may have been off at the deadline;
 that cannot extend the window. Final status replays the fixed prefix and verifies
 the digest, so later status times and calendar notices cannot change the result.
+This includes notices appended later with a backdated observation clock.
 After verifying the seal and retaining its report/evidence, disable this collector's
 own task; it never makes further broker requests after the deadline or seal.
 
@@ -101,6 +106,9 @@ are logged to `logs/commissioning-v2.err.log`; status reports clock regression w
 a distinct state. A changed implementation/dependency or replaced source ledger
 stops the run, including custody. Do not edit manifests, move boundaries, remove
 failed cases, or restore old timestamps to make a run pass.
+The digest conservatively covers every Python module in the package, project and
+lock files, source archives and runtime versions. Any package code edit ends the
+run, including edits to modules loaded indirectly by package initializers.
 
 If an implementation correction is necessary, stop only this collector's task,
 verify its processes have exited, preserve the entire run and hashes, and deploy

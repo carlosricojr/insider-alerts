@@ -230,8 +230,8 @@ and required the following corrections:
   latest position. Compare the latest known descendant separately over the full
   history/enrollment/horizon span, flag affected cases, never rebind or stop custody
   merely because a later notice exists.
-- B5 implemented: verify implementation digest over all commissioning
-  modules, imported shared helpers, calendar, frozen control definitions and lock
+- B5 implemented: verify implementation digest over the entire Python package,
+  calendar sources, frozen control definitions and lock
   file/runtime dependency versions. An actual implementation change ends this run;
   recovery needs a new future activation, never a silent continuation. Activation
   requires clean local main equal to freshly fetched origin/main.
@@ -260,10 +260,9 @@ files) and the full `uv run pytest` completed successfully on this worktree. Thi
 is a development checkpoint, not a production-readiness or review-of-record claim;
 rerun the full gate after the worker/installer and remaining report corrections.
 
-Runtime implementation details for the next step: hash actual commissioning
-files plus `calendar_v2`, `execution/observer`, its `research/bar_feed` dependency,
-`strategy/e07`, `backtest/models`, `execution/windows_job`, frozen control defaults,
-package initializers, `uv.lock`/`pyproject.toml`, and source archive bytes. Bind the
+Runtime implementation binding hashes every Python module in the package,
+including dependencies loaded indirectly by initializers, plus
+`uv.lock`/`pyproject.toml` and source archive bytes. Bind the
 Python/SQLite/ib_async/rfc8785/tzdata versions too. Verify before custody and again
 before network/response publication; a mid-run mismatch leaves its durable attempt
 unanswered and stops writes, with a typed external error. Default worker never
@@ -274,9 +273,9 @@ Sealing needs both locks: acquire network, then nonblocking custody, and defer i
 custody is busy. Normal custody releases its lock before trying network, so there
 is no nested-lock cycle. All journal writes must occur under one of these locks;
 both held at seal prevents a custody/heartbeat append between report watermark and
-seal. Persist only the report digest, report as-of clock and prior sequence/hash
-watermark in the seal; the immutable preceding records and calendar as-of that
-clock reproduce the report without a potentially oversized embedded JSON report.
+seal. Persist the report digest, report as-of clock, prior sequence/hash
+watermark and calendar sequence/hash in the seal; the immutable preceding records
+and exact calendar prefix reproduce the report without an oversized embedded JSON.
 Final status replays that fixed prefix/as-of and verifies the digest, then adds
 seal metadata. Do not recalculate a different terminal report at each later status
 time. An identical sealing retry is read-only/idempotent; no writes follow a seal.
@@ -294,3 +293,12 @@ Next: finish full gates, independent adversarial review and canonical PR, then
 deploy and activate a genuinely future window. This is one complete
 commissioning release; do not ship another unused prerequisite-only release.
 Nothing in this worktree is deployed or activated; the goal remains unachieved.
+
+Independent read-only reviews of `212a23a` (Claude sessions
+`c882b22a-2345-415c-adb0-520cd624e30d` and
+`95d0f42f-7780-469c-9585-807627806791`) found five issues. Corrections retain first
+outside-window observations, prioritize reachable deadlines over expired backlog,
+bind the sealed calendar prefix against later/backdated notices, hash the whole
+Python package, and make both CI jobs install and execute the frozen uv environment.
+Regression tests cover each behavioral correction. Full local gates had passed
+before these findings; rerun them and review the corrected exact head before PR.

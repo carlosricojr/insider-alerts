@@ -475,7 +475,12 @@ def test_implementation_digest_covers_shared_code_lock_runtime_and_hours(tmp_pat
     original = worker.implementation_digest(tmp_path)
     (tmp_path / "README.md").write_text("unrelated review", encoding="utf-8")
     assert worker.implementation_digest(tmp_path) == original
-    for relative in ("src/insider_alerts/strategy/e07.py", "uv.lock"):
+    for relative in (
+        "src/insider_alerts/strategy/e07.py",
+        "src/insider_alerts/research/capture.py",
+        "src/insider_alerts/backtest/engine.py",
+        "uv.lock",
+    ):
         path = tmp_path / relative
         prior = path.read_bytes()
         path.write_bytes(prior + b"\n# changed\n")
@@ -490,6 +495,48 @@ def test_implementation_digest_covers_shared_code_lock_runtime_and_hours(tmp_pat
     archive.write_bytes(b"changed")
     with pytest.raises(worker.BoundaryFailure, match="hours_archive_changed"):
         worker.implementation_digest(tmp_path)
+
+
+def test_digest_file_set_contains_every_loaded_project_module():
+    included = set(worker.implementation_files(ROOT))
+    for name, module in tuple(sys.modules.items()):
+        source = getattr(module, "__file__", None)
+        if name.startswith("insider_alerts") and source is not None:
+            assert Path(source) in included, name
+
+
+@pytest.mark.parametrize("racing", [False, True])
+def test_backdated_calendar_notice_cannot_change_sealed_report(setup, monkeypatch, racing):
+    runtime, clock, _, _, _ = setup
+    clock[0] = parse(runtime.journal.records()[0]["payload"]["recovery_deadline"]) + timedelta(
+        days=2
+    )
+    original = runtime.calendar.versions
+    initial = original()
+    calls = [0]
+
+    def racing_versions():
+        versions = original()
+        calls[0] += 1
+        if calls[0] == 3:
+            runtime.calendar.append_notice(
+                notice(),
+                expected_parent=initial[-1].digest,
+                observed_at=clock[0] - timedelta(hours=1),
+            )
+        return versions
+
+    if racing:
+        monkeypatch.setattr(runtime.calendar, "versions", racing_versions)
+    assert asyncio.run(runtime.run_once())["result"] == "sealed"
+    if not racing:
+        runtime.calendar.append_notice(
+            notice(), expected_parent=initial[-1].digest, observed_at=clock[0] - timedelta(hours=1)
+        )
+    result = runtime.status()
+    assert result["seal"]["calendar_head"] == {"sequence": 1, "sha256": initial[-1].digest}
+    assert result["calendar"]["latest_known_version"] == initial[-1].digest
+    assert not result["calendar"]["conflicted_dates"]
 
 
 def test_full_synthetic_window_captures_first_and_last_enrollment_horizons(setup):

@@ -41,33 +41,17 @@ class LockBusy(RuntimeError):
     pass
 
 
-def implementation_digest(root: Path) -> str:
+def implementation_files(root: Path) -> tuple[Path, ...]:
     package = root / "src" / "insider_alerts"
-    files = set((package / "research").glob("commissioning*.py"))
-    files.update(
-        package / name
-        for name in (
-            "__init__.py",
-            "execution/__init__.py",
-            "research/__init__.py",
-            "strategy/__init__.py",
-            "backtest/__init__.py",
-        )
-    )
-    files.update(
-        package / name
-        for name in (
-            "research/calendar_v2.py",
-            "execution/observer.py",
-            "research/bar_feed.py",
-            "strategy/e07.py",
-            "backtest/models.py",
-            "execution/windows_job.py",
-            "execution/canary.py",
-        )
-    )
+    # Package initializers import additional research/backtest/execution modules.
+    # Hash the complete package, not a hand-maintained approximation to that graph.
+    files = set(package.rglob("*.py"))
     files.update(root / name for name in ("uv.lock", "pyproject.toml"))
     files.update((root / "docs/research/calendar-sources").glob("nyse-*"))
+    return tuple(sorted(files))
+
+
+def implementation_digest(root: Path) -> str:
     if (
         digest((root / "docs/research/calendar-sources/nyse-hours-2026-10-26.html").read_bytes())
         != HOURS_SHA256
@@ -76,7 +60,7 @@ def implementation_digest(root: Path) -> str:
     material = {
         "files": {
             str(path.relative_to(root)).replace("\\", "/"): digest(safe_path(path).read_bytes())
-            for path in sorted(files)
+            for path in implementation_files(root)
         },
         "runtime": {
             "python": sys.version,
@@ -225,7 +209,15 @@ class Runtime:
             "sha256": prior[-1]["sha256"],
         }:
             raise BoundaryFailure("seal_watermark_mismatch")
-        result = report(prior, versions, now=parse(material["report_as_of"]))
+        calendar_head = material["calendar_head"]
+        sequence = calendar_head["sequence"]
+        if (
+            type(sequence) is not int
+            or not 1 <= sequence <= len(versions)
+            or versions[sequence - 1].digest != calendar_head["sha256"]
+        ):
+            raise BoundaryFailure("seal_calendar_head_mismatch")
+        result = report(prior, versions[:sequence], now=parse(material["report_as_of"]))
         if digest(rfc8785.dumps(result)) != material["report_sha256"]:
             raise BoundaryFailure("seal_report_digest_mismatch")
         return result | {
@@ -251,10 +243,10 @@ class Runtime:
         # Caller holds network. Normal custody never nests acquisition of network.
         try:
             with exclusive_lock(self.folder / "custody-lock.db"):
+                now = self.clock()
                 records, versions = self.load()
                 if records[-1]["kind"] == "seal":
                     return {"result": "sealed", "seal_sha256": records[-1]["sha256"]}
-                now = self.clock()
                 if now < parse(records[0]["payload"]["recovery_deadline"]):
                     raise BoundaryFailure("seal_before_recovery_deadline")
                 result = report(records, versions, now=now)
@@ -264,6 +256,7 @@ class Runtime:
                     "singleton",
                     {
                         "report_as_of": timestamp(now),
+                        "calendar_head": {"sequence": len(versions), "sha256": versions[-1].digest},
                         "watermark": result["watermark"],
                         "report_sha256": digest(rfc8785.dumps(result)),
                     },

@@ -252,3 +252,13 @@ def test_future_journal_clock_and_altered_manifest_fail_closed(setup):
     records[0]["payload"]["maximum_attempts_per_job"] = 7
     with pytest.raises(ValueError, match="frozen derivation"):
         Evidence(records, VERSION, clock[0])
+
+
+def test_reachable_decision_deadline_precedes_expired_backlog(setup):
+    journal, clock = setup
+    clock[0] = parse("2026-10-28T11:00:00Z")
+    add_candidate(journal, clock, "new", "NEW", signal="2026-10-28T10:30:00Z")
+    state, jobs, _ = evidence(journal, clock)
+    initial = [job for job in jobs if job.owner.startswith("case:") and job.stage == "R1"]
+    assert len(initial) == 2
+    assert state.next_request(initial)["symbol"] == "NEW"
