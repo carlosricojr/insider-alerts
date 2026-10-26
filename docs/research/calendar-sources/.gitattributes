@@ -1,0 +1,2 @@
+# Preserve retrieved source bytes on every platform.
+*.html -text
