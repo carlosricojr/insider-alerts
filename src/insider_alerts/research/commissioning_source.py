@@ -9,12 +9,33 @@ cannot masquerade as a successful empty response.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from datetime import UTC, date, datetime
+from importlib.metadata import version
 from typing import Any
 
 EXCHANGES = frozenset({"NYSE", "NASDAQ", "AMEX", "ARCA", "BATS", "ISLAND", "IEX"})
 SYMBOL_MAP = {"BRK.A": "BRK A", "BRK.B": "BRK B"}
+
+
+def error_message(value: str) -> str:
+    text = " ".join(value.split())[:2000]
+    text = re.sub(r"\b[DUF]\d{6,}\b", "[account]", text)
+    return re.sub(r"https?://\S+", "[url]", text)
+
+
+def broker_category(code: int, message: str) -> str:
+    if code != 162:
+        return f"broker_{code}"
+    lower = message.lower()
+    if "pacing" in lower:
+        return "hmds_162_pacing"
+    if "permissions" in lower or "permission" in lower:
+        return "hmds_162_permissions"
+    if "query returned no data" in lower:
+        return "hmds_162_no_data"
+    return "hmds_162_unclassified"
 
 
 def timestamp(value: datetime) -> str:
@@ -52,7 +73,7 @@ class CommissioningSource:
         expected_conid: int | None,
         schedule: bool = False,
     ) -> dict[str, Any]:
-        from ib_async import IB, RequestError, Stock, util
+        from ib_async import IB, Contract, RequestError, Stock, util
 
         now = self.clock()
         timestamp(now)
@@ -64,6 +85,10 @@ class CommissioningSource:
             or end > now
             or not 0 <= (end.date() - start).days <= 365
             or (schedule and symbol != "SPY")
+            or (
+                expected_conid is not None
+                and (type(expected_conid) is not int or expected_conid <= 0)
+            )
         ):
             raise ValueError("invalid bounded acquisition request")
         result: dict[str, Any] = {
@@ -72,17 +97,40 @@ class CommissioningSource:
             "mapped_symbol": SYMBOL_MAP.get(symbol, symbol),
             "started_at": timestamp(now),
             "identity": None,
+            "symbol_resolution": None,
+            "symbol_resolution_changed": False,
+            "sdk_version": version("ib_async"),
+            "server_version": None,
+            "connection": {"host": "127.0.0.1", "port": 4001, "client_id": 179},
+            "notices": [],
             "request": None,
             "client_dispatch_at": None,
             "response_at": None,
             "response": None,
             "result": "incomplete",
             "error_code": None,
+            "error_message": None,
+            "error_category": None,
+            "cleanup_errors": [],
+            "clock_integrity": "unchecked",
             "stage": "connect",
         }
         ib = self.factory() if self.factory else IB()
         req_id: int | None = None
         future: Any = None
+
+        def on_notice(request_id: int, code: int, message: str, *extra: Any) -> None:
+            if len(result["notices"]) < 100:
+                result["notices"].append(
+                    {
+                        "request_id": request_id,
+                        "code": code,
+                        "message": error_message(message),
+                        "observed_at": timestamp(self.clock()),
+                    }
+                )
+
+        ib.errorEvent += on_notice
         try:
             ib.wrapper.clientId = 179
             ib.RaiseRequestErrors = True
@@ -90,9 +138,15 @@ class CommissioningSource:
             if not ib.client.isReady():
                 raise SourceFailure("api_not_ready")
             ib.connectedEvent.emit()
+            result["server_version"] = ib.client.serverVersion()
             result["stage"] = "qualify"
+            requested_contract = (
+                Contract(conId=expected_conid, exchange="SMART")
+                if expected_conid is not None
+                else Stock(result["mapped_symbol"], "SMART", "USD")
+            )
             details = await self._bounded(
-                lambda: ib.reqContractDetailsAsync(Stock(result["mapped_symbol"], "SMART", "USD")),
+                lambda: ib.reqContractDetailsAsync(requested_contract),
                 8,
             )
             if len(details) != 1:
@@ -109,21 +163,47 @@ class CommissioningSource:
                 "observed_at": timestamp(self.clock()),
                 "historical_issuer_identity_verified": False,
             }
-            if (
-                type(contract.conId) is not int
-                or contract.conId <= 0
-                or contract.symbol != result["mapped_symbol"]
-                or contract.secType != "STK"
-                or contract.currency != "USD"
-                or contract.primaryExchange not in EXCHANGES
-            ):
-                raise SourceFailure("contract_not_supported")
-            if expected_conid is not None and contract.conId != expected_conid:
-                raise SourceFailure("contract_identity_changed")
+            if expected_conid is None:
+                if (
+                    type(contract.conId) is not int
+                    or contract.conId <= 0
+                    or contract.symbol != result["mapped_symbol"]
+                    or contract.secType != "STK"
+                    or contract.currency != "USD"
+                    or contract.primaryExchange not in EXCHANGES
+                ):
+                    raise SourceFailure("contract_not_supported")
+            else:
+                if contract.conId != expected_conid:
+                    raise SourceFailure("pinned_contract_not_returned")
+                # Symbol drift is evidence, not permission to substitute an
+                # instrument or lose its horizon. History stays on the pinned ID.
+                try:
+                    current = await self._bounded(
+                        lambda: ib.reqContractDetailsAsync(
+                            Stock(result["mapped_symbol"], "SMART", "USD")
+                        ),
+                        8,
+                    )
+                    ids = [item.contract.conId for item in current]
+                    result["symbol_resolution"] = {"conids": ids, "result": "received"}
+                    result["symbol_resolution_changed"] = ids != [expected_conid]
+                except RequestError as exc:
+                    result["symbol_resolution"] = {
+                        "result": "broker_error",
+                        "code": exc.code,
+                        "message": error_message(exc.message),
+                    }
+                except Exception as exc:
+                    result["symbol_resolution"] = {
+                        "result": "unavailable",
+                        "error_type": type(exc).__name__,
+                    }
             result["stage"] = "history"
             # Count calendar days conservatively; keep the exact needed range in
             # the request, and let the reader reject/ignore extra returned dates.
-            duration = f"{max(2, (end.date() - start).days + 2)} D"
+            days = max(2, (end.date() - start).days + 2)
+            duration = f"{days} D" if days <= 365 else "2 Y"
             result["request"] = {
                 "start_date": str(start),
                 "end_at": timestamp(end),
@@ -153,8 +233,6 @@ class CommissioningSource:
             )
             response = await asyncio.wait_for(future, timeout=timeout)
             result["response_at"] = timestamp(self.clock())
-            if result["response_at"] < result["client_dispatch_at"]:
-                raise SourceFailure("clock_reversed")
             if schedule:
                 result["response"] = {
                     "start": str(response.startDateTime),
@@ -183,7 +261,12 @@ class CommissioningSource:
                 empty = not response
             result["result"] = "empty_response" if empty else "received"
         except RequestError as exc:
-            result.update(result="broker_error", error_code=int(exc.code))
+            result.update(
+                result="broker_error",
+                error_code=int(exc.code),
+                error_message=error_message(exc.message),
+                error_category=broker_category(exc.code, exc.message),
+            )
         except TimeoutError:
             result["result"] = "timeout"
         except SourceFailure as exc:
@@ -206,8 +289,8 @@ class CommissioningSource:
                 ib.disconnect()
             except Exception as exc:
                 cleanup_errors.append(type(exc).__name__)
-            if cleanup_errors:
-                result.update(result="cleanup_error", cleanup_errors=cleanup_errors)
+            ib.errorEvent -= on_notice
+            result["cleanup_errors"] = cleanup_errors
             result["finished_at"] = timestamp(self.clock())
             clocks = [result["started_at"]]
             if result["identity"]:
@@ -217,6 +300,5 @@ class CommissioningSource:
                 for key in ("client_dispatch_at", "response_at", "finished_at")
                 if result[key] is not None
             )
-            if clocks != sorted(clocks):
-                result["result"] = "clock_reversed"
+            result["clock_integrity"] = "valid" if clocks == sorted(clocks) else "reversed"
         return result

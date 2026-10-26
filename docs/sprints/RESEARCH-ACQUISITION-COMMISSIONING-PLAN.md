@@ -41,9 +41,9 @@ first observations and revisions. Bar presence after the close is not proof of
 vendor finality. Invalid/empty responses, rejections, clock reversals, and broker
 outages receive typed evidence; no invented values or fills.
 
-Operate off-hours 18:00–08:00 New York, at most one symbol per six-minute
-scheduled invocation, with a durable five-minute minimum, hard I/O deadlines
-and OS-released process ownership. Keep
+Capture ledger fields on a hidden one-minute cadence. Broker I/O operates only
+18:00–08:00 New York, with a durable five-minute minimum between attempts,
+hard I/O deadlines and separate OS-released custody/network locks. Keep
 durable attempt receipts so a restart cannot defeat pacing. Fair rotation must
 not starve the benchmark. Source reads close before broker I/O or output writes.
 Qualification is by current instrument, with symbol/contract ambiguity rejected.
@@ -89,8 +89,10 @@ Fresh metadata diagnosis at 20:23 UTC October 26: 210 active 45-day symbols,
 53 distinct symbols and 82 candidates in the last 14 calendar days. Healthy recent
 days had 86–92 successful polls. Of 181 short attempt intervals on October 22–23,
 150 were ten minutes and 31 were five minutes. Scheduler/clock jitter against
-the exact five-minute durable gate loses alternate slots. Use a six-minute task
-cadence with the five-minute safety minimum, and measure actual service capacity.
+the exact five-minute durable gate loses alternate slots. The final design uses
+a one-minute custody cadence with the five-minute network safety minimum; jitter
+can then cost one minute rather than an entire five-minute trigger interval.
+Measure actual service capacity instead of assuming theoretical supply.
 
 Use event-driven collection: initial pre-signal-history request, a request after
 the frozen tenth horizon session, and an independent later-session repeat to
@@ -125,17 +127,140 @@ measured commissioning, separately evaluate migration of bar polling while
 preserving candidate capture and all historical evidence. Weekend daytime
 requests remain disallowed under the same off-hours boundary.
 
-Current state: diagnosis/design challenge complete. The new order-incapable
-`commissioning_source` adapter records contract IDs and exact local SDK-dispatch
-times, preserves raw SDK projections and distinguishes broker error codes, empty
-responses and timeouts. Fifteen focused tests and strict typing pass. No worker,
-commissioning journal, activation, PR or deployment exists yet.
+The second challenge in the same Claude session completed with concrete source
+and custody corrections. Later requests now follow the originally pinned conId;
+symbol re-resolution is recorded independently and never silently substitutes a
+new instrument or drops a changed-symbol horizon. Unknown/delisted data remains
+missing, not excluded. Symbol drift is not itself proof of a corporate event.
+The source preserves sanitized broker messages (162 is ambiguous), SDK/server
+versions and farm notices. Receipt result, cleanup and clock integrity are
+separate axes, so received data is retained even when unusable.
 
-Before implementing the remaining pipeline, a follow-up design challenge is
-resolving one-minute read-only eligibility-field custody alongside independently
-paced off-hours broker requests. Later historical bar retrieval cannot become
-pre-entry evidence. This may supersede the initial six-minute whole-worker cadence;
-the durable five-minute minimum between network attempts remains a constraint.
-The previous calendar foundation is deployed and live/SEC/autopilot workers are
-healthy. Next action is the design challenge and a concrete final acquisition
-contract, followed by implementation and prospective commissioning.
+Custody keeps actual first observation and source cycle-start clocks separate.
+Use the 09:20 decision cutoff for availability diagnostics; merely being observed
+before the 09:30 auction is insufficient. Copy only whitelisted non-outcome fields
+and runtime metadata in one read-only source transaction. Current runtime metadata
+is context, not automatic proof of an older row's producer: rows predating that
+runtime require an unknown-producer flag. Preserve every eligibility revision.
+The future trial must bind its own pre-cutoff read/decision snapshot; later R1
+history can never be substituted for that snapshot.
+
+Journal response identity is the preceding attempt digest. Sequence/hash bindings
+and source observation clocks let future readers freeze a receipt watermark;
+duplicate completion is idempotent and conflicting completion is rejected. The
+receipt's contained bar index/content digest provides immutable per-bar identity.
+No old V1 schema or decision semantics are silently inherited.
+
+Freeze the recovery deadline at activation as the later of 08:00 New York on
+W19+5 calendar days and W20+3 calendar days. This supplies two off-hours recovery
+windows after the calendar session needed for the stability repeat. No extension
+after observing data. Operational coverage proportions are descriptive; do not
+adopt the challenge's unsupported Clopper–Pearson numerical claim as confidence
+or power evidence. Scientific yield/power remain separate, required work.
+
+Current state: adapter, append-only journal, calendar-bound window, source custody,
+per-date receipt validation and deterministic planner are implemented locally.
+Focused tests cover source failures, original-contract history, immutable custody,
+concurrency/corruption, cutoff/DST/holiday/leap dates, source revisions, request
+pacing, retry recovery, range merging and fixed first-receipt stability comparisons.
+No worker, activation, PR or deployment exists yet. Full gates and independent
+adversarial review are still required for the complete worker/installer diff.
+
+Primary source semantics:
+https://www.interactivebrokers.com/docs/tws-api/doc/md/historical-bars
+and https://www.interactivebrokers.com/docs/tws-api/doc/error-handling/error-codes.
+Record TRADES as the provider's daily RTH series; it is not proof of auction fills
+or a total-return/dividend series. Do not infer corporate-action cause from price
+direction or optimize request selection from realized prices.
+The window, read-only custody, receipt validation and pure planner are now local.
+The manifest freezes retries until the recovery deadline, 300-second minimum
+pacing, capped exponential backoff and a one-in-five benchmark reservation while
+candidates are due. Merge compatible
+due ranges, but never merge distinct pinned contracts. Each new candidate first
+resolves its own current identity; ticker reuse cannot inherit an older candidate's
+pin. Qualification pins identity even if the following history request fails.
+The first complete R2 and first complete later-session R3 are fixed; a changed R3
+is not retried until a convenient matching pair appears. All raw receipts remain.
+
+SPY price requests follow the same three stages through W19 and a later close;
+daily completed SCHEDULE checks run through W20. This preserves benchmark horizon
+coverage and calendar cross-checks without unnecessary daily SPY price polling.
+Late source-field corrections retain the original admission and separately record
+their actual revision observation and revised admission; they cannot backdate a
+corrected feature or silently move the denominator. Report acquisition, custody,
+canary agreement and admission as separate descriptive counts, not one overloaded
+completeness flag. Unassignable rows and invalid symbols remain explicit.
+
+Worker design still to implement/review: explicit activation creates the isolated
+calendar and commissioning journals; default execution cannot initialize them.
+Bind the reviewed implementation files (including pure shared dependencies), source
+ledger path/file identity and archived hours bytes at activation. Compare the
+implementation digest on every run, allowing unrelated reviewed main commits but
+stopping both custody and acquisition if its actual code changes. A separate one-minute custody lock
+and network lock are released by the OS on process death. Both are nonblocking;
+custody commits before network work, with no live ledger connection held. A durable
+attempt precedes broker I/O. Network time is capped at 50 seconds and the earlier
+of the 08:00 cutoff and recovery deadline, using wall and monotonic clocks. Parallel
+hidden scheduled invocations permit custody during a slow or stuck network call;
+the task has a two-minute hard execution limit. Record bounded failure heartbeats,
+retain unanswered attempts, and never infer success from process exit alone.
+
+The third read-only challenge completed in Claude session
+`865f0399-7fef-4d56-8b2e-eeccad175f25`, response UUID
+`6c605b4d-323d-4110-96f5-25d28d045264`. It confirmed outcome-blind request selection
+and required the following corrections:
+
+- B1 implemented: remove permanent six-attempt exhaustion. Infrastructure failures
+  (including unanswered/crashed attempts and client-179 conflicts) use a global
+  exponential backoff capped at 30 minutes; content failures use per-job backoff
+  capped at six hours. The fixed recovery deadline bounds both. Neither logout nor
+  malformed content silently removes a candidate. Backoff classifies unknown
+  errors conservatively as infrastructure, without relabeling error 162 as pacing.
+- B2 implemented: identity/clock/request failures invalidate a whole receipt;
+  individual malformed/duplicate/non-session bars invalidate only their own dates.
+  Required missing dates remain missing, with reasons. Bad extra dates cannot
+  discard valid required dates. Complete receipts and missing dates are separate.
+- B4 implemented: seal a pre-boundary packet-ID inventory in activation. Capture
+  new pre-boundary observations as preexisting. Existing malformed timestamps do
+  not contaminate the fresh window's unassignable count. Source path/device/inode
+  are bound and replacement is rejected. Custody polls include runtime context.
+  One mixed completeness flag was removed in favor of separate descriptive axes.
+- B3 remains worker work: load the originally bound calendar by digest, never by
+  latest position. Compare the latest known descendant separately over the full
+  history/enrollment/horizon span, flag affected cases, never rebind or stop custody
+  merely because a later notice exists.
+- B5 remains worker work: verify implementation digest over all commissioning
+  modules, imported shared helpers, calendar, frozen control definitions and lock
+  file/runtime dependency versions. An actual implementation change ends this run;
+  recovery needs a new future activation, never a silent continuation. Activation
+  requires clean local main equal to freshly fetched origin/main.
+- B6 remains worker work: the first network-locked post-deadline invocation writes
+  an idempotent seal with actual seal time, report digest and prior watermark.
+  Interim reports never masquerade as final. Late responses remain outside the
+  fixed deadline even when the PC was off at sealing time.
+
+Finish status dimensions: five-minute-resolution custody continuity, SDK/server
+and farm notices, attempts by overnight window, reasons for missing dates, pin
+source receipt/symbol drift, and calendar contradictions. Add the proposed frozen
+SPY W10 checkpoint (one extra request) and actual per-date observation lags; do not
+assume differing bar observation times have harmless corporate-action semantics.
+Runtime tests must cover simultaneous custody/network callers, crash/restart,
+overnight outage recovery, client 326, source/code replacement, latest-calendar
+notices, typed clock-regression status, and late/idempotent sealing. No new design
+permission is needed: the remaining worker design has been challenged read-only.
+
+Before release, clarify the timestamp labels: the current admission flag named
+`contemporaneous_custody` compares source observation with 09:20, not SQLite commit.
+Rename it to `observed_before_decision`, expose journal construction separately,
+and retain the requirement that a future trial bind its own pre-cutoff read. A
+source observation before cutoff does not prove durability before cutoff.
+
+Intermediate core verification: `uv run ruff check .`, `uv run mypy src` (77 source
+files) and the full `uv run pytest` completed successfully on this worktree. This
+is a development checkpoint, not a production-readiness or review-of-record claim;
+rerun the full gate after the worker/installer and remaining report corrections.
+
+Next: implement worker/installer and the listed integration/fault tests, then full
+gates, independent adversarial review and canonical PR. This is one complete
+commissioning release; do not ship another unused prerequisite-only release.
+Nothing in this worktree is deployed or activated; the goal remains unachieved.

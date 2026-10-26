@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import UTC, date, datetime, timedelta
+from importlib.metadata import version
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -10,7 +12,11 @@ import pytest
 from ib_async import IB, RequestError, Stock
 from ib_async.objects import BarData, HistoricalSchedule, HistoricalSession
 
-from insider_alerts.research.commissioning_source import CommissioningSource
+from insider_alerts.research.commissioning_source import (
+    CommissioningSource,
+    broker_category,
+    error_message,
+)
 
 NOW = datetime(2026, 10, 26, 22, tzinfo=UTC)
 END = datetime(2026, 10, 26, 20, tzinfo=UTC)
@@ -29,6 +35,9 @@ async def exercise(
     connect_error: Exception | None = None,
     clock: Any = lambda: NOW,
     disconnect_error: bool = False,
+    symbol_current_conid: int | None = None,
+    symbol_error: Exception | None = None,
+    notices: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], IB]:
     ib = IB()
     state: dict[str, Any] = {"cancel": [], "disconnected": 0, "dispatch": []}
@@ -41,10 +50,18 @@ async def exercise(
     monkeypatch.setattr(ib.client, "isReady", lambda: True)
     monkeypatch.setattr(ib.client, "getReqId", lambda: 7)
     monkeypatch.setattr(ib.client, "cancelHistoricalData", state["cancel"].append)
+    current = copy.deepcopy(contract)
+    if symbol_current_conid is not None:
+        current.conId = symbol_current_conid
     monkeypatch.setattr(
         ib,
         "reqContractDetailsAsync",
-        AsyncMock(return_value=[SimpleNamespace(contract=contract)] * details_count),
+        AsyncMock(
+            side_effect=[
+                [SimpleNamespace(contract=contract)] * details_count,
+                symbol_error if symbol_error is not None else [SimpleNamespace(contract=current)],
+            ]
+        ),
     )
 
     def disconnect() -> None:
@@ -55,6 +72,8 @@ async def exercise(
     def dispatch(*args: Any) -> None:
         state["dispatch"].append(args)
         state["dispatch_clock"] = clock()
+        if notices:
+            ib.errorEvent.emit(-1, 2105, "Historical data farm disconnected", None)
         if not pending:
             if isinstance(response, Exception):
                 ib.wrapper._endReq(7, response, success=False)
@@ -110,9 +129,31 @@ def test_qualification_cannot_fall_back(
     assert not state["dispatch"] and state["disconnected"] == 1
 
 
-def test_contract_drift_prevents_history(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wrong_pinned_contract_prevents_history(monkeypatch: pytest.MonkeyPatch) -> None:
     result, state, _ = asyncio.run(exercise(monkeypatch, conid=999))
-    assert result["result"] == "contract_identity_changed" and not state["dispatch"]
+    assert result["result"] == "pinned_contract_not_returned" and not state["dispatch"]
+
+
+def test_symbol_drift_does_not_replace_or_drop_pinned_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, state, _ = asyncio.run(exercise(monkeypatch, conid=123, symbol_current_conid=999))
+    assert result["symbol_resolution_changed"] is True
+    assert result["symbol_resolution"]["conids"] == [999]
+    assert state["dispatch"][0][1].conId == 123
+    assert result["identity"]["conid"] == 123
+
+
+def test_symbol_lookup_failure_still_requests_pinned_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, state, _ = asyncio.run(
+        exercise(
+            monkeypatch, conid=123, symbol_error=RequestError(2, 200, "No security definition")
+        )
+    )
+    assert result["symbol_resolution"]["code"] == 200
+    assert state["dispatch"][0][1].conId == 123
 
 
 def test_explicit_symbol_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -125,13 +166,13 @@ def test_connect_failure_and_cleanup_failure(monkeypatch: pytest.MonkeyPatch) ->
     assert result["result"] == "source_error" and result["stage"] == "connect"
     assert state["disconnected"] == 1 and not state["dispatch"]
     result, _, _ = asyncio.run(exercise(monkeypatch, disconnect_error=True))
-    assert result["result"] == "cleanup_error"
+    assert result["result"] == "empty_response" and result["cleanup_errors"] == ["RuntimeError"]
 
 
 def test_clock_reversal_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     times = iter([NOW, NOW - timedelta(seconds=1), NOW, NOW, NOW, NOW])
     result, _, _ = asyncio.run(exercise(monkeypatch, clock=lambda: next(times)))
-    assert result["result"] == "clock_reversed"
+    assert result["clock_integrity"] == "reversed" and result["result"] == "empty_response"
 
 
 def test_schedule_projection_does_not_discard_future_or_contradictions(
@@ -157,3 +198,32 @@ def test_nonfinite_sdk_values_are_preserved_not_zeroed(monkeypatch: pytest.Monke
 def test_off_hours_budget_exhaustion_has_no_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     result, state, _ = asyncio.run(exercise(monkeypatch, budget=0))
     assert result["result"] == "timeout" and not state["dispatch"]
+
+
+@pytest.mark.parametrize(
+    "message,category",
+    [
+        ("Historical data request pacing violation", "hmds_162_pacing"),
+        ("No market data permissions for ISLAND", "hmds_162_permissions"),
+        ("HMDS query returned no data", "hmds_162_no_data"),
+        ("Unknown historical service error", "hmds_162_unclassified"),
+    ],
+)
+def test_error_162_does_not_imply_only_pacing(message: str, category: str) -> None:
+    assert broker_category(162, message) == category
+
+
+def test_error_messages_are_bounded_and_sanitized() -> None:
+    value = error_message("Account U1234567\n https://example.test/?token=secret " + "x" * 3000)
+    assert len(value) <= 2000
+    assert "U1234567" not in value and "secret" not in value and "\n" not in value
+
+
+def test_source_versions_and_farm_notices(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, _, ib = asyncio.run(exercise(monkeypatch, notices=True))
+    assert version("ib_async") == result["sdk_version"] == "2.1.0"
+    assert callable(ib.wrapper.startReq) and callable(ib.wrapper._endReq)
+    assert isinstance(ib.wrapper._results, dict)
+    assert result["server_version"] == 0  # The fake session has no real server.
+    assert result["connection"]["client_id"] == 179
+    assert result["notices"][0]["code"] == 2105
