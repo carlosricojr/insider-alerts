@@ -260,6 +260,27 @@ files) and the full `uv run pytest` completed successfully on this worktree. Thi
 is a development checkpoint, not a production-readiness or review-of-record claim;
 rerun the full gate after the worker/installer and remaining report corrections.
 
+Runtime implementation details for the next step: hash actual commissioning
+files plus `calendar_v2`, `execution/observer`, its `research/bar_feed` dependency,
+`strategy/e07`, `backtest/models`, `execution/windows_job`, frozen control defaults,
+package initializers, `uv.lock`/`pyproject.toml`, and source archive bytes. Bind the
+Python/SQLite/ib_async/rfc8785/tzdata versions too. Verify before custody and again
+before network/response publication; a mid-run mismatch leaves its durable attempt
+unanswered and stops writes, with a typed external error. Default worker never
+implicitly creates either journal. Activation snapshots the source inventory,
+then creates the future manifest exclusively from a clean reviewed deployment.
+
+Sealing needs both locks: acquire network, then nonblocking custody, and defer if
+custody is busy. Normal custody releases its lock before trying network, so there
+is no nested-lock cycle. All journal writes must occur under one of these locks;
+both held at seal prevents a custody/heartbeat append between report watermark and
+seal. Persist only the report digest, report as-of clock and prior sequence/hash
+watermark in the seal; the immutable preceding records and calendar as-of that
+clock reproduce the report without a potentially oversized embedded JSON report.
+Final status replays that fixed prefix/as-of and verifies the digest, then adds
+seal metadata. Do not recalculate a different terminal report at each later status
+time. An identical sealing retry is read-only/idempotent; no writes follow a seal.
+
 Next: implement worker/installer and the listed integration/fault tests, then full
 gates, independent adversarial review and canonical PR. This is one complete
 commissioning release; do not ship another unused prerequisite-only release.
