@@ -223,10 +223,19 @@ def test_error_162_does_not_imply_only_pacing(message: str, category: str) -> No
     assert broker_category(162, message) == category
 
 
-def test_error_messages_are_bounded_and_sanitized() -> None:
-    value = error_message("Account U1234567\n https://example.test/?token=secret " + "x" * 3000)
+@pytest.mark.parametrize("prefix", ["U", "D", "F", "I", "DU", "DF", "du", "df"])
+def test_error_messages_are_bounded_and_sanitized(prefix: str) -> None:
+    account = prefix + "1234567"
+    value = error_message(f"Account {account}\n https://example.test/?token=secret " + "x" * 3000)
     assert len(value) <= 2000
-    assert "U1234567" not in value and "secret" not in value and "\n" not in value
+    assert account not in value and "secret" not in value and "\n" not in value
+    assert "[account]" in value and "[url]" in value
+
+
+def test_error_redaction_precedes_truncation() -> None:
+    value = error_message("x" * 1994 + " DU1234567 HTTPS://example.test/?token=secret")
+    assert len(value) == 2000
+    assert "DU" not in value and "123" not in value
 
 
 def test_source_versions_and_farm_notices(monkeypatch: pytest.MonkeyPatch) -> None:

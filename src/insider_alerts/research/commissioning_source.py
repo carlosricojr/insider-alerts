@@ -20,9 +20,9 @@ SYMBOL_MAP = {"BRK.A": "BRK A", "BRK.B": "BRK B"}
 
 
 def error_message(value: str) -> str:
-    text = " ".join(value.split())[:2000]
-    text = re.sub(r"\b[DUF]\d{6,}\b", "[account]", text)
-    return re.sub(r"https?://\S+", "[url]", text)
+    text = " ".join(value.split())
+    text = re.sub(r"\b(?:D[UF]|[DUFI])\d{6,}\b", "[account]", text, flags=re.IGNORECASE)
+    return re.sub(r"https?://\S+", "[url]", text, flags=re.IGNORECASE)[:2000]
 
 
 def broker_category(code: int, message: str) -> str:

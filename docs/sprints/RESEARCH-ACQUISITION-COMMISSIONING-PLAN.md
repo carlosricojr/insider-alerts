@@ -306,3 +306,9 @@ files) and Pytest passed at `8fbfc4c`. Both reviewers inspected all 25 changed
 files and confirmed all five corrections. Their remaining stale comment and
 contradictory implementation-binding prose are corrected without behavior changes.
 Canonical PR review, CI, deployment and future activation remain next.
+
+PR #68's substantive CodeRabbit review of `9d67996` found one account-redaction
+gap for two-letter paper-account prefixes. The source sanitizer now covers those
+prefixes case-insensitively and redacts before truncation, with regression tests.
+Both CI jobs passed on the prior head (Linux: 1,251 tests, 79% coverage; Windows:
+159 tests). The corrective head requires fresh gates and review before merge.
