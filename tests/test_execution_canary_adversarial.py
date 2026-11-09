@@ -725,10 +725,12 @@ def test_repriced_target_fill_before_pointer_commit_keeps_attribution(
         BrokerOrder(101, f"IA-E07-{token}-ENTRY", "TEST", "entry", "Filled", 20, 0, 10)
     ]
     asyncio.run(runner.cycle(now + timedelta(minutes=12)))
-    runner.store.event("due_target_exit_intent", packet_id="crash-test-packet", target_order_id=201)
+    runner.store.event("due_target_price_intent", packet_id="crash-test-packet",
+                       modification={"target_order_id": 201, "perm_id": 120, "conid": 123,
+                                     "requested_limit_price": .01})
     broker.order_values = [BrokerOrder(
         201, f"IA-E07-{token}-TARGET", "TEST", "target", "Filled", 20, 0, 10.2,
-        limit_price=price,
+        limit_price=price, perm_id=120, conid=123,
     )]
     broker.snapshot = AccountSnapshot("ACCOUNT", 493.5, 493.5, 493.5, {}, 0)
     asyncio.run(runner.cycle(now + timedelta(minutes=13)))

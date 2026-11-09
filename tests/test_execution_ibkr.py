@@ -539,8 +539,14 @@ def test_exit_rejection_bounds_and_marks_missing_reason():
     assert detail.count("code=201") == 3 and len(detail) < 900
 
 
-@pytest.mark.parametrize("outcome", ["accepted", "adopted", "rejected", "foreign", "partial"])
-def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
+@pytest.mark.parametrize("outcome", [
+    "accepted", "adopted", "rejected", "foreign", "partial", "delayed", "stale", "nonbid",
+    "missing_stop_after_quote", "duplicate_stop_after_quote", "duplicate_target_after_quote",
+    "slow_intent",
+])
+def test_due_exit_reprices_existing_target_without_another_sell(
+    outcome: str, monkeypatch: pytest.MonkeyPatch,
+):
     from copy import deepcopy
     from datetime import UTC, datetime, timedelta
 
@@ -557,13 +563,53 @@ def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
     target = Trade(contract, target_order, OrderStatus(status="Submitted", filled=0, remaining=16))
     stop = Trade(contract, stop_order, OrderStatus(status="PreSubmitted", filled=0, remaining=16))
     if outcome == "adopted":
-        target.order.lmtPrice = 0.01
+        target.order.lmtPrice = 12.34
     original = deepcopy(target.order)
+    from eventkit import Event
+    quote = _State(bid=12.34, bidSize=700, marketDataType=1,
+                   ticks=[_State(tickType=1, price=12.34, time=datetime.now(UTC))],
+                   updateEvent=Event())
+    def market_data(*args):
+        asyncio.get_running_loop().call_soon(quote.updateEvent.emit, quote)
+        return quote
+    if outcome == "delayed":
+        quote.marketDataType = 3
+    if outcome == "stale":
+        quote.ticks[0].time -= timedelta(seconds=30)
+    if outcome == "nonbid":
+        quote.ticks[0].tickType = 4
+    broker.ib.reqMktData = market_data
+    broker.ib.isConnected = lambda: True
+    broker.ib.cancelMktData = lambda *args: None
+    intents = []
+    def record_intent(detail):
+        intents.append(detail)
+        if outcome == "slow_intent":
+            class LateClock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return datetime.now(tz) + timedelta(seconds=10)
+            monkeypatch.setattr(ibkr_module, "datetime", LateClock)
+    broker.exit_modification_intent = record_intent
     if outcome == "foreign":
         target.order.clientId = 99
     if outcome == "partial":
         target.orderStatus.filled = 1
+    calls = 0
     async def orders():
+        nonlocal calls
+        calls += 1
+        if calls >= 3 and outcome == "missing_stop_after_quote":
+            return [target]
+        if calls >= 3 and outcome == "duplicate_stop_after_quote":
+            return [target, stop, stop]
+        if calls >= 3 and outcome == "duplicate_target_after_quote":
+            duplicate = deepcopy(target.order)
+            duplicate.orderId = 99
+            duplicate.permId = 999
+            duplicate.clientId = 99
+            return [target, stop, _State(order=duplicate, contract=contract,
+                                        orderStatus=target.orderStatus)]
         return [target, stop]
     async def positions():
         return [_State(account="ACCT", contract=contract, position=16)]
@@ -592,7 +638,7 @@ def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
     elif outcome == "accepted":
         assert asyncio.run(coro) == 20
         expected = deepcopy(original)
-        expected.lmtPrice = 0.01
+        expected.lmtPrice = 12.34
         assert len(placed) == 1
         assert vars(placed[0]) == vars(expected)
         assert stop.order == stop_order
