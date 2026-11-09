@@ -5,6 +5,7 @@ import math
 import re
 import sys
 from collections import deque
+from copy import deepcopy
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
@@ -739,6 +740,23 @@ class IbkrBroker:
             allow_partial_protection=order_ref.endswith("-QTYFAIL"),
         ):
             raise IbkrExecutionError("IBKR_EXIT_POSITION_OR_ORDER_CONFLICT")
+        if order_ref.endswith("-OVERDUE"):
+            targets = [t for t in self._all_open_trades
+                       if t.order.account == self._account()
+                       and str(t.contract.symbol) == symbol
+                       and t.order.orderRef == prefix + "-TARGET"]
+            if targets:
+                stops = [t for t in self._all_open_trades
+                         if t.order.account == self._account()
+                         and str(t.contract.symbol) == symbol
+                         and t.order.orderRef == prefix + "-STOP"]
+                if (len(targets) != 1 or len(stops) != 1
+                    or targets[0].order.clientId != self.client_id
+                    or stops[0].order.clientId != self.client_id):
+                    raise IbkrExecutionError("IBKR_EXIT_TARGET_OWNERSHIP_CONFLICT")
+                return await self._replace_target_with_due_exit(
+                    targets[0], contract, order_ref, dispatch_window,
+                )
         order = MarketOrder(
             "SELL",
             quantity,
@@ -762,6 +780,38 @@ class IbkrBroker:
                 )
             )
         return int(trade.order.orderId)
+
+    async def _replace_target_with_due_exit(
+        self, target: Any, contract: Any, order_ref: str,
+        dispatch_window: tuple[datetime, datetime] | None,
+    ) -> int:
+        """Make the existing sell marketable with a price-only modification."""
+        if dispatch_window is None or target.order.orderId <= 0 or target.order.permId <= 0:
+            raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_NOT_PROVEN")
+        replacement = deepcopy(target.order)
+        # A market exit accepts any available positive execution price. One cent
+        # provides a positive cent-price floor without another sell commitment.
+        replacement.lmtPrice = 0.01
+        self._errors = deque((e for e in self._errors if e[0] != replacement.orderId), maxlen=100)
+        self._check_exit_window(dispatch_window)
+        trade = self.ib.placeOrder(contract, replacement)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+            errors = [code for req, code, _ in self._errors if req == replacement.orderId]
+            if errors or trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
+                detail = self._order_rejection_detail(
+                    replacement.orderId, replacement.account, trade.orderStatus.status,
+                )
+                self.disconnect()  # Rebuild SDK state; rejection need not cancel the original.
+                raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_REJECTED: " + detail)
+            if (trade.order.lmtPrice == replacement.lmtPrice
+                and trade.order.orderId == replacement.orderId
+                and trade.order.permId == replacement.permId
+                and trade.orderStatus.status in {"Submitted", "PreSubmitted", "Filled"}):
+                return int(replacement.orderId)
+        self.disconnect()
+        raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_ACK_TIMEOUT")
 
     async def confirm_missing_exit(
         self, symbol: str, quantity: int, *, oca_group: str, order_ref_prefix: str,

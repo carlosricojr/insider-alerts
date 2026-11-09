@@ -1185,9 +1185,12 @@ class CanaryRunner:
             )
             # Order ids are client/session scoped; reconcile the durable reference too.
             if timed is not None and (
-                timed.symbol != row["symbol"] or timed.kind != "time"
+                timed.symbol != row["symbol"] or (timed.kind != "time"
+                and timed.order_id != row["target_order_id"])
                 or timed.order_ref not in {f"IA-E07-{token}-{suffix}"
                                           for suffix in ("TIME", "OVERDUE", "QTYFAIL")}
+                and not (timed.order_id == row["target_order_id"]
+                         and timed.order_ref == f"IA-E07-{token}-TARGET")
             ):
                 timed = None
             if timed is None:
@@ -1381,7 +1384,7 @@ class CanaryRunner:
                         )
                 continue
             reason = (
-                "stop"
+                "time" if filled_exit.order_id == row["timed_exit_order_id"] else "stop"
                 if filled_exit.kind == "stop"
                 else ("target" if filled_exit.kind == "target" else "time")
             )
