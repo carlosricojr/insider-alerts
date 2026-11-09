@@ -1229,12 +1229,11 @@ class CanaryRunner:
                 confirm = getattr(self.broker, "confirm_missing_exit", None)
                 if prior_day and current_position_quantity > 0 and callable(confirm):
                     quantity = int(current_position_quantity)
-                    if quantity != current_position_quantity or quantity != row["live_quantity"]:
-                        raise ValueError("missing exit has non-integral residual position")
-                    if await confirm(
+                    if (quantity == current_position_quantity
+                        and quantity == row["live_quantity"] and await confirm(
                         str(row["symbol"]), quantity, oca_group=str(row["oca_group"]),
                         order_ref_prefix=f"IA-E07-{token}",
-                    ):
+                    )):
                         stamp = datetime.now(UTC).isoformat()
                         with self.store.connect() as connection:
                             connection.execute(

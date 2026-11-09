@@ -24,4 +24,11 @@ before package change (never restart or silently reactivate), restart hidden liv
 task, verify broker positions/orders, new heartbeats and clean synced main.
 Rollback through reviewed main; preserve evidence and broker protection.
 
-Handoff: design investigation underway; no production changes yet.
+Handoff: implementation and restart/session/adapter regressions complete. Local
+ruff, mypy, full suite (Windows job tests isolated) and both CI gates passed on
+b8bbbf5. Independent settled-diff review was clean. CodeRabbit then identified
+quantity-failure isolation and an emergency residual-flatten regression; both
+addressed with adapter-level tests. Re-run full gates and exact-head review before
+merge. Deployment must disable commissioning triggers, verify no instances remain,
+preserve journals/hashes, and leave the frozen collector disabled. No new window
+is activated. Record actual deployment and broker reconciliation in PR evidence.

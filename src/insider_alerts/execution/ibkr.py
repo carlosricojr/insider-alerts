@@ -709,6 +709,7 @@ class IbkrBroker:
         prefix = order_ref.rsplit("-", 1)[0]
         if not await self.confirm_missing_exit(
             symbol, quantity, oca_group=oca_group, order_ref_prefix=prefix,
+            allow_partial_protection=order_ref.endswith("-QTYFAIL"),
         ):
             raise IbkrExecutionError("IBKR_EXIT_POSITION_OR_ORDER_CONFLICT")
         order = MarketOrder(
@@ -735,6 +736,7 @@ class IbkrBroker:
 
     async def confirm_missing_exit(
         self, symbol: str, quantity: int, *, oca_group: str, order_ref_prefix: str,
+        allow_partial_protection: bool = False,
     ) -> bool:
         """Prove absence across all clients; never equate cached absence with expiry."""
         account = self._account()
@@ -771,9 +773,10 @@ class IbkrBroker:
                 and trade.contract.conId == contract.conId
                 and trade.contract.secType == "STK" and trade.contract.currency == "USD"
                 and order.orderType == ("STP" if order.orderRef.endswith("-STOP") else "LMT")
-                and order.ocaType == 1 and float(order.totalQuantity) == quantity
+                and order.ocaType == 1
+                and (allow_partial_protection or float(order.totalQuantity) == quantity)
                 and trade.orderStatus.status in {"Submitted", "PreSubmitted"}
-                and float(trade.orderStatus.filled) == 0
+                and (allow_partial_protection or float(trade.orderStatus.filled) == 0)
             ):
                 return False
         self._all_open_trades = list(trades)
