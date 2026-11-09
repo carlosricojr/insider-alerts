@@ -30,8 +30,8 @@ def _mk_broker() -> IbkrBroker:
         },
     )()
 
-    async def _contract(symbol: str) -> str:
-        return symbol
+    async def _contract(symbol: str) -> object:
+        return _State(symbol=symbol, conId=123, secType="STK", currency="USD")
 
     broker._contract = _contract
     return broker
@@ -433,3 +433,88 @@ def test_submit_market_on_open_allows_partial_fills() -> None:
 
     assert order_id == int(captured["order"].orderId)  # type: ignore[attr-defined]
     assert not bool(getattr(captured["order"], "allOrNone", False))
+
+
+@pytest.mark.parametrize("conflict,position", [(False, 16), (True, 16), (False, 15), (False, 0)])
+def test_missing_exit_uses_fresh_account_orders_and_residual(conflict: bool, position: int) -> None:
+    broker = _mk_broker()
+    async def orders():
+        return ([_State(order=_State(account="ACCT", ocaGroup="other", action="SELL",
+                                    orderRef="foreign", orderType="MKT"),
+                        contract=_State(symbol="TEST"))] if conflict else [])
+    async def positions():
+        return [_State(account="ACCT", contract=_State(
+            symbol="TEST", conId=123, secType="STK", currency="USD"), position=position)]
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.ib.reqPositionsAsync = positions
+    assert asyncio.run(broker.confirm_missing_exit(
+        "TEST", 16, oca_group="oca", order_ref_prefix="IA-E07-TEST",
+    )) == (not conflict and position == 16)
+
+
+def test_missing_exit_timeout_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _mk_broker()
+    async def orders():
+        raise TimeoutError()
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.disconnect = lambda: None  # type: ignore[method-assign]
+    with pytest.raises(IbkrExecutionError, match="MISSING_EXIT_RECONCILIATION_FAILED"):
+        asyncio.run(broker.confirm_missing_exit(
+            "TEST", 16, oca_group="oca", order_ref_prefix="ref",
+        ))
+
+
+def test_market_exit_does_not_reuse_cached_filled_order() -> None:
+    broker = _mk_broker()
+    async def orders():
+        return []
+    async def positions():
+        return [_State(account="ACCT", contract=_State(
+            symbol="TEST", conId=123, secType="STK", currency="USD"), position=16)]
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.ib.reqPositionsAsync = positions
+    broker._existing_trade = lambda ref: _State(order=_State(orderId=123))  # type: ignore[method-assign]
+    sent = []
+    def place(contract, order):
+        sent.append(order)
+        order.orderId = 456
+        return _State(order=order, orderStatus=_State(status="Submitted"), log=[])
+    broker.ib.placeOrder = place
+    assert asyncio.run(broker.submit_market_exit(
+        "TEST", 16, oca_group="oca", order_ref="IA-E07-TEST-OVERDUE",
+    )) == 456
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("kind,allowed", [("QTYFAIL", True), ("OVERDUE", False)])
+def test_market_exit_quantity_failure_keeps_emergency_residual_flatten(kind: str, allowed: bool):
+    broker = _mk_broker()
+    protective = _State(
+        contract=_State(symbol="TEST", conId=123, secType="STK", currency="USD"),
+        order=_State(account="ACCT", action="SELL", orderRef="IA-E07-TEST-TARGET",
+                     orderType="LMT", ocaGroup="oca", ocaType=1, totalQuantity=20),
+        orderStatus=_State(status="Submitted", filled=5),
+    )
+    async def orders():
+        return [protective]
+    async def positions():
+        return [_State(account="ACCT", contract=protective.contract, position=15)]
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.ib.reqPositionsAsync = positions
+    placed = []
+    def place(contract, order):
+        placed.append(order)
+        order.orderId = 456
+        return _State(order=order, orderStatus=_State(status="Submitted"), log=[])
+    broker.ib.placeOrder = place
+    coro = broker.submit_market_exit(
+        "TEST", 15, oca_group="oca", order_ref=f"IA-E07-TEST-{kind}",
+    )
+    if allowed:
+        assert asyncio.run(coro) == 456
+        assert placed[0].totalQuantity == 15
+        assert placed[0].ocaGroup == "oca"
+    else:
+        with pytest.raises(IbkrExecutionError, match="POSITION_OR_ORDER_CONFLICT"):
+            asyncio.run(coro)
+        assert not placed

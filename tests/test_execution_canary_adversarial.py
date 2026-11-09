@@ -338,7 +338,7 @@ def test_overdue_tenth_session_exit_uses_immediate_market_exit(
     ]
     broker.snapshot = AccountSnapshot("ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 20}, 2)
 
-    asyncio.run(runner.cycle(now + timedelta(days=1)))
+    asyncio.run(runner.cycle(now + timedelta(days=1, minutes=12)))
     assert broker.market_exits == [
         ("TEST", 20, f"IA-E07-{token}-EXIT")
     ]
@@ -645,3 +645,68 @@ def test_filled_target_closes_position_and_persists_exit_commission(
     assert row["live_state"] == "closed"
     assert row["live_exit_reason"] == "target"
     assert row["live_exit_commission"] == 0.42
+
+
+@pytest.mark.parametrize("adopted", [False, True])
+@pytest.mark.parametrize("stale_filled", [False, True])
+@pytest.mark.parametrize("prior_day,confirmed", [(True, True), (True, False), (False, True)])
+def test_missing_timed_exit_requires_prior_day_and_broker_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior_day: bool, confirmed: bool,
+    stale_filled: bool, adopted: bool,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    asyncio.run(runner.cycle(now))
+    token = broker_token("crash-test-packet")
+    broker.snapshot = AccountSnapshot("ACCOUNT", 293.5, 293.5, 293.5, {"TEST": 20}, 0)
+    broker.order_values = [
+        BrokerOrder(101, f"IA-E07-{token}-ENTRY", "TEST", "entry", "Filled", 20, 0, 10)
+    ]
+    asyncio.run(runner.cycle(now + timedelta(minutes=12)))
+    runner.store.update("crash-test-packet", live_state="closing", timed_exit_order_id=999,
+                        live_exit_session="2026-01-05")
+    broker.order_values = [
+        BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Submitted", 0, 20, 0),
+        BrokerOrder(202, f"IA-E07-{token}-STOP", "TEST", "stop", "Submitted", 0, 20, 0),
+    ]
+    if stale_filled:
+        broker.order_values.append(BrokerOrder(
+            999, f"IA-E07-{token}-OVERDUE", "TEST", "time", "Filled", 20, 0, 10,
+        ))
+    stamp = "2026-01-05T20:00:00+00:00" if prior_day else "2026-01-06T14:59:00+00:00"
+    with runner.store.connect() as c:
+        c.execute("INSERT INTO events(occurred_at,level,event_type,packet_id,detail_json) "
+                  "VALUES(?,'info','overdue_market_exit_submitted','crash-test-packet','{\"order_id\":999}')",
+                  (stamp,))
+    if adopted:
+        with runner.store.connect() as c:
+            c.execute("UPDATE events SET event_type='orphan_exit_order_adopted' "
+                      "WHERE event_type='overdue_market_exit_submitted'")
+    async def confirm(*args: Any, **kwargs: Any) -> bool:
+        return confirmed
+    broker.confirm_missing_exit = confirm  # type: ignore[attr-defined]
+    due = datetime(2026, 1, 6, 15, 0, tzinfo=UTC)
+    asyncio.run(runner._reconcile_orders(
+        broker.order_values, broker.session_values, broker.snapshot, due,
+    ))
+    row = runner.store.rows()[0]
+    assert (row["timed_exit_order_id"] is None) == (prior_day and confirmed)
+    assert not broker.market_exits
+    assert asyncio.run(runner._submit_due_time_exits(due)) == 0
+
+
+@pytest.mark.parametrize("due", [
+    datetime(2026, 1, 10, 15, 0, tzinfo=UTC),  # Saturday
+    datetime(2026, 1, 6, 14, 29, tzinfo=UTC),  # pre-open
+    datetime(2026, 1, 6, 21, 0, tzinfo=UTC),  # close
+    datetime(2026, 1, 19, 15, 0, tzinfo=UTC),  # holiday
+])
+def test_overdue_exit_waits_for_exchange_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, due: datetime,
+) -> None:
+    runner, broker = _runner(tmp_path, monkeypatch, due)
+    asyncio.run(runner.cycle(due))
+    runner.store.update("crash-test-packet", live_state="open", live_quantity=20,
+                        live_exit_session="2026-01-05", oca_group="test")
+    assert asyncio.run(runner._submit_due_time_exits(due)) == 0
+    assert not broker.market_exits

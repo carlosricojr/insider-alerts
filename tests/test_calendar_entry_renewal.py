@@ -44,6 +44,13 @@ def adapter_at(now: datetime, kind: str = "fallback"):
         if kind == "native" else projected_schedule(now) if kind == "projection" else []
     )
     adapter = broker(FakeIb(response, hours(today)))
+    async def open_orders():
+        return []
+    async def positions():
+        return [SimpleNamespace(account="TEST", position=20, contract=SimpleNamespace(
+            symbol="TEST", conId=1, secType="STK", currency="USD"))]
+    adapter.ib.reqAllOpenOrdersAsync = open_orders
+    adapter.ib.reqPositionsAsync = positions
     asyncio.run(adapter.sessions(around=now, count=120))
     return adapter
 
@@ -169,14 +176,15 @@ def test_session_relative_dispatch(
     "2026-10-15T09:29:59", "2026-10-15T09:30:00",
     "2026-10-15T16:00:00", "2026-10-17T12:00:00", "2026-11-26T12:00:00",
 ])
-def test_overdue_recovery_retains_existing_day_order_behavior(
+def test_overdue_recovery_defers_outside_regular_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stamp: str,
 ) -> None:
     now = datetime.fromisoformat(stamp).replace(tzinfo=NEW_YORK)
     runner, fake = due_position(tmp_path, monkeypatch, now)
     runner.store.update("crash-test-packet", live_exit_session="2026-10-01")
-    assert asyncio.run(runner._submit_due_time_exits(now)) == 1
-    assert len(fake.market_exits) == 1
+    expected = int(stamp == "2026-10-15T09:30:00")
+    assert asyncio.run(runner._submit_due_time_exits(now)) == expected
+    assert len(fake.market_exits) == expected
     with runner.store.connect() as connection:
         assert connection.execute(
             "select count(*) from events where event_type='timed_exit_calendar_unavailable'"
@@ -222,7 +230,7 @@ def test_adapter_rechecks_after_contract_lookup_before_place_order(
 
     async def slow_contract(symbol: str):
         monkeypatch.setattr(module, "datetime", Clock)
-        return SimpleNamespace()
+        return SimpleNamespace(conId=1, secType="STK", currency="USD")
 
     monkeypatch.setattr(adapter, "_contract", slow_contract)
     method = adapter.submit_market_on_close if kind == "moc" else adapter.submit_market_exit
@@ -439,7 +447,7 @@ def test_adapter_dispatch_inside_window_preserves_oca_and_order_type(
             return now.astimezone(tz)
 
     async def contract(symbol):
-        return SimpleNamespace()
+        return SimpleNamespace(conId=1, secType="STK", currency="USD")
 
     async def no_sleep(seconds):
         pass

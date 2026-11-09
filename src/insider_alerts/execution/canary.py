@@ -172,6 +172,10 @@ class CanaryBroker(Protocol):
 
     async def cancel_order(self, order_id: int) -> None: ...
 
+    async def confirm_missing_exit(
+        self, symbol: str, quantity: int, *, oca_group: str, order_ref_prefix: str,
+    ) -> bool: ...
+
     async def orders(self) -> list[BrokerOrder]: ...
 
 
@@ -432,6 +436,21 @@ class CanaryStore:
                 (*values.values(), packet_id),
             )
             conn.commit()
+
+    def bind_timed_exit(self, packet_id: str, order_id: int, event_type: str) -> None:
+        """Commit the pointer and its order-bound observation clock together."""
+        stamp = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE candidates SET live_state='closing',timed_exit_order_id=?,"
+                "updated_at=? WHERE packet_id=?", (order_id, stamp, packet_id),
+            )
+            connection.execute(
+                "INSERT INTO events(occurred_at,level,event_type,packet_id,detail_json) "
+                "VALUES(?,?,?,?,?)", (stamp, "info", event_type, packet_id,
+                                      json.dumps({"order_id": order_id}, sort_keys=True)),
+            )
+            connection.commit()
 
     def event(
         self,
@@ -820,22 +839,14 @@ class CanaryRunner:
                     by_ref.get(f"IA-E07-{token}-{suffix}")
                     for suffix in exit_suffixes
                     if by_ref.get(f"IA-E07-{token}-{suffix}") is not None
+                    and by_ref[f"IA-E07-{token}-{suffix}"].status.lower() != "filled"
                 ),
                 None,
             )
             if order is None:
                 continue
-            self.store.update(
-                str(row["packet_id"]),
-                live_state="closing",
-                timed_exit_order_id=order.order_id,
-            )
-            self.store.event(
-                "orphan_exit_order_adopted",
-                packet_id=str(row["packet_id"]),
-                level="warning",
-                order_id=order.order_id,
-                status=order.status,
+            self.store.bind_timed_exit(
+                str(row["packet_id"]), order.order_id, "orphan_exit_order_adopted",
             )
 
     def _account_gate(
@@ -1074,6 +1085,7 @@ class CanaryRunner:
         account: AccountSnapshot,
         now: datetime,
     ) -> tuple[int, int]:
+        self._deferred_exit_packets: set[str] = set()
         by_id = {order.order_id: order for order in orders}
         by_ref = {order.order_ref: order for order in orders}
         opened = closed = 0
@@ -1171,7 +1183,82 @@ class CanaryRunner:
                 if row["timed_exit_order_id"] is not None
                 else None
             )
+            # Order ids are client/session scoped; reconcile the durable reference too.
+            if timed is not None and (
+                timed.symbol != row["symbol"] or timed.kind != "time"
+                or timed.order_ref not in {f"IA-E07-{token}-{suffix}"
+                                          for suffix in ("TIME", "OVERDUE", "QTYFAIL")}
+            ):
+                timed = None
+            if timed is None:
+                timed = next((order for order in orders if order.symbol == row["symbol"]
+                              and order.order_ref in {f"IA-E07-{token}-OVERDUE",
+                                                      f"IA-E07-{token}-TIME"}
+                              and order.status.lower() not in {"filled", "cancelled", "inactive",
+                                                               "apicancelled"}), None)
             current_position_quantity = account.positions.get(str(row["symbol"]), 0.0)
+            if (timed is not None and timed.status.lower() == "filled"
+                    and current_position_quantity > 0):
+                timed = None
+            if timed is None and row["timed_exit_order_id"] is not None:
+                with self.store.connect() as connection:
+                    submission = connection.execute(
+                        "SELECT occurred_at,detail_json FROM events WHERE packet_id=? "
+                        "AND event_type IN "
+                        "('timed_exit_submitted','overdue_market_exit_submitted',"
+                        "'orphan_exit_order_adopted') "
+                        "ORDER BY id DESC LIMIT 1", (str(row["packet_id"]),),
+                    ).fetchone()
+                # Never infer same-day acceptance failure from a missing callback.
+                prior_day = False
+                if submission is not None:
+                    try:
+                        sent_at = datetime.fromisoformat(submission[0])
+                        detail = json.loads(submission[1])
+                        prior_day = (
+                            sent_at.tzinfo is not None
+                            and sent_at.astimezone(NEW_YORK).date()
+                            < now.astimezone(NEW_YORK).date()
+                            and detail.get("order_id") == row["timed_exit_order_id"]
+                            and row["live_exit_session"] is not None
+                            and row["live_exit_session"]
+                            < now.astimezone(NEW_YORK).date().isoformat()
+                        )
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                confirm = getattr(self.broker, "confirm_missing_exit", None)
+                if prior_day and current_position_quantity > 0 and callable(confirm):
+                    quantity = int(current_position_quantity)
+                    if (quantity == current_position_quantity
+                        and quantity == row["live_quantity"] and await confirm(
+                        str(row["symbol"]), quantity, oca_group=str(row["oca_group"]),
+                        order_ref_prefix=f"IA-E07-{token}",
+                    )):
+                        stamp = datetime.now(UTC).isoformat()
+                        with self.store.connect() as connection:
+                            connection.execute(
+                                "UPDATE candidates SET live_state='open',live_quantity=?,"
+                                "timed_exit_order_id=NULL,updated_at=? WHERE packet_id=?",
+                                (quantity, stamp, str(row["packet_id"])),
+                            )
+                            connection.execute(
+                                "INSERT INTO events(occurred_at,level,event_type,"
+                                "packet_id,detail_json) VALUES(?,?,?,?,?)",
+                                (stamp, "critical", "missing_timed_exit_recovered",
+                                 str(row["packet_id"]), json.dumps({
+                                     "missing_order_id": row["timed_exit_order_id"],
+                                     "residual_quantity": quantity,
+                                 }, sort_keys=True)),
+                            )
+                            connection.commit()
+                        self._deferred_exit_packets.add(str(row["packet_id"]))
+                        # Repair/reconcile protection in the next cycle before dispatch.
+                        continue
+                self.store.event(
+                    "missing_timed_exit_unresolved", packet_id=str(row["packet_id"]),
+                    level="critical", missing_order_id=row["timed_exit_order_id"],
+                )
+
             cancelled_statuses = {"cancelled", "canceled", "apicancelled", "inactive"}
             if (
                 timed is not None
@@ -1199,7 +1286,7 @@ class CanaryRunner:
                     for order in (stop, target, timed)
                     if order
                     and order.filled > 0
-                    and (order.remaining <= 0 or current_position_quantity == 0)
+                    and current_position_quantity == 0
                 ),
                 None,
             )
@@ -1398,11 +1485,18 @@ class CanaryRunner:
             "live_state='open' AND live_exit_session<=? AND timed_exit_order_id IS NULL",
             (local.date().isoformat(),),
         ):
+            if str(row["packet_id"]) in getattr(self, "_deferred_exit_packets", set()):
+                continue
             send_now = datetime.now(UTC) if enforce_wall_clock else now
             local = send_now.astimezone(NEW_YORK)
             due_date = date.fromisoformat(str(row["live_exit_session"]))
             is_overdue = due_date < local.date()
             dispatch_window = None
+            if is_overdue:
+                session = self.broker.session_bounds(send_now)
+                if session is None or not session[0] <= send_now < session[1]:
+                    continue
+                dispatch_window = session
             after_moc_cutoff = False
             if not is_overdue:
                 session = self.broker.session_bounds(send_now)
@@ -1462,16 +1556,7 @@ class CanaryRunner:
                     dispatch_window=dispatch_window,
                 )
                 event_type = "timed_exit_submitted"
-            self.store.update(
-                str(row["packet_id"]),
-                live_state="closing",
-                timed_exit_order_id=order_id,
-            )
-            self.store.event(
-                event_type,
-                packet_id=str(row["packet_id"]),
-                order_id=order_id,
-            )
+            self.store.bind_timed_exit(str(row["packet_id"]), order_id, event_type)
             count += 1
         return count
 

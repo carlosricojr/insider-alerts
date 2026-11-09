@@ -683,10 +683,35 @@ class IbkrBroker:
     ) -> int:
         from ib_async import MarketOrder
 
-        existing = self._existing_trade(order_ref)
-        if existing is not None:
-            return int(existing.order.orderId)
         contract = await self._contract(symbol)
+        try:
+            active = await asyncio.wait_for(
+                self.ib.reqAllOpenOrdersAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            self.disconnect()
+            raise IbkrExecutionError("IBKR_EXIT_OPEN_ORDERS_FAILED") from exc
+        matches = [t for t in active if t.order.orderRef == order_ref
+                   and t.order.account == self._account()]
+        if matches:
+            if len(matches) != 1:
+                raise IbkrExecutionError("IBKR_EXIT_DUPLICATE_REFERENCE")
+            existing = matches[0]
+            if (existing.contract.conId != contract.conId
+                or existing.order.action != "SELL" or existing.order.ocaGroup != oca_group
+                or existing.order.orderType != "MKT" or existing.order.ocaType != 1
+                or float(existing.order.totalQuantity) != quantity
+                or existing.orderStatus.status not in {
+                    "Submitted", "PreSubmitted", "PendingSubmit",
+                }):
+                raise IbkrExecutionError("IBKR_EXIT_IDENTITY_CONFLICT")
+            return int(existing.order.orderId)
+        prefix = order_ref.rsplit("-", 1)[0]
+        if not await self.confirm_missing_exit(
+            symbol, quantity, oca_group=oca_group, order_ref_prefix=prefix,
+            allow_partial_protection=order_ref.endswith("-QTYFAIL"),
+        ):
+            raise IbkrExecutionError("IBKR_EXIT_POSITION_OR_ORDER_CONFLICT")
         order = MarketOrder(
             "SELL",
             quantity,
@@ -703,8 +728,60 @@ class IbkrBroker:
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(0.5)
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
-            raise IbkrExecutionError(f"IBKR rejected emergency market exit for {symbol}")
+            raise IbkrExecutionError(
+                f"IBKR rejected emergency market exit for {symbol}: "
+                + "; ".join(str(item.message) for item in trade.log)
+            )
         return int(trade.order.orderId)
+
+    async def confirm_missing_exit(
+        self, symbol: str, quantity: int, *, oca_group: str, order_ref_prefix: str,
+        allow_partial_protection: bool = False,
+    ) -> bool:
+        """Prove absence across all clients; never equate cached absence with expiry."""
+        account = self._account()
+        contract = await self._contract(symbol)
+        try:
+            trades = await asyncio.wait_for(
+                self.ib.reqAllOpenOrdersAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
+            )
+            positions = await asyncio.wait_for(
+                self.ib.reqPositionsAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            self.disconnect()
+            raise IbkrExecutionError("IBKR_MISSING_EXIT_RECONCILIATION_FAILED") from exc
+        matching_positions = [
+            p for p in positions if p.account == account and str(p.contract.symbol) == symbol
+        ]
+        if any(p.contract.conId != contract.conId or p.contract.secType != "STK"
+               or p.contract.currency != "USD" for p in matching_positions):
+            return False
+        current = sum(
+            float(p.position) for p in positions
+            if p.account == account and str(p.contract.symbol) == symbol
+        )
+        if not math.isfinite(current) or current != quantity or quantity <= 0:
+            return False
+        for trade in trades:
+            order = trade.order
+            if order.account != account or str(trade.contract.symbol) != symbol:
+                continue
+            if not (
+                order.ocaGroup == oca_group and order.action == "SELL"
+                and order.orderRef in {order_ref_prefix + "-STOP", order_ref_prefix + "-TARGET"}
+                and trade.contract.conId == contract.conId
+                and trade.contract.secType == "STK" and trade.contract.currency == "USD"
+                and order.orderType == ("STP" if order.orderRef.endswith("-STOP") else "LMT")
+                and order.ocaType == 1
+                and (allow_partial_protection or float(order.totalQuantity) == quantity)
+                and trade.orderStatus.status in {"Submitted", "PreSubmitted"}
+                and (allow_partial_protection or float(trade.orderStatus.filled) == 0)
+            ):
+                return False
+        self._all_open_trades = list(trades)
+        self._all_orders_checked_at = asyncio.get_running_loop().time()
+        return True
 
     async def cancel_order(self, order_id: int) -> None:
         trade = next(
