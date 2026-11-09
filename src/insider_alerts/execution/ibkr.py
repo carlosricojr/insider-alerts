@@ -788,6 +788,9 @@ class IbkrBroker:
         """Make the existing sell marketable with a price-only modification."""
         if dispatch_window is None or target.order.orderId <= 0 or target.order.permId <= 0:
             raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_NOT_PROVEN")
+        # confirm_missing_exit just refreshed lmtPrice from openOrder callbacks.
+        if target.order.lmtPrice == 0.01:
+            return int(target.order.orderId)
         replacement = deepcopy(target.order)
         # A market exit accepts any available positive execution price. One cent
         # provides a positive cent-price floor without another sell commitment.
@@ -916,6 +919,8 @@ class IbkrBroker:
                     remaining=float(trade.orderStatus.remaining),
                     average_fill_price=float(trade.orderStatus.avgFillPrice or 0.0),
                     commission=sum(commissions) if commissions else None,
+                    limit_price=(float(trade.order.lmtPrice)
+                                 if trade.order.orderType == "LMT" else None),
                 )
             )
         return output

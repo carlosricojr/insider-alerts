@@ -539,7 +539,7 @@ def test_exit_rejection_bounds_and_marks_missing_reason():
     assert detail.count("code=201") == 3 and len(detail) < 900
 
 
-@pytest.mark.parametrize("outcome", ["accepted", "rejected", "foreign", "partial"])
+@pytest.mark.parametrize("outcome", ["accepted", "adopted", "rejected", "foreign", "partial"])
 def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
     from copy import deepcopy
     from datetime import UTC, datetime, timedelta
@@ -556,6 +556,8 @@ def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
                           orderRef="IA-E07-TEST-STOP", tif="GTC")
     target = Trade(contract, target_order, OrderStatus(status="Submitted", filled=0, remaining=16))
     stop = Trade(contract, stop_order, OrderStatus(status="PreSubmitted", filled=0, remaining=16))
+    if outcome == "adopted":
+        target.order.lmtPrice = 0.01
     original = deepcopy(target.order)
     if outcome == "foreign":
         target.order.clientId = 99
@@ -584,7 +586,10 @@ def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
     coro = broker.submit_market_exit("TEST", 16, oca_group="oca",
                                     order_ref="IA-E07-TEST-OVERDUE",
                                     dispatch_window=(now, now + timedelta(minutes=1)))
-    if outcome == "accepted":
+    if outcome == "adopted":
+        assert asyncio.run(coro) == 20
+        assert not placed
+    elif outcome == "accepted":
         assert asyncio.run(coro) == 20
         expected = deepcopy(original)
         expected.lmtPrice = 0.01
