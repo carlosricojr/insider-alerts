@@ -28,6 +28,10 @@ from insider_alerts.strategy.e07 import (
 NEW_YORK = ZoneInfo("America/New_York")
 ARM_PHRASE = "I_ACCEPT_LIVE_CANARY_RISK"
 LIVE_AUXILIARY_BUDGET_SECONDS = 5.0
+_AUXILIARY_BUDGET_ERROR = (
+    "CANARY_AUXILIARY_BUDGET_EXCEEDED: live management already attempted; "
+    "new entries blocked; synchronous storage waits are not preemptible"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -642,18 +646,20 @@ class CanaryRunner:
         if not self.config.live_armed:
             return await collect()
         completed = False
+        deadline = monotonic() + LIVE_AUXILIARY_BUDGET_SECONDS
         budget = asyncio.timeout(LIVE_AUXILIARY_BUDGET_SECONDS)
         try:
             async with budget:
                 result = await collect()
+                # A synchronous write may finish after the deadline without
+                # yielding to asyncio's cancellation callback. Still forbid buys.
+                if monotonic() >= deadline:
+                    raise IbkrExecutionError(_AUXILIARY_BUDGET_ERROR)
                 completed = True
                 return result
         except TimeoutError as exc:
             if budget.expired():
-                raise IbkrExecutionError(
-                    "CANARY_AUXILIARY_BUDGET_EXCEEDED: live management already attempted; "
-                    "new entries blocked; synchronous storage waits are not preemptible"
-                ) from exc
+                raise IbkrExecutionError(_AUXILIARY_BUDGET_ERROR) from exc
             raise
         finally:
             if not completed:

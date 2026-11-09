@@ -672,19 +672,26 @@ def test_completed_target_reconstructs_only_complete_bound_executions(complete: 
 
 
 @pytest.mark.parametrize("fresh_quantity", [0, 3])
+@pytest.mark.parametrize("prior_callback", [False, True])
 def test_entry_refresh_uses_complete_returned_positions_and_bypasses_order_cache(
-    fresh_quantity: int,
+    fresh_quantity: int, prior_callback: bool,
 ):
     broker = _mk_broker()
     calls = []
-    stale = _State(account="ACCT", position=9, avgCost=10, contract=_State(symbol="STALE"))
+    stale = _State(account="ACCT", position=9, avgCost=10,
+                   contract=_State(symbol="STALE", conId=10))
     fresh = _State(account="ACCT", position=fresh_quantity, avgCost=12,
-                   contract=_State(symbol="FRESH"))
-    foreign = _State(account="OTHER", position=20, avgCost=30, contract=_State(symbol="FOREIGN"))
+                   contract=_State(symbol="FRESH", conId=11))
+    foreign = _State(account="OTHER", position=20, avgCost=30,
+                     contract=_State(symbol="FOREIGN", conId=12))
 
     async def positions():
         calls.append("positions")
-        return [fresh, foreign]
+        earlier = _State(account="ACCT", position=20, avgCost=15, contract=fresh.contract)
+        foreign_same_contract = _State(
+            account="OTHER", position=99, avgCost=50, contract=fresh.contract,
+        )
+        return ([earlier] if prior_callback else []) + [fresh, foreign, foreign_same_contract]
 
     async def orders():
         calls.append("orders")

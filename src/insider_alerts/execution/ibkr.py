@@ -471,7 +471,15 @@ class IbkrBroker:
                 ) from exc
             self._all_orders_checked_at = float("-inf")
             snapshot = await self.account_snapshot()
-            selected = [p for p in positions if p.account == snapshot.account and p.position != 0]
+            # A complete positions response can contain several updates for one
+            # contract, including a final zero. Retain the last callback first.
+            latest = {int(p.contract.conId): p for p in positions if p.account == snapshot.account}
+            selected = [p for p in latest.values() if p.position != 0]
+            if (any(conid <= 0 for conid in latest)
+                or any(not math.isfinite(float(p.position)) for p in selected)
+                or len({str(p.contract.symbol) for p in selected}) != len(selected)):
+                self.disconnect()
+                raise IbkrExecutionError("IBKR_ENTRY_POSITIONS_AMBIGUOUS")
             return replace(
                 snapshot,
                 positions={str(p.contract.symbol): float(p.position) for p in selected},

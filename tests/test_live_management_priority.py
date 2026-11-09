@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -146,6 +147,29 @@ def test_external_auxiliary_cancellation_discards_sdk_session(
     asyncio.run(scenario())
     assert disconnected == [True]
     assert broker.entry_calls == 0
+    assert _metadata(runner).get("last_cycle_success_utc") is None
+
+
+def test_synchronous_auxiliary_overrun_finishes_then_blocks_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
+    runner, broker = _runner(tmp_path, monkeypatch, now)
+    disconnected = []
+
+    async def slow_synchronous_storage(*args, **kwargs):
+        # No asyncio yield: its scheduled timeout callback cannot run here.
+        time.sleep(0.04)
+        return (0, 0)
+
+    monkeypatch.setattr(runner, "_settle_shadow", slow_synchronous_storage)
+    monkeypatch.setattr(broker, "disconnect", lambda: disconnected.append(True))
+    monkeypatch.setattr(module, "LIVE_AUXILIARY_BUDGET_SECONDS", 0.01)
+    with pytest.raises(IbkrExecutionError, match="AUXILIARY_BUDGET_EXCEEDED"):
+        asyncio.run(runner.cycle(now, disconnect_after=False))
+    assert broker.entry_calls == 0
+    assert disconnected == [True]
+    assert runner.store.rows()[0]["live_state"] == "queued"
     assert _metadata(runner).get("last_cycle_success_utc") is None
 
 
