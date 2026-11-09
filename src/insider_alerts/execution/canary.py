@@ -807,7 +807,7 @@ class CanaryRunner:
 
     def _due_target_intent(self, row: sqlite3.Row, order: BrokerOrder | None) -> bool:
         """Attribute only broker-observed repricing bound to a durable dispatch intent."""
-        if order is None or order.limit_price != 0.01 or order.symbol != row["symbol"]:
+        if order is None or order.limit_price is None or order.symbol != row["symbol"]:
             return False
         token = broker_token(str(row["packet_id"]))
         if order.order_ref != f"IA-E07-{token}-TARGET":
@@ -815,11 +815,16 @@ class CanaryRunner:
         with self.store.connect() as connection:
             events = connection.execute(
                 "SELECT detail_json FROM events WHERE packet_id=? "
-                "AND event_type='due_target_exit_intent'", (str(row["packet_id"]),),
+                "AND event_type IN ('due_target_exit_intent','due_target_price_intent')",
+                (str(row["packet_id"]),),
             ).fetchall()
-        return any(
-            json.loads(event[0]).get("target_order_id") == order.order_id for event in events
-        )
+        for event in events:
+            detail = json.loads(event[0])
+            detail = detail.get("modification", detail)
+            if (detail.get("target_order_id") == order.order_id
+                and detail.get("requested_limit_price", 0.01) == order.limit_price):
+                return True
+        return False
 
     def _adopt_broker_orders(self, orders: Sequence[BrokerOrder]) -> None:
         """Bind broker-accepted orders that survived a crash before the SQLite commit."""
@@ -1508,7 +1513,8 @@ class CanaryRunner:
         local = now.astimezone(NEW_YORK)
         count = 0
         for row in self.store.rows(
-            "live_state='open' AND live_exit_session<=? AND timed_exit_order_id IS NULL",
+            "live_state IN ('open','closing') AND live_exit_session<=? "
+            "AND (timed_exit_order_id IS NULL OR timed_exit_order_id=target_order_id)",
             (local.date().isoformat(),),
         ):
             if str(row["packet_id"]) in getattr(self, "_deferred_exit_packets", set()):
@@ -1569,13 +1575,25 @@ class CanaryRunner:
                     target_order_id=row["target_order_id"], quantity=row["live_quantity"],
                     intended_exit_session=row["live_exit_session"],
                 )
-                order_id = await self.broker.submit_market_exit(
-                    str(row["symbol"]),
-                    int(row["live_quantity"]),
-                    oca_group=str(row["oca_group"]),
-                    order_ref=f"IA-E07-{token}-OVERDUE",
-                    dispatch_window=dispatch_window,
-                )
+                def record_price_intent(
+                    detail: dict[str, object], packet: str = str(row["packet_id"]),
+                ) -> None:
+                    self.store.event(
+                        "due_target_price_intent", packet_id=packet, modification=detail,
+                    )
+                if hasattr(self.broker, "exit_modification_intent"):
+                    self.broker.exit_modification_intent = record_price_intent
+                try:
+                    order_id = await self.broker.submit_market_exit(
+                        str(row["symbol"]),
+                        int(row["live_quantity"]),
+                        oca_group=str(row["oca_group"]),
+                        order_ref=f"IA-E07-{token}-OVERDUE",
+                        dispatch_window=dispatch_window,
+                    )
+                finally:
+                    if hasattr(self.broker, "exit_modification_intent"):
+                        self.broker.exit_modification_intent = None
                 event_type = "overdue_market_exit_submitted"
             else:
                 assert dispatch_window is not None

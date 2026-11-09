@@ -5,6 +5,7 @@ import math
 import re
 import sys
 from collections import deque
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
@@ -56,6 +57,7 @@ class IbkrBroker:
         self.port = port
         self.client_id = client_id
         self.configured_account = account
+        self.exit_modification_intent: Callable[[dict[str, object]], None] | None = None
         self.ib: Any = None
         self._contracts: dict[str, Any] = {}
         self._errors: deque[tuple[int, int, str]] = deque(maxlen=100)
@@ -752,7 +754,9 @@ class IbkrBroker:
                          and t.order.orderRef == prefix + "-STOP"]
                 if (len(targets) != 1 or len(stops) != 1
                     or targets[0].order.clientId != self.client_id
-                    or stops[0].order.clientId != self.client_id):
+                    or stops[0].order.clientId != self.client_id
+                    or float(stops[0].orderStatus.remaining) != quantity
+                    or float(targets[0].orderStatus.remaining) != quantity):
                     raise IbkrExecutionError("IBKR_EXIT_TARGET_OWNERSHIP_CONFLICT")
                 return await self._replace_target_with_due_exit(
                     targets[0], contract, order_ref, dispatch_window,
@@ -788,13 +792,67 @@ class IbkrBroker:
         """Make the existing sell marketable with a price-only modification."""
         if dispatch_window is None or target.order.orderId <= 0 or target.order.permId <= 0:
             raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_NOT_PROVEN")
-        # confirm_missing_exit just refreshed lmtPrice from openOrder callbacks.
-        if target.order.lmtPrice == 0.01:
+        request_ib = self.ib
+        ticker = request_ib.reqMktData(contract, "", False, False)
+        bid_observed_at: datetime | None = None
+        observed_bid: float | None = None
+
+        def on_quote(updated: Any) -> None:
+            nonlocal bid_observed_at, observed_bid
+            for tick in updated.ticks:
+                if tick.tickType == 1 and math.isfinite(float(tick.price)) and tick.price > 0:
+                    bid_observed_at = tick.time
+                    observed_bid = float(tick.price)
+
+        ticker.updateEvent += on_quote
+        try:
+            quote_deadline = asyncio.get_running_loop().time() + 5.0
+            while asyncio.get_running_loop().time() < quote_deadline:
+                await asyncio.sleep(0.1)
+                if (ticker.marketDataType == 1 and observed_bid is not None
+                    and float(ticker.bid) == observed_bid
+                    and math.isfinite(float(ticker.bidSize)) and float(ticker.bidSize) > 0
+                    and isinstance(bid_observed_at, datetime)
+                    and bid_observed_at.tzinfo is not None):
+                    break
+            else:
+                raise IbkrExecutionError("IBKR_EXIT_LIVE_BID_UNAVAILABLE")
+            bid = observed_bid
+            quote_time = bid_observed_at
+        finally:
+            ticker.updateEvent -= on_quote
+            request_ib.cancelMktData(contract)
+        prefix = order_ref.rsplit("-", 1)[0]
+        if not await self.confirm_missing_exit(
+            str(contract.symbol), int(target.order.totalQuantity),
+            oca_group=target.order.ocaGroup, order_ref_prefix=prefix,
+        ):
+            self.disconnect()
+            raise IbkrExecutionError("IBKR_EXIT_POST_QUOTE_RECONCILIATION_FAILED")
+        if quote_time is None or not 0 <= (datetime.now(UTC) - quote_time).total_seconds() <= 3:
+            raise IbkrExecutionError("IBKR_EXIT_LIVE_BID_STALE")
+        current = [t for t in self._all_open_trades
+                   if t.order.orderId == target.order.orderId
+                   and t.order.permId == target.order.permId
+                   and t.order.clientId == self.client_id]
+        if len(current) != 1 or not callable(self.exit_modification_intent):
+            raise IbkrExecutionError("IBKR_EXIT_TARGET_INTENT_OR_IDENTITY_MISSING")
+        target = current[0]
+        if (target.orderStatus.status not in {"Submitted", "PreSubmitted"}
+            or float(target.orderStatus.remaining) != float(target.order.totalQuantity)
+            or not request_ib.isConnected()):
+            self.disconnect()
+            raise IbkrExecutionError("IBKR_EXIT_TARGET_STATE_CHANGED")
+        self._check_exit_window(dispatch_window)
+        self.exit_modification_intent({
+            "target_order_id": int(target.order.orderId), "requested_limit_price": bid,
+            "quote_asof": quote_time.isoformat(), "conid": int(contract.conId),
+            "perm_id": int(target.order.permId),
+        })
+        if target.order.lmtPrice == bid:
             return int(target.order.orderId)
         replacement = deepcopy(target.order)
-        # A market exit accepts any available positive execution price. One cent
-        # provides a positive cent-price floor without another sell commitment.
-        replacement.lmtPrice = 0.01
+        replacement.lmtPrice = float(bid)
         self._errors = deque((e for e in self._errors if e[0] != replacement.orderId), maxlen=100)
         self._check_exit_window(dispatch_window)
         trade = self.ib.placeOrder(contract, replacement)
