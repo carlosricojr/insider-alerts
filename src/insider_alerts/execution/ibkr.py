@@ -902,6 +902,35 @@ class IbkrBroker:
                 kind = "target"
             else:
                 kind = "time"
+            order_id = int(trade.order.orderId)
+            filled = float(trade.orderStatus.filled)
+            remaining = float(trade.orderStatus.remaining)
+            average_price = float(trade.orderStatus.avgFillPrice or 0.0)
+            # completedOrder omits API orderId/status fill totals after reconnect.
+            # Recover only a complete, uniquely identified execution set; never
+            # infer a fill from the terminal status or from a current flat position.
+            if order_id == 0 and trade.orderStatus.status == "Filled" and trade.fills:
+                executions = [fill.execution for fill in trade.fills]
+                ids = {execution.orderId for execution in executions}
+                exec_ids = {execution.execId for execution in executions}
+                valid = all(
+                    fill.contract.conId == trade.contract.conId
+                    and fill.execution.acctNumber == trade.order.account
+                    and fill.execution.permId == trade.order.permId
+                    and math.isfinite(float(fill.execution.shares))
+                    and math.isfinite(float(fill.execution.price))
+                    and float(fill.execution.shares) > 0 and float(fill.execution.price) > 0
+                    for fill in trade.fills
+                )
+                shares = sum(float(execution.shares) for execution in executions)
+                if (valid and len(ids) == 1 and next(iter(ids)) > 0
+                    and len(exec_ids) == len(executions) and "" not in exec_ids
+                    and shares == float(trade.order.totalQuantity)):
+                    order_id = int(next(iter(ids)))
+                    filled = shares
+                    remaining = 0.0
+                    average_price = sum(float(e.shares) * float(e.price)
+                                        for e in executions) / shares
             commissions = [
                 float(fill.commissionReport.commission)
                 for fill in trade.fills
@@ -910,14 +939,14 @@ class IbkrBroker:
             ]
             output.append(
                 BrokerOrder(
-                    order_id=int(trade.order.orderId),
+                    order_id=order_id,
                     order_ref=ref,
                     symbol=str(trade.contract.symbol),
                     kind=kind,
                     status=str(trade.orderStatus.status),
-                    filled=float(trade.orderStatus.filled),
-                    remaining=float(trade.orderStatus.remaining),
-                    average_fill_price=float(trade.orderStatus.avgFillPrice or 0.0),
+                    filled=filled,
+                    remaining=remaining,
+                    average_fill_price=average_price,
                     commission=sum(commissions) if commissions else None,
                     limit_price=(float(trade.order.lmtPrice)
                                  if trade.order.orderType == "LMT" else None),

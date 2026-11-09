@@ -604,3 +604,22 @@ def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
         if outcome == "rejected":
             assert disconnected
             assert target.order.lmtPrice == 13.76
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_completed_target_reconstructs_only_complete_bound_executions(complete: bool):
+    from ib_async import CommissionReport, Execution, Fill, LimitOrder, OrderStatus, Stock, Trade
+    broker = _mk_broker()
+    contract = Stock("TEST", "SMART", "USD", conId=123)
+    order = LimitOrder("SELL", 16, .01, orderId=0, permId=120, account="ACCT",
+                       orderRef="IA-E07-TEST-TARGET")
+    execution = Execution(execId="unique", orderId=20, permId=120, acctNumber="ACCT",
+                          shares=16 if complete else 8, price=12.3)
+    fill = Fill(contract, execution, CommissionReport(commission=.35), None)
+    trade = Trade(contract, order, OrderStatus(status="Filled"), [fill])
+    broker.ib.trades = lambda: [trade]
+    result = asyncio.run(broker.orders())[0]
+    assert result.order_id == (20 if complete else 0)
+    assert result.filled == (16 if complete else 0)
+    assert result.average_fill_price == (12.3 if complete else 0)
+    assert result.limit_price == .01
