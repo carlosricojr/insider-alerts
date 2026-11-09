@@ -317,6 +317,9 @@ class FakeBroker:
     async def account_snapshot(self) -> AccountSnapshot:
         return self.snapshot
 
+    async def fresh_account_snapshot(self) -> AccountSnapshot:
+        return self.snapshot
+
     async def preview_entry(self, symbol: str, quantity: int) -> CommissionPreview:
         return CommissionPreview(self.commission, "USD")
 

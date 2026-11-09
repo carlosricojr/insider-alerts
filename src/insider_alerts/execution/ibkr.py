@@ -7,6 +7,7 @@ import sys
 from collections import deque
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
@@ -455,6 +456,52 @@ class IbkrBroker:
             ),
             average_costs=average_costs,
         )
+
+    async def fresh_account_snapshot(self) -> AccountSnapshot:
+        """Complete fresh positions/orders, retaining newer streamed position callbacks."""
+        request_ib = self.ib
+        account = self._account()
+        updates: list[Any] = []
+
+        def on_position(position: Any) -> None:
+            if position.account == account:
+                updates.append(position)
+
+        request_ib.positionEvent += on_position
+        try:
+            try:
+                positions = await asyncio.wait_for(
+                    request_ib.reqPositionsAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                self.disconnect()
+                raise IbkrExecutionError(
+                    "IBKR_ENTRY_POSITIONS_REFRESH_FAILED: broker position state is unknown"
+                ) from exc
+            self._all_orders_checked_at = float("-inf")
+            snapshot = await self.account_snapshot()
+            # positionEnd closes the request's response container, while later
+            # positionEvent callbacks can arrive during the order refresh. Those
+            # newer observations must win, including their zero updates.
+            latest = {int(p.contract.conId): p for p in [*positions, *updates]
+                      if p.account == account}
+            selected = [p for p in latest.values() if p.position != 0]
+            if (any(conid <= 0 for conid in latest)
+                or any(not math.isfinite(float(p.position)) for p in selected)
+                or len({str(p.contract.symbol) for p in selected}) != len(selected)):
+                self.disconnect()
+                raise IbkrExecutionError("IBKR_ENTRY_POSITIONS_AMBIGUOUS")
+            return replace(
+                snapshot,
+                positions={str(p.contract.symbol): float(p.position) for p in selected},
+                average_costs={str(p.contract.symbol): float(p.avgCost) for p in selected
+                               if math.isfinite(float(p.avgCost)) and float(p.avgCost) > 0},
+            )
+        except asyncio.CancelledError:
+            self.disconnect()
+            raise
+        finally:
+            request_ib.positionEvent -= on_position
 
     async def preview_entry(self, symbol: str, quantity: int) -> CommissionPreview:
         from ib_async import MarketOrder
