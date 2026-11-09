@@ -518,3 +518,22 @@ def test_market_exit_quantity_failure_keeps_emergency_residual_flatten(kind: str
         with pytest.raises(IbkrExecutionError, match="POSITION_OR_ORDER_CONFLICT"):
             asyncio.run(coro)
         assert not placed
+
+
+@pytest.mark.parametrize("status", ["Inactive", "Cancelled", "ApiCancelled"])
+def test_exit_rejection_retains_order_specific_broker_error(status: str):
+    broker = _mk_broker()
+    broker._errors.extend([(77, 201, "equity insufficient U1234567"),
+                           (88, 201, "unrelated private rejection")])
+    detail = broker._order_rejection_detail(77, "ACCT", status)
+    assert "code=201" in detail and "equity insufficient" in detail
+    assert "U1234567" not in detail and "unrelated" not in detail
+    assert f"status={status}" in detail
+
+
+def test_exit_rejection_bounds_and_marks_missing_reason():
+    broker = _mk_broker()
+    assert "no broker error recorded" in broker._order_rejection_detail(77, "ACCT", "Cancelled")
+    broker._errors.extend((77, 201, "x" * 1000) for _ in range(10))
+    detail = broker._order_rejection_detail(77, "ACCT", "Cancelled")
+    assert detail.count("code=201") == 3 and len(detail) < 900
