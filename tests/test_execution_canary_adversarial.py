@@ -647,11 +647,12 @@ def test_filled_target_closes_position_and_persists_exit_commission(
     assert row["live_exit_commission"] == 0.42
 
 
+@pytest.mark.parametrize("adopted", [False, True])
 @pytest.mark.parametrize("stale_filled", [False, True])
 @pytest.mark.parametrize("prior_day,confirmed", [(True, True), (True, False), (False, True)])
 def test_missing_timed_exit_requires_prior_day_and_broker_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior_day: bool, confirmed: bool,
-    stale_filled: bool,
+    stale_filled: bool, adopted: bool,
 ) -> None:
     now = datetime(2026, 1, 5, 14, 18, 30, tzinfo=UTC)
     runner, broker = _runner(tmp_path, monkeypatch, now)
@@ -677,6 +678,10 @@ def test_missing_timed_exit_requires_prior_day_and_broker_confirmation(
         c.execute("INSERT INTO events(occurred_at,level,event_type,packet_id,detail_json) "
                   "VALUES(?,'info','overdue_market_exit_submitted','crash-test-packet','{\"order_id\":999}')",
                   (stamp,))
+    if adopted:
+        with runner.store.connect() as c:
+            c.execute("UPDATE events SET event_type='orphan_exit_order_adopted' "
+                      "WHERE event_type='overdue_market_exit_submitted'")
     async def confirm(*args: Any, **kwargs: Any) -> bool:
         return confirmed
     broker.confirm_missing_exit = confirm  # type: ignore[attr-defined]

@@ -437,6 +437,21 @@ class CanaryStore:
             )
             conn.commit()
 
+    def bind_timed_exit(self, packet_id: str, order_id: int, event_type: str) -> None:
+        """Commit the pointer and its order-bound observation clock together."""
+        stamp = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE candidates SET live_state='closing',timed_exit_order_id=?,"
+                "updated_at=? WHERE packet_id=?", (order_id, stamp, packet_id),
+            )
+            connection.execute(
+                "INSERT INTO events(occurred_at,level,event_type,packet_id,detail_json) "
+                "VALUES(?,?,?,?,?)", (stamp, "info", event_type, packet_id,
+                                      json.dumps({"order_id": order_id}, sort_keys=True)),
+            )
+            connection.commit()
+
     def event(
         self,
         event_type: str,
@@ -830,17 +845,8 @@ class CanaryRunner:
             )
             if order is None:
                 continue
-            self.store.update(
-                str(row["packet_id"]),
-                live_state="closing",
-                timed_exit_order_id=order.order_id,
-            )
-            self.store.event(
-                "orphan_exit_order_adopted",
-                packet_id=str(row["packet_id"]),
-                level="warning",
-                order_id=order.order_id,
-                status=order.status,
+            self.store.bind_timed_exit(
+                str(row["packet_id"]), order.order_id, "orphan_exit_order_adopted",
             )
 
     def _account_gate(
@@ -1199,7 +1205,8 @@ class CanaryRunner:
                     submission = connection.execute(
                         "SELECT occurred_at,detail_json FROM events WHERE packet_id=? "
                         "AND event_type IN "
-                        "('timed_exit_submitted','overdue_market_exit_submitted') "
+                        "('timed_exit_submitted','overdue_market_exit_submitted',"
+                        "'orphan_exit_order_adopted') "
                         "ORDER BY id DESC LIMIT 1", (str(row["packet_id"]),),
                     ).fetchone()
                 # Never infer same-day acceptance failure from a missing callback.
@@ -1550,18 +1557,7 @@ class CanaryRunner:
                     dispatch_window=dispatch_window,
                 )
                 event_type = "timed_exit_submitted"
-            stamp = datetime.now(UTC).isoformat()
-            with self.store.connect() as connection:
-                connection.execute(
-                    "UPDATE candidates SET live_state='closing',timed_exit_order_id=?,"
-                    "updated_at=? WHERE packet_id=?", (order_id, stamp, str(row["packet_id"])),
-                )
-                connection.execute(
-                    "INSERT INTO events(occurred_at,level,event_type,packet_id,detail_json) "
-                    "VALUES(?,?,?,?,?)", (stamp, "info", event_type, str(row["packet_id"]),
-                                          json.dumps({"order_id": order_id}, sort_keys=True)),
-                )
-                connection.commit()
+            self.store.bind_timed_exit(str(row["packet_id"]), order_id, event_type)
             count += 1
         return count
 
