@@ -107,6 +107,7 @@ class BrokerOrder:
     remaining: float
     average_fill_price: float
     commission: float | None = None
+    limit_price: float | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -804,6 +805,22 @@ class CanaryRunner:
             }
         )
 
+    def _due_target_intent(self, row: sqlite3.Row, order: BrokerOrder | None) -> bool:
+        """Attribute only broker-observed repricing bound to a durable dispatch intent."""
+        if order is None or order.limit_price != 0.01 or order.symbol != row["symbol"]:
+            return False
+        token = broker_token(str(row["packet_id"]))
+        if order.order_ref != f"IA-E07-{token}-TARGET":
+            return False
+        with self.store.connect() as connection:
+            events = connection.execute(
+                "SELECT detail_json FROM events WHERE packet_id=? "
+                "AND event_type='due_target_exit_intent'", (str(row["packet_id"]),),
+            ).fetchall()
+        return any(
+            json.loads(event[0]).get("target_order_id") == order.order_id for event in events
+        )
+
     def _adopt_broker_orders(self, orders: Sequence[BrokerOrder]) -> None:
         """Bind broker-accepted orders that survived a crash before the SQLite commit."""
 
@@ -843,6 +860,11 @@ class CanaryRunner:
                 ),
                 None,
             )
+            if order is None:
+                target = by_ref.get(f"IA-E07-{token}-TARGET")
+                if target is not None and target.status.lower() != "filled" \
+                        and self._due_target_intent(row, target):
+                    order = target
             if order is None:
                 continue
             self.store.bind_timed_exit(
@@ -1185,9 +1207,12 @@ class CanaryRunner:
             )
             # Order ids are client/session scoped; reconcile the durable reference too.
             if timed is not None and (
-                timed.symbol != row["symbol"] or timed.kind != "time"
+                timed.symbol != row["symbol"] or (timed.kind != "time"
+                and timed.order_id != row["target_order_id"])
                 or timed.order_ref not in {f"IA-E07-{token}-{suffix}"
                                           for suffix in ("TIME", "OVERDUE", "QTYFAIL")}
+                and not (timed.order_id == row["target_order_id"]
+                         and timed.order_ref == f"IA-E07-{token}-TARGET")
             ):
                 timed = None
             if timed is None:
@@ -1381,7 +1406,8 @@ class CanaryRunner:
                         )
                 continue
             reason = (
-                "stop"
+                "time" if (filled_exit.order_id == row["timed_exit_order_id"]
+                           or self._due_target_intent(row, filled_exit)) else "stop"
                 if filled_exit.kind == "stop"
                 else ("target" if filled_exit.kind == "target" else "time")
             )
@@ -1538,6 +1564,11 @@ class CanaryRunner:
                                    closes if after_moc_cutoff else cutoff)
             token = broker_token(str(row["packet_id"]))
             if is_overdue or after_moc_cutoff:
+                self.store.event(
+                    "due_target_exit_intent", packet_id=str(row["packet_id"]),
+                    target_order_id=row["target_order_id"], quantity=row["live_quantity"],
+                    intended_exit_session=row["live_exit_session"],
+                )
                 order_id = await self.broker.submit_market_exit(
                     str(row["symbol"]),
                     int(row["live_quantity"]),

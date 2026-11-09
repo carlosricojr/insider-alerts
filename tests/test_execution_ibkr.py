@@ -537,3 +537,89 @@ def test_exit_rejection_bounds_and_marks_missing_reason():
     broker._errors.extend((77, 201, "x" * 1000) for _ in range(10))
     detail = broker._order_rejection_detail(77, "ACCT", "Cancelled")
     assert detail.count("code=201") == 3 and len(detail) < 900
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "adopted", "rejected", "foreign", "partial"])
+def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
+    from copy import deepcopy
+    from datetime import UTC, datetime, timedelta
+
+    from ib_async import LimitOrder, OrderStatus, Stock, StopOrder, Trade
+
+    broker = _mk_broker()
+    contract = Stock("TEST", "SMART", "USD", conId=123)
+    target_order = LimitOrder("SELL", 16, 13.76, account="ACCT", orderId=20,
+                              permId=120, clientId=1, ocaGroup="oca", ocaType=1,
+                              orderRef="IA-E07-TEST-TARGET", tif="GTC")
+    stop_order = StopOrder("SELL", 16, 11.26, account="ACCT", orderId=21,
+                          permId=121, clientId=1, ocaGroup="oca", ocaType=1,
+                          orderRef="IA-E07-TEST-STOP", tif="GTC")
+    target = Trade(contract, target_order, OrderStatus(status="Submitted", filled=0, remaining=16))
+    stop = Trade(contract, stop_order, OrderStatus(status="PreSubmitted", filled=0, remaining=16))
+    if outcome == "adopted":
+        target.order.lmtPrice = 0.01
+    original = deepcopy(target.order)
+    if outcome == "foreign":
+        target.order.clientId = 99
+    if outcome == "partial":
+        target.orderStatus.filled = 1
+    async def orders():
+        return [target, stop]
+    async def positions():
+        return [_State(account="ACCT", contract=contract, position=16)]
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.ib.reqPositionsAsync = positions
+    broker._check_exit_window = lambda window: None  # type: ignore[method-assign]
+    disconnected = []
+    broker.disconnect = lambda: disconnected.append(True)  # type: ignore[method-assign]
+    placed = []
+    def place(_contract, order):
+        placed.append(order)
+        assert order is not target_order
+        if outcome == "rejected":
+            broker._errors.append((20, 201, "rejected modification"))
+        else:
+            target.order = order  # Emulate openOrder callback acknowledgement.
+        return target
+    broker.ib.placeOrder = place
+    now = datetime.now(UTC)
+    coro = broker.submit_market_exit("TEST", 16, oca_group="oca",
+                                    order_ref="IA-E07-TEST-OVERDUE",
+                                    dispatch_window=(now, now + timedelta(minutes=1)))
+    if outcome == "adopted":
+        assert asyncio.run(coro) == 20
+        assert not placed
+    elif outcome == "accepted":
+        assert asyncio.run(coro) == 20
+        expected = deepcopy(original)
+        expected.lmtPrice = 0.01
+        assert len(placed) == 1
+        assert vars(placed[0]) == vars(expected)
+        assert stop.order == stop_order
+        assert not disconnected
+    else:
+        with pytest.raises(IbkrExecutionError):
+            asyncio.run(coro)
+        assert len(placed) == int(outcome == "rejected")
+        if outcome == "rejected":
+            assert disconnected
+            assert target.order.lmtPrice == 13.76
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_completed_target_reconstructs_only_complete_bound_executions(complete: bool):
+    from ib_async import CommissionReport, Execution, Fill, LimitOrder, OrderStatus, Stock, Trade
+    broker = _mk_broker()
+    contract = Stock("TEST", "SMART", "USD", conId=123)
+    order = LimitOrder("SELL", 16, .01, orderId=0, permId=120, account="ACCT",
+                       orderRef="IA-E07-TEST-TARGET")
+    execution = Execution(execId="unique", orderId=20, permId=120, acctNumber="ACCT",
+                          shares=16 if complete else 8, price=12.3)
+    fill = Fill(contract, execution, CommissionReport(commission=.35), None)
+    trade = Trade(contract, order, OrderStatus(status="Filled"), [fill])
+    broker.ib.trades = lambda: [trade]
+    result = asyncio.run(broker.orders())[0]
+    assert result.order_id == (20 if complete else 0)
+    assert result.filled == (16 if complete else 0)
+    assert result.average_fill_price == (12.3 if complete else 0)
+    assert result.limit_price == .01
