@@ -846,9 +846,8 @@ class IbkrBroker:
         if quote_time is None or not 0 <= (datetime.now(UTC) - quote_time).total_seconds() <= 3:
             raise IbkrExecutionError("IBKR_EXIT_LIVE_BID_STALE")
         current = [t for t in self._all_open_trades
-                   if t.order.orderId == target.order.orderId
-                   and t.order.permId == target.order.permId
-                   and t.order.clientId == self.client_id]
+                   if t.order.account == target.order.account
+                   and t.order.orderRef == target.order.orderRef]
         current_stops = [t for t in self._all_open_trades
                          if t.order.account == target.order.account
                          and t.order.orderRef == stop_ref]

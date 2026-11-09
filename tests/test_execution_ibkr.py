@@ -541,7 +541,8 @@ def test_exit_rejection_bounds_and_marks_missing_reason():
 
 @pytest.mark.parametrize("outcome", [
     "accepted", "adopted", "rejected", "foreign", "partial", "delayed", "stale", "nonbid",
-    "missing_stop_after_quote", "duplicate_stop_after_quote", "slow_intent",
+    "missing_stop_after_quote", "duplicate_stop_after_quote", "duplicate_target_after_quote",
+    "slow_intent",
 ])
 def test_due_exit_reprices_existing_target_without_another_sell(
     outcome: str, monkeypatch: pytest.MonkeyPatch,
@@ -602,6 +603,13 @@ def test_due_exit_reprices_existing_target_without_another_sell(
             return [target]
         if calls >= 3 and outcome == "duplicate_stop_after_quote":
             return [target, stop, stop]
+        if calls >= 3 and outcome == "duplicate_target_after_quote":
+            duplicate = deepcopy(target.order)
+            duplicate.orderId = 99
+            duplicate.permId = 999
+            duplicate.clientId = 99
+            return [target, stop, _State(order=duplicate, contract=contract,
+                                        orderStatus=target.orderStatus)]
         return [target, stop]
     async def positions():
         return [_State(account="ACCT", contract=contract, position=16)]
