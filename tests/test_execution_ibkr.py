@@ -21,6 +21,8 @@ class _State:
 
 
 def _mk_broker() -> IbkrBroker:
+    from eventkit import Event
+
     broker = IbkrBroker(host="127.0.0.1", port=4001, client_id=1)
     broker.ib = type(
         "_FakeIb",
@@ -29,6 +31,8 @@ def _mk_broker() -> IbkrBroker:
             "managedAccounts": staticmethod(lambda: ["ACCT"]),
         },
     )()
+
+    broker.ib.positionEvent = Event()
 
     async def _contract(symbol: str) -> object:
         return _State(symbol=symbol, conId=123, secType="STK", currency="USD")
@@ -721,12 +725,77 @@ def test_entry_refresh_uses_complete_returned_positions_and_bypasses_order_cache
 def test_entry_position_refresh_failure_discards_sdk_state():
     broker = _mk_broker()
     disconnected = []
+    position_event = broker.ib.positionEvent
 
     async def positions():
         raise TimeoutError("no positionEnd")
 
     broker.ib.reqPositionsAsync = positions
-    broker.disconnect = lambda: disconnected.append(True)
+    def disconnect():
+        disconnected.append(True)
+        broker.ib = None
+
+    broker.disconnect = disconnect
     with pytest.raises(IbkrExecutionError, match="ENTRY_POSITIONS_REFRESH_FAILED"):
         asyncio.run(broker.fresh_account_snapshot())
     assert disconnected == [True]
+    assert broker.ib is None
+    assert len(position_event) == 0
+
+
+def test_entry_refresh_retains_zero_update_after_position_end_during_order_refresh():
+    broker = _mk_broker()
+    held = _State(account="ACCT", position=20, avgCost=12,
+                  contract=_State(symbol="TEST", conId=10))
+    flat = _State(account="ACCT", position=0, avgCost=0, contract=held.contract)
+
+    async def positions():
+        broker.ib.positionEvent.emit(held)
+        return [held]
+
+    async def orders():
+        # This callback occurs after the positions request's response container closed.
+        broker.ib.positionEvent.emit(flat)
+        await asyncio.sleep(0)
+        return []
+
+    broker.ib.reqPositionsAsync = positions
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.ib.positions = lambda account: [held]
+    broker.ib.accountValues = lambda account: [
+        _State(tag=tag, value="100", currency="USD")
+        for tag in ["NetLiquidation", "AvailableFunds", "SettledCash"]
+    ]
+    broker.ib.openTrades = lambda: []
+    snapshot = asyncio.run(broker.fresh_account_snapshot())
+    assert snapshot.positions == {}
+    assert snapshot.average_costs == {}
+    assert len(broker.ib.positionEvent) == 0
+
+
+def test_entry_refresh_cancellation_detaches_listener_after_disconnect():
+    broker = _mk_broker()
+    position_event = broker.ib.positionEvent
+    started = asyncio.Event()
+
+    async def positions():
+        started.set()
+        await asyncio.Event().wait()
+
+    def disconnect():
+        broker.ib = None
+
+    broker.ib.reqPositionsAsync = positions
+    broker.disconnect = disconnect
+
+    async def scenario():
+        task = asyncio.create_task(broker.fresh_account_snapshot())
+        await started.wait()
+        assert len(position_event) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert broker.ib is None
+    assert len(position_event) == 0

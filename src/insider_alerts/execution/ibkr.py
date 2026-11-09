@@ -458,11 +458,20 @@ class IbkrBroker:
         )
 
     async def fresh_account_snapshot(self) -> AccountSnapshot:
-        """Complete fresh position and all-client order requests before an entry."""
+        """Complete fresh positions/orders, retaining newer streamed position callbacks."""
+        request_ib = self.ib
+        account = self._account()
+        updates: list[Any] = []
+
+        def on_position(position: Any) -> None:
+            if position.account == account:
+                updates.append(position)
+
+        request_ib.positionEvent += on_position
         try:
             try:
                 positions = await asyncio.wait_for(
-                    self.ib.reqPositionsAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
+                    request_ib.reqPositionsAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 self.disconnect()
@@ -471,9 +480,11 @@ class IbkrBroker:
                 ) from exc
             self._all_orders_checked_at = float("-inf")
             snapshot = await self.account_snapshot()
-            # A complete positions response can contain several updates for one
-            # contract, including a final zero. Retain the last callback first.
-            latest = {int(p.contract.conId): p for p in positions if p.account == snapshot.account}
+            # positionEnd closes the request's response container, while later
+            # positionEvent callbacks can arrive during the order refresh. Those
+            # newer observations must win, including their zero updates.
+            latest = {int(p.contract.conId): p for p in [*positions, *updates]
+                      if p.account == account}
             selected = [p for p in latest.values() if p.position != 0]
             if (any(conid <= 0 for conid in latest)
                 or any(not math.isfinite(float(p.position)) for p in selected)
@@ -489,6 +500,8 @@ class IbkrBroker:
         except asyncio.CancelledError:
             self.disconnect()
             raise
+        finally:
+            request_ib.positionEvent -= on_position
 
     async def preview_entry(self, symbol: str, quantity: int) -> CommissionPreview:
         from ib_async import MarketOrder
