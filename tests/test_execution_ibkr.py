@@ -669,3 +669,57 @@ def test_completed_target_reconstructs_only_complete_bound_executions(complete: 
     assert result.filled == (16 if complete else 0)
     assert result.average_fill_price == (12.3 if complete else 0)
     assert result.limit_price == .01
+
+
+@pytest.mark.parametrize("fresh_quantity", [0, 3])
+def test_entry_refresh_uses_complete_returned_positions_and_bypasses_order_cache(
+    fresh_quantity: int,
+):
+    broker = _mk_broker()
+    calls = []
+    stale = _State(account="ACCT", position=9, avgCost=10, contract=_State(symbol="STALE"))
+    fresh = _State(account="ACCT", position=fresh_quantity, avgCost=12,
+                   contract=_State(symbol="FRESH"))
+    foreign = _State(account="OTHER", position=20, avgCost=30, contract=_State(symbol="FOREIGN"))
+
+    async def positions():
+        calls.append("positions")
+        return [fresh, foreign]
+
+    async def orders():
+        calls.append("orders")
+        return []
+
+    broker.ib.reqPositionsAsync = positions
+    broker.ib.reqAllOpenOrdersAsync = orders
+    broker.ib.positions = lambda account: [stale]
+    broker.ib.accountValues = lambda account: [
+        _State(tag=tag, value="100", currency="USD")
+        for tag in ["NetLiquidation", "AvailableFunds", "SettledCash"]
+    ]
+    broker.ib.openTrades = lambda: []
+
+    async def scenario():
+        broker._all_orders_checked_at = asyncio.get_running_loop().time()
+        broker._all_open_trades = [object()]
+        return await broker.fresh_account_snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert calls == ["positions", "orders"]
+    assert snapshot.positions == ({"FRESH": 3} if fresh_quantity else {})
+    assert snapshot.average_costs == ({"FRESH": 12} if fresh_quantity else {})
+    assert snapshot.open_order_count == 0
+
+
+def test_entry_position_refresh_failure_discards_sdk_state():
+    broker = _mk_broker()
+    disconnected = []
+
+    async def positions():
+        raise TimeoutError("no positionEnd")
+
+    broker.ib.reqPositionsAsync = positions
+    broker.disconnect = lambda: disconnected.append(True)
+    with pytest.raises(IbkrExecutionError, match="ENTRY_POSITIONS_REFRESH_FAILED"):
+        asyncio.run(broker.fresh_account_snapshot())
+    assert disconnected == [True]

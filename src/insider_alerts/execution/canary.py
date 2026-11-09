@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
 from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT
-from insider_alerts.execution.errors import ContractQualificationError
+from insider_alerts.execution.errors import ContractQualificationError, IbkrExecutionError
 from insider_alerts.strategy.e07 import (
     deterministic_rank,
     eligibility,
@@ -26,6 +27,7 @@ from insider_alerts.strategy.e07 import (
 
 NEW_YORK = ZoneInfo("America/New_York")
 ARM_PHRASE = "I_ACCEPT_LIVE_CANARY_RISK"
+LIVE_AUXILIARY_BUDGET_SECONDS = 5.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -125,6 +127,14 @@ class CycleResult:
     live_gate: str = "not_checked"
 
 
+@dataclass(slots=True, frozen=True)
+class LiveManagementState:
+    account: AccountSnapshot
+    orders: tuple[BrokerOrder, ...]
+    result: CycleResult
+    timed_exits: int
+
+
 class CanaryBroker(Protocol):
     async def connect(self, *, readonly: bool) -> None: ...
 
@@ -137,6 +147,8 @@ class CanaryBroker(Protocol):
     async def daily_bars(self, symbol: str, *, duration: str = "6 M") -> list[DailyBar]: ...
 
     async def account_snapshot(self) -> AccountSnapshot: ...
+
+    async def fresh_account_snapshot(self) -> AccountSnapshot: ...
 
     async def preview_entry(self, symbol: str, quantity: int) -> CommissionPreview: ...
 
@@ -569,24 +581,27 @@ class CanaryRunner:
                     {"schedule_evidence": json.dumps(schedule_evidence, sort_keys=True)},
                     now=datetime.now(UTC),
                 )
-            result = await self._discover(activation, sessions, now)
-            shadow_opened, shadow_closed = await self._settle_shadow(sessions, now)
-            result = CycleResult(
-                **{
-                    **asdict(result),
-                    "shadow_opened": shadow_opened,
-                    "shadow_closed": shadow_closed,
-                }
-            )
-            if not self.config.live_armed:
-                final_result = CycleResult(
-                    **{**asdict(result), "live_gate": "shadow_only_not_armed"}
+            managed: LiveManagementState | None = None
+            if self.config.live_armed:
+                self.store.set_metadata({"cycle_phase": "live_management"}, now=datetime.now(UTC))
+                managed = await self._manage_live(
+                    CycleResult(), sessions, datetime.now(UTC) if wall_clock_mode else now,
+                    enforce_wall_clock=wall_clock_mode,
                 )
+            self.store.set_metadata({"cycle_phase": "auxiliary"}, now=datetime.now(UTC))
+            result = await self._run_auxiliary(activation, sessions, now)
+            if managed is None:
+                final_result = CycleResult(**{
+                    **asdict(result), "live_gate": "shadow_only_not_armed",
+                })
             else:
-                final_result = await self._run_live(
-                    result,
-                    sessions,
-                    datetime.now(UTC) if wall_clock_mode else now,
+                result = CycleResult(**{
+                    **asdict(result), "live_opened": managed.result.live_opened,
+                    "live_closed": managed.result.live_closed,
+                })
+                self.store.set_metadata({"cycle_phase": "entry_validation"}, now=datetime.now(UTC))
+                final_result = await self._submit_live_entries(
+                    result, managed, sessions, datetime.now(UTC) if wall_clock_mode else now,
                     enforce_wall_clock=wall_clock_mode,
                 )
             success_time = datetime.now(UTC)
@@ -594,6 +609,7 @@ class CanaryRunner:
                 {
                     "last_cycle_success_utc": success_time.isoformat(),
                     "last_cycle_error": "",
+                    "cycle_phase": "complete",
                 },
                 now=success_time,
             )
@@ -610,6 +626,39 @@ class CanaryRunner:
             raise
         finally:
             if disconnect_after:
+                self.broker.disconnect()
+
+    async def _run_auxiliary(
+        self, activation: datetime, sessions: Sequence[date], now: datetime,
+    ) -> CycleResult:
+        """Bound cancellable live auxiliary work; never reuse a canceled SDK session."""
+        async def collect() -> CycleResult:
+            result = await self._discover(activation, sessions, now)
+            opened, closed = await self._settle_shadow(sessions, now)
+            return CycleResult(**{
+                **asdict(result), "shadow_opened": opened, "shadow_closed": closed,
+            })
+
+        if not self.config.live_armed:
+            return await collect()
+        completed = False
+        budget = asyncio.timeout(LIVE_AUXILIARY_BUDGET_SECONDS)
+        try:
+            async with budget:
+                result = await collect()
+                completed = True
+                return result
+        except TimeoutError as exc:
+            if budget.expired():
+                raise IbkrExecutionError(
+                    "CANARY_AUXILIARY_BUDGET_EXCEEDED: live management already attempted; "
+                    "new entries blocked; synchronous storage waits are not preemptible"
+                ) from exc
+            raise
+        finally:
+            if not completed:
+                # External cancellation does not call ib_async's historical-data
+                # timeout cleanup. Discard the socket and its outstanding futures.
                 self.broker.disconnect()
 
     async def _discover(
@@ -760,23 +809,70 @@ class CanaryRunner:
         return opened, closed
 
     async def _run_live(
-        self,
-        result: CycleResult,
-        sessions: Sequence[date],
-        now: datetime,
-        *,
-        enforce_wall_clock: bool,
+        self, result: CycleResult, sessions: Sequence[date], now: datetime,
+        *, enforce_wall_clock: bool,
     ) -> CycleResult:
-        calendar_gate = getattr(self.broker, "calendar_gate", None)
+        """Compatibility wrapper; production cycle separates management from entries."""
+        managed = await self._manage_live(
+            result, sessions, now, enforce_wall_clock=enforce_wall_clock,
+        )
+        return await self._submit_live_entries(
+            managed.result, managed, sessions, now, enforce_wall_clock=enforce_wall_clock,
+        )
+
+    async def _manage_live(
+        self, result: CycleResult, sessions: Sequence[date], now: datetime,
+        *, enforce_wall_clock: bool,
+    ) -> LiveManagementState:
         account = await self.broker.account_snapshot()
         broker_orders = await self.broker.orders()
         self._adopt_broker_orders(broker_orders)
-        gate = self._account_gate(account, broker_orders)
-        live_opened, live_closed = await self._reconcile_orders(
-            broker_orders, sessions, account, now
-        )
+        opened, closed = await self._reconcile_orders(broker_orders, sessions, account, now)
         timed_exits = await self._submit_due_time_exits(now, enforce_wall_clock=enforce_wall_clock)
-        submitted = 0
+        self.store.set_metadata({
+            "last_live_management_success_utc": datetime.now(UTC).isoformat(),
+            "last_live_management_opened": str(opened),
+            "last_live_management_closed": str(closed),
+            "last_live_management_time_exits": str(timed_exits),
+        }, now=datetime.now(UTC))
+        managed_result = CycleResult(**{
+            **asdict(result), "live_opened": opened, "live_closed": closed,
+        })
+        return LiveManagementState(account, tuple(broker_orders), managed_result, timed_exits)
+
+    @staticmethod
+    def _management_signature(
+        account: AccountSnapshot, orders: Sequence[BrokerOrder],
+    ) -> tuple[object, ...]:
+        """Exclude changing valuations and commissions; bind positions and order state."""
+        order_states = [(
+            order.order_id, order.order_ref, order.symbol, order.kind,
+            order.status.lower(), order.filled, order.remaining, order.average_fill_price,
+            order.perm_id, order.conid, order.limit_price,
+        ) for order in orders]
+        return (
+            account.account, tuple(sorted(account.positions.items())),
+            tuple(sorted(order_states, key=repr)),
+        )
+
+    async def _submit_live_entries(
+        self, result: CycleResult, managed: LiveManagementState,
+        sessions: Sequence[date], now: datetime, *, enforce_wall_clock: bool,
+    ) -> CycleResult:
+        account, broker_orders = managed.account, managed.orders
+        gate = self._account_gate(account, broker_orders)
+        local = now.astimezone(NEW_YORK)
+        if (self.config.entry_submission_start <= local.time()
+                < self.config.entry_submission_deadline):
+            account = await self.broker.fresh_account_snapshot()
+            broker_orders = tuple(await self.broker.orders())
+            if self._management_signature(account, broker_orders) != self._management_signature(
+                managed.account, managed.orders,
+            ):
+                gate = "management_state_changed_before_entry"
+            else:
+                gate = self._account_gate(account, broker_orders)
+        calendar_gate = getattr(self.broker, "calendar_gate", None)
         if gate == "account_ready" and callable(calendar_gate):
             gate = calendar_gate(now, for_entry=True) or gate
         if gate == "account_ready" and self.store.rows(
@@ -788,24 +884,17 @@ class CanaryRunner:
             horizon = [day for day in sessions if today <= day <= ENTRY_HORIZON_LIMIT]
             if today not in horizon or len(horizon) < self.config.max_sessions:
                 gate = "calendar_entry_horizon_incomplete"
+        submitted = 0
         if gate == "account_ready":
             submitted = await self._submit_due_entries(
-                account,
-                now,
-                sessions=sessions,
-                enforce_wall_clock=enforce_wall_clock,
+                account, now, sessions=sessions, enforce_wall_clock=enforce_wall_clock,
             )
         else:
             self.store.event("live_gate_blocked", level="warning", reason=gate)
-        return CycleResult(
-            **{
-                **asdict(result),
-                "live_submitted": submitted,
-                "live_opened": live_opened,
-                "live_closed": live_closed,
-                "live_gate": f"{gate};time_exits={timed_exits}",
-            }
-        )
+        return CycleResult(**{
+            **asdict(result), "live_submitted": submitted,
+            "live_gate": f"{gate};time_exits={managed.timed_exits}",
+        })
 
     def _due_target_intent(self, row: sqlite3.Row, order: BrokerOrder | None) -> bool:
         """Attribute only broker-observed repricing bound to a durable dispatch intent."""

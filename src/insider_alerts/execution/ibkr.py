@@ -7,6 +7,7 @@ import sys
 from collections import deque
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
@@ -455,6 +456,31 @@ class IbkrBroker:
             ),
             average_costs=average_costs,
         )
+
+    async def fresh_account_snapshot(self) -> AccountSnapshot:
+        """Complete fresh position and all-client order requests before an entry."""
+        try:
+            try:
+                positions = await asyncio.wait_for(
+                    self.ib.reqPositionsAsync(), _OPEN_ORDERS_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                self.disconnect()
+                raise IbkrExecutionError(
+                    "IBKR_ENTRY_POSITIONS_REFRESH_FAILED: broker position state is unknown"
+                ) from exc
+            self._all_orders_checked_at = float("-inf")
+            snapshot = await self.account_snapshot()
+            selected = [p for p in positions if p.account == snapshot.account and p.position != 0]
+            return replace(
+                snapshot,
+                positions={str(p.contract.symbol): float(p.position) for p in selected},
+                average_costs={str(p.contract.symbol): float(p.avgCost) for p in selected
+                               if math.isfinite(float(p.avgCost)) and float(p.avgCost) > 0},
+            )
+        except asyncio.CancelledError:
+            self.disconnect()
+            raise
 
     async def preview_entry(self, symbol: str, quantity: int) -> CommissionPreview:
         from ib_async import MarketOrder
