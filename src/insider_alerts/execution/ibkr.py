@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import sys
 from collections import deque
 from datetime import UTC, date, datetime, time, timedelta
@@ -669,8 +670,34 @@ class IbkrBroker:
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(0.5)
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
-            raise IbkrExecutionError(f"IBKR rejected market-on-close for {symbol}")
+            raise IbkrExecutionError(
+                f"IBKR rejected market-on-close for {symbol}: "
+                + self._order_rejection_detail(
+                    int(trade.order.orderId), order.account, trade.orderStatus.status,
+                )
+            )
         return int(trade.order.orderId)
+
+    def _order_rejection_detail(self, order_id: int, account: str, status: str) -> str:
+        # IB uses one monotonic request/order ID sequence per connection; connect
+        # clears _errors. Match only this order, never connection/request errors.
+        # errorEvent has the raw broker text; trade.log may append contract reprs.
+        errors = [(code, message) for req, code, message in self._errors if req == order_id]
+        details: list[str] = []
+        for code, message in errors[-3:]:
+            safe_code = str(code) if type(code) is int and 0 <= code <= 2**31 - 1 else "unknown"
+            if isinstance(message, str):
+                text = "".join(char for char in message if char.isprintable())
+                for identifier in (account, self.configured_account):
+                    if identifier:
+                        text = text.replace(identifier, "[account]")
+                text = re.sub(r"(?:DU|DF|U|F)\d{5,}", "[account]", text, flags=re.I)
+                text = text[:240] + ("..." if len(text) > 240 else "")
+            else:
+                text = "broker message unavailable"
+            details.append(f"code={safe_code} message={text}")
+        reason = " | ".join(details) if details else "no broker error recorded"
+        return f"order_id={order_id} status={status}; {reason}"
 
     async def submit_market_exit(
         self,
@@ -730,7 +757,9 @@ class IbkrBroker:
         if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
             raise IbkrExecutionError(
                 f"IBKR rejected emergency market exit for {symbol}: "
-                + "; ".join(str(item.message) for item in trade.log)
+                + self._order_rejection_detail(
+                    int(trade.order.orderId), order.account, trade.orderStatus.status,
+                )
             )
         return int(trade.order.orderId)
 
