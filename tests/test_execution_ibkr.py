@@ -541,8 +541,11 @@ def test_exit_rejection_bounds_and_marks_missing_reason():
 
 @pytest.mark.parametrize("outcome", [
     "accepted", "adopted", "rejected", "foreign", "partial", "delayed", "stale", "nonbid",
+    "missing_stop_after_quote", "duplicate_stop_after_quote", "slow_intent",
 ])
-def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
+def test_due_exit_reprices_existing_target_without_another_sell(
+    outcome: str, monkeypatch: pytest.MonkeyPatch,
+):
     from copy import deepcopy
     from datetime import UTC, datetime, timedelta
 
@@ -578,12 +581,27 @@ def test_due_exit_reprices_existing_target_without_another_sell(outcome: str):
     broker.ib.isConnected = lambda: True
     broker.ib.cancelMktData = lambda *args: None
     intents = []
-    broker.exit_modification_intent = intents.append
+    def record_intent(detail):
+        intents.append(detail)
+        if outcome == "slow_intent":
+            class LateClock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return datetime.now(tz) + timedelta(seconds=10)
+            monkeypatch.setattr(ibkr_module, "datetime", LateClock)
+    broker.exit_modification_intent = record_intent
     if outcome == "foreign":
         target.order.clientId = 99
     if outcome == "partial":
         target.orderStatus.filled = 1
+    calls = 0
     async def orders():
+        nonlocal calls
+        calls += 1
+        if calls >= 3 and outcome == "missing_stop_after_quote":
+            return [target]
+        if calls >= 3 and outcome == "duplicate_stop_after_quote":
+            return [target, stop, stop]
         return [target, stop]
     async def positions():
         return [_State(account="ACCT", contract=contract, position=16)]

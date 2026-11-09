@@ -792,6 +792,20 @@ class IbkrBroker:
         """Make the existing sell marketable with a price-only modification."""
         if dispatch_window is None or target.order.orderId <= 0 or target.order.permId <= 0:
             raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_NOT_PROVEN")
+        def identity(trade: Any) -> tuple[Any, ...]:
+            order = trade.order
+            return (order.orderId, order.permId, order.clientId, order.account,
+                    trade.contract.conId, order.totalQuantity, order.ocaGroup,
+                    order.ocaType, order.orderRef, order.orderType)
+
+        expected_target = identity(target)
+        stop_ref = order_ref.rsplit("-", 1)[0] + "-STOP"
+        initial_stops = [t for t in self._all_open_trades
+                         if t.order.account == target.order.account
+                         and t.order.orderRef == stop_ref]
+        if len(initial_stops) != 1:
+            raise IbkrExecutionError("IBKR_EXIT_STOP_IDENTITY_MISSING")
+        expected_stop = identity(initial_stops[0])
         request_ib = self.ib
         ticker = request_ib.reqMktData(contract, "", False, False)
         bid_observed_at: datetime | None = None
@@ -835,7 +849,16 @@ class IbkrBroker:
                    if t.order.orderId == target.order.orderId
                    and t.order.permId == target.order.permId
                    and t.order.clientId == self.client_id]
-        if len(current) != 1 or not callable(self.exit_modification_intent):
+        current_stops = [t for t in self._all_open_trades
+                         if t.order.account == target.order.account
+                         and t.order.orderRef == stop_ref]
+        if (len(current) != 1 or len(current_stops) != 1
+            or identity(current[0]) != expected_target
+            or identity(current_stops[0]) != expected_stop
+            or current_stops[0].orderStatus.status not in {"Submitted", "PreSubmitted"}
+            or float(current_stops[0].orderStatus.remaining) != float(target.order.totalQuantity)
+            or not callable(self.exit_modification_intent)):
+            self.disconnect()
             raise IbkrExecutionError("IBKR_EXIT_TARGET_INTENT_OR_IDENTITY_MISSING")
         target = current[0]
         if (target.orderStatus.status not in {"Submitted", "PreSubmitted"}
@@ -855,6 +878,9 @@ class IbkrBroker:
         replacement.lmtPrice = float(bid)
         self._errors = deque((e for e in self._errors if e[0] != replacement.orderId), maxlen=100)
         self._check_exit_window(dispatch_window)
+        if (not request_ib.isConnected() or quote_time is None
+            or not 0 <= (datetime.now(UTC) - quote_time).total_seconds() <= 3):
+            raise IbkrExecutionError("IBKR_EXIT_BID_EXPIRED_BEFORE_DISPATCH")
         trade = self.ib.placeOrder(contract, replacement)
         deadline = asyncio.get_running_loop().time() + 5.0
         while asyncio.get_running_loop().time() < deadline:
@@ -1006,6 +1032,7 @@ class IbkrBroker:
                     remaining=remaining,
                     average_fill_price=average_price,
                     commission=sum(commissions) if commissions else None,
+                    perm_id=int(trade.order.permId), conid=int(trade.contract.conId),
                     limit_price=(float(trade.order.lmtPrice)
                                  if trade.order.orderType == "LMT" else None),
                 )

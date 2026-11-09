@@ -108,6 +108,8 @@ class BrokerOrder:
     average_fill_price: float
     commission: float | None = None
     limit_price: float | None = None
+    perm_id: int | None = None
+    conid: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -820,9 +822,12 @@ class CanaryRunner:
             ).fetchall()
         for event in events:
             detail = json.loads(event[0])
-            detail = detail.get("modification", detail)
+            detail = detail.get("modification", {})
             if (detail.get("target_order_id") == order.order_id
-                and detail.get("requested_limit_price", 0.01) == order.limit_price):
+                and order.perm_id is not None and order.conid is not None
+                and detail.get("perm_id") == order.perm_id
+                and detail.get("conid") == order.conid
+                and detail.get("requested_limit_price") == order.limit_price):
                 return True
         return False
 
