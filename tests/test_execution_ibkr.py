@@ -484,6 +484,11 @@ def test_market_exit_does_not_reuse_cached_filled_order() -> None:
         order.orderId = 456
         return _State(order=order, orderStatus=_State(status="Submitted"), log=[])
     broker.ib.placeOrder = place
+    async def new_timed_exit(contract, order, dispatch_window):
+        # This test covers existing-order selection; boundary proofs are exercised
+        # with complete broker responses in test_execution_confirmed_exit_rejection.
+        return int(place(contract, order).order.orderId)
+    broker._submit_new_timed_exit = new_timed_exit
     assert asyncio.run(broker.submit_market_exit(
         "TEST", 16, oca_group="oca", order_ref="IA-E07-TEST-OVERDUE",
     )) == 456
@@ -648,10 +653,12 @@ def test_due_exit_reprices_existing_target_without_another_sell(
         assert stop.order == stop_order
         assert not disconnected
     else:
-        with pytest.raises(IbkrExecutionError):
+        with pytest.raises(IbkrExecutionError) as captured:
             asyncio.run(coro)
         assert len(placed) == int(outcome == "rejected")
         if outcome == "rejected":
+            from insider_alerts.execution.errors import ConfirmedNewOrderRejection
+            assert not isinstance(captured.value, ConfirmedNewOrderRejection)
             assert disconnected
             assert target.order.lmtPrice == 13.76
 

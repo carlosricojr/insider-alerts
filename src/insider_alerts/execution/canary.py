@@ -16,7 +16,11 @@ from zoneinfo import ZoneInfo
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
 from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT
-from insider_alerts.execution.errors import ContractQualificationError, IbkrExecutionError
+from insider_alerts.execution.errors import (
+    ConfirmedNewOrderRejection,
+    ContractQualificationError,
+    IbkrExecutionError,
+)
 from insider_alerts.strategy.e07 import (
     deterministic_rank,
     eligibility,
@@ -1612,6 +1616,7 @@ class CanaryRunner:
     ) -> int:
         local = now.astimezone(NEW_YORK)
         count = 0
+        rejections = 0
         for row in self.store.rows(
             "live_state IN ('open','closing') AND live_exit_session<=? "
             "AND (timed_exit_order_id IS NULL OR timed_exit_order_id=target_order_id)",
@@ -1684,30 +1689,64 @@ class CanaryRunner:
                 if hasattr(self.broker, "exit_modification_intent"):
                     self.broker.exit_modification_intent = record_price_intent
                 try:
-                    order_id = await self.broker.submit_market_exit(
-                        str(row["symbol"]),
-                        int(row["live_quantity"]),
-                        oca_group=str(row["oca_group"]),
-                        order_ref=f"IA-E07-{token}-OVERDUE",
-                        dispatch_window=dispatch_window,
-                    )
+                    try:
+                        order_id = await self.broker.submit_market_exit(
+                            str(row["symbol"]),
+                            int(row["live_quantity"]),
+                            oca_group=str(row["oca_group"]),
+                            order_ref=f"IA-E07-{token}-OVERDUE",
+                            dispatch_window=dispatch_window,
+                        )
+                    except ConfirmedNewOrderRejection as rejection:
+                        self._record_confirmed_exit_rejection(
+                            row, rejection, f"IA-E07-{token}-OVERDUE",
+                        )
+                        rejections += 1
+                        continue
                 finally:
                     if hasattr(self.broker, "exit_modification_intent"):
                         self.broker.exit_modification_intent = None
                 event_type = "overdue_market_exit_submitted"
             else:
                 assert dispatch_window is not None
-                order_id = await self.broker.submit_market_on_close(
-                    str(row["symbol"]),
-                    int(row["live_quantity"]),
-                    oca_group=str(row["oca_group"]),
-                    order_ref=f"IA-E07-{token}-TIME",
-                    dispatch_window=dispatch_window,
-                )
+                try:
+                    order_id = await self.broker.submit_market_on_close(
+                        str(row["symbol"]),
+                        int(row["live_quantity"]),
+                        oca_group=str(row["oca_group"]),
+                        order_ref=f"IA-E07-{token}-TIME",
+                        dispatch_window=dispatch_window,
+                    )
+                except ConfirmedNewOrderRejection as rejection:
+                    self._record_confirmed_exit_rejection(row, rejection, f"IA-E07-{token}-TIME")
+                    rejections += 1
+                    continue
                 event_type = "timed_exit_submitted"
             self.store.bind_timed_exit(str(row["packet_id"]), order_id, event_type)
             count += 1
+        if rejections:
+            raise IbkrExecutionError(
+                f"IBKR_TIMED_EXIT_REJECTIONS: confirmed={rejections}; accepted={count}; "
+                "cycle failed; new entries blocked"
+            )
         return count
+
+    def _record_confirmed_exit_rejection(
+        self, row: sqlite3.Row, rejection: ConfirmedNewOrderRejection, order_ref: str,
+    ) -> None:
+        if (rejection.symbol != str(row["symbol"])
+            or rejection.quantity != int(row["live_quantity"])
+            or rejection.order_ref != order_ref):
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_IDENTITY_CONFLICT") from rejection
+        self.store.event(
+            "timed_exit_rejected_confirmed", level="error", packet_id=str(row["packet_id"]),
+            order_id=rejection.order_id, order_ref=rejection.order_ref,
+            quantity=rejection.quantity, broker_code=201, detail=rejection.detail,
+            client_id=rejection.client_id, contract_id=rejection.contract_id,
+            submitted_at=rejection.submitted_at,
+            executions_checked_at=rejection.executions_checked_at,
+            verified_at=rejection.verified_at,
+        )
 
 
 def status_report(ledger_db: str) -> dict[str, Any]:

@@ -5,10 +5,11 @@ import math
 import re
 import sys
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from insider_alerts.backtest.models import DailyBar
@@ -34,6 +35,7 @@ from insider_alerts.execution.canary import (
     CommissionPreview,
 )
 from insider_alerts.execution.errors import (
+    ConfirmedNewOrderRejection,
     IbkrContractQualificationError,
     IbkrExecutionError,
 )
@@ -459,6 +461,12 @@ class IbkrBroker:
 
     async def fresh_account_snapshot(self) -> AccountSnapshot:
         """Complete fresh positions/orders, retaining newer streamed position callbacks."""
+        return (await self._fresh_account_state())[0]
+
+    async def _fresh_account_state(
+        self, *, order_reader: Callable[[], Awaitable[list[Any]]] | None = None,
+    ) -> tuple[AccountSnapshot, list[Any]]:
+        """Retain raw qualified position identity for execution-boundary proofs."""
         request_ib = self.ib
         account = self._account()
         updates: list[Any] = []
@@ -478,7 +486,11 @@ class IbkrBroker:
                 raise IbkrExecutionError(
                     "IBKR_ENTRY_POSITIONS_REFRESH_FAILED: broker position state is unknown"
                 ) from exc
-            self._all_orders_checked_at = float("-inf")
+            if order_reader is None:
+                self._all_orders_checked_at = float("-inf")
+            else:
+                self._all_open_trades = await order_reader()
+                self._all_orders_checked_at = asyncio.get_running_loop().time()
             snapshot = await self.account_snapshot()
             # positionEnd closes the request's response container, while later
             # positionEvent callbacks can arrive during the order refresh. Those
@@ -496,7 +508,7 @@ class IbkrBroker:
                 positions={str(p.contract.symbol): float(p.position) for p in selected},
                 average_costs={str(p.contract.symbol): float(p.avgCost) for p in selected
                                if math.isfinite(float(p.avgCost)) and float(p.avgCost) > 0},
-            )
+            ), selected
         except asyncio.CancelledError:
             self.disconnect()
             raise
@@ -716,17 +728,267 @@ class IbkrBroker:
             transmit=True,
         )
         order.orderType = "MOC"
-        self._check_exit_window(dispatch_window)
-        trade = self.ib.placeOrder(contract, order)
-        await asyncio.sleep(0.5)
-        if trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}:
-            raise IbkrExecutionError(
-                f"IBKR rejected market-on-close for {symbol}: "
-                + self._order_rejection_detail(
-                    int(trade.order.orderId), order.account, trade.orderStatus.status,
+        return await self._submit_new_timed_exit(contract, order, dispatch_window)
+
+    async def _raw_open_order_proof(self) -> tuple[list[Any], list[Any]]:
+        """Capture decoded fields which ib_async omits when updating cached Trade objects."""
+        request_ib = self.ib
+        wrapper = request_ib.wrapper
+        if "openOrders" in wrapper._futures or "openOrders" in wrapper._results:
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_OPEN_ORDERS_OVERLAP")
+        names = ("openOrder", "openOrderEnd", "orderStatus")
+        original = {name: (name in vars(wrapper), getattr(wrapper, name)) for name in names}
+        raw: list[tuple[Any, Any, str]] = []
+        statuses: dict[tuple[int, int, int], list[tuple[str, float, float, int]]] = {}
+        owned: Any = None
+        invalid = False
+        ended = 0
+
+        def capture(order_id: int, contract: Any, order: Any, state: Any) -> None:
+            nonlocal invalid
+            try:
+                if not order.whatIf:
+                    if (owned is None or wrapper._futures.get("openOrders") is not owned
+                        or order_id != order.orderId):
+                        invalid = True
+                    raw.append((deepcopy(contract), deepcopy(order), str(state.status)))
+            except Exception:
+                invalid = True
+            finally:
+                original["openOrder"][1](order_id, contract, order, state)
+
+        def capture_end() -> None:
+            nonlocal invalid, ended
+            if owned is None or wrapper._futures.get("openOrders") is not owned:
+                invalid = True
+            ended += 1
+            original["openOrderEnd"][1]()
+
+        def capture_status(
+            order_id: int, status: str, filled: float, remaining: float, average: float,
+            perm_id: int, parent_id: int, last: float, client_id: int, why: str,
+            cap: float = 0,
+        ) -> None:
+            nonlocal invalid
+            try:
+                if owned is None or wrapper._futures.get("openOrders") is not owned:
+                    invalid = True
+                statuses.setdefault((client_id, order_id, perm_id), []).append((
+                    status, float(filled), float(remaining), parent_id,
+                ))
+            except Exception:
+                invalid = True
+            finally:
+                original["orderStatus"][1](order_id, status, filled, remaining, average,
+                                          perm_id, parent_id, last, client_id, why, cap)
+
+        wrapper.openOrder, wrapper.openOrderEnd = capture, capture_end
+        wrapper.orderStatus = capture_status
+        try:
+            future = request_ib.reqAllOpenOrdersAsync()
+            owned = wrapper._futures.get("openOrders")
+            if owned is not future or owned is None:
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_OPEN_ORDERS_NOT_OWNED")
+            trades = await asyncio.wait_for(future, _OPEN_ORDERS_TIMEOUT_SECONDS)
+            if (invalid or ended != 1 or len(raw) != len(trades)
+                or "openOrders" in wrapper._futures or "openOrders" in wrapper._results
+                or wrapper.openOrder is not capture or wrapper.openOrderEnd is not capture_end
+                or wrapper.orderStatus is not capture_status):
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_OPEN_ORDERS_INCOMPLETE")
+            snapshots: list[Any] = []
+            keys: set[tuple[Any, ...]] = set()
+            for (contract, order, state), cached in zip(raw, trades, strict=True):
+                key = (order.account, order.clientId, order.orderId, order.permId, contract.conId)
+                cached_key = (cached.order.account, cached.order.clientId, cached.order.orderId,
+                              cached.order.permId, cached.contract.conId)
+                if not order.account or contract.conId <= 0 or key in keys or key != cached_key:
+                    raise IbkrExecutionError("IBKR_TIMED_EXIT_OPEN_ORDERS_IDENTITY_CONFLICT")
+                keys.add(key)
+                status_key = (order.clientId, order.orderId, order.permId)
+                if status_key not in statuses:
+                    raise IbkrExecutionError("IBKR_TIMED_EXIT_FRESH_ORDER_STATUS_MISSING")
+                receipts = statuses[status_key]
+                status, filled, remaining, _ = receipts[-1]
+                if any(not math.isfinite(f) or not math.isfinite(r)
+                       or f < 0 or r < 0 or parent != order.parentId
+                       for _, f, r, parent in receipts):
+                    raise IbkrExecutionError("IBKR_TIMED_EXIT_FRESH_ORDER_STATUS_INVALID")
+                snapshots.append(SimpleNamespace(
+                    contract=contract, order=order, broker_open_status=state,
+                    orderStatus=SimpleNamespace(status=status, filled=filled, remaining=remaining),
+                    status_receipts=tuple(receipts),
+                    cached_status=deepcopy(cached.orderStatus), fills=list(cached.fills),
+                ))
+            if set(statuses) != {(t.order.clientId, t.order.orderId, t.order.permId)
+                                 for t in snapshots}:
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_UNEXPLAINED_ORDER_STATUS")
+            return list(trades), snapshots
+        finally:
+            for name, (was_overridden, callback) in original.items():
+                if was_overridden:
+                    setattr(wrapper, name, callback)
+                else:
+                    delattr(wrapper, name)
+
+    async def _timed_exit_state(
+        self, contract: Any, quantity: int, oca_group: str, order_ref: str, expected_account: str,
+    ) -> tuple[str, dict[str, float], tuple[tuple[Any, ...], ...]]:
+        """Fresh held quantity and owned protection, with immutable account order evidence."""
+        raw_trades: list[Any] = []
+        async def read_orders() -> list[Any]:
+            trades, decoded = await self._raw_open_order_proof()
+            raw_trades.extend(decoded)
+            return trades
+        snapshot, positions = await self._fresh_account_state(order_reader=read_orders)
+        symbol = str(contract.symbol)
+        held = [p for p in positions if str(p.contract.symbol) == symbol]
+        if (not snapshot.account or snapshot.account != expected_account
+            or not oca_group or not order_ref.startswith("IA-E07-")
+            or contract.conId <= 0 or quantity <= 0
+            or len(held) != 1 or float(held[0].position) != quantity
+            or held[0].contract.conId != contract.conId
+            or held[0].contract.secType != "STK" or held[0].contract.currency != "USD"):
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_POSITION_NOT_PROVEN")
+        prefix = order_ref.rsplit("-", 1)[0]
+        refs: list[str] = []
+        identities: list[tuple[Any, ...]] = []
+        for trade in raw_trades:
+            order, status, actual = trade.order, trade.orderStatus, trade.contract
+            if order.account != snapshot.account:
+                continue
+            identities.append((
+                order.orderId, order.permId, order.clientId, actual.conId,
+                actual.symbol, actual.secType, actual.currency, order.orderRef,
+                order.action, order.orderType, order.ocaGroup, order.ocaType,
+                float(order.totalQuantity), float(status.filled), float(status.remaining),
+                status.status, order.tif, order.lmtPrice, order.auxPrice,
+                order.outsideRth, order.parentId, trade.broker_open_status,
+            ))
+            if (str(actual.symbol) != symbol and actual.conId != contract.conId
+                and order.ocaGroup != oca_group):
+                continue
+            if not (
+                actual.conId == contract.conId and str(actual.symbol) == symbol
+                and actual.secType == "STK" and actual.currency == "USD"
+                and order.orderRef in {prefix + "-STOP", prefix + "-TARGET"}
+                and order.action == "SELL" and order.ocaGroup == oca_group
+                and order.ocaType == 1 and order.clientId == self.client_id
+                and order.orderId > 0 and order.permId > 0
+                and order.orderType == ("STP" if order.orderRef.endswith("-STOP") else "LMT")
+                and order.tif == "GTC" and float(order.totalQuantity) == quantity
+                and float(status.filled) == 0 and float(status.remaining) == quantity
+                and status.status in {"Submitted", "PreSubmitted"} and not trade.fills
+                and trade.cached_status.status in {"Submitted", "PreSubmitted"}
+                and float(trade.cached_status.filled) == 0
+                and float(trade.cached_status.remaining) == quantity
+                and all(s in {"Submitted", "PreSubmitted"} and f == 0 and r == quantity
+                        and parent == 0 for s, f, r, parent in trade.status_receipts)
+                and trade.broker_open_status in {"Submitted", "PreSubmitted"}
+                # transmit is not decoded by openOrder. Fresh accepted status is
+                # the broker evidence that this protective order is transmitted.
+                and order.parentId == 0
+                and math.isfinite(float(price := order.auxPrice if order.orderType == "STP"
+                                        else order.lmtPrice)) and 0 < price < sys.float_info.max
+            ):
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_PROTECTION_NOT_PROVEN")
+            refs.append(order.orderRef)
+        if refs.count(prefix + "-STOP") != 1 or refs.count(prefix + "-TARGET") > 1:
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_PROTECTION_NOT_PROVEN")
+        return snapshot.account, dict(snapshot.positions), tuple(sorted(identities, key=repr))
+
+    async def _submit_new_timed_exit(
+        self, contract: Any, order: Any, dispatch_window: tuple[datetime, datetime] | None,
+    ) -> int:
+        """Isolate only positively refused NEW orders; every uncertain case stays global."""
+        from ib_async import ExecutionFilter
+
+        request_ib = self.ib
+        account, symbol = str(order.account), str(contract.symbol)
+        quantity = int(order.totalQuantity)
+        reference, group = str(order.orderRef), str(order.ocaGroup)
+        expected = (account, reference, "SELL", order.orderType, quantity, group, 1, contract.conId)
+        errors: list[tuple[int, int]] = []
+
+        def on_error(req_id: int, code: int, _message: str, _contract: Any) -> None:
+            if code not in {2104, 2106, 2107, 2108, 2158}:
+                errors.append((req_id, code))
+
+        request_ib.errorEvent += on_error
+        try:
+            baseline = await self._timed_exit_state(contract, quantity, group, reference, account)
+            previous_ids = {(t.order.clientId, t.order.orderId)
+                            for t in [*request_ib.trades(), *self._all_open_trades]}
+            if errors or not request_ib.isConnected():
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_PREFLIGHT_ERROR")
+            if dispatch_window is not None:
+                self._check_exit_window(dispatch_window)
+            submitted_at = datetime.now(UTC).isoformat()
+            trade = request_ib.placeOrder(contract, order)
+            order_id = int(trade.order.orderId)
+            await asyncio.sleep(0.5)
+            if (order_id <= 0 or (self.client_id, order_id) in previous_ids
+                or trade.order.clientId != self.client_id):
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_NEW_IDENTITY_NOT_PROVEN")
+            if trade.orderStatus.status not in {"Inactive", "Cancelled", "ApiCancelled"}:
+                if errors or not request_ib.isConnected():
+                    raise IbkrExecutionError("IBKR_TIMED_EXIT_SUBMISSION_AMBIGUOUS")
+                return order_id
+            detail = self._order_rejection_detail(order_id, account, trade.orderStatus.status)
+
+            def refusal_is_proven() -> bool:
+                actual = trade.order
+                identity = (actual.account, actual.orderRef, actual.action, actual.orderType,
+                            actual.totalQuantity, actual.ocaGroup, actual.ocaType,
+                            trade.contract.conId)
+                return (
+                    request_ib is self.ib and request_ib.isConnected()
+                    and order_id > 0 and (self.client_id, order_id) not in previous_ids
+                    and actual.clientId == self.client_id and actual.orderId == order_id
+                    and identity == expected and actual.orderType in {"MOC", "MKT"}
+                    and dispatch_window is not None
+                    and ((actual.orderType == "MOC" and reference.endswith("-TIME"))
+                         or (actual.orderType == "MKT" and reference.endswith("-OVERDUE")))
+                    and trade.orderStatus.status in {"Inactive", "Cancelled", "ApiCancelled"}
+                    and float(trade.orderStatus.filled) == 0 and not trade.fills
+                    and float(trade.orderStatus.remaining) in {0, quantity}
+                    and (order_id, 201) in errors
+                    and all(req == order_id and code in {201, 202} for req, code in errors)
                 )
+
+            if not refusal_is_proven():
+                raise IbkrExecutionError(f"IBKR_TIMED_EXIT_REJECTION_UNCONFIRMED: {detail}")
+            try:
+                # Query responses do not emit execDetailsEvent in ib_async; inspect
+                # returned executions as well as the trade's live fill cache.
+                fills = await asyncio.wait_for(request_ib.reqExecutionsAsync(
+                    ExecutionFilter(acctCode=account, clientId=self.client_id),
+                ), _OPEN_ORDERS_TIMEOUT_SECONDS)
+                executions_checked_at = datetime.now(UTC).isoformat()
+                for fill in fills:
+                    execution = fill.execution
+                    if ((execution.clientId == self.client_id and execution.orderId == order_id)
+                        or (int(trade.order.permId) > 0
+                            and execution.permId == trade.order.permId)
+                        or execution.orderRef == reference):
+                        raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_EXECUTION_PRESENT")
+                after = await self._timed_exit_state(contract, quantity, group, reference, account)
+            except Exception as exc:
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_REFRESH_FAILED") from exc
+            if after != baseline or not refusal_is_proven():
+                raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_STATE_CHANGED")
+            raise ConfirmedNewOrderRejection(
+                order_id=order_id, order_ref=reference, symbol=symbol, quantity=quantity,
+                client_id=self.client_id, contract_id=int(expected[-1]), detail=detail,
+                submitted_at=submitted_at, executions_checked_at=executions_checked_at,
+                verified_at=datetime.now(UTC).isoformat(),
             )
-        return int(trade.order.orderId)
+        except ConfirmedNewOrderRejection:
+            raise
+        except BaseException:
+            self.disconnect()
+            raise
+        finally:
+            request_ib.errorEvent -= on_error
 
     def _order_rejection_detail(self, order_id: int, account: str, status: str) -> str:
         # IB uses one monotonic request/order ID sequence per connection; connect
@@ -819,6 +1081,8 @@ class IbkrBroker:
             outsideRth=False,
             transmit=True,
         )
+        if order_ref.endswith("-OVERDUE"):
+            return await self._submit_new_timed_exit(contract, order, dispatch_window)
         if dispatch_window is not None:
             self._check_exit_window(dispatch_window)
         trade = self.ib.placeOrder(contract, order)

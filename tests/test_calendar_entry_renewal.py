@@ -55,6 +55,23 @@ def adapter_at(now: datetime, kind: str = "fallback"):
     return adapter
 
 
+def protected_moc_adapter_at(now: datetime):
+    from tests.test_execution_confirmed_exit_rejection import adapter as protected_adapter
+
+    adapter = adapter_at(now)
+    _, fake = protected_adapter()
+    adapter.ib = fake
+    adapter.configured_account = "ACCT"
+    adapter.client_id = 1
+    adapter._contracts["TEST"] = fake.contract
+    fake.held.position = 20
+    for trade in fake.active:
+        trade.order.totalQuantity = 20
+        trade.order.ocaGroup = "same-oca"
+        trade.orderStatus.remaining = 20
+    return adapter
+
+
 @pytest.mark.parametrize("stamp,approved", [
     ("2026-10-01T03:59:59+00:00", True),
     ("2026-10-01T04:00:00+00:00", False),
@@ -215,10 +232,11 @@ def test_adapter_rechecks_after_contract_lookup_before_place_order(
 ) -> None:
     import insider_alerts.execution.ibkr as module
     now = datetime(2026, 11, 27, 12, 44, tzinfo=NEW_YORK)
-    adapter = adapter_at(now)
+    adapter = protected_moc_adapter_at(now) if kind == "moc" else adapter_at(now)
     fake = adapter.ib
-    fake.trades = lambda: []
-    fake.managedAccounts = lambda: ["TEST"]
+    if kind != "moc":
+        fake.trades = lambda: []
+        fake.managedAccounts = lambda: ["TEST"]
     placed = []
     fake.placeOrder = lambda *args: placed.append(args)
     end = now.replace(minute=45) if kind == "moc" else now.replace(hour=13, minute=0)
@@ -230,12 +248,15 @@ def test_adapter_rechecks_after_contract_lookup_before_place_order(
 
     async def slow_contract(symbol: str):
         monkeypatch.setattr(module, "datetime", Clock)
-        return SimpleNamespace(conId=1, secType="STK", currency="USD")
+        return fake.contract if kind == "moc" else SimpleNamespace(
+            conId=1, secType="STK", currency="USD",
+        )
 
     monkeypatch.setattr(adapter, "_contract", slow_contract)
     method = adapter.submit_market_on_close if kind == "moc" else adapter.submit_market_exit
     with pytest.raises(IbkrExecutionError, match="EXIT_DISPATCH_WINDOW_MISSED"):
-        asyncio.run(method("TEST", 20, oca_group="same-oca", order_ref="test-TIME",
+        asyncio.run(method("TEST", 20, oca_group="same-oca",
+                           order_ref="IA-E07-TEST-TIME" if kind == "moc" else "test-TIME",
                            dispatch_window=(now.replace(minute=30), end)))
     assert placed == []
 
@@ -428,14 +449,22 @@ def test_adapter_dispatch_inside_window_preserves_oca_and_order_type(
 ) -> None:
     import insider_alerts.execution.ibkr as module
     now = datetime(2026, 11, 27, 12, 30, tzinfo=NEW_YORK)
-    adapter = adapter_at(now)
+    adapter = protected_moc_adapter_at(now) if kind == "moc" else adapter_at(now)
     fake = adapter.ib
     placed = []
-    fake.trades = lambda: []
-    fake.managedAccounts = lambda: ["TEST"]
+    if kind != "moc":
+        fake.trades = lambda: []
+        fake.managedAccounts = lambda: ["TEST"]
+    else:
+        fake.mode = "accepted"
+    original_place = fake.placeOrder if kind == "moc" else None
 
     def place(contract, order):
         placed.append(order)
+        if original_place is not None:
+            trade = original_place(contract, order)
+            trade.order.orderId = 77
+            return trade
         return SimpleNamespace(order=SimpleNamespace(orderId=77),
                                orderStatus=SimpleNamespace(status="Submitted"))
 
@@ -447,7 +476,9 @@ def test_adapter_dispatch_inside_window_preserves_oca_and_order_type(
             return now.astimezone(tz)
 
     async def contract(symbol):
-        return SimpleNamespace(conId=1, secType="STK", currency="USD")
+        return fake.contract if kind == "moc" else SimpleNamespace(
+            conId=1, secType="STK", currency="USD",
+        )
 
     async def no_sleep(seconds):
         pass
@@ -456,7 +487,8 @@ def test_adapter_dispatch_inside_window_preserves_oca_and_order_type(
     monkeypatch.setattr(adapter, "_contract", contract)
     monkeypatch.setattr(module.asyncio, "sleep", no_sleep)
     method = adapter.submit_market_on_close if kind == "moc" else adapter.submit_market_exit
-    assert asyncio.run(method("TEST", 20, oca_group="same-oca", order_ref="test-TIME",
+    assert asyncio.run(method("TEST", 20, oca_group="same-oca",
+                              order_ref="IA-E07-TEST-TIME" if kind == "moc" else "test-TIME",
                               dispatch_window=(now, now + timedelta(minutes=15)))) == 77
     assert len(placed) == 1
     assert (placed[0].ocaGroup, placed[0].ocaType, placed[0].totalQuantity) == ("same-oca", 1, 20)
