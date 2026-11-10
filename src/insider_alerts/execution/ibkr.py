@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import re
 import sys
@@ -8,7 +10,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -119,12 +121,18 @@ class IbkrBroker:
             raise IbkrExecutionError("IBKR_TIMED_EXIT_BATCH_STATE_CHANGED")
 
     async def _refresh_exit_batch(self) -> None:
-        self._check_exit_batch()
-        if self._exit_batch_receipts:
-            # Any one receipt holds the complete account signature. Unexpected
-            # intervening changes conservatively abort this degraded batch.
-            await self._exit_batch_receipts[0][3]()
-        self._check_exit_batch()
+        try:
+            self._check_exit_batch()
+            if self._exit_batch_receipts:
+                # Any one receipt holds the complete account signature. Unexpected
+                # intervening changes conservatively abort this degraded batch.
+                await self._exit_batch_receipts[0][3]()
+            self._check_exit_batch()
+        except BaseException:
+            # A timed-out SDK request retains its canceled future/container.
+            # Never reuse that socket for later order or reconciliation requests.
+            self.disconnect()
+            raise
 
     async def connect(self, *, readonly: bool) -> None:
         if self.ib is not None and self.ib.isConnected():
@@ -888,6 +896,18 @@ class IbkrBroker:
                 else:
                     delattr(wrapper, name)
 
+    @staticmethod
+    def _raw_order_fingerprint(contract: Any, order: Any) -> str:
+        # The full callback dataclasses include constant undecoded SDK defaults.
+        # Those only participate in comparison; affirmative safety evidence comes
+        # from the decoded fields/status gates, never from an undecoded default.
+        try:
+            encoded = json.dumps((asdict(contract), asdict(order)), sort_keys=True,
+                                 allow_nan=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_RAW_EVIDENCE_INVALID") from exc
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     async def _timed_exit_state(
         self, contract: Any, quantity: int, oca_group: str, order_ref: str, expected_account: str,
         *, allow_rejection: int | None = None,
@@ -916,6 +936,7 @@ class IbkrBroker:
             if order.account != snapshot.account:
                 continue
             identities.append((
+                self._raw_order_fingerprint(actual, order),
                 order.orderId, order.permId, order.clientId, actual.conId,
                 actual.symbol, actual.secType, actual.currency, order.orderRef,
                 order.action, order.orderType, order.ocaGroup, order.ocaType,
@@ -924,6 +945,10 @@ class IbkrBroker:
                 order.outsideRth, order.parentId, trade.broker_open_status,
                 trade.cached_status.status, float(trade.cached_status.filled),
                 float(trade.cached_status.remaining), bool(trade.fills),
+                tuple(sorted(set(trade.status_receipts))),
+                order.goodAfterTime, order.goodTillDate, bool(order.conditions),
+                order.conditionsIgnoreRth, order.conditionsCancelOrder,
+                order.algoStrategy, order.notHeld, order.adjustedOrderType,
             ))
             if (str(actual.symbol) != symbol and actual.conId != contract.conId
                 and order.ocaGroup != oca_group):
@@ -937,6 +962,11 @@ class IbkrBroker:
                 and order.orderId > 0 and order.permId > 0
                 and order.orderType == ("STP" if order.orderRef.endswith("-STOP") else "LMT")
                 and order.tif == "GTC" and float(order.totalQuantity) == quantity
+                and not order.goodAfterTime and not order.goodTillDate and not order.conditions
+                and not order.conditionsIgnoreRth and not order.conditionsCancelOrder
+                and not order.algoStrategy and not order.notHeld
+                # Gateway uses this exact documented sentinel for no adjustment.
+                and order.adjustedOrderType in {"", "None"}
                 and float(status.filled) == 0 and float(status.remaining) == quantity
                 and status.status in {"Submitted", "PreSubmitted"} and not trade.fills
                 and trade.cached_status.status in {"Submitted", "PreSubmitted"}

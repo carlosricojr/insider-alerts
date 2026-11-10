@@ -33,6 +33,13 @@ proof, then checks errors and window/quote freshness without another await. The
 normal target-modification path adds no await; continuation after a refusal adds
 one final refresh. Any intervening unexplained change aborts conservatively.
 All batch state and listeners clear in finally, including persistence/cancellation.
+Refresh failures discard the socket and any canceled SDK request containers.
+Normalized complete status-receipt sets prevent a prior position's partial fill
+from disappearing behind a later zero update. Full raw Order/Contract dataclass
+fingerprints bind all callback fields; undecoded SDK defaults are comparison-only.
+Serialization rejects nonfinite/unrepresentable evidence. Owned protection must
+have no decoded date/condition/algo activation. Only empty or Gateway's exact
+documented `None` adjusted-order sentinel denotes no adjustment.
 
 Verification: adversarial multi-position, identity/partial/fill/cancel/refresh/race,
 deadline and cleanup tests; full Ruff, strict mypy and pytest; independent settled
@@ -45,6 +52,7 @@ Primary references:
 - https://www.interactivebrokers.com/docs/tws-api/doc/order-management/execution-details
 - https://www.interactivebrokers.com/docs/tws-api/doc/order-management/order-status
 - https://interactivebrokers.github.io/tws-api/message_codes.html
+- https://www.interactivebrokers.com/campus/ibkr-quant-news/an-introduction-to-tws-api-with-jupyter-notebooks/
 
 Read-only Gateway smoke verified fresh raw order/status receipt availability and
 exact callback restoration; the temporary client disconnected. Native installed-

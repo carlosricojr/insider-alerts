@@ -12,7 +12,17 @@ from typing import Any
 
 import pytest
 from eventkit import Event
-from ib_async import IB, LimitOrder, OrderState, OrderStatus, Stock, StopOrder, Trade
+from ib_async import (
+    IB,
+    LimitOrder,
+    MarketOrder,
+    OrderState,
+    OrderStatus,
+    Stock,
+    StopOrder,
+    TimeCondition,
+    Trade,
+)
 
 import insider_alerts.execution.ibkr as ibkr_module
 from insider_alerts.execution.errors import ConfirmedNewOrderRejection, IbkrExecutionError
@@ -109,6 +119,17 @@ class ExitIb:
                             contract.conId = 999
                         elif self.wire_defect == "status":
                             state.status = "Cancelled"
+                        elif self.wire_defect == "goodAfterTime":
+                            order.goodAfterTime = "20300101 15:00:00 US/Eastern"
+                        elif self.wire_defect == "goodTillDate":
+                            order.goodTillDate = "20300101 15:00:00 US/Eastern"
+                        elif self.wire_defect == "conditions":
+                            order.conditions = [TimeCondition(time="20300101 15:00:00 US/Eastern")]
+                            order.conditionsCancelOrder = True
+                        elif self.wire_defect == "triggerMethod":
+                            order.triggerMethod = 2
+                        elif self.wire_defect == "minQty":
+                            order.minQty = 9
                     self.wrapper.openOrder(order.orderId, contract, order, state)
                     if self.wire_failure != "missing_status":
                         remaining = (9 if self.wire_failure == "partial_status"
@@ -279,7 +300,7 @@ def test_uncertain_or_changed_state_stops_globally(mode: str) -> None:
 @pytest.mark.parametrize("defect", [
     "missing_stop", "duplicate_stop", "wrong_conid", "wrong_account", "wrong_owner",
     "stop_zero", "stop_nan", "target_zero", "parent", "wrong_quantity", "unset_stop",
-    "unset_target",
+    "unset_target", "goodAfterTime", "goodTillDate", "conditions",
 ])
 def test_malformed_protection_or_position_prevents_any_dispatch(defect: str) -> None:
     broker, fake = adapter()
@@ -303,6 +324,10 @@ def test_malformed_protection_or_position_prevents_any_dispatch(defect: str) -> 
         fake.active[0].order.auxPrice = sys.float_info.max
     elif defect == "unset_target":
         fake.active[1].order.lmtPrice = sys.float_info.max
+    elif defect in {"goodAfterTime", "goodTillDate"}:
+        setattr(fake.active[0].order, defect, "20300101 15:00:00 US/Eastern")
+    elif defect == "conditions":
+        fake.active[0].order.conditions = [TimeCondition(time="20300101 15:00:00 US/Eastern")]
     else:
         fake.held.position = 9
     with pytest.raises(IbkrExecutionError):
@@ -371,7 +396,10 @@ def test_account_context_drift_cannot_prove_a_refusal(monkeypatch: pytest.Monkey
     assert not fake.attempts
 
 
-@pytest.mark.parametrize("defect", ["oca", "account", "action", "tif", "contract", "status"])
+@pytest.mark.parametrize("defect", [
+    "oca", "account", "action", "tif", "contract", "status", "goodAfterTime", "goodTillDate",
+    "conditions", "triggerMethod", "minQty",
+])
 def test_native_wrapper_cached_projection_cannot_hide_changed_broker_order(defect: str) -> None:
     broker, fake = adapter()
     fake.wire_defect = defect
@@ -678,9 +706,9 @@ def test_batch_cancellation_and_nested_entry_restore_listener_state(
     assert broker._exit_batch_errors is None and broker._exit_batch_receipts == []
 
 
-@pytest.mark.parametrize("late_fill", [False, True])
+@pytest.mark.parametrize("failure", ["none", "late_fill", "timeout", "cancel"])
 def test_continuation_to_existing_target_revalidates_prior_refusal_before_modification(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_fill: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
     runner, fake, now = pair_runner(tmp_path, monkeypatch, market=True)
     stop = next(t for t in fake.active if t.contract.symbol == "SECOND")
@@ -696,12 +724,24 @@ def test_continuation_to_existing_target_revalidates_prior_refusal_before_modifi
                                                    time=ibkr_module.datetime.fromtimestamp(
                                                        now.timestamp(), UTC))])
     def quote_request(*args: Any) -> Any:
-        if late_fill:
+        if failure == "late_fill":
             fake.attempts[0].fills.append(SimpleNamespace())
         asyncio.get_running_loop().call_soon(quote.updateEvent.emit, quote)
         return quote
     monkeypatch.setattr(fake, "reqMktData", quote_request, raising=False)
     monkeypatch.setattr(fake, "cancelMktData", lambda *args: None, raising=False)
+    original_wire = fake.wire_orders
+    async def wire() -> list[Trade]:
+        rows = await original_wire()
+        if fake.order_requests == 9:
+            if failure == "timeout":
+                fake.wire_failure = "timeout"
+            elif failure == "cancel":
+                raise asyncio.CancelledError()
+        return rows
+    monkeypatch.setattr(fake, "wire_orders", wire)
+    if failure == "timeout":
+        monkeypatch.setattr(ibkr_module, "_OPEN_ORDERS_TIMEOUT_SECONDS", .1)
     original = fake.placeOrder
     modifications: list[Any] = []
     def place(contract: Any, order: Any) -> Trade:
@@ -711,10 +751,103 @@ def test_continuation_to_existing_target_revalidates_prior_refusal_before_modifi
             return target
         return original(contract, order)
     monkeypatch.setattr(fake, "placeOrder", place)
-    reason = "BATCH_STATE_CHANGED" if late_fill else "TIMED_EXIT_REJECTIONS"
-    with pytest.raises(IbkrExecutionError, match=reason):
+    expected = (asyncio.CancelledError if failure == "cancel" else TimeoutError
+                if failure == "timeout" else IbkrExecutionError)
+    with pytest.raises(expected):
         asyncio.run(runner.cycle(now, disconnect_after=False))
-    assert len(fake.attempts) == 1 and len(modifications) == int(not late_fill)
+    assert len(fake.attempts) == 1 and len(modifications) == int(failure == "none")
     assert len(quote.updateEvent) == 0 and len(fake.errorEvent) == 1
     assert runner.broker.exit_modification_intent is None
     assert runner.broker._exit_batch_errors is None and runner.broker._exit_batch_receipts == []
+    if failure != "none":
+        assert runner.broker.ib is None and not fake.connected
+
+
+def test_prior_protective_partial_then_zero_during_next_proof_cannot_disappear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, fake, now = pair_runner(tmp_path, monkeypatch)
+    original = fake.wrapper.orderStatus
+    # Avoid recursion while retaining all three native callback receipts.
+    injected = False
+    def inject(*args: Any) -> None:
+        nonlocal injected
+        original(*args)
+        if fake.order_requests == 4 and args[0] == 20 and not injected:
+            injected = True
+            partial = list(args)
+            partial[2:4] = [1, 9]
+            fake.wrapper.orderStatus(*partial)
+            fake.wrapper.orderStatus(*args)
+    monkeypatch.setattr(fake.wrapper, "orderStatus", inject)
+    with pytest.raises(IbkrExecutionError, match="BATCH_STATE_CHANGED"):
+        asyncio.run(runner.cycle(now, disconnect_after=False))
+    assert injected and len(fake.attempts) == 1
+    assert fake.wrapper.orderStatus is inject
+    assert runner.broker._exit_batch_errors is None and runner.broker._exit_batch_receipts == []
+
+
+@pytest.mark.parametrize("failure", ["none", "timeout", "cancel"])
+def test_existing_market_adoption_refresh_failure_discards_socket_and_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from insider_alerts.execution.canary import broker_token
+
+    runner, fake, now = pair_runner(tmp_path, monkeypatch, market=True)
+    existing = MarketOrder("SELL", 10, orderId=88, permId=188, clientId=1, account="ACCT",
+                           ocaGroup="oca-two", ocaType=1, tif="DAY",
+                           orderRef=f"IA-E07-{broker_token('two')}-OVERDUE")
+    fake.active.append(Trade(fake.second.contract, existing, OrderStatus(
+        status="Submitted", filled=0, remaining=10,
+    )))
+    original = fake.wire_orders
+    async def wire() -> list[Trade]:
+        rows = await original()
+        if fake.order_requests == 6:
+            if failure == "timeout":
+                fake.wire_failure = "timeout"
+            elif failure == "cancel":
+                raise asyncio.CancelledError()
+        return rows
+    monkeypatch.setattr(fake, "wire_orders", wire)
+    if failure == "timeout":
+        monkeypatch.setattr(ibkr_module, "_OPEN_ORDERS_TIMEOUT_SECONDS", .1)
+    expected = (asyncio.CancelledError if failure == "cancel" else TimeoutError
+                if failure == "timeout" else IbkrExecutionError)
+    with pytest.raises(expected):
+        asyncio.run(runner._submit_due_time_exits(now))
+    assert len(fake.attempts) == 1 and len(fake.errorEvent) == 1
+    row = next(row for row in runner.store.rows() if row["packet_id"] == "two")
+    assert row["timed_exit_order_id"] == (88 if failure == "none" else None)
+    assert runner.broker._exit_batch_errors is None and runner.broker._exit_batch_receipts == []
+    assert all(name not in vars(fake.wrapper)
+               for name in ("openOrder", "openOrderEnd", "orderStatus"))
+    if failure != "none":
+        assert runner.broker.ib is None and not fake.connected
+
+
+@pytest.mark.parametrize("invalid", ["nonfinite", "unrepresentable"])
+def test_raw_order_fingerprint_rejects_unavailable_evidence(invalid: str) -> None:
+    from ib_async import TagValue
+
+    broker, fake = adapter()
+    order = fake.active[0].order
+    original = broker._raw_order_fingerprint(fake.contract, order)
+    assert original == broker._raw_order_fingerprint(deepcopy(fake.contract), deepcopy(order))
+    if invalid == "nonfinite":
+        order.discretionaryAmt = float("nan")
+    else:
+        order.algoParams = [TagValue("unexpected", object())]
+    with pytest.raises(IbkrExecutionError, match="RAW_EVIDENCE_INVALID"):
+        broker._raw_order_fingerprint(fake.contract, order)
+
+
+@pytest.mark.parametrize("adjustment", ["None", "none", "NONE", "null", "STP", "TRAIL"])
+def test_only_exact_gateway_no_adjustment_sentinel_is_accepted(adjustment: str) -> None:
+    broker, fake = adapter()
+    fake.active[0].order.adjustedOrderType = adjustment
+    expected = ConfirmedNewOrderRejection if adjustment == "None" else IbkrExecutionError
+    with pytest.raises(expected) as captured:
+        asyncio.run(submit(broker))
+    assert isinstance(captured.value, ConfirmedNewOrderRejection) == (adjustment == "None")
+    assert len(fake.attempts) == int(adjustment == "None")
