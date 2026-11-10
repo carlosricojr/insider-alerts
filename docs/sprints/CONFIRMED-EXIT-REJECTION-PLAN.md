@@ -26,6 +26,14 @@ required; SDK caches are conservative overlays. No cache rewrite or SDK fork.
 Transmission is proven by fresh accepted status: transmit is not decoded by
 openOrder. UNSET_DOUBLE is unavailable price evidence even though finite.
 
+The batch owns continuous error coverage across preliminary reads and retains
+each refusal's live identity/fill predicate and immutable whole-account proof.
+Every subsequent mutation validates those receipts against the final fresh raw
+proof, then checks errors and window/quote freshness without another await. The
+normal target-modification path adds no await; continuation after a refusal adds
+one final refresh. Any intervening unexplained change aborts conservatively.
+All batch state and listeners clear in finally, including persistence/cancellation.
+
 Verification: adversarial multi-position, identity/partial/fill/cancel/refresh/race,
 deadline and cleanup tests; full Ruff, strict mypy and pytest; independent settled
 review; canonical exact-head review of record and green CI. Parent reviews readiness

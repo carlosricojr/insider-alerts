@@ -251,6 +251,8 @@ def test_only_proved_new_refusal_can_be_isolated(market: bool, mode: str) -> Non
     assert fake.execution_requests == 1 and fake.position_requests >= 2
     assert fake.connected and broker.ib is fake
     assert len(fake.errorEvent) == 1 and len(fake.positionEvent) == 0
+    assert broker._exit_batch_errors is None
+    assert broker._exit_batch_receipts == []
 
 
 @pytest.mark.parametrize("mode", [
@@ -602,3 +604,117 @@ def test_persistence_failure_stops_loop_and_rolls_back_acceptance_pointer(
         asyncio.run(runner.cycle(now, disconnect_after=False))
     assert len(fake.attempts) == attempts
     assert all(row["timed_exit_order_id"] is None for row in runner.store.rows())
+    assert len(fake.errorEvent) == 1 and runner.broker._exit_batch_errors is None
+    assert runner.broker._exit_batch_receipts == []
+
+
+@pytest.mark.parametrize("change", ["fill", "position"])
+def test_late_first_rejection_change_during_second_preflight_stops_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    runner, fake, now = pair_runner(tmp_path, monkeypatch)
+    original = fake.reqPositionsAsync
+    async def changed() -> list[Any]:
+        rows = await original()
+        if fake.position_requests == 3:  # A baseline/end proof finished; B is refreshing.
+            if change == "fill":
+                fake.attempts[0].fills.append(SimpleNamespace())
+            else:
+                fake.held.position = 9
+                rows[0].position = 9
+        return rows
+    monkeypatch.setattr(fake, "reqPositionsAsync", changed)
+    with pytest.raises(IbkrExecutionError, match="BATCH_STATE_CHANGED"):
+        asyncio.run(runner.cycle(now, disconnect_after=False))
+    assert len(fake.attempts) == 1
+    assert len(fake.errorEvent) == 1 and runner.broker._exit_batch_errors is None
+    assert runner.broker._exit_batch_receipts == []
+
+
+@pytest.mark.parametrize("market", [False, True])
+def test_systemic_error_between_attempt_listeners_stops_next_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: bool,
+) -> None:
+    runner, fake, now = pair_runner(tmp_path, monkeypatch, market=market)
+    observed_connected: list[bool] = []
+    if market:
+        original = fake.wire_orders
+        async def orders() -> list[Trade]:
+            rows = await original()
+            if fake.order_requests == 6:  # Initial management refresh + A's four reads.
+                observed_connected.append(fake.isConnected())
+                fake.errorEvent.emit(-1, 1100, "gateway lost", None)
+            return rows
+        monkeypatch.setattr(fake, "wire_orders", orders)
+    else:
+        original_contract = runner.broker._contract
+        async def contract(symbol: str) -> Any:
+            if symbol == "SECOND":
+                observed_connected.append(fake.isConnected())
+                fake.errorEvent.emit(-1, 1100, "gateway lost", None)
+            return await original_contract(symbol)
+        monkeypatch.setattr(runner.broker, "_contract", contract)
+    with pytest.raises(IbkrExecutionError, match="BATCH_STATE_CHANGED"):
+        asyncio.run(runner.cycle(now, disconnect_after=False))
+    assert observed_connected == [True]
+    assert len(fake.attempts) == 1 and len(fake.errorEvent) == 1
+    assert runner.broker._exit_batch_errors is None and runner.broker._exit_batch_receipts == []
+
+
+def test_batch_cancellation_and_nested_entry_restore_listener_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, fake = adapter()
+    async def run() -> None:
+        with broker.timed_exit_batch():
+            with (pytest.raises(IbkrExecutionError, match="BATCH_OVERLAP"),
+                  broker.timed_exit_batch()):
+                pytest.fail("Nested batch must fail")
+            fake.mode = "cancelled"
+            await submit(broker)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+    assert len(fake.errorEvent) == 1 and len(fake.positionEvent) == 0
+    assert broker._exit_batch_errors is None and broker._exit_batch_receipts == []
+
+
+@pytest.mark.parametrize("late_fill", [False, True])
+def test_continuation_to_existing_target_revalidates_prior_refusal_before_modification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_fill: bool,
+) -> None:
+    runner, fake, now = pair_runner(tmp_path, monkeypatch, market=True)
+    stop = next(t for t in fake.active if t.contract.symbol == "SECOND")
+    target_order = LimitOrder("SELL", 10, 11, orderId=31, permId=131, clientId=1,
+                              account="ACCT", ocaGroup=stop.order.ocaGroup, ocaType=1,
+                              orderRef=stop.order.orderRef.replace("-STOP", "-TARGET"), tif="GTC")
+    target = Trade(stop.contract, target_order, OrderStatus(status="Submitted", filled=0,
+                                                           remaining=10))
+    fake.active.append(target)
+    runner.store.update("two", target_order_id=31)
+    quote = SimpleNamespace(bid=10.5, bidSize=100, marketDataType=1, updateEvent=Event(),
+                            ticks=[SimpleNamespace(tickType=1, price=10.5,
+                                                   time=ibkr_module.datetime.fromtimestamp(
+                                                       now.timestamp(), UTC))])
+    def quote_request(*args: Any) -> Any:
+        if late_fill:
+            fake.attempts[0].fills.append(SimpleNamespace())
+        asyncio.get_running_loop().call_soon(quote.updateEvent.emit, quote)
+        return quote
+    monkeypatch.setattr(fake, "reqMktData", quote_request, raising=False)
+    monkeypatch.setattr(fake, "cancelMktData", lambda *args: None, raising=False)
+    original = fake.placeOrder
+    modifications: list[Any] = []
+    def place(contract: Any, order: Any) -> Trade:
+        if order.orderId == 31:
+            modifications.append(order)
+            target.order = order
+            return target
+        return original(contract, order)
+    monkeypatch.setattr(fake, "placeOrder", place)
+    reason = "BATCH_STATE_CHANGED" if late_fill else "TIMED_EXIT_REJECTIONS"
+    with pytest.raises(IbkrExecutionError, match=reason):
+        asyncio.run(runner.cycle(now, disconnect_after=False))
+    assert len(fake.attempts) == 1 and len(modifications) == int(not late_fill)
+    assert len(quote.updateEvent) == 0 and len(fake.errorEvent) == 1
+    assert runner.broker.exit_modification_intent is None
+    assert runner.broker._exit_batch_errors is None and runner.broker._exit_batch_receipts == []

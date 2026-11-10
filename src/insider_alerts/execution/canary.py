@@ -6,6 +6,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -1613,6 +1614,15 @@ class CanaryRunner:
 
     async def _submit_due_time_exits(
         self, now: datetime, *, enforce_wall_clock: bool = False,
+    ) -> int:
+        batch = getattr(self.broker, "timed_exit_batch", nullcontext)
+        with batch():
+            return await self._submit_due_time_exits_in_batch(
+                now, enforce_wall_clock=enforce_wall_clock,
+            )
+
+    async def _submit_due_time_exits_in_batch(
+        self, now: datetime, *, enforce_wall_clock: bool,
     ) -> int:
         local = now.astimezone(NEW_YORK)
         count = 0

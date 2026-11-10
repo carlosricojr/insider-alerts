@@ -5,7 +5,8 @@ import math
 import re
 import sys
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -45,6 +46,7 @@ __all__ = ["IbkrBroker", "IbkrExecutionError"]
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _OPEN_ORDERS_TIMEOUT_SECONDS = 10.0
 _SCHEDULE_TIMEOUT_SECONDS = 5.0
+_TimedExitProof = tuple[str, dict[str, float], tuple[tuple[Any, ...], ...]]
 
 
 class IbkrBroker:
@@ -68,6 +70,61 @@ class IbkrBroker:
         self._all_orders_checked_at = 0.0
         self._allow_calendar_fallback = False
         self.schedule_evidence: dict[str, str] = {}
+        self._exit_batch_ib: Any = None
+        self._exit_batch_errors: list[tuple[int, int]] | None = None
+        self._exit_batch_receipts: list[
+            tuple[int, Callable[[], bool], _TimedExitProof,
+                  Callable[[], Awaitable[_TimedExitProof]]]
+        ] = []
+
+    @contextmanager
+    def timed_exit_batch(self) -> Iterator[None]:
+        """Keep rejection proofs and systemic-error coverage alive across due rows."""
+        if self._exit_batch_errors is not None:
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_BATCH_OVERLAP")
+        request_ib = self.ib
+        if request_ib is None or not request_ib.isConnected():
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_BATCH_CONNECTION_UNAVAILABLE")
+        errors: list[tuple[int, int]] = []
+        self._exit_batch_ib, self._exit_batch_errors = request_ib, errors
+
+        def on_error(req_id: int, code: int, _message: str, _contract: Any) -> None:
+            if code not in {2104, 2106, 2107, 2108, 2158}:
+                errors.append((req_id, code))
+
+        request_ib.errorEvent += on_error
+        try:
+            yield
+            self._check_exit_batch()
+        finally:
+            request_ib.errorEvent -= on_error
+            self._exit_batch_errors = None
+            self._exit_batch_ib = None
+            self._exit_batch_receipts.clear()
+
+    def _check_exit_batch(
+        self, proof: _TimedExitProof | None = None, *, allow_rejection: int | None = None,
+    ) -> None:
+        if self._exit_batch_errors is None:
+            return
+        allowed = {receipt[0] for receipt in self._exit_batch_receipts}
+        if allow_rejection is not None:
+            allowed.add(allow_rejection)
+        if (self.ib is not self._exit_batch_ib or not self.ib.isConnected()
+            or any(req not in allowed or code not in {201, 202}
+                   for req, code in self._exit_batch_errors)
+            or any(not witness() or proof is not None and proof != previous
+                   for _, witness, previous, _ in self._exit_batch_receipts)):
+            self.disconnect()
+            raise IbkrExecutionError("IBKR_TIMED_EXIT_BATCH_STATE_CHANGED")
+
+    async def _refresh_exit_batch(self) -> None:
+        self._check_exit_batch()
+        if self._exit_batch_receipts:
+            # Any one receipt holds the complete account signature. Unexpected
+            # intervening changes conservatively abort this degraded batch.
+            await self._exit_batch_receipts[0][3]()
+        self._check_exit_batch()
 
     async def connect(self, *, readonly: bool) -> None:
         if self.ib is not None and self.ib.isConnected():
@@ -715,6 +772,7 @@ class IbkrBroker:
 
         existing = self._existing_trade(order_ref)
         if existing is not None:
+            self._check_exit_batch()
             return int(existing.order.orderId)
         contract = await self._contract(symbol)
         order = MarketOrder(
@@ -832,7 +890,8 @@ class IbkrBroker:
 
     async def _timed_exit_state(
         self, contract: Any, quantity: int, oca_group: str, order_ref: str, expected_account: str,
-    ) -> tuple[str, dict[str, float], tuple[tuple[Any, ...], ...]]:
+        *, allow_rejection: int | None = None,
+    ) -> _TimedExitProof:
         """Fresh held quantity and owned protection, with immutable account order evidence."""
         raw_trades: list[Any] = []
         async def read_orders() -> list[Any]:
@@ -863,6 +922,8 @@ class IbkrBroker:
                 float(order.totalQuantity), float(status.filled), float(status.remaining),
                 status.status, order.tif, order.lmtPrice, order.auxPrice,
                 order.outsideRth, order.parentId, trade.broker_open_status,
+                trade.cached_status.status, float(trade.cached_status.filled),
+                float(trade.cached_status.remaining), bool(trade.fills),
             ))
             if (str(actual.symbol) != symbol and actual.conId != contract.conId
                 and order.ocaGroup != oca_group):
@@ -894,7 +955,9 @@ class IbkrBroker:
             refs.append(order.orderRef)
         if refs.count(prefix + "-STOP") != 1 or refs.count(prefix + "-TARGET") > 1:
             raise IbkrExecutionError("IBKR_TIMED_EXIT_PROTECTION_NOT_PROVEN")
-        return snapshot.account, dict(snapshot.positions), tuple(sorted(identities, key=repr))
+        proof = snapshot.account, dict(snapshot.positions), tuple(sorted(identities, key=repr))
+        self._check_exit_batch(proof, allow_rejection=allow_rejection)
+        return proof
 
     async def _submit_new_timed_exit(
         self, contract: Any, order: Any, dispatch_window: tuple[datetime, datetime] | None,
@@ -922,6 +985,7 @@ class IbkrBroker:
                 raise IbkrExecutionError("IBKR_TIMED_EXIT_PREFLIGHT_ERROR")
             if dispatch_window is not None:
                 self._check_exit_window(dispatch_window)
+            self._check_exit_batch()
             submitted_at = datetime.now(UTC).isoformat()
             trade = request_ib.placeOrder(contract, order)
             order_id = int(trade.order.orderId)
@@ -930,6 +994,7 @@ class IbkrBroker:
                 or trade.order.clientId != self.client_id):
                 raise IbkrExecutionError("IBKR_TIMED_EXIT_NEW_IDENTITY_NOT_PROVEN")
             if trade.orderStatus.status not in {"Inactive", "Cancelled", "ApiCancelled"}:
+                self._check_exit_batch()
                 if errors or not request_ib.isConnected():
                     raise IbkrExecutionError("IBKR_TIMED_EXIT_SUBMISSION_AMBIGUOUS")
                 return order_id
@@ -971,11 +1036,19 @@ class IbkrBroker:
                             and execution.permId == trade.order.permId)
                         or execution.orderRef == reference):
                         raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_EXECUTION_PRESENT")
-                after = await self._timed_exit_state(contract, quantity, group, reference, account)
+                after = await self._timed_exit_state(
+                    contract, quantity, group, reference, account, allow_rejection=order_id,
+                )
             except Exception as exc:
                 raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_REFRESH_FAILED") from exc
             if after != baseline or not refusal_is_proven():
                 raise IbkrExecutionError("IBKR_TIMED_EXIT_REJECTION_STATE_CHANGED")
+            if self._exit_batch_errors is not None:
+                async def refresh() -> _TimedExitProof:
+                    return await self._timed_exit_state(
+                        contract, quantity, group, reference, account,
+                    )
+                self._exit_batch_receipts.append((order_id, refusal_is_proven, after, refresh))
             raise ConfirmedNewOrderRejection(
                 order_id=order_id, order_ref=reference, symbol=symbol, quantity=quantity,
                 client_id=self.client_id, contract_id=int(expected[-1]), detail=detail,
@@ -1044,6 +1117,7 @@ class IbkrBroker:
                     "Submitted", "PreSubmitted", "PendingSubmit",
                 }):
                 raise IbkrExecutionError("IBKR_EXIT_IDENTITY_CONFLICT")
+            await self._refresh_exit_batch()
             return int(existing.order.orderId)
         prefix = order_ref.rsplit("-", 1)[0]
         if not await self.confirm_missing_exit(
@@ -1154,6 +1228,8 @@ class IbkrBroker:
         ):
             self.disconnect()
             raise IbkrExecutionError("IBKR_EXIT_POST_QUOTE_RECONCILIATION_FAILED")
+        if self._exit_batch_receipts:
+            await self._refresh_exit_batch()
         if quote_time is None or not 0 <= (datetime.now(UTC) - quote_time).total_seconds() <= 3:
             raise IbkrExecutionError("IBKR_EXIT_LIVE_BID_STALE")
         current = [t for t in self._all_open_trades
@@ -1183,6 +1259,7 @@ class IbkrBroker:
             "perm_id": int(target.order.permId),
         })
         if target.order.lmtPrice == bid:
+            self._check_exit_batch()
             return int(target.order.orderId)
         replacement = deepcopy(target.order)
         replacement.lmtPrice = float(bid)
@@ -1191,6 +1268,7 @@ class IbkrBroker:
         if (not request_ib.isConnected() or quote_time is None
             or not 0 <= (datetime.now(UTC) - quote_time).total_seconds() <= 3):
             raise IbkrExecutionError("IBKR_EXIT_BID_EXPIRED_BEFORE_DISPATCH")
+        self._check_exit_batch()
         trade = self.ib.placeOrder(contract, replacement)
         deadline = asyncio.get_running_loop().time() + 5.0
         while asyncio.get_running_loop().time() < deadline:
@@ -1206,6 +1284,7 @@ class IbkrBroker:
                 and trade.order.orderId == replacement.orderId
                 and trade.order.permId == replacement.permId
                 and trade.orderStatus.status in {"Submitted", "PreSubmitted", "Filled"}):
+                self._check_exit_batch()
                 return int(replacement.orderId)
         self.disconnect()
         raise IbkrExecutionError("IBKR_EXIT_TARGET_MODIFICATION_ACK_TIMEOUT")
