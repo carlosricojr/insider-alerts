@@ -53,9 +53,13 @@ the actual loaded trust bundle, or current TLS safety. Raw task argument hashes,
 paths and local receipts are retained outside Git; no secret/config contents or
 scientific outcomes are copied into this plan.
 
-The validator searches cwd before module ancestors for an authoritative Git
-checkout, then verifies bound artifacts in both that checkout and the activation
-commit. A different virtualenv with a patched checkout lock still fails. Later
+`_reviewed_repo_root` selects the first cwd or module ancestor containing existing
+`.git`, `uv.lock` and registry-schema paths, searching cwd ancestors first. This
+is an existence check, not proof of an authoritative Git checkout. A matching
+working directory can precede the module checkout and supply the schema loaded
+by `_validate_registry`. Subsequent checks verify bound artifacts in the selected
+root and activation commit. A different virtualenv with a patched checkout lock
+still fails. Later
 commits are allowed only with activation ancestry and identical bound artifacts.
 See [inference.py](../../src/insider_alerts/research/inference.py),
 `_reviewed_repo_root` / `_validate_registry`, and
@@ -302,19 +306,22 @@ and blocked PR #66; it never mutates the cohort to fit the implementation.
    slice before implementation; reserve evidence-dependent trust/activation and
    operational-window decisions until the implementation/rollback is reviewable.
 3. Add synthetic tests for mixed cwd/import/interpreter/root/lock rejection and
-   the intended split's success. Retain changed-lock rejection, registry,
+   the intended split's success. Include a matching cwd with only the required
+   paths: it precedes the module checkout and supplies the loaded schema, without
+   establishing Git authority. Retain changed-lock rejection, registry,
    receipt/armed, no-retry, concurrency, Windows confinement/hidden-process and
    source identity tests. Add per-client offline TLS negatives/positive controls.
 4. Run pinned Linux full quality/coverage and Windows boundary gates for an
    implementation. For this plan-only PR, retain structural/link checks and
    actual repo check results; trusted CI excludes documentation paths by design.
-   The unchanged-base Mac run on 2026-11-11 passed Ruff/Mypy/coverage but failed 35
-   capture cases (1,284 passed, 13 skipped). A synthetic fixture records the code
-   failing closed because Linux /proc/self/fd handle-relative access is absent.
-   This is not a passing full suite. Existing Docker/Colima engines were
-   unavailable; no new VM/service was started to disguise that limit. Current
-   supported-platform gates or a legitimate documented doc-applicability
-   procedure must be established before merge; no new waiver is granted here.
+   On 2026-11-11 the full frozen Linux gate passed Ruff/Mypy/coverage and 1,319
+   tests, with 13 skipped, in a network-disconnected disposable container. Runtime,
+   test, workflow and lock bytes are unchanged by the documentation revisions.
+   The existing Colima VM was started for validation and returned to stopped;
+   its user profile and the selected Docker context were unchanged. Earlier
+   Darwin failures (1,284 passed, 35 failed, 13 skipped; representative
+   /proc/self/fd limitation) and the initial read-only fixture-mount failure
+   remain in local evidence. Neither failed attempt is labeled a pass or waived.
    Do not weaken a workflow or silently label a failing required gate passed.
 5. After separate implementation review/merge and owner activation decision,
    snapshot task XML/args/principals, package/import/CA provenance and bound
