@@ -31,9 +31,11 @@ position management, the cash account, two nominal $200 slots and broker gates.
 - Required available-Claude and independent Sol design reviews requested
   revisions. The plan addresses ownership, custody, trust and safe operational
   handoff without changing runtime or scientific records.
-- Frozen uv 0.9.15 / Python 3.12 base checks: Ruff/Mypy/coverage pass; full pytest
-  records 1,284 passed, 35 failed, 13 skipped. A representative synthetic capture
-  fixture fails closed on unavailable /proc/self/fd access on Darwin. This is
-  not a passing full suite or a waiver of applicable supported-platform gates.
+- Frozen uv 0.9.15 / Python 3.12 Linux full gate: Ruff/Mypy/coverage pass;
+  pytest records 1,319 passed, 13 skipped in an isolated network-disconnected
+  container. Runtime, test and lock bytes match the reviewed source. Earlier
+  Darwin failures and a read-only fixture-mount failure remain in local evidence.
+- TLS admission includes compromised-intermediate rejection through alternate
+  cross-signed paths. Root removal or successful HTTPS alone is insufficient.
 - This PR changes documentation only. Runtime code, locks, registry, policy,
   historical artifacts, installed checkout and running workers are unchanged.

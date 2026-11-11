@@ -194,10 +194,25 @@ published 2026-10-20 with fixed boundary 2026.10.18, and
 [Certifi's 2026.10.19–2026.10.23 change](https://github.com/certifi/python-certifi/compare/2026.10.19...2026.10.23)
 support the scoped removal. [PR #66's exact regression](https://github.com/carlosricojr/insider-alerts/blob/54e3818aedf28c975d919033c726d196e62192fc/tests/test_certifi_trust_store.py)
 checks emSign ECC Root CA-G3, Root CA-C1 and ECC Root CA-C3 DER fingerprints.
-G-TLS requires excluding that exact upstream-bound set in every effective loaded
-trust path (including OS stores), not merely rejecting a generic untrusted cert.
-No compromised key or live interception test is used. Successful
-HTTPS/TLS handshakes only demonstrate compatibility, not distrust enforcement.
+The three-anchor regression is necessary evidence for that scoped update, not
+complete incident containment. [Mozilla's incident tracker, comment 25](https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c25)
+confirms affected intermediates also have AAA Certificate Services cross-signs;
+Mozilla rejects that issuer because its root store does not trust it. Other
+effective stores must be inspected rather than assumed to inherit that result.
+
+G-TLS requires both the exact removed-root exclusions and rejection of every
+verified compromised intermediate/key identity across all effective trust paths,
+including AAA Certificate Services cross-signs and OS stores. Inventory the
+current primary incident certificate set with provenance and hashes; prove each
+actual client's path validation rejects it, or require another independently
+verified fail-closed control. Merely removing the three anchors, observing a
+revocation notice, or rejecting a generic untrusted certificate is insufficient.
+Offline admission fixtures must include public compromised-intermediate and
+cross-signed certificate paths, approved-chain positive controls and explicit
+rejection when an alternate trusted anchor is present. Missing inventory or
+unproven client enforcement blocks admission. No compromised private key or live
+interception test is used. Successful HTTPS/TLS handshakes demonstrate
+compatibility, not distrust enforcement.
 
 [SEC HTTPX](../../src/insider_alerts/sec/client.py) and
 [ntfy HTTPX](../../src/insider_alerts/notify/ntfy.py) clients do not supply an
@@ -209,9 +224,9 @@ G-TLS client inventory, to complete per actual process before admission:
 
 | Client/process boundary | Trust source to verify | Required proof/control |
 | --- | --- | --- |
-| SEC HTTPX parent/history/features/ingestion | trust_env selection and effective Certifi/env context | Loaded bundle/context identity; exact removed-root exclusion; offline approved-chain and untrusted/hostname/invalid-chain negatives. |
+| SEC HTTPX parent/history/features/ingestion | trust_env selection and effective Certifi/env context | Loaded bundle/context identity; G-TLS root and compromised-intermediate/cross-sign rejection; offline approved-chain and untrusted/hostname/invalid-chain controls. |
 | ntfy HTTPX operational producer/canary | Same library, separate process/task environment | Same distrust controls; stub sender only, no real notification. |
-| urllib review/market_context.py | Python default SSL context and effective environment/OS roots | Identify loaded stores and exact exclusions; offline request fixture. |
+| urllib review/market_context.py | Python default SSL context and effective environment/OS roots | Identify loaded stores; G-TLS root and compromised-intermediate/cross-sign rejection; offline request fixture. |
 | urllib backtest/prices.py | Its own Python default context | Same proof, without live price requests or backtests. |
 | alpha child interpreter/scripts | Independently installed libraries, task args and env inheritance | Enumerate actual HTTPS clients/stores and loaded bundle; synthetic child/context tests, no broker/order call. |
 | quant child interpreter/scripts | Independent child source and environment | Same inventory and distrust proof; no inference/model/network execution. |
@@ -224,8 +239,9 @@ A task-scoped immutable vetted CA file is only a proposal for security and
 scientific review: it preserves lock bytes but changes the effective environment.
 It requires an external manifest with exact provenance/hash, confinement and
 fail-closed preflight, and negative TLS tests for every actual HTTPX/urllib/child
-client. Missing/tampered file, untrusted root, hostname mismatch and invalid chain
-must fail; approved chains must pass. Prove the target process actually loads it.
+client, including the public cross-signed path fixtures above. Missing/tampered
+file, untrusted root, compromised intermediate, hostname mismatch and invalid
+chain must fail; approved chains must pass. Prove the target process loads it.
 Never disable verification, modify Certifi in place, restore distrusted roots
 online or count a successful handshake as security clearance.
 
