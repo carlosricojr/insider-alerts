@@ -1,0 +1,127 @@
+# Offline environment isolation: execution plan and proposal
+
+Updated: 2026-11-15. Base: merged plan f05ef61, PR #75. Carlos approved only
+offline synthetic feasibility, proposed environment mapping and a proposed
+pinned-root update policy on 2026-11-11. This document enacts none of them.
+PR #66 remains blocked. Carlos-PC is under an incident hold; no host call,
+deployment, trust change, task cutover, new cohort or record re-signing is part
+of this slice.
+
+## Outcome, constraints and verification
+
+The [merged plan](2026-11-11-environment-isolation-plan.md) remains authoritative.
+This is its step 1. Actual installed-process trust, blinded Trial-integrity,
+custody and canonical-store evidence are still incomplete and held. Offline
+fixtures can expose a proposal's failure without establishing operational safety.
+
+The required read-only Claude design challenge requested revisions before
+implementation. The tests address its cwd/Git distinction, differing line-ending
+digests, strict X509/cross-sign controls, proxy/retry isolation and additive
+urllib trust. They import and call metadata guards only. They never invoke a
+Trial, terminal, inference entry point, installer, live writer or broker.
+Existing synthetic unit suites remain required CI gates; no study outcomes or
+real historical records are read to obtain maintenance evidence.
+
+| Boundary | Expected result | Evidence status |
+| --- | --- | --- |
+| Cwd versus module root | Complete cwd markers win; incomplete cwd falls back. Neither proves Git authority. | New synthetic tests; hosted result pending. |
+| Fake `.git` marker | Root selection can pass, but Git artifact admission must reject it. | New metadata-only negative; hosted result pending. |
+| LF versus CRLF lock | Registry-normalized digest remains equal; raw commissioning digest changes. | Disposable synthetic lock only; hosted result pending. |
+| Changed lock contents | Both digests change; missing bound files fail. | No real sealed lock is edited; hosted result pending. |
+| Windows runtime path | Existing helper accepts an in-root file and rejects sibling, missing and directory paths. | Actual hosted Windows gate pending; existing junction tests retained. |
+| SEC and ntfy HTTPX | Explicit good bundle accepts its leaf; both bad chains and wrong host fail verification. | Actual loopback client tests pending. |
+| urllib market context and prices | Good-only file plus an additional bad CA directory can still accept the synthetic bad chain. | Expected negative feasibility result; hosted confirmation pending. |
+| Windows store enumeration | Labelled synthetic enumeration can add trust to urllib's default context. | Model only, not inventory or modification of real Windows trust. |
+| Missing/malformed/empty bundle | Distinguish HTTPX explicit-file errors from default-path behavior; no generic exception is verification proof. | Positive controls, actual issuer/configuration errors; hosted result pending. |
+
+No passing result is claimed until current-head CI actually supplies it. The
+environment-only trust variant is **not proposed for admission**: urllib's default
+context can combine other trust sources with an environment bundle. A virtualenv
+split also cannot make a changed checkout lock satisfy sealed artifact checks.
+Do not patch a guard or historical record to make either proposal succeed.
+
+## Offline TLS fixture procedure and limits
+
+Fixture setup uses the existing disposable CI image's OpenSSL executable with
+fixed argument lists, finite command deadlines and bounded output. No Python
+dependency or lock is added. It creates unrelated synthetic good/bad roots, one
+synthetic intermediate cross-signed by two bad roots, and strictly formed leaves.
+OpenSSL verifies each positive chain with `-x509_strict` before client tests.
+Signing keys are removed before any client test; only ephemeral leaf keys remain
+in the disposable temporary directory. No PEM or private key is committed.
+Generator source, tool/Python/OpenSSL versions and LF-normalized public-fixture
+hashes are recorded in the CI provenance summary. Different random fixture keys
+are expected between isolated runs; their identity is never operational evidence.
+
+Each negative has a positive control against the same synthetic server. Accepted
+connections are counted before TLS verification, and actual verification codes
+are observed while original errors/results propagate unchanged. Client proxies
+are removed, `NO_PROXY=*` bypasses registry proxies, retries are one, and socket
+and DNS guards reject every non-loopback destination. ntfy posts only synthetic
+content to the owned loopback receiver. Market/price tests call low-level download
+methods only; they do not start a research/backtest/market pipeline. Owned servers
+have finite socket and shutdown waits. No OS certificate store is edited.
+
+The cross-sign model does not identify a real compromised certificate, prove
+all operational alternate paths rejected, or establish loaded trust of any
+running process. Alpha/quant children are not executed. A future trust proposal
+still needs the merged plan's identity, custody, per-client and G-TLS evidence.
+
+Primary contracts: [HTTPX SSL configuration](https://www.python-httpx.org/advanced/ssl/),
+[Python 3.12 default contexts](https://docs.python.org/3.12/library/ssl.html#ssl.create_default_context),
+[Windows certificate enumeration](https://docs.python.org/3.12/library/ssl.html#ssl.enum_certificates).
+Observed tests must be tied to the frozen installed versions, not inferred from
+documentation for a different runtime.
+
+## Proposed mapping: no task is moved
+
+`S` means the preserved scientific checkout and its sealed cohort authority.
+`R` means a proposed, separately reviewed patched operational checkout. These
+are logical selectors, not installed paths or an approved runtime layout.
+Observed task states are only the dated observations in the merged plan.
+
+| Consumer or paired owners | Proposed environment | Admission conflict / retained authority |
+| --- | --- | --- |
+| Research capture/history, Trial, terminal/manual seal/inference | S | Same sealed bytes, activation ancestry and evidence authority; no maintenance execution to inspect outcomes. |
+| Bar/session feeds and point-in-time feature capture | S pending producer admission | Preserve observation provenance, append-only sequence and single-writer ownership. |
+| Commissioning V2 | Existing root and state | Whole-package/runtime digest and path/device/inode custody prohibit silently transplanting it. |
+| SEC Ingestion Worker + SEC Ingestion Watchdog | R, only as a pair | Coordinate acquisition ownership with the Autopilot decision pair; no second writer or empty replacement store. |
+| Autopilot Worker + Autopilot Watchdog | R, conditional | Source/decision/notification chain and alpha/quant child admission must remain compatible; do not start legacy disabled workers. |
+| Live canary + watchdog, Observer, notification coverage | R together, conditional | Order-capable cutover needs its own approval, original ledger custody, one position manager and all E07/F00/broker gates. |
+| Alpha/quant child processes | Their existing reviewed environments pending proof | Do not infer interpreter, trust or source compatibility from a parent virtualenv. |
+| Development/CI | Disposable synthetic roots | No secrets, live store mounts, writers or study outcomes. |
+
+Canonical existing stores are not relocated, copied, reset, shared through a
+junction or reassigned by this proposal. The current path helper confines runtime
+files to their own checkout. A proposed R cannot simply reuse out-of-root paths;
+the table is **not admitted** until a later approved selector/store/custody design
+satisfies the guards. Same-root consumer relationships and complete producer
+version/source fields remain the merged plan's G-SRC/G-STORE gates. No new
+receipt, armed attestation or policy exception is manufactured here.
+
+## Pinned-root update policy: proposal only
+
+| Change | Proposed rule, requiring later owner approval where applicable |
+| --- | --- |
+| Any of the eight registry-bound artifacts | Preserve the active cohort's bytes and sealed digests. A patched lock is not a compatible update merely because code imports. |
+| Other Python, project/runtime/calendar or source identity | Treat commissioning/custody bindings separately; absence from the eight-artifact list is not permission to change it. |
+| Line endings | Registry CRLF normalization does not waive raw commissioning binding. Never normalize and re-sign historical records. |
+| Tests and documentation outside bound artifacts | Review normally in an isolated checkout; this does not establish that a live pinned checkout may diverge from `origin/main`. |
+| Pinned S versus current main | Keep the existing clean-main rule in force. Any named pinned-root exception needs explicit scope, security/update process, evidence and approval; no automatic exception is enacted. |
+| Security maintenance for an online scientific writer | A frozen environment is not certified safe by TLS success. The demonstrated environment-only narrowing is inadequate for urllib. Require blinded exposure/integrity and actual per-client trust/custody evidence before deciding interim posture. |
+| Urgent incompatibility | Stop the proposed update/admission and present a separate reviewed resolution; never bypass validation, mutate the cohort or restart an armed worker. |
+
+## Delivery and rollback
+
+Run existing full Linux Ruff/Mypy/pytest/71% coverage and Windows boundary gates,
+adding both new test modules without removing any previous check. Under the
+current compute policy these run in already-authorized hosted CI, not on the Mac
+or Carlos-PC. Update this result ledger with actual exact-head evidence before
+final independent/canonical review and authorized source merge. A negative
+feasibility result must be reported as such; it is not a gate waiver for PR #66.
+
+This PR changes tests, their CI selection and this proposal only. No service,
+CLI behavior or deployment target changes. Browser and host deployment are N/A
+for this offline test/document slice; verify the merged source and hosted gates.
+Rollback is a source revert of this slice; there is no runtime cutover to undo.
+Later installer, trust, interim-posture and activation choices remain separate.
