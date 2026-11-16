@@ -17,23 +17,24 @@ fixtures can expose a proposal's failure without establishing operational safety
 The required read-only Claude design challenge requested revisions before
 implementation. The tests address its cwd/Git distinction, differing line-ending
 digests, strict X509/cross-sign controls, proxy/retry isolation and additive
-urllib trust. They import and call metadata guards only. They never invoke a
-Trial, terminal, inference entry point, installer, live writer or broker.
+urllib trust. Root/digest tests call metadata guards only; TLS tests call the listed low-level
+clients against owned loopback servers. Neither invokes a Trial, terminal,
+inference entry point, installer, live writer or broker.
 Existing synthetic unit suites remain required CI gates; no study outcomes or
 real historical records are read to obtain maintenance evidence.
 
 | Boundary | Expected result | Evidence status |
 | --- | --- | --- |
-| Cwd versus module root | Complete cwd markers win; incomplete cwd falls back. Neither proves Git authority. | New synthetic tests; hosted result pending. |
-| Fake `.git` marker | Root selection can pass, but Git artifact admission must reject it. | New metadata-only negative; hosted result pending. |
-| LF versus CRLF lock | Registry-normalized digest remains equal; raw commissioning digest changes. | Disposable synthetic lock only; hosted result pending. |
-| Changed lock contents | Both digests change; missing bound files fail. | No real sealed lock is edited; hosted result pending. |
-| Windows runtime path | Existing helper accepts an in-root file and rejects sibling, missing and directory paths. | Actual hosted Windows gate pending; existing junction tests retained. |
-| SEC and ntfy HTTPX | Explicit good bundle accepts its leaf; both bad chains and wrong host fail verification. | Actual loopback client tests pending. |
-| urllib market context and prices | Good-only file plus an additional bad CA directory can still accept the synthetic bad chain. | Expected negative feasibility result; hosted confirmation pending. |
-| Windows store enumeration | Labelled synthetic enumeration can add trust to urllib's default context. | Model only, not inventory or modification of real Windows trust. |
-| Missing/malformed/empty bundle | Distinguish HTTPX explicit-file errors from default-path behavior; no generic exception is verification proof. | Positive controls, actual issuer/configuration errors; hosted result pending. |
-| Already initialized urllib opener | A retained context can continue trusting the previous anchor after environment mutation. | Separate negative feasibility control; corrected-head hosted result pending. |
+| Cwd versus module root | Complete cwd markers win; incomplete cwd falls back. Neither proves Git authority. | Passed at 7828bdd in hosted run43791145901. |
+| Fake `.git` marker | Root selection can pass, but Git artifact admission must reject it. | Metadata-only rejection passed at 7828bdd. |
+| LF versus CRLF lock | Registry-normalized digest remains equal; raw commissioning digest changes. | Passed on a disposable synthetic lock at 7828bdd. |
+| Changed lock contents | Both digests change; missing bound files fail. | Rejection passed; real sealed lock unchanged. |
+| Windows runtime path | Existing helper accepts an in-root file and rejects sibling, missing and directory paths. | Hosted Windows passed; previous junction tests retained. |
+| SEC and ntfy HTTPX | Explicit good bundle accepts its leaf; both bad chains and wrong host fail verification. | Actual loopback client controls passed at 7828bdd. |
+| urllib market context and prices | Good-only file plus an additional bad CA directory can still accept the synthetic bad chain. | Negative feasibility result demonstrated at 7828bdd. |
+| Windows store enumeration | Labelled synthetic enumeration can add trust to urllib's default context. | Hosted Windows model passed; no real-store inventory/change. |
+| Missing/malformed/empty bundle | Distinguish HTTPX explicit-file errors from default-path behavior; no generic exception is verification proof. | Positive/error controls passed; does not prove operational safety. |
+| Already initialized urllib opener | A retained context can continue trusting the previous anchor after environment mutation. | Retained-context negative demonstrated at 7828bdd. |
 
 Initial hosted run `43789522143` at `7521b45` failed: Linux recorded 14 failed,
 1,341 passed and 21 skipped; Windows recorded 16 failed, 195 passed and 5 skipped.
@@ -51,8 +52,12 @@ control deliberately preserves the cache and demonstrates that an environment
 change need not update a running client's trust. The existing mapping therefore
 remains unadmitted; no restart, trust update or runtime cutover follows.
 
-No passing result is claimed until current-head CI actually supplies it. The
-environment-only trust variant is **not proposed for admission**: urllib's default
+Hosted run [43791145901](https://github.com/carlosricojr/insider-alerts/actions/runs/43791145901)
+at exact source head `7828bddf66b3e2a30fa736250913b349c52cfd67` passed full Linux
+Ruff/Mypy/pytest/coverage and Windows boundary jobs. These are fixture results,
+not final merge or operational acceptance. A later head still needs its actual
+applicable checks and reviews before merge. The environment-only trust variant
+is **not proposed for admission**: urllib's default
 context can combine other trust sources with an environment bundle. A virtualenv
 split also cannot make a changed checkout lock satisfy sealed artifact checks.
 Do not patch a guard or historical record to make either proposal succeed.

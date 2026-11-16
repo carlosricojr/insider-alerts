@@ -2,15 +2,16 @@
 
 **Phase:** the approved offline feasibility slice of merged isolation plan #75.
 Implementation changes tests, their CI selection and a mapping/update-policy
-proposal only. Hosted verification and settled-head reviews are pending.
+proposal only. Full hosted Linux/Windows gates passed at 7828bdd; settled-head
+independent/canonical review, matching-head checks and source merge remain due.
 
-**Ball is with:** coordinator for actual full Linux and Windows gates, then
-independent/canonical review and authorized source merge. Carlos retains all
+**Ball is with:** coordinator for current-head independent/canonical review,
+applicable CI/readiness and authorized source merge. Carlos retains all
 later trust, pinned-root exception, interim-posture, cutover and activation
 choices. No such decision is enacted here; #66 remains BLOCKED.
 
-**Next action:** validate the synthetic metadata and actual loopback-TLS matrix
-in existing hosted CI. Preserve negative feasibility results. The environment-only
+**Next action:** review the settled offline result and proposals; retain actual
+matching-head hosted checks before merge. Preserve negative feasibility results. The environment-only
 trust variant is not proposed for admission: urllib can add trust sources beyond
 the environment file. A passing fixture never certifies a frozen online writer
 or an actual installed trust bundle as safe.
@@ -19,7 +20,8 @@ Initial hosted run43789522143 failed in the new TLS fixture. Corrections use a
 positive rate/deterministic clock and isolate fresh urllib opener initialization
 per trust profile, with restoration. A separate retained-context control keeps
 the genuine inability to reload trust by environment mutation explicit. Initial
-Linux14/Windows16 failures remain recorded; corrected-head gates are pending.
+Linux14/Windows16 failures remain recorded. Corrected run43791145901 passed both
+quality and Windows boundaries at7828bdd; no operational admission follows.
 
 **Delivered for verification:**
 
