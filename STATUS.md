@@ -1,41 +1,49 @@
-# Status — 2026-11-11
+# Status — 2026-11-15
 
-## Phase
+**Phase:** the approved offline feasibility slice of merged isolation plan #75.
+Implementation changes tests, their CI selection and a mapping/update-policy
+proposal only. Full hosted Linux/Windows gates passed at 7828bdd; settled-head
+independent/canonical review, matching-head checks and source merge remain due.
 
-Environment-isolation planning only. Carlos selected separate research/runtime
-environments while preserving the current OPP-E07-V1 cohort and sealed records.
-No implementation, trust override, task cutover or activation is approved here.
+**Ball is with:** coordinator for current-head independent/canonical review,
+applicable CI/readiness and authorized source merge. Carlos retains all
+later trust, pinned-root exception, interim-posture, cutover and activation
+choices. No such decision is enacted here; #66 remains BLOCKED.
 
-## Ball is with
+**Next action:** review the settled offline result and proposals; retain actual
+matching-head hosted checks before merge. Preserve negative feasibility results. The environment-only
+trust variant is not proposed for admission: urllib can add trust sources beyond
+the environment file. A passing fixture never certifies a frozen online writer
+or an actual installed trust bundle as safe.
 
-Coordinator: current-head independent review, canonical review and applicable
-verification. Carlos: the plan's explicit architecture/interim-posture choices,
-then evidence-dependent security and activation decisions. No live worker is
-paused or restarted by this document.
+Initial hosted run43789522143 failed in the new TLS fixture. Corrections use a
+positive rate/deterministic clock and isolate fresh urllib opener initialization
+per trust profile, with restoration. A separate retained-context control keeps
+the genuine inability to reload trust by environment mutation explicit. Initial
+Linux14/Windows16 failures remain recorded. Corrected run43791145901 passed both
+quality and Windows boundaries at7828bdd; no operational admission follows.
 
-## Next action
+The settled-head CLI review found one supported-Python compatibility issue:
+an opener need not retain its SSL context on 3.11. The revised test inspects the
+actual handler and requires either retained-anchor behavior or verified bad-chain
+rejection from a fresh context. Hosted Python 3.11 coverage is added without
+removing any prior gate. New-head CI and independent/canonical rechecks remain due.
 
-Review [the isolation plan](docs/deployment/2026-11-11-environment-isolation-plan.md).
-Complete blinded Trial-integrity and per-consumer/process/store/TLS evidence.
-Reject any split requiring sealed-artifact edits or a validator bypass. Preserve
-position management, the cash account, two nominal $200 slots and broker gates.
+**Delivered for verification:**
 
-## Evidence
+- [Execution/results plan and mapping/pinned-root policy proposal](docs/deployment/2026-11-11-offline-isolation-feasibility.md).
+- Cwd/module/Git-authority, missing-file and registry-versus-commissioning
+  line-ending guard tests; additive actual Windows confinement cases.
+- Four real client paths against owned loopback HTTPS with ephemeral synthetic
+  cross-sign fixtures, strict X509 controls and real verification-error evidence.
+  No keys, operational CA files or historical evidence are committed.
+- All existing Linux full quality/coverage and Windows boundary checks retained.
+  No suite or crypto fixture generation has run on the Mac for this slice;
+  validation is hosted. Small syntax/source checks are not a passing full gate.
 
-- PR #66 remains blocked: its Certifi lock differs from the active registry.
-  A virtualenv split alone cannot satisfy checkout/activation artifact checks.
-- Read-only Windows metadata shows the shared clean main checkout at c791c4f,
-  its LF-normalized sealed lock and installed Certifi 2026.1.4. Per-process trust
-  is not verified. Trial result 2 has a blinded invalid_evidence_dispositions
-  error; its underlying integrity cause remains a blocking diagnostic.
-- Required available-Claude and independent Sol design reviews requested
-  revisions. The plan addresses ownership, custody, trust and safe operational
-  handoff without changing runtime or scientific records.
-- Frozen uv 0.9.15 / Python 3.12 Linux full gate: Ruff/Mypy/coverage pass;
-  pytest records 1,319 passed, 13 skipped in an isolated network-disconnected
-  container. Runtime, test and lock bytes match the reviewed source. Earlier
-  Darwin failures and a read-only fixture-mount failure remain in local evidence.
-- TLS admission includes compromised-intermediate rejection through alternate
-  cross-signed paths. Root removal or successful HTTPS alone is insufficient.
-- This PR changes documentation only. Runtime code, locks, registry, policy,
-  historical artifacts, installed checkout and running workers are unchanged.
+**Unchanged boundaries:** cohort/registry, sealed lock, production source,
+receipt/armed/custody records, task/store mapping and trading controls. Actual
+process trust and blinded Trial-integrity evidence remain incomplete. Carlos-PC
+hold ACTIVE: zero host calls/probes/deployment/activation. Browser and runtime
+deployment are N/A for this offline test/document slice; merged source and all
+applicable actual hosted gates still require verification.
