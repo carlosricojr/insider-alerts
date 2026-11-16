@@ -33,6 +33,23 @@ real historical records are read to obtain maintenance evidence.
 | urllib market context and prices | Good-only file plus an additional bad CA directory can still accept the synthetic bad chain. | Expected negative feasibility result; hosted confirmation pending. |
 | Windows store enumeration | Labelled synthetic enumeration can add trust to urllib's default context. | Model only, not inventory or modification of real Windows trust. |
 | Missing/malformed/empty bundle | Distinguish HTTPX explicit-file errors from default-path behavior; no generic exception is verification proof. | Positive controls, actual issuer/configuration errors; hosted result pending. |
+| Already initialized urllib opener | A retained context can continue trusting the previous anchor after environment mutation. | Separate negative feasibility control; corrected-head hosted result pending. |
+
+Initial hosted run `43789522143` at `7521b45` failed: Linux recorded 14 failed,
+1,341 passed and 21 skipped; Windows recorded 16 failed, 195 passed and 5 skipped.
+All failures were in the new TLS module. The fixture supplied a zero rate to a
+client that divides by it, preventing those TLS controls from running. Other
+controls changed the CA environment after urllib had cached its HTTPS context,
+so they did not test the newly selected profile. Those failures remain evidence;
+they are not a passing trust result.
+
+Corrected profile tests supply a valid positive rate with a deterministic clock
+and forbidden sleeps. Each urllib profile initializes a fresh test-local opener,
+restoring its predecessor afterward. This models initialization under that
+profile, not a production patch or live trust reload. A separate retained-opener
+control deliberately preserves the cache and demonstrates that an environment
+change need not update a running client's trust. The existing mapping therefore
+remains unadmitted; no restart, trust update or runtime cutover follows.
 
 No passing result is claimed until current-head CI actually supplies it. The
 environment-only trust variant is **not proposed for admission**: urllib's default
@@ -70,6 +87,8 @@ still needs the merged plan's identity, custody, per-client and G-TLS evidence.
 Primary contracts: [HTTPX SSL configuration](https://www.python-httpx.org/advanced/ssl/),
 [Python 3.12 default contexts](https://docs.python.org/3.12/library/ssl.html#ssl.create_default_context),
 [Windows certificate enumeration](https://docs.python.org/3.12/library/ssl.html#ssl.enum_certificates).
+[CPython HTTPS handler](https://github.com/python/cpython/blob/v3.12.10/Lib/urllib/request.py#L1264)
+constructs and retains its context; the default opener is cached by `urlopen`.
 Observed tests must be tied to the frozen installed versions, not inferred from
 documentation for a different runtime.
 

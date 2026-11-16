@@ -15,9 +15,10 @@ import subprocess
 import sys
 import threading
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -288,7 +289,17 @@ def https_server(chain, private_key):
         assert not thread.is_alive(), "owned loopback server must stop"
 
 
-def request_client(kind, url):
+def forbidden_sleep(seconds):
+    raise AssertionError(f"synthetic client unexpectedly requested a sleep: {seconds}")
+
+
+def request_client(kind, url, *, fresh_opener=True):
+    """Profile tests isolate urllib initialization; retained-context tests opt out.
+
+    This resets test-local library state with restoration, not verification or
+    production client behavior. It does not prove that a running writer reloads
+    trust when its environment changes.
+    """
     settings = Settings(
         _env_file=None,
         SEC_USER_AGENT="synthetic offline test contact@example.invalid",
@@ -301,7 +312,7 @@ def request_client(kind, url):
         NTFY_TIMEOUT_SECONDS=2,
     )
     if kind == "sec":
-        return SecHttpClient(settings, now_fn=lambda: 100).get_text(url)
+        return SecHttpClient(settings, now_fn=lambda: 100, sleep_fn=forbidden_sleep).get_text(url)
     if kind == "ntfy":
         assert (
             NtfyNotifier(settings).send("synthetic", "synthetic", markdown=False).http_status == 200
@@ -310,15 +321,43 @@ def request_client(kind, url):
     options = {
         "user_agent": "synthetic",
         "timeout_seconds": 2,
-        "rate_limit_per_second": 0,
+        "rate_limit_per_second": 1,
         "retry_attempts": 1,
         "retry_min_seconds": 0,
         "retry_max_seconds": 0,
+        "now_fn": lambda: 100,
+        "sleep_fn": forbidden_sleep,
     }
-    if kind == "market_context":
-        return DailyMarketDataClient(**options)._download_text(url, symbol="SYNTHETIC")
-    assert kind == "prices"
-    return StooqPriceClient(**options)._download_text(url=url, symbol="SYNTHETIC")
+    # urlopen caches its HTTPSHandler/SSLContext globally. Each trust profile
+    # needs a newly initialized opener; restore the prior one after the request.
+    scope = patch.object(urllib.request, "_opener", None) if fresh_opener else nullcontext()
+    with scope:
+        if kind == "market_context":
+            return DailyMarketDataClient(**options)._download_text(url, symbol="SYNTHETIC")
+        assert kind == "prices"
+        return StooqPriceClient(**options)._download_text(url=url, symbol="SYNTHETIC")
+
+
+@pytest.mark.parametrize("kind", ("market_context", "prices"))
+def test_retained_urllib_context_does_not_reload_changed_environment(
+    kind, isolated_tls, tls_material, monkeypatch
+):
+    with https_server(tls_material["chains"]["b"], tls_material["bad_key"]) as (server, url):
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_material["roots"]["bad-b"]))
+        assert "synthetic" in request_client(kind, url, fresh_opener=False)
+        retained = urllib.request._opener
+        assert retained is not None
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_material["roots"]["good"]))
+        before = server.attempts
+        # Deliberate negative feasibility result: a live cached context retains
+        # the old anchor. Environment mutation is not an admitted trust update.
+        assert "synthetic" in request_client(kind, url, fresh_opener=False)
+        assert server.attempts > before and urllib.request._opener is retained
+        before = server.attempts
+        with pytest.raises(CLIENT_ERRORS):
+            request_client(kind, url)
+        assert server.attempts > before and set(isolated_tls) & {20, 21}
+        assert urllib.request._opener is retained, "fresh-profile state must be restored"
 
 
 @pytest.mark.parametrize("kind", CLIENTS)

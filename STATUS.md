@@ -15,6 +15,12 @@ trust variant is not proposed for admission: urllib can add trust sources beyond
 the environment file. A passing fixture never certifies a frozen online writer
 or an actual installed trust bundle as safe.
 
+Initial hosted run43789522143 failed in the new TLS fixture. Corrections use a
+positive rate/deterministic clock and isolate fresh urllib opener initialization
+per trust profile, with restoration. A separate retained-context control keeps
+the genuine inability to reload trust by environment mutation explicit. Initial
+Linux14/Windows16 failures remain recorded; corrected-head gates are pending.
+
 **Delivered for verification:**
 
 - [Execution/results plan and mapping/pinned-root policy proposal](docs/deployment/2026-11-11-offline-isolation-feasibility.md).
