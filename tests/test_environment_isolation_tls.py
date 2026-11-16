@@ -339,7 +339,7 @@ def request_client(kind, url, *, fresh_opener=True):
 
 
 @pytest.mark.parametrize("kind", ("market_context", "prices"))
-def test_retained_urllib_context_does_not_reload_changed_environment(
+def test_urllib_context_lifecycle_preserves_trust_profile_controls(
     kind, isolated_tls, tls_material, monkeypatch
 ):
     with https_server(tls_material["chains"]["b"], tls_material["bad_key"]) as (server, url):
@@ -347,11 +347,32 @@ def test_retained_urllib_context_does_not_reload_changed_environment(
         assert "synthetic" in request_client(kind, url, fresh_opener=False)
         retained = urllib.request._opener
         assert retained is not None
+        handlers = [
+            handler
+            for handler in retained.handlers
+            if isinstance(handler, urllib.request.HTTPSHandler)
+        ]
+        assert len(handlers) == 1
+        context = handlers[0]._context
+        assert context is None or isinstance(context, ssl.SSLContext)
+        retains_context = context is not None
+        if os.environ.get("RUNNER_TEMP"):
+            path = Path(os.environ["RUNNER_TEMP"]) / "insider-offline-tls-provenance.json"
+            assert path.stat().st_size < 8192
+            provenance = json.loads(path.read_text())
+            provenance.setdefault("urllib_retains_context", {})[kind] = retains_context
+            path.write_text(json.dumps(provenance), encoding="utf-8")
         monkeypatch.setenv("SSL_CERT_FILE", str(tls_material["roots"]["good"]))
         before = server.attempts
-        # Deliberate negative feasibility result: a live cached context retains
-        # the old anchor. Environment mutation is not an admitted trust update.
-        assert "synthetic" in request_client(kind, url, fresh_opener=False)
+        if retains_context:
+            # Negative feasibility result: a retained context keeps its anchor.
+            assert "synthetic" in request_client(kind, url, fresh_opener=False)
+        else:
+            # Python 3.11 can defer context creation until each connection.
+            # This branch must reject the bad chain, not weaken the control.
+            with pytest.raises(CLIENT_ERRORS):
+                request_client(kind, url, fresh_opener=False)
+            assert set(isolated_tls) & {20, 21}
         assert server.attempts > before and urllib.request._opener is retained
         before = server.attempts
         with pytest.raises(CLIENT_ERRORS):

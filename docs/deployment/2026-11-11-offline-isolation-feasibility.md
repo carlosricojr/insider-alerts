@@ -49,7 +49,14 @@ and forbidden sleeps. Each urllib profile initializes a fresh test-local opener,
 restoring its predecessor afterward. This models initialization under that
 profile, not a production patch or live trust reload. A separate retained-opener
 control deliberately preserves the cache and demonstrates that an environment
-change need not update a running client's trust. The existing mapping therefore
+change need not update a running client's trust when its context is retained.
+Context lifetime differs across supported Python versions. The test observes
+the actual HTTPS handler before the second request: a retained context must
+keep its previous anchor; a handler creating fresh contexts must reject the bad
+chain after the trust-profile change. Both branches require actual connections
+and verification controls; neither is skipped. An additional hosted Python 3.11
+TLS gate verifies compatibility with the declared minimum minor version, and CI
+provenance records the observed context lifetime. The existing mapping therefore
 remains unadmitted; no restart, trust update or runtime cutover follows.
 
 Hosted run [43791145901](https://github.com/carlosricojr/insider-alerts/actions/runs/43791145901)
@@ -94,6 +101,9 @@ Primary contracts: [HTTPX SSL configuration](https://www.python-httpx.org/advanc
 [Windows certificate enumeration](https://docs.python.org/3.12/library/ssl.html#ssl.enum_certificates).
 [CPython HTTPS handler](https://github.com/python/cpython/blob/v3.12.10/Lib/urllib/request.py#L1264)
 constructs and retains its context; the default opener is cached by `urlopen`.
+[Python 3.11's handler](https://github.com/python/cpython/blob/v3.11.10/Lib/urllib/request.py#L1268)
+can instead leave context creation to each connection. Runtime-specific fixture
+results are not permission to change a live writer's effective trust.
 Observed tests must be tied to the frozen installed versions, not inferred from
 documentation for a different runtime.
 

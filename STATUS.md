@@ -23,6 +23,12 @@ the genuine inability to reload trust by environment mutation explicit. Initial
 Linux14/Windows16 failures remain recorded. Corrected run43791145901 passed both
 quality and Windows boundaries at7828bdd; no operational admission follows.
 
+The settled-head CLI review found one supported-Python compatibility issue:
+an opener need not retain its SSL context on 3.11. The revised test inspects the
+actual handler and requires either retained-anchor behavior or verified bad-chain
+rejection from a fresh context. Hosted Python 3.11 coverage is added without
+removing any prior gate. New-head CI and independent/canonical rechecks remain due.
+
 **Delivered for verification:**
 
 - [Execution/results plan and mapping/pinned-root policy proposal](docs/deployment/2026-11-11-offline-isolation-feasibility.md).
