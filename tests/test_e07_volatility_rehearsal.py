@@ -59,6 +59,8 @@ def system(tmp_path, monkeypatch):
 
         async def acquire(self, symbol, *, start, end, expected_conid):
             calls.append((symbol, start, end, expected_conid, self.budget()))
+            if mode[0] == "exception":
+                raise TimeoutError("simulated source exception")
             response = source_response(symbol, start, end, False, self.clock(), bound)
             response["identity"]["primary_exchange"] = "NASDAQ"
             response["symbol_resolution_changed"] = False
@@ -84,12 +86,14 @@ def system(tmp_path, monkeypatch):
     return instance, make, clock, calls, mode
 
 
-def add_case(instance, clock, *, packet="candidate", cik="0000000123", entry="2026-10-27"):
+def add_case(
+    instance, clock, *, packet="candidate", cik="0000000123", entry="2026-10-27", symbol="TEST"
+):
     row = dict.fromkeys(COLUMNS) | {
         "packet_id": packet,
         "accession_number": "fixture-accession",
         "cik": cik,
-        "symbol": "TEST",
+        "symbol": symbol,
         "signal_at": timestamp(clock[0]),
         "created_at": timestamp(clock[0]),
         "entry_session": entry,
@@ -124,7 +128,7 @@ def test_offhours_capture_durable_read_and_daily_contract_pin(system):
     # stays in the denominator and receives a fallback.
     clock[0] = parse("2026-10-27T13:17:00Z")
     instance = make()
-    add_case(instance, clock, packet="late-candidate")
+    add_case(instance, clock, packet="late-candidate", symbol="LATE")
     report = run(instance)
     assert report["preopen"] == {
         "features_observed": 1,
@@ -139,7 +143,7 @@ def test_offhours_capture_durable_read_and_daily_contract_pin(system):
     report = run(instance)
     assert calls[-1][3] == 456
     assert calls[-1][1].isoformat() == "2026-10-27"
-    assert report["daily_projections"]["provider_projection_observed"] == 1
+    assert report["daily_projections"]["issuer_linked_projection_observed"] == 1
     assert report["outcome_price_basis"] == "as_traded_unverified"
 
 
@@ -223,8 +227,10 @@ def test_legacy_network_lock_prevents_dispatched_attempt(system):
     clock[0] = parse("2026-10-27T11:00:00Z")
     add_case(instance, clock)
     lock = instance.calendar.path.parent / "network-lock.db"
-    with runtime.exclusive_lock(lock), pytest.raises(runtime.LockBusy):
+    with runtime.exclusive_lock(lock):
         run(instance)
+    heartbeat = json.loads((instance.folder / "heartbeat.json").read_bytes())
+    assert heartbeat["acquisition_issue"] == "legacy_network_lock_busy"
     assert not calls
     assert not any(row["kind"] == "attempt" for row in instance.journal.records())
     assert run(make())["custody"] == {"admitted": 1}
@@ -265,3 +271,95 @@ def test_rehearsal_seals_at_fixed_drain_even_after_restart(system):
 def test_sec_contact_rejects_invalid_header_material(contact):
     with pytest.raises(ValueError, match="invalid rehearsal SEC contact"):
         runtime.sec_user_agent(contact)
+
+
+def test_duplicate_scoped_cases_share_one_request_but_keep_both_reads(system):
+    instance, make, clock, calls, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock)
+    add_case(instance, clock, packet="same-instrument")
+    run(instance)
+    clock[0] += timedelta(minutes=6)
+    run(make())
+    assert len(calls) == 1
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    assert run(make())["preopen"] == {"features_observed": 2}
+    clock[0] = parse("2026-10-27T22:30:00Z")
+    assert run(make())["daily_projections"]["issuer_linked_projection_observed"] == 2
+    assert len(calls) == 2
+
+
+def test_one_bad_case_does_not_abandon_other_durable_reads(system, monkeypatch):
+    instance, _, clock, _, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock, packet="bad")
+    add_case(instance, clock, packet="good")
+    run(instance)
+    actual = runtime.decision_material
+
+    def material(case, *args):
+        if case["row"]["packet_id"] == "bad":
+            raise ValueError("candidate-level schema failure")
+        return actual(case, *args)
+
+    monkeypatch.setattr(runtime, "decision_material", material)
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    assert run(instance)["preopen"] == {"candidate_input_invalid": 1, "features_observed": 1}
+
+
+def test_source_exception_is_a_durable_typed_response(system):
+    instance, _, clock, _, mode = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock)
+    mode[0] = "exception"
+    report = run(instance)
+    assert report["provider_result_counts"] == {"source_exception": 1}
+    assert report["unanswered_requests"] == 0
+
+
+def test_directory_failure_can_retry_without_blocking_bars(system):
+    instance, make, clock, calls, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock)
+
+    def unavailable(_):
+        raise OSError("simulated upstream failure")
+
+    instance.directory = unavailable
+    run(instance)
+    assert len(calls) == 1
+    clock[0] += timedelta(minutes=16)
+    run(make())
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    assert run(make())["preopen"] == {"features_observed": 1}
+
+
+def test_heartbeat_checks_quiet_clock_regression_across_restart(system):
+    instance, make, clock, _, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    run(instance)
+    clock[0] -= timedelta(minutes=1)
+    with pytest.raises(ValueError, match="heartbeat clock ahead"):
+        make().load()
+
+
+def test_daytime_and_legacy_client_contention_leave_no_requests(system):
+    instance, make, clock, calls, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock)
+    instance.network_idle = lambda: False
+    run(instance)
+    assert not calls
+    heartbeat = json.loads((instance.folder / "heartbeat.json").read_bytes())
+    assert heartbeat["acquisition_issue"] == "legacy_client_not_idle"
+    clock[0] = parse("2026-10-27T12:00:00Z")
+    run(make())
+    assert not calls
+
+
+def test_probe_budget_stops_at_0800_new_york(system):
+    instance, _, clock, calls, _ = system
+    clock[0] = parse("2026-10-27T11:59:57Z")
+    add_case(instance, clock)
+    run(instance)
+    assert 0 < calls[0][-1] <= 3

@@ -11,7 +11,8 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
@@ -19,7 +20,7 @@ from typing import Any
 
 import rfc8785
 
-from e07_volatility_exits.features import FEATURE_CUTOFF
+from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF
 from insider_alerts.config import Settings
 from insider_alerts.execution.observer import COLUMNS, safe_path, valid_symbol
 from insider_alerts.execution.windows_job import ensure_kill_on_close_process_tree
@@ -39,6 +40,7 @@ from insider_alerts.sec.client import SecHttpClient, SecHttpError
 from ops.research.e07_volatility_input_audit import _history
 from ops.research.e07_volatility_rehearsal_contract import (
     DIRECTORY_URL,
+    DirectoryReceipt,
     bar_proof,
     decision_material,
     issuer_directory,
@@ -50,6 +52,7 @@ REHEARSAL_SESSIONS = 2
 HOLD_SESSIONS = 10
 PACE = timedelta(minutes=5)
 MAX_ATTEMPTS = 3
+DIRECTORY_RETRY = timedelta(minutes=15)
 READ_WINDOW = timedelta(minutes=2)
 
 
@@ -110,26 +113,29 @@ def fingerprint(root: Path) -> str:
 def legacy_idle() -> bool:
     if os.name != "nt":
         return False
-    result = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference='Stop'; "
-            "$t=Get-ScheduledTask -TaskName 'Insider Alerts Research Commissioning V2'; "
-            "if($t.State -ne 'Disabled'){exit 1}; "
-            "$filter=\"Name='pythonw.exe' OR Name='python.exe'\"; "
-            "$p=@(Get-CimInstance Win32_Process -Filter $filter | "
-            "Where-Object {$_.CommandLine -like "
-            "'*insider_alerts.research.commissioning_worker*'}); "
-            "if($p.Count){exit 1}; exit 0",
-        ],
-        timeout=10,
-        capture_output=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference='Stop'; "
+                "$t=Get-ScheduledTask -TaskName 'Insider Alerts Research Commissioning V2'; "
+                "if($t.State -ne 'Disabled'){exit 1}; "
+                "$filter=\"Name='pythonw.exe' OR Name='python.exe'\"; "
+                "$p=@(Get-CimInstance Win32_Process -Filter $filter | "
+                "Where-Object {$_.CommandLine -like "
+                "'*insider_alerts.research.commissioning_worker*'}); "
+                "if($p.Count){exit 1}; exit 0",
+            ],
+            timeout=10,
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
     return result.returncode == 0
 
 
@@ -179,7 +185,19 @@ class Job:
 
     @property
     def key(self) -> str:
-        return f"{self.case['entity']}/{self.stage}/{self.dates[-1]}"
+        row = self.case["payload"]["row"]
+        return digest(
+            rfc8785.dumps(
+                {
+                    "stage": self.stage,
+                    "symbol": row["symbol"],
+                    "cik": row["cik"],
+                    "dates": list(self.dates),
+                    "deadline": timestamp(self.deadline),
+                    "conid": self.conid if self.stage == "daily" else None,
+                }
+            )
+        )
 
 
 class Evidence:
@@ -190,6 +208,8 @@ class Evidence:
         self.attempts: dict[str, list[dict[str, Any]]] = {}
         self.responses: dict[str, dict[str, Any]] = {}
         self.cycle: dict[str, dict[str, Any]] = {}
+        self.directories: list[dict[str, Any]] = []
+        self.directory_attempts: dict[str, list[datetime]] = {}
         self.last_attempt: datetime | None = None
         for record in records:
             self.add(record, keep=False)
@@ -207,6 +227,10 @@ class Evidence:
             self.responses[entity] = record
         elif kind == "cycle":
             self.cycle[entity] = record
+            if entity == "directory":
+                self.directories.append(record)
+            elif entity.startswith("directory-attempt:"):
+                self.directory_attempts.setdefault(entity, []).append(parse(record["recorded_at"]))
 
     def prior(self, case: dict[str, Any]) -> Job:
         payload = case["payload"]
@@ -214,15 +238,26 @@ class Evidence:
         done = last_rth_close(self.version, date.fromisoformat(dates[-1])) + timedelta(minutes=1)
         return Job(case, "history", dates, done, parse(payload["cutoff"]))
 
-    def proof(self, job: Job) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    def matching_attempts(self, job: Job) -> list[dict[str, Any]]:
+        matches = []
         for attempt in self.attempts.get(job.key, ()):
             request = attempt["payload"]
+            producer = self.cases.get(request["source_case"])
             if (
-                request["case_sha256"] != job.case["sha256"]
+                producer is None
+                or producer["sha256"] != request["case_sha256"]
                 or request["job_stage"] != job.stage
                 or tuple(request["required_dates"]) != job.dates
+                or request["symbol"] != job.case["payload"]["row"]["symbol"]
+                or producer["payload"]["row"]["cik"] != job.case["payload"]["row"]["cik"]
+                or (job.stage == "daily" and request["expected_conid"] != job.conid)
             ):
                 continue
+            matches.append(attempt)
+        return matches
+
+    def proof(self, job: Job) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+        for attempt in self.matching_attempts(job):
             response = self.responses.get(attempt["sha256"])
             if response is None:
                 continue
@@ -234,17 +269,39 @@ class Evidence:
                 finalized_at=job.finalized_at,
                 deadline=job.deadline,
             )
-            if proof is not None:
+            if proof is not None and (job.conid is None or proof["conid"] == job.conid):
                 return attempt, response, proof
         return None
 
     def pin(self, job: Job) -> int | None:
-        for attempt in self.attempts.get(job.key, ()):
+        for attempt in self.matching_attempts(job):
             response = self.responses.get(attempt["sha256"])
             if response is not None:
                 conid = qualified_identity(attempt, response)
                 if conid is not None:
                     return conid
+        return None
+
+    def confirmed(self, case: dict[str, Any]) -> dict[str, Any] | None:
+        entity = case["entity"]
+        decision = self.cycle.get("read:" + entity)
+        ack = self.cycle.get("commit:" + entity)
+        if decision is None or ack is None:
+            return None
+        observed = parse(ack["payload"]["commit_observed_at"])
+        material = decision["payload"]
+        if (
+            ack["payload"]["decision_sha256"] == decision["sha256"]
+            and material["case_sha256"] == case["sha256"]
+            and parse(case["recorded_at"])
+            <= parse(material["first_read_at"])
+            <= parse(material["completed_read_at"])
+            <= parse(decision["recorded_at"])
+            <= observed
+            < parse(case["payload"]["cutoff"])
+            and observed <= parse(ack["recorded_at"])
+        ):
+            return decision
         return None
 
     def daily(self, case: dict[str, Any], conid: int | None) -> tuple[Job, ...]:
@@ -271,24 +328,14 @@ class Evidence:
         for case in self.admitted():
             entity = case["entity"]
             boundary = parse(case["payload"]["cutoff"])
-            decision = self.cycle.get("read:" + entity)
-            ack = self.cycle.get("commit:" + entity)
-            if decision is not None and ack is not None:
-                body = ack["payload"]
-                if (
-                    body["decision_sha256"] == decision["sha256"]
-                    and parse(decision["recorded_at"])
-                    <= parse(body["commit_observed_at"])
-                    < boundary
-                    and parse(body["commit_observed_at"]) <= parse(ack["recorded_at"])
-                ):
-                    preopen[decision["payload"]["reason"] or "features_observed"] += 1
-                else:
-                    preopen["durability_not_proven_before_cutoff"] += 1
+            decision = self.confirmed(case)
+            if decision is not None:
+                preopen[decision["payload"]["reason"] or "features_observed"] += 1
             elif now >= boundary:
-                preopen[
-                    "durability_not_proven_before_cutoff" if decision else "preopen_read_missed"
-                ] += 1
+                if "read:" + entity in self.cycle:
+                    preopen["durability_not_proven_before_cutoff"] += 1
+                else:
+                    preopen["preopen_read_missed"] += 1
             else:
                 preopen["waiting_for_cutoff"] += 1
             for job in self.daily(case, self.pin(self.prior(case))):
@@ -297,7 +344,10 @@ class Evidence:
                 elif job.conid is None:
                     daily["contract_pin_unavailable"] += 1
                 elif self.proof(job):
-                    daily["provider_projection_observed"] += 1
+                    if decision is not None and decision["payload"].get("issuer_linked"):
+                        daily["issuer_linked_projection_observed"] += 1
+                    else:
+                        daily["issuer_unverified_projection_observed"] += 1
                 elif now >= job.deadline:
                     daily["daily_window_missed"] += 1
                 else:
@@ -313,6 +363,14 @@ class Evidence:
             "preopen": dict(preopen),
             "daily_projections": dict(daily),
             "outcome_price_basis": "as_traded_unverified",
+            "provider_result_counts": dict(
+                Counter(response["payload"]["result"] for response in self.responses.values())
+            ),
+            "unanswered_requests": sum(
+                attempt["sha256"] not in self.responses
+                for requests in self.attempts.values()
+                for attempt in requests
+            ),
             "sealed": self.records[-1]["kind"] == "seal",
         }
 
@@ -389,6 +447,10 @@ class Rehearsal:
         checkpoint = safe_path(self.folder / "heartbeat.json")
         if checkpoint.exists():
             body = json.loads(checkpoint.read_bytes())
+            # A quiet cycle can make the most recent known clock newer
+            # than the last journal entry.
+            if parse(body["observed_at"]) > self.now():
+                raise ValueError("heartbeat clock ahead of local clock")
             sequence = body["journal_sequence"]
             if (
                 type(sequence) is not int
@@ -422,6 +484,8 @@ class Rehearsal:
             try:
                 signal = parse(row["signal_at"])
                 created = parse(row["created_at"])
+                if observed < max(signal, created) <= observed + timedelta(seconds=2):
+                    continue
                 if max(signal, created) > observed:
                     raise ValueError("candidate source clock is in the future")
                 if min(signal, created) < activated:
@@ -476,7 +540,14 @@ class Rehearsal:
         ):
             return
         day_key = f"directory-attempt:{today}"
-        if day_key in evidence.cycle or now.astimezone(calendar.NY).hour in range(8, 18):
+        recent = evidence.directory_attempts.get(day_key, ())
+        current = evidence.directories[-1] if evidence.directories else None
+        if (
+            8 <= now.astimezone(calendar.NY).hour < 18
+            or (current and parse(current["recorded_at"]).astimezone(calendar.NY).date() == today)
+            or len(recent) >= MAX_ATTEMPTS
+            or (recent and now < recent[-1] + DIRECTORY_RETRY)
+        ):
             return
         self.append(
             evidence, "cycle", day_key, {"started_at": timestamp(now), "url": DIRECTORY_URL}
@@ -502,32 +573,70 @@ class Rehearsal:
         )
 
     def preopen(self, evidence: Evidence) -> None:
-        for case in evidence.admitted():
-            now = self.now()
+        read_at = self.now()
+        due = [
+            case
+            for case in evidence.admitted()
+            if "read:" + case["entity"] not in evidence.cycle
+            and parse(case["payload"]["cutoff"]) - READ_WINDOW
+            <= read_at
+            < parse(case["payload"]["cutoff"])
+        ]
+        if not due:
+            return
+        # One durable prefix feeds this pass. A separate pass after candidate
+        # capture only reads any new cases that still have time before cutoff.
+        durable = Evidence(self.journal.records(), evidence.version)
+        directory = next(
+            (
+                record
+                for record in reversed(durable.directories)
+                if parse(record["recorded_at"]) <= read_at
+            ),
+            None,
+        )
+        parsed_directory = None
+        if directory is not None:
+            with suppress(TypeError, KeyError, ValueError):
+                parsed_directory = DirectoryReceipt(
+                    directory, issuer_directory(directory["payload"]["raw"])
+                )
+        for case in due:
             entity = case["entity"]
             cutoff = parse(case["payload"]["cutoff"])
-            read_key = "read:" + entity
-            if read_key in evidence.cycle or not cutoff - READ_WINDOW <= now < cutoff:
-                continue
-            # Reopen the actual durable journal. A result built from an old in-memory
-            # response or from a post-cutoff read cannot claim a timely decision.
-            read_at = self.now()
-            durable = Evidence(self.journal.records(), evidence.version)
-            proof = durable.proof(durable.prior(case))
-            material = decision_material(
-                case["payload"] | {"case_sha256": case["sha256"]},
-                (proof,) if proof else (),
-                durable.cycle.get("directory"),
-                evidence.version,
-                cutoff,
-            )
+            if self.now() >= cutoff:
+                break
+            try:
+                prior = durable.prior(case)
+                proof = durable.proof(replace(prior, conid=durable.pin(prior)))
+                material = decision_material(
+                    case["payload"] | {"case_sha256": case["sha256"]},
+                    proof,
+                    parsed_directory,
+                    evidence.version,
+                    cutoff,
+                )
+            except (
+                ValueError,
+                AttributeError,
+                TypeError,
+                KeyError,
+                IndexError,
+                ArithmeticError,
+            ) as exc:
+                material = {
+                    "case_sha256": case["sha256"],
+                    "reason": "candidate_input_invalid",
+                    "error_type": type(exc).__name__,
+                    "fallback_width": BASE_WIDTH,
+                }
             completed = self.now()
             if completed >= cutoff:
-                continue
+                break
             decision = self.append(
                 evidence,
                 "cycle",
-                read_key,
+                "read:" + entity,
                 material
                 | {
                     "first_read_at": timestamp(read_at),
@@ -535,8 +644,8 @@ class Rehearsal:
                     "input_watermark": durable.records[-1]["sha256"],
                 },
             )
-            # A return from Journal.append is after SQLite's FULL-synchronous commit.
-            # On restart a missing confirmation remains unverified.
+            # Journal.append returns after SQLite finishes the durable write.
+            # Lack of confirmation remains unverified across restart.
             confirmed = self.now()
             if confirmed < cutoff:
                 self.append(
@@ -549,42 +658,52 @@ class Rehearsal:
                     },
                 )
 
-    async def acquire(self, evidence: Evidence, now: datetime) -> None:
+    async def acquire(self, evidence: Evidence, now: datetime) -> str | None:
         wall = now.astimezone(calendar.NY)
         if 8 <= wall.hour < 18 or (evidence.last_attempt and now < evidence.last_attempt + PACE):
-            return
-        pending: list[Job] = []
+            return None
+        pending: dict[str, Job] = {}
         for case in evidence.admitted():
             prior = evidence.prior(case)
             pin = evidence.pin(prior)
-            pending.append(
-                Job(case, prior.stage, prior.dates, prior.finalized_at, prior.deadline, pin)
-            )
+            pending.setdefault(prior.key, replace(prior, conid=pin))
             if pin is not None:
-                pending.extend(evidence.daily(case, pin))
+                for job in evidence.daily(case, pin):
+                    pending.setdefault(job.key, job)
         ready = [
             job
-            for job in pending
+            for job in pending.values()
             if job.finalized_at <= now < job.deadline
             and len(evidence.attempts.get(job.key, ())) < MAX_ATTEMPTS
             and not evidence.proof(job)
         ]
         if not ready:
-            return
-        # Share the existing coordination lock for client 179. This opens
-        # only its empty lock database, never the archived source journal for write.
+            return None
+        # Share the empty coordination lock for client 179 with the legacy
+        # program. Its archived source journal is never opened for write.
         lock = safe_path(self.calendar.path.parent / "network-lock.db")
         if not lock.is_file():
-            raise ValueError("legacy network coordination lock unavailable")
-        with exclusive_lock(lock):
-            await self.request(
-                evidence,
-                min(ready, key=lambda item: (item.stage != "history", item.deadline, item.key)),
-            )
+            return "legacy_network_lock_unavailable"
+        try:
+            with exclusive_lock(lock):
+                if not self.network_idle():
+                    return "legacy_client_not_idle"
+                await self.request(
+                    evidence,
+                    min(
+                        ready,
+                        key=lambda item: (
+                            item.stage != "history",
+                            item.deadline,
+                            item.key,
+                        ),
+                    ),
+                )
+        except LockBusy:
+            return "legacy_network_lock_busy"
+        return None
 
     async def request(self, evidence: Evidence, job: Job) -> None:
-        if not self.network_idle():
-            raise ValueError("legacy acquisition client is not verified idle")
         now = self.now()
         wall = now.astimezone(calendar.NY)
         pause_date = wall.date() + timedelta(days=wall.hour >= 18)
@@ -604,6 +723,7 @@ class Rehearsal:
                 "start_date": job.dates[0],
                 "end_at": timestamp(end),
                 "case_sha256": job.case["sha256"],
+                "source_case": job.case["entity"],
                 "job_stage": job.stage,
                 "required_dates": list(job.dates),
             },
@@ -615,12 +735,15 @@ class Rehearsal:
                 expiry - self.ticks(), (min(job.deadline, pause) - self.now()).total_seconds()
             )
 
-        response = await self.source(clock=self.now, budget=remaining).acquire(
-            intent["payload"]["symbol"],
-            start=date.fromisoformat(job.dates[0]),
-            end=end,
-            expected_conid=job.conid,
-        )
+        try:
+            response = await self.source(clock=self.now, budget=remaining).acquire(
+                intent["payload"]["symbol"],
+                start=date.fromisoformat(job.dates[0]),
+                end=end,
+                expected_conid=job.conid,
+            )
+        except (OSError, RuntimeError) as exc:
+            response = {"result": "source_exception", "error_type": type(exc).__name__}
         self.append(evidence, "response", intent["sha256"], response)
 
     async def cycle(self) -> None:
@@ -628,13 +751,15 @@ class Rehearsal:
             raise ValueError("rehearsal explicitly requires activation")
         with exclusive_lock(self.folder / "worker-lock.db"):
             evidence = self.load()
+            acquisition_issue = None
             if evidence.records[-1]["kind"] != "seal":
                 now = self.now()
                 if now < parse(evidence.frozen["expiry"]):
+                    self.preopen(evidence)
                     self.capture(evidence)
                     self.preopen(evidence)
                     self.refresh_directory(evidence, self.now())
-                    await self.acquire(evidence, self.now())
+                    acquisition_issue = await self.acquire(evidence, self.now())
                 else:
                     self.append(
                         evidence,
@@ -645,7 +770,12 @@ class Rehearsal:
                             "reason": "fixed_rehearsal_end",
                         },
                     )
-            self.heartbeat(evidence.report(self.now()))
+            self.heartbeat(
+                evidence.report(self.now())
+                | {
+                    "acquisition_issue": acquisition_issue,
+                }
+            )
 
     def heartbeat(self, status: dict[str, Any]) -> None:
         temporary = safe_path(self.folder / "heartbeat.pending.json")
@@ -676,9 +806,9 @@ def main() -> None:
     elif args.status:
         report = rehearsal.load().report(rehearsal.now())
         heartbeat = safe_path(rehearsal.folder / "heartbeat.json")
-        report["latest_heartbeat"] = (
-            json.loads(heartbeat.read_bytes()).get("observed_at") if heartbeat.exists() else None
-        )
+        health = json.loads(heartbeat.read_bytes()) if heartbeat.exists() else {}
+        report["latest_heartbeat"] = health.get("observed_at")
+        report["acquisition_issue"] = health.get("acquisition_issue")
         print(json.dumps(report, sort_keys=True))
     else:
         ensure_kill_on_close_process_tree()
