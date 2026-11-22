@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -47,11 +47,14 @@ from e07_volatility_exits.replay import (
     BarKey,
     ExitReplay,
     OrdinaryCashDistribution,
+    PrimaryExitReplay,
+    ReplayAgreementError,
     ReplayCandidate,
     ReplayCosts,
     UnavailableExecution,
     UnsupportedAction,
     compare_exit_widths,
+    compare_primary_exit_widths,
 )
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.execution.canary import CanaryConfig
@@ -313,10 +316,13 @@ def test_early_close_and_protection_are_checked_against_the_session_clock() -> N
             )
 
 
-def test_unknown_auction_fails_even_without_cash_to_enter() -> None:
+@pytest.mark.parametrize("compare", [compare_exit_widths, compare_primary_exit_widths])
+def test_unknown_auction_fails_even_without_cash_to_enter(
+    compare: Callable[..., ExitReplay | PrimaryExitReplay],
+) -> None:
     candidate = _candidate()
     with pytest.raises(UnavailableExecution, match="missing or invalid opening evidence"):
-        compare_exit_widths(
+        compare(
             SESSIONS,
             SETTLEMENTS,
             [candidate],
@@ -331,14 +337,17 @@ def test_unknown_auction_fails_even_without_cash_to_enter() -> None:
         )
 
 
-def test_holding_coverage_is_required_before_an_early_exit() -> None:
+@pytest.mark.parametrize("compare", [compare_exit_widths, compare_primary_exit_widths])
+def test_holding_coverage_is_required_before_an_early_exit(
+    compare: Callable[..., ExitReplay | PrimaryExitReplay],
+) -> None:
     candidate = _candidate()
     bars = _bars(candidate)
     key = candidate.instrument, candidate.entry_day
     bars[key] = replace(bars[key], high=12)
     del bars[candidate.instrument, SESSIONS[9]]
     with pytest.raises(UnavailableExecution, match="missing or invalid execution bar"):
-        compare_exit_widths(
+        compare(
             SESSIONS,
             SETTLEMENTS,
             [candidate],
@@ -447,7 +456,10 @@ def test_projected_auction_mark_is_applied_after_continuous_prices(
     assert not any(exit.same_bar_collision for exit in result.exits)
 
 
-def test_ambiguous_first_second_cannot_touch_a_barrier_even_when_entry_is_suppressed() -> None:
+@pytest.mark.parametrize("compare", [compare_exit_widths, compare_primary_exit_widths])
+def test_ambiguous_first_second_cannot_touch_a_barrier_even_when_entry_is_suppressed(
+    compare: Callable[..., ExitReplay | PrimaryExitReplay],
+) -> None:
     candidate = _candidate()
     bars = _bars(candidate)
     opening = _auctions([candidate], bars)
@@ -456,7 +468,7 @@ def test_ambiguous_first_second_cannot_touch_a_barrier_even_when_entry_is_suppre
     assert isinstance(fill, AuctionFill)
     opening[key] = replace(fill, path=replace(fill.path, low=9.5, first_low=9.5))
     with pytest.raises(UnavailableExecution, match="first protected second can touch a barrier"):
-        compare_exit_widths(
+        compare(
             SESSIONS,
             SETTLEMENTS,
             [candidate],
@@ -620,12 +632,15 @@ def test_distribution_cannot_fund_an_entry_before_its_preopen_release() -> None:
     assert fixed.net_pnl == sum(exit.net_pnl for day in fixed.sessions for exit in day.exits)
 
 
-def test_action_preflight_requires_complete_windows_independent_of_execution() -> None:
+@pytest.mark.parametrize("compare", [compare_exit_widths, compare_primary_exit_widths])
+def test_action_preflight_requires_complete_windows_independent_of_execution(
+    compare: Callable[..., ExitReplay | PrimaryExitReplay],
+) -> None:
     candidate = _candidate()
     coverage = _action_coverage([candidate])
     del coverage[candidate.instrument, SESSIONS[9]]
     with pytest.raises(UnavailableExecution, match="missing corporate-action coverage"):
-        compare_exit_widths(
+        compare(
             SESSIONS,
             SETTLEMENTS,
             [candidate],
@@ -1408,3 +1423,112 @@ def test_same_session_placebo_only_changes_the_matched_replay_book() -> None:
     assert baseline.matched.sessions[0].exits == ()
     assert tuple(exit.packet_id for exit in baseline.scaled.sessions[0].exits) == ("a",)
     assert tuple(exit.packet_id for exit in alternative.matched.sessions[0].exits) == ("b",)
+
+
+@pytest.mark.parametrize("matched", [0.05, 0.20, 0.04, math.nan])
+def test_primary_replay_is_independent_of_matched_width(matched: float) -> None:
+    candidate = _candidate(width=0.15)
+    candidate = replace(candidate, widths=replace(candidate.widths, matched=matched))
+    bars = _bars(candidate)
+    key = candidate.instrument, candidate.entry_day
+    later = candidate.instrument, SESSIONS[1]
+    bars[later] = replace(bars[later], low=9.0)
+    opening = _auctions([candidate], bars)
+    fill = opening[key]
+    assert isinstance(fill, AuctionFill)
+    opening[key] = replace(fill, path=replace(fill.path, low=9.45, first_low=9.45, first_high=9.65))
+    inputs = dict(
+        action_coverage=_action_coverage([candidate]),
+        opening_evidence=opening,
+        session_hours=HOURS,
+        entry_convention=CONVENTION,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    primary = compare_primary_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+    assert primary.fixed.sessions[1].exits[0].reason == "stop"
+    assert not primary.scaled.sessions[1].exits
+    assert primary.paired_daily_pnl[1] == D("20.53")
+    assert (
+        sum(primary.paired_daily_pnl)
+        == primary.scaled.net_pnl - primary.fixed.net_pnl
+        == D("19.98")
+    )
+
+    if matched == 0.05:
+        with pytest.raises(
+            UnavailableExecution, match="first protected second can touch a barrier"
+        ):
+            compare_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+    elif matched == 0.20:
+        diagnostic = compare_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+        diagnostic.require_primary_agreement(primary)
+        assert diagnostic.paired_daily_pnl == primary.paired_daily_pnl
+        with pytest.raises(ReplayAgreementError, match="differs from the primary"):
+            diagnostic.require_primary_agreement(
+                replace(primary, execution_evidence_sha256="0" * 64)
+            )
+        with pytest.raises(ReplayAgreementError, match="differs from the primary"):
+            diagnostic.require_primary_agreement(replace(primary, fixed=primary.scaled))
+    else:
+        with pytest.raises(ValueError, match="invalid replay candidate"):
+            compare_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+
+
+@pytest.mark.parametrize(
+    ("scaled", "missing", "accepted"),
+    [(float("nan"), None, False), (0.05, "no_snapshot", False), (BASE_WIDTH, "no_snapshot", True)],
+)
+def test_primary_requires_the_scaled_width_and_fixed_fallback(
+    scaled: float, missing: Literal["no_snapshot"] | None, accepted: bool
+) -> None:
+    candidate = _candidate(width=scaled)
+    candidate = replace(candidate, widths=replace(candidate.widths, matched=0.05, missing=missing))
+    bars = _bars(candidate)
+    inputs = dict(
+        action_coverage=_action_coverage([candidate]),
+        opening_evidence=_auctions([candidate], bars),
+        session_hours=HOURS,
+        entry_convention=CONVENTION,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    if accepted:
+        primary = compare_primary_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+        assert primary.fixed == primary.scaled
+    else:
+        with pytest.raises(ValueError, match="invalid replay candidate"):
+            compare_primary_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+    with pytest.raises(ValueError, match="invalid replay candidate"):
+        compare_exit_widths(SESSIONS, SETTLEMENTS, [candidate], bars, **inputs)
+
+
+def test_primary_completes_when_only_the_matched_book_cannot_afford_a_fill() -> None:
+    first = _candidate(width=0.15)
+    first = replace(first, widths=replace(first.widths, matched=0.05))
+    second = _candidate("b", instrument="102", width=0.15)
+    gapped = _candidate("c", day=SESSIONS[1], instrument="103", width=0.15)
+    candidates = [first, second, gapped]
+    bars = _bars(*candidates)
+    first_key = first.instrument, first.entry_day
+    gapped_key = gapped.instrument, gapped.entry_day
+    bars[first_key] = replace(bars[first_key], high=10.70)
+    bars[gapped_key] = DailyBar(gapped.symbol, gapped.entry_day, 30, 30, 30, 30, 100_000)
+    inputs = dict(
+        action_coverage=_action_coverage(candidates),
+        opening_evidence=_auctions(candidates, bars),
+        session_hours=HOURS,
+        entry_convention=CONVENTION,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    primary = compare_primary_exit_widths(SESSIONS, SETTLEMENTS, candidates, bars, **inputs)
+    assert primary.fixed.sessions[1].entries[0].state == "capacity_suppressed"
+    assert primary.scaled.sessions[1].entries[0].state == "capacity_suppressed"
+    with pytest.raises(
+        UnavailableExecution, match=f"fills exceed settled cash on {gapped.entry_day}"
+    ):
+        compare_exit_widths(SESSIONS, SETTLEMENTS, candidates, bars, **inputs)

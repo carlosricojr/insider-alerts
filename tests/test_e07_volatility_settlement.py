@@ -11,7 +11,7 @@ import pytest
 
 from e07_volatility_exits.auction import Auction, AuctionFill, EntryConvention, EntryPath
 from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF, ExitWidths
-from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts
+from e07_volatility_exits.replay import ReplayAgreementError, ReplayCandidate, ReplayCosts
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research import calendar_v2
 from ops.research.e07_volatility_settlement import (
@@ -19,6 +19,7 @@ from ops.research.e07_volatility_settlement import (
     NSCC_VETERANS_DAY_SHA256,
     SOURCE_STATUS,
     bind_settlement,
+    compare_primary_with_settlement,
     compare_with_settlement,
 )
 
@@ -247,11 +248,7 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
         )
     observed = []
     for binding in (primary, delayed):
-        result_with_binding = compare_with_settlement(
-            version,
-            sessions,
-            candidates,
-            bars,
+        inputs = dict(
             action_coverage={
                 (candidate.instrument, day): () for candidate in candidates for day in sessions
             },
@@ -262,7 +259,18 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
             previous_session=previous,
             release=binding.release,
         )
+        result_with_binding = compare_with_settlement(version, sessions, candidates, bars, **inputs)
+        primary_result = compare_primary_with_settlement(
+            version, sessions, candidates, bars, **inputs
+        )
+        result_with_binding.require_primary_agreement(primary_result)
         assert result_with_binding.settlement.digest == binding.digest
+        assert result_with_binding.replay.paired_daily_pnl == primary_result.replay.paired_daily_pnl
+        other_binding = delayed if binding == primary else primary
+        with pytest.raises(ReplayAgreementError, match="different settlement binding"):
+            result_with_binding.require_primary_agreement(
+                replace(primary_result, settlement=other_binding)
+            )
         result = result_with_binding.replay
         observed.append(tuple(row.entries[0].state for row in result.fixed.sessions[:4]))
         assert result.fixed.sessions[0].unsettled_cash == Decimal("220")

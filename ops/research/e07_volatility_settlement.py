@@ -12,15 +12,18 @@ from typing import Literal
 
 import rfc8785
 
-from e07_volatility_exits.auction import Auction, EntryConvention
+from e07_volatility_exits.auction import Auction, EntryConvention, SessionHours
 from e07_volatility_exits.replay import (
     ActionCoverage,
     BarKey,
     CollisionPolicy,
     ExitReplay,
+    PrimaryExitReplay,
+    ReplayAgreementError,
     ReplayCandidate,
     ReplayCosts,
     compare_exit_widths,
+    compare_primary_exit_widths,
 )
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.calendar_v2 import Version
@@ -55,9 +58,20 @@ class SettlementBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class PrimarySettlementReplay:
+    settlement: SettlementBinding
+    replay: PrimaryExitReplay
+
+
+@dataclass(frozen=True, slots=True)
 class SettlementReplay:
     settlement: SettlementBinding
     replay: ExitReplay
+
+    def require_primary_agreement(self, primary: PrimarySettlementReplay) -> None:
+        if self.settlement != primary.settlement:
+            raise ReplayAgreementError("diagnostic replay has a different settlement binding")
+        self.replay.require_primary_agreement(primary.replay)
 
 
 def _next_settlement(trade_day: date) -> date:
@@ -148,6 +162,23 @@ def bind_settlement(
     )
 
 
+def _replay_calendar(
+    version: Version,
+    sessions: tuple[date, ...],
+    *,
+    previous_session: date,
+    release: CashRelease,
+) -> tuple[SettlementBinding, SessionHours]:
+    binding = bind_settlement(version, sessions, previous_session=previous_session, release=release)
+    hours: dict[date, tuple[datetime, datetime]] = {}
+    for day in sessions:
+        session = version.day(day)
+        if session.opens_at is None or session.closes_at is None:
+            raise ValueError(f"missing exchange hours on {day}")
+        hours[day] = (session.opens_at, session.closes_at)
+    return binding, hours
+
+
 def compare_with_settlement(
     version: Version,
     sessions: Sequence[date],
@@ -165,13 +196,9 @@ def compare_with_settlement(
 ) -> SettlementReplay:
     """Use one verified session sequence for both the binding and the replay."""
     sessions = tuple(sessions)
-    binding = bind_settlement(version, sessions, previous_session=previous_session, release=release)
-    hours: dict[date, tuple[datetime, datetime]] = {}
-    for day in sessions:
-        session = version.day(day)
-        if session.opens_at is None or session.closes_at is None:
-            raise ValueError(f"missing exchange hours on {day}")
-        hours[day] = (session.opens_at, session.closes_at)
+    binding, hours = _replay_calendar(
+        version, sessions, previous_session=previous_session, release=release
+    )
     replay = compare_exit_widths(
         sessions,
         binding.cash_release_dates,
@@ -187,3 +214,40 @@ def compare_with_settlement(
         collision=collision,
     )
     return SettlementReplay(binding, replay)
+
+
+def compare_primary_with_settlement(
+    version: Version,
+    sessions: Sequence[date],
+    candidates: Sequence[ReplayCandidate],
+    bars: Mapping[BarKey, DailyBar],
+    *,
+    action_coverage: ActionCoverage,
+    opening_evidence: Mapping[BarKey, Auction],
+    entry_convention: EntryConvention,
+    initial_cash: Decimal,
+    costs: ReplayCosts,
+    previous_session: date,
+    release: CashRelease,
+    collision: CollisionPolicy = "stop_first",
+) -> PrimarySettlementReplay:
+    """Replay the primary comparison using the verified settlement calendar."""
+    sessions = tuple(sessions)
+    binding, hours = _replay_calendar(
+        version, sessions, previous_session=previous_session, release=release
+    )
+    replay = compare_primary_exit_widths(
+        sessions,
+        binding.cash_release_dates,
+        candidates,
+        bars,
+        action_coverage=action_coverage,
+        opening_evidence=opening_evidence,
+        session_hours=hours,
+        entry_convention=entry_convention,
+        initial_cash=initial_cash,
+        costs=costs,
+        previous_session=previous_session,
+        collision=collision,
+    )
+    return PrimarySettlementReplay(binding, replay)

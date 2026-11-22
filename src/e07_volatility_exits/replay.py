@@ -179,6 +179,22 @@ class PortfolioResult:
         return self.sessions[-1].equity - self.initial_cash
 
 
+class ReplayAgreementError(RuntimeError):
+    """The primary books or their evidence differ between replays."""
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryExitReplay:
+    fixed: PortfolioResult
+    scaled: PortfolioResult
+    action_coverage_sha256: str
+    execution_evidence_sha256: str
+
+    @property
+    def paired_daily_pnl(self) -> tuple[Decimal, ...]:
+        return _paired_daily_pnl(self.scaled, self.fixed)
+
+
 @dataclass(frozen=True, slots=True)
 class ExitReplay:
     fixed: PortfolioResult
@@ -189,20 +205,28 @@ class ExitReplay:
 
     @property
     def paired_daily_pnl(self) -> tuple[Decimal, ...]:
-        return self._paired_daily_pnl(self.fixed)
+        return _paired_daily_pnl(self.scaled, self.fixed)
 
     @property
     def scaled_vs_matched_daily_pnl(self) -> tuple[Decimal, ...]:
-        return self._paired_daily_pnl(self.matched)
+        return _paired_daily_pnl(self.scaled, self.matched)
 
-    def _paired_daily_pnl(self, comparison: PortfolioResult) -> tuple[Decimal, ...]:
-        difference = ZERO
-        increments = []
-        for other, scaled in zip(comparison.sessions, self.scaled.sessions, strict=True):
-            cumulative = scaled.equity - other.equity
-            increments.append(cumulative - difference)
-            difference = cumulative
-        return tuple(increments)
+    def require_primary_agreement(self, primary: PrimaryExitReplay) -> None:
+        expected = PrimaryExitReplay(
+            self.fixed, self.scaled, self.action_coverage_sha256, self.execution_evidence_sha256
+        )
+        if expected != primary:
+            raise ReplayAgreementError("diagnostic replay differs from the primary comparison")
+
+
+def _paired_daily_pnl(scaled: PortfolioResult, comparison: PortfolioResult) -> tuple[Decimal, ...]:
+    difference = ZERO
+    increments = []
+    for other, session in zip(comparison.sessions, scaled.sessions, strict=True):
+        cumulative = session.equity - other.equity
+        increments.append(cumulative - difference)
+        difference = cumulative
+    return tuple(increments)
 
 
 @dataclass(slots=True)
@@ -237,13 +261,18 @@ def _bar(bars: Mapping[BarKey, DailyBar], candidate: ReplayCandidate, session: d
 
 
 def _ranked_entries(
-    candidates: Sequence[ReplayCandidate], sessions: Sequence[date], previous_session: date
+    candidates: Sequence[ReplayCandidate],
+    sessions: Sequence[date],
+    previous_session: date,
+    *,
+    include_matched: bool,
 ) -> dict[date, list[ReplayCandidate]]:
     groups: dict[date, list[ReplayCandidate]] = defaultdict(list)
     allowed = set(sessions[: len(sessions) - POLICY.max_sessions + 1])
     cohort_calendar = (previous_session, *sessions)
     seen: set[str] = set()
     for candidate in candidates:
+        widths = candidate.widths
         if (
             not candidate.packet_id
             or candidate.packet_id in seen
@@ -257,16 +286,16 @@ def _ranked_entries(
             )
             != candidate.entry_day
             or not POLICY.min_price <= candidate.planning_close <= POLICY.max_price
-            or candidate.widths.instrument != candidate.instrument
-            or candidate.widths.cutoff.utcoffset() is None
-            or candidate.widths.cutoff
-            != datetime.combine(candidate.entry_day, FEATURE_CUTOFF, e07.NEW_YORK)
-            or not MIN_WIDTH <= candidate.widths.scaled <= MAX_WIDTH
-            or not MIN_WIDTH <= candidate.widths.matched <= MAX_WIDTH
+            or widths.instrument != candidate.instrument
+            or widths.cutoff.utcoffset() is None
+            or widths.cutoff != datetime.combine(candidate.entry_day, FEATURE_CUTOFF, e07.NEW_YORK)
+            or not MIN_WIDTH <= widths.scaled <= MAX_WIDTH
+            or (include_matched and not MIN_WIDTH <= widths.matched <= MAX_WIDTH)
             or (
-                candidate.widths.missing is not None
+                widths.missing is not None
                 and (
-                    candidate.widths.scaled != BASE_WIDTH or candidate.widths.matched != BASE_WIDTH
+                    widths.scaled != BASE_WIDTH
+                    or (include_matched and widths.matched != BASE_WIDTH)
                 )
             )
         ):
@@ -645,6 +674,79 @@ def compare_exit_widths(
     and a qualified closing mark on the entry day, and a qualified holding
     bar on every possible later day.
     """
+    portfolios, action_digest, execution_digest = _compare_books(
+        sessions,
+        settlements,
+        candidates,
+        bars,
+        action_coverage=action_coverage,
+        opening_evidence=opening_evidence,
+        session_hours=session_hours,
+        entry_convention=entry_convention,
+        initial_cash=initial_cash,
+        costs=costs,
+        previous_session=previous_session,
+        collision=collision,
+        arms=("fixed", "scaled", "matched"),
+    )
+    fixed, scaled, matched = portfolios
+    return ExitReplay(fixed, scaled, matched, action_digest, execution_digest)
+
+
+def compare_primary_exit_widths(
+    sessions: Sequence[date],
+    settlements: Mapping[date, date],
+    candidates: Sequence[ReplayCandidate],
+    bars: Mapping[BarKey, DailyBar],
+    *,
+    action_coverage: ActionCoverage,
+    opening_evidence: Mapping[BarKey, Auction],
+    session_hours: SessionHours,
+    entry_convention: EntryConvention,
+    initial_cash: Decimal,
+    costs: ReplayCosts,
+    previous_session: date,
+    collision: CollisionPolicy = "stop_first",
+) -> PrimaryExitReplay:
+    """Replay fixed and scaled exits independently of the placebo.
+
+    Requires the same complete coverage as compare_exit_widths.
+    """
+    portfolios, action_digest, execution_digest = _compare_books(
+        sessions,
+        settlements,
+        candidates,
+        bars,
+        action_coverage=action_coverage,
+        opening_evidence=opening_evidence,
+        session_hours=session_hours,
+        entry_convention=entry_convention,
+        initial_cash=initial_cash,
+        costs=costs,
+        previous_session=previous_session,
+        collision=collision,
+        arms=("fixed", "scaled"),
+    )
+    fixed, scaled = portfolios
+    return PrimaryExitReplay(fixed, scaled, action_digest, execution_digest)
+
+
+def _compare_books(
+    sessions: Sequence[date],
+    settlements: Mapping[date, date],
+    candidates: Sequence[ReplayCandidate],
+    bars: Mapping[BarKey, DailyBar],
+    *,
+    action_coverage: ActionCoverage,
+    opening_evidence: Mapping[BarKey, Auction],
+    session_hours: SessionHours,
+    entry_convention: EntryConvention,
+    initial_cash: Decimal,
+    costs: ReplayCosts,
+    previous_session: date,
+    collision: CollisionPolicy,
+    arms: tuple[Arm, ...],
+) -> tuple[tuple[PortfolioResult, ...], str, str]:
     if (
         len(sessions) < POLICY.max_sessions
         or previous_session >= sessions[0]
@@ -659,17 +761,18 @@ def compare_exit_widths(
     ):
         raise ValueError("invalid replay calendar, capital, or collision rule")
 
-    arrivals = _ranked_entries(candidates, sessions, previous_session)
+    arrivals = _ranked_entries(
+        candidates, sessions, previous_session, include_matched="matched" in arms
+    )
     names, auctions, misses = _select_auctions(arrivals, opening_evidence)
     coverage, action_digest = _bind_actions(sessions, arrivals, action_coverage, misses)
     holding = _holding_bars(sessions, arrivals, misses, bars)
     execution_digest = validate_opening_evidence(
         names, auctions, session_hours, entry_convention, holding
     )
-    arms: tuple[Arm, ...] = ("fixed", "scaled", "matched")
     _require_resolved_entry_prices(arrivals, auctions, arms)
     books = [_Book(initial_cash, costs, arm, collision) for arm in arms]
-    paths: list[list[SessionResult]] = [[], [], []]
+    paths: list[list[SessionResult]] = [[] for _ in books]
     for session in sessions:
         entries = arrivals.get(session, ())
         for book, path in zip(books, paths, strict=True):
@@ -688,5 +791,5 @@ def compare_exit_widths(
 
     if any(book.positions for book in books):
         raise ValueError("replay ended with unliquidated positions")
-    fixed, scaled, matched = (PortfolioResult(initial_cash, tuple(path)) for path in paths)
-    return ExitReplay(fixed, scaled, matched, action_digest, execution_digest)
+    portfolios = tuple(PortfolioResult(initial_cash, tuple(path)) for path in paths)
+    return portfolios, action_digest, execution_digest
