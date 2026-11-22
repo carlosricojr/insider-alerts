@@ -71,7 +71,7 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-class ClockDiscontinuity(ValueError):
+class ClockDiscontinuity(RuntimeError):
     """The wall clock disagrees with the current process's monotonic clock."""
 
 
@@ -495,7 +495,12 @@ class Rehearsal:
                     continue
                 if max(signal, created) > observed:
                     raise ValueError("candidate source clock is in the future")
-                entry = session_for(evidence.version, signal)
+                if min(signal, created) < activated:
+                    if row["entry_session"] not in evidence.frozen["entries"]:
+                        continue
+                    entry = date.fromisoformat(row["entry_session"])
+                else:
+                    entry = session_for(evidence.version, signal)
             except (ValueError, TypeError, AttributeError):
                 self.append(
                     evidence,
@@ -823,12 +828,13 @@ def main() -> None:
             return
         except Exception as exc:
             # Error summaries remain independent of the evidence journal.
-            folder = safe_path(root / FOLDER)
-            if folder.is_dir():
-                path = safe_path(folder / "worker-errors.log")
-                with path.open("a", encoding="utf-8") as file:
-                    event = {"error": type(exc).__name__, "at": timestamp(utc_now())}
-                    file.write(json.dumps(event) + "\n")
+            with suppress(OSError, ValueError):
+                folder = safe_path(root / FOLDER)
+                if folder.is_dir():
+                    path = safe_path(folder / "worker-errors.log")
+                    with path.open("a", encoding="utf-8") as file:
+                        event = {"error": type(exc).__name__, "at": timestamp(utc_now())}
+                        file.write(json.dumps(event) + "\n")
             if sys.stderr is not None:
                 print(f"Rehearsal error: {type(exc).__name__}", file=sys.stderr)
             raise SystemExit(1) from exc

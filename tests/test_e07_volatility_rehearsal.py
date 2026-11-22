@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import date, timedelta
 
@@ -59,6 +60,8 @@ def system(tmp_path, monkeypatch):
 
         async def acquire(self, symbol, *, start, end, expected_conid):
             calls.append((symbol, start, end, expected_conid, self.budget()))
+            if mode[0] == "clock":
+                raise runtime.ClockDiscontinuity("simulated clock discontinuity")
             if mode[0] == "exception":
                 raise ValueError("simulated source schema exception")
             response = source_response(symbol, start, end, False, self.clock(), bound)
@@ -225,7 +228,7 @@ def test_clock_discontinuity_is_not_a_valid_decision_clock():
     ticks = [0.0]
     clock = runtime.checked_clock(lambda: wall[0], lambda: ticks[0])
     wall[0] += timedelta(minutes=1)
-    with pytest.raises(ValueError, match="discontinuity"):
+    with pytest.raises(runtime.ClockDiscontinuity, match="discontinuity"):
         clock()
 
 
@@ -388,3 +391,32 @@ def test_empty_window_records_worker_availability_without_candidate_claim(system
     report = run(instance)
     assert report["read_windows_seen"] == ["2026-10-27"]
     assert report["preopen"] == {}
+
+
+def test_clock_disagreement_escapes_acquisition_and_preserves_intent(system):
+    instance, _, clock, _, mode = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock)
+    mode[0] = "clock"
+    with pytest.raises(runtime.ClockDiscontinuity):
+        run(instance)
+    assert instance.load().report(instance.now())["unanswered_requests"] == 1
+
+
+def test_construction_failure_reports_worker_error(system, monkeypatch):
+    instance, _, _, _, _ = system
+
+    def unavailable(_root):
+        raise ValueError("deliberate construction failure")
+
+    monkeypatch.setattr(
+        runtime, "__file__", str(instance.root / "ops/research/e07_volatility_rehearsal.py")
+    )
+    monkeypatch.setattr(runtime, "ensure_kill_on_close_process_tree", lambda: None)
+    monkeypatch.setattr(runtime, "Rehearsal", unavailable)
+    monkeypatch.setattr(sys, "argv", ["rehearsal", "--cycle"])
+    with pytest.raises(SystemExit) as exc:
+        runtime.main()
+    assert exc.value.code == 1
+    report = json.loads((instance.folder / "worker-errors.log").read_bytes())
+    assert report["error"] == "ValueError"
