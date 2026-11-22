@@ -224,6 +224,7 @@ class AutoPilotCycleResult:
     source_items_seen: int = 0
     source_boundary_rejected: int = 0
     source_invalid_items: int = 0
+    cutover_excluded: int = 0
 
 
 @dataclass(slots=True)
@@ -243,6 +244,7 @@ class SecIngestionCycleResult:
     source_items_seen: int = 0
     source_boundary_rejected: int = 0
     source_invalid_items: int = 0
+    cutover_excluded: int = 0
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -2149,6 +2151,7 @@ def sec_poll(
             f"source_items_seen={result.source_items_seen}, "
             f"source_boundary_rejected={result.source_boundary_rejected}, "
             f"source_invalid_items={result.source_invalid_items}, "
+            f"cutover_excluded={result.cutover_excluded}, "
             f"dry_run={dry_run})"
         )
         typer.echo(summary)
@@ -3421,6 +3424,7 @@ def ops_sec_ingestion(
             source_items_seen=poll_result.source_items_seen,
             source_boundary_rejected=poll_result.source_boundary_rejected,
             source_invalid_items=poll_result.source_invalid_items,
+            cutover_excluded=poll_result.cutover_excluded,
         )
         cycle_message = (
             "ops SEC ingestion cycle completed "
@@ -3429,6 +3433,7 @@ def ops_sec_ingestion(
             f"source_items_seen={cycle.source_items_seen}, "
             f"source_boundary_rejected={cycle.source_boundary_rejected}, "
             f"source_invalid_items={cycle.source_invalid_items}, "
+            f"cutover_excluded={cycle.cutover_excluded}, "
             f"enrich_scanned={cycle.enriched_scanned}, "
             f"enrich_updated={cycle.enriched_updated}, "
             f"enqueue_processed={cycle.enqueue_processed}, "
@@ -3930,7 +3935,14 @@ def ops_autopilot(
                 f"parse_failed={enqueue_result.parse_failed}, "
                 f"market_failed={enqueue_result.market_failed})",
             )
-        pending = list_pending_review_packets(settings.database_path, limit=decision_limit)
+        if settings.sec_rss_cutover_at is None:
+            pending = list_pending_review_packets(settings.database_path, limit=decision_limit)
+        else:
+            pending = list_pending_review_packets(
+                settings.database_path,
+                limit=decision_limit,
+                rss_cutover_at=settings.sec_rss_cutover_at,
+            )
         conviction_history = _load_conviction_history(
             settings.database_path,
             as_of_date=date.today(),
@@ -4317,6 +4329,7 @@ def ops_autopilot(
             source_items_seen=poll_result.source_items_seen,
             source_boundary_rejected=poll_result.source_boundary_rejected,
             source_invalid_items=poll_result.source_invalid_items,
+            cutover_excluded=poll_result.cutover_excluded,
         )
         cycle_message = (
             "ops autopilot cycle completed "
@@ -4325,6 +4338,7 @@ def ops_autopilot(
             f"source_items_seen={cycle.source_items_seen}, "
             f"source_boundary_rejected={cycle.source_boundary_rejected}, "
             f"source_invalid_items={cycle.source_invalid_items}, "
+            f"cutover_excluded={cycle.cutover_excluded}, "
             f"enrich_scanned={cycle.enriched_scanned}, enrich_updated={cycle.enriched_updated}, "
             f"enqueue_processed={cycle.enqueue_processed}, "
             f"enqueue_enqueued={cycle.enqueue_enqueued}, "

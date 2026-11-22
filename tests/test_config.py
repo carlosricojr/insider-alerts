@@ -22,6 +22,7 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("NOTIFICATION_TRANSPORT_DB", raising=False)
     monkeypatch.delenv("NOTIFICATION_TRANSPORT_POLICY_PATH", raising=False)
     monkeypatch.delenv("SEC_RSS_URL", raising=False)
+    monkeypatch.delenv("SEC_RSS_CUTOVER_AT", raising=False)
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     monkeypatch.delenv("SEC_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("SEC_RATE_LIMIT_PER_SECOND", raising=False)
@@ -54,6 +55,7 @@ def test_config_defaults(monkeypatch) -> None:
         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4"
         "&start=0&count=40&output=rss"
     )
+    assert settings.sec_rss_cutover_at is None
     assert settings.sec_rate_limit_per_second == 5.0
     assert settings.market_context_enabled is False
     assert settings.market_data_timeout_seconds == 10.0
@@ -171,3 +173,9 @@ def test_config_rejects_inverted_sec_retry_bounds() -> None:
             SEC_RETRY_MIN_SECONDS=2,
             SEC_RETRY_MAX_SECONDS=1,
         )
+
+
+
+def test_config_cutover_requires_a_timezone() -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        Settings(_env_file=None, SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00")

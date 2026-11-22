@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS = 10.0
@@ -32,6 +32,7 @@ class Settings(BaseSettings):
         default="https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&start=0&count=40&output=rss",
         alias="SEC_RSS_URL",
     )
+    sec_rss_cutover_at: AwareDatetime | None = Field(default=None, alias="SEC_RSS_CUTOVER_AT")
     sec_user_agent: str = Field(
         default="insider-alerts/0.2 (contact: sec-access@example.com)",
         alias="SEC_USER_AGENT",

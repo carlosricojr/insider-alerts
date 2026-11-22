@@ -28,12 +28,14 @@ from insider_alerts.sec.index import locate_form4_xml, validate_sec_url
 from insider_alerts.sec.rss import parse_form4_rss_with_diagnostics
 from insider_alerts.sec.store import (
     StoreResult,
+    bind_rss_cutover,
     form4_source_boundary_sql,
     init_db,
     list_filings_missing_xml,
     record_sec_processing_rejections,
     update_form4_xml_urls,
     upsert_filing_refs,
+    within_rss_cutover,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ class PollResult:
     source_items_seen: int = 0
     source_boundary_rejected: int = 0
     source_invalid_items: int = 0
+    cutover_excluded: int = 0
 
 
 @dataclass(slots=True)
@@ -99,8 +102,19 @@ def _is_terminal_non_form4_xml(xml_text: str) -> bool:
 def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> PollResult:
     client = SecHttpClient(settings)
     rss_text = client.get_text(settings.sec_rss_url)
-    parsed = parse_form4_rss_with_diagnostics(rss_text, max_items=max_items)
+    observed_at = datetime.now(UTC)
+    cutoff_at = settings.sec_rss_cutover_at
+    parsed = parse_form4_rss_with_diagnostics(
+        rss_text, max_items=max_items, require_timezone=cutoff_at is not None
+    )
     refs = parsed.refs
+    if cutoff_at is not None:
+        refs = [
+            ref
+            for ref in refs
+            if within_rss_cutover(ref.filed_at, cutoff_at=cutoff_at, observed_at=observed_at)
+        ]
+    cutover_excluded = len(parsed.refs) - len(refs)
 
     if dry_run:
         return PollResult(
@@ -110,6 +124,7 @@ def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> P
             source_items_seen=parsed.items_seen,
             source_boundary_rejected=parsed.source_boundary_rejected,
             source_invalid_items=parsed.invalid_items,
+            cutover_excluded=cutover_excluded,
         )
 
     result: StoreResult = upsert_filing_refs(settings.database_path, refs)
@@ -120,6 +135,7 @@ def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> P
         source_items_seen=parsed.items_seen,
         source_boundary_rejected=parsed.source_boundary_rejected,
         source_invalid_items=parsed.invalid_items,
+        cutover_excluded=cutover_excluded,
     )
 
 
@@ -130,7 +146,9 @@ def enrich_filings_with_xml_url(
     progress_callback: Callable[[str], None] | None = None,
 ) -> EnrichResult:
     client = SecHttpClient(settings)
-    refs = list_filings_missing_xml(settings.database_path, limit=limit)
+    refs = list_filings_missing_xml(
+        settings.database_path, limit=limit, rss_cutover_at=settings.sec_rss_cutover_at
+    )
 
     pending_updates: list[tuple[str, str, str, str]] = []
     terminal_rejections: list[tuple[str, str, str, str, str]] = []
@@ -242,6 +260,11 @@ def enqueue_review_packets(
         )
         """,
     ]
+    cutoff_at = settings.sec_rss_cutover_at
+    if cutoff_at is not None:
+        where_parts.append(
+            "f.source = 'sec_rss' AND sec_rss_cutover_allows(f.filed_at, f.created_at)"
+        )
     params: list[object] = []
     if start_date is not None:
         where_parts.append("date(f.filed_at) >= ?")
@@ -254,6 +277,8 @@ def enqueue_review_packets(
 
     with connect(settings.database_path) as conn:
         conn.row_factory = __import__("sqlite3").Row
+        if cutoff_at is not None:
+            bind_rss_cutover(conn, cutoff_at)
         rows = conn.execute(
             f"""
             WITH deduped AS (

@@ -12,6 +12,7 @@ from typing import Any
 import rfc8785
 
 from insider_alerts.sec.models import FilingRef
+from insider_alerts.sec.store import bind_rss_cutover, form4_source_boundary_sql
 
 VALID_DECISIONS = {"approve", "reject", "escalate", "deadletter"}
 PACKET_ID_RE = re.compile(r"^\d{10}-\d{2}-\d{6}\|\d{10}\|4(?:/A)?$")
@@ -600,16 +601,33 @@ def list_deadletters(db_path: str) -> list[dict[str, str]]:
     return [dict(row) for row in rows]
 
 
-def list_pending_review_packets(db_path: str, *, limit: int) -> list[dict[str, object]]:
+def list_pending_review_packets(
+    db_path: str, *, limit: int, rss_cutover_at: datetime | None = None
+) -> list[dict[str, object]]:
     ensure_review_tables(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
+        cutover_filter = ""
+        if rss_cutover_at is not None:
+            bind_rss_cutover(conn, rss_cutover_at)
+            source_boundary = form4_source_boundary_sql("f")
+            cutover_filter = f"""
+                AND EXISTS (
+                    SELECT 1 FROM filings f
+                    WHERE f.accession_number = review_packets.accession_number
+                      AND f.cik = review_packets.cik
+                      AND f.form_type = review_packets.form_type
+                      AND f.source = 'sec_rss'
+                      AND sec_rss_cutover_allows(f.filed_at, f.created_at)
+                      AND {source_boundary}
+                )
             """
+        rows = conn.execute(
+            f"""
             SELECT packet_id, accession_number, cik, form_type, payload_json, status,
                    created_at, updated_at
             FROM review_packets
-            WHERE status = 'pending'
+            WHERE status = 'pending' {cutover_filter}
             -- Oldest first prevents retryable judge outages from stranding earlier signals once
             -- the pending queue grows beyond the caller's bounded decision limit.
             ORDER BY created_at ASC, packet_id ASC

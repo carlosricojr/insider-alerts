@@ -5,7 +5,7 @@ import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from insider_alerts.sec.models import FilingRef
@@ -55,6 +55,40 @@ def form4_source_boundary_sql(table_alias: str = "") -> str:
 class StoreResult:
     inserted: int
     skipped_existing: int
+
+
+def within_rss_cutover(
+    filed_at: datetime, *, cutoff_at: datetime, observed_at: datetime
+) -> bool:
+    """Use aware timestamps and preserve subsecond precision at both bounds."""
+    if cutoff_at.utcoffset() is None or observed_at.utcoffset() is None:
+        raise ValueError("RSS cutover bounds must be timezone-aware")
+    if filed_at.utcoffset() is None:
+        return False
+    return cutoff_at.astimezone(UTC) <= filed_at.astimezone(UTC) <= observed_at.astimezone(UTC)
+
+
+def bind_rss_cutover(conn: sqlite3.Connection, cutoff_at: datetime) -> None:
+    """Give one queue read a fixed observation bound for its SQL predicate."""
+    observed_at = datetime.now(UTC)
+
+    def allows(filed_at: object, created_at: object) -> bool:
+        if not isinstance(filed_at, str) or not isinstance(created_at, str):
+            return False
+        try:
+            filed = datetime.fromisoformat(filed_at)
+            if not within_rss_cutover(filed, cutoff_at=cutoff_at, observed_at=observed_at):
+                return False
+            inserted = datetime.fromisoformat(created_at)
+            # SQLite CURRENT_TIMESTAMP records UTC at whole-second precision.
+            if inserted.utcoffset() is None:
+                inserted = inserted.replace(tzinfo=UTC)
+            recorded_upper = inserted.astimezone(UTC) + timedelta(seconds=1)
+            return filed.astimezone(UTC) < recorded_upper
+        except (ValueError, OverflowError):
+            return False
+
+    conn.create_function("sec_rss_cutover_allows", 2, allows, deterministic=True)
 
 
 def _connect_sqlite(db_path: str | Path, *, write: bool) -> sqlite3.Connection:
@@ -186,11 +220,18 @@ def upsert_filing_refs(db_path: str, refs: list[FilingRef]) -> StoreResult:
     return StoreResult(inserted=inserted, skipped_existing=skipped)
 
 
-def list_filings_missing_xml(db_path: str, *, limit: int) -> list[FilingRef]:
+def list_filings_missing_xml(
+    db_path: str, *, limit: int, rss_cutover_at: datetime | None = None
+) -> list[FilingRef]:
     init_db(db_path)
     source_boundary = form4_source_boundary_sql()
     with _connect_sqlite(db_path, write=False) as conn:
         conn.row_factory = sqlite3.Row
+        if rss_cutover_at is not None:
+            bind_rss_cutover(conn, rss_cutover_at)
+            source_boundary += (
+                " AND source = 'sec_rss' AND sec_rss_cutover_allows(filed_at, created_at)"
+            )
         rows = conn.execute(
             f"""
             SELECT source, cik, accession_number, form_type, filed_at,
