@@ -22,7 +22,9 @@ gets exchange-open days from a separate verified equity calendar.
 - The U.S. regular-way standard moved to T+1 on May 28, 2024.
   [SEC T+1 guidance](https://www.sec.gov/exams/educationhelpguidesfaqs/t1-faq)
 
-The observation clock is local file retrieval. Historical possession is
+The [provenance record](e07-cash-settlement-2026.provenance.json) retains
+source and observation metadata. The SEC guidance is an unarchived reference.
+Historical possession is
 unverified. This projection assumes ordinary clearing service on unlisted
 weekdays. The individual DTC/NSCC operational notices are absent from the
 archived inputs. The DTCC index lists NSCC notice a9837 and DTC notices

@@ -71,3 +71,5 @@ quality, receipt time, point-in-time features, or readiness. Before any new tria
 separately commission acquisition, extraordinary-closure detection, freshness,
 version-conflict handling, and complete decision-time provenance. No journal or
 scheduled task is installed by this release.
+
+The volatility-exit replay has a separate [settlement calendar projection](E07-CASH-SETTLEMENT-2026.md) with a bounded clearing schedule.

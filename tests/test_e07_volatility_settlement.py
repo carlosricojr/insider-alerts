@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -37,11 +38,18 @@ def version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> calendar_v2.Vers
 
 
 def test_archived_notices_are_bound_to_the_projection() -> None:
-    for name, expected in (
-        ("dtc-settlement-holidays-2026.pdf", DTC_SCHEDULE_SHA256),
-        ("nscc-veterans-day-risk-2026.pdf", NSCC_VETERANS_DAY_SHA256),
-    ):
-        assert hashlib.sha256((SOURCE_DIR / name).read_bytes()).hexdigest() == expected
+    expected = {
+        "dtc-settlement-holidays-2026.pdf": DTC_SCHEDULE_SHA256,
+        "nscc-veterans-day-risk-2026.pdf": NSCC_VETERANS_DAY_SHA256,
+    }
+    path = SOURCE_DIR / "e07-cash-settlement-2026.provenance.json"
+    provenance = json.loads(path.read_bytes())
+    assert provenance["historical_possession_claimed"] is False
+    assert {source["artifact"]: source["sha256"] for source in provenance["sources"]} == expected
+    for source in provenance["sources"]:
+        raw = (SOURCE_DIR / source["artifact"]).read_bytes()
+        assert len(raw) == source["bytes"]
+        assert hashlib.sha256(raw).hexdigest() == source["sha256"]
 
 
 @pytest.mark.parametrize(
@@ -186,5 +194,5 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
         result = result_with_binding.replay
         observed.append(tuple(row.entries[0].state for row in result.fixed.sessions[:4]))
         assert result.fixed.sessions[0].unsettled_cash == Decimal("220")
-    assert observed[0][:3] == ("opened", "cash_suppressed", "opened")
+    assert observed[0] == ("opened", "cash_suppressed", "opened", "cash_suppressed")
     assert observed[1] == ("opened", "cash_suppressed", "cash_suppressed", "opened")
