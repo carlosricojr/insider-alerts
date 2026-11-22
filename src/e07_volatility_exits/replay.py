@@ -6,7 +6,7 @@ import hashlib
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
@@ -16,6 +16,8 @@ from e07_volatility_exits.auction import (
     Auction,
     AuctionFill,
     AuctionMiss,
+    EntryConvention,
+    EntryPath,
     SessionHours,
     valid_bar,
     validate_opening_evidence,
@@ -210,7 +212,7 @@ class _Position:
     entry_debit: Decimal
     stop: float
     target: float
-    protected_bar: DailyBar
+    entry_path: EntryPath
     completed_sessions: int = 0
     cash_distributions: Decimal = ZERO
 
@@ -404,27 +406,62 @@ def _bind_actions(
     return bound, digest
 
 
+def _barriers(price: float, width: float) -> tuple[float, float]:
+    return price * (1.0 - width), price * (1.0 + width)
+
+
+def _require_resolved_entry_prices(
+    arrivals: Mapping[date, list[ReplayCandidate]],
+    auctions: Mapping[BarKey, Auction],
+    arms: tuple[Arm, ...],
+) -> None:
+    for day, candidates in arrivals.items():
+        for candidate in candidates:
+            auction = auctions[candidate.instrument, day]
+            if (
+                isinstance(auction, AuctionMiss)
+                or auction.path.first_low == auction.path.first_high
+            ):
+                continue
+            for arm in arms:
+                stop, target = _barriers(auction.price, _width(candidate, arm))
+                if auction.path.first_low <= stop or auction.path.first_high >= target:
+                    raise UnavailableExecution(
+                        f"first protected second can touch a barrier for {candidate.packet_id}"
+                    )
+
+
 def _exit(
-    position: _Position, bar: DailyBar, collision_rule: CollisionPolicy
+    position: _Position,
+    prices: DailyBar | EntryPath,
+    collision_rule: CollisionPolicy,
+    *,
+    close_can_trigger: bool,
 ) -> tuple[float, str, bool, bool] | None:
     stop, target = position.stop, position.target
-    stop_hit, target_hit = bar.low <= stop, bar.high >= target
+    first = prices.first_low if isinstance(prices, EntryPath) else prices.open
+    stop_hit, target_hit = prices.low <= stop, prices.high >= target
     collision = stop_hit and target_hit
-    ambiguous = collision and stop < bar.open < target
-    if position.completed_sessions == 1:
-        if bar.open <= stop:
-            return bar.open, "stop", collision, False
-        if bar.open >= target:
-            return bar.open, "target", collision, False
-    if collision and collision_rule == "target_first" and bar.open > stop:
-        return max(target, bar.open), "stop_and_target_same_day_target_assumed", True, ambiguous
+    ambiguous = collision and stop < first < target
+    if isinstance(prices, EntryPath):
+        if first <= stop:
+            return first, "stop", collision, False
+        if first >= target:
+            return first, "target", collision, False
+    if collision and collision_rule == "target_first" and first > stop:
+        return max(target, first), "stop_and_target_same_day_target_assumed", True, ambiguous
     if stop_hit:
         reason = "stop_and_target_same_day_stop_assumed" if collision else "stop"
-        return min(stop, bar.open), reason, collision, ambiguous
+        return min(stop, first), reason, collision, ambiguous
     if target_hit:
-        return max(target, bar.open), "target", False, False
+        return max(target, first), "target", False, False
+    if isinstance(prices, EntryPath) and close_can_trigger:
+        if prices.close <= stop:
+            return prices.close, "closing_stop", False, False
+        if prices.close >= target:
+            return prices.close, "closing_target", False, False
     if position.completed_sessions == POLICY.max_sessions:
-        return bar.close, "time", False, False
+        return prices.close, "time", False, False
     return None
 
 
@@ -512,14 +549,14 @@ class _Book:
                     f"auction fills exceed settled cash on {session}; broker outcome required"
                 )
 
-            width = _width(candidate, self.arm)
+            stop, target = _barriers(auction.price, _width(candidate, self.arm))
             self.positions[candidate.instrument] = _Position(
                 candidate,
                 commitment.quantity,
                 debit,
-                auction.price * (1.0 - width),
-                auction.price * (1.0 + width),
-                auction.protected_bar,
+                stop,
+                target,
+                auction.path,
             )
             self.cash -= debit
             decisions[packet] = EntryDecision(packet, "opened")
@@ -532,20 +569,22 @@ class _Book:
         session: date,
         settlement: date,
         entries: tuple[EntryDecision, ...],
+        *,
+        close_can_trigger: bool,
     ) -> SessionResult:
         exits = []
         market_value = ZERO
         for instrument, position in tuple(self.positions.items()):
             candidate = position.candidate
-            bar = (
-                position.protected_bar
+            prices = (
+                position.entry_path
                 if position.completed_sessions == 0
                 else bars[instrument, session]
             )
             position.completed_sessions += 1
-            outcome = _exit(position, bar, self.collision)
+            outcome = _exit(position, prices, self.collision, close_can_trigger=close_can_trigger)
             if outcome is None:
-                market_value += _notional(position.quantity, bar.close)
+                market_value += _notional(position.quantity, prices.close)
                 continue
 
             price, reason, collision, ambiguous = outcome
@@ -588,7 +627,7 @@ def compare_exit_widths(
     action_coverage: ActionCoverage,
     opening_evidence: Mapping[BarKey, Auction],
     session_hours: SessionHours,
-    protection_delay: timedelta,
+    entry_convention: EntryConvention,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
@@ -603,7 +642,8 @@ def compare_exit_widths(
     attests to a covered session without events. Unsupported actions in a
     possible holding window make the comparison unavailable before replay.
     An opening miss requires independent evidence. Require protected prices
-    on the entry day and a qualified holding bar on every possible later day.
+    and a qualified closing mark on the entry day, and a qualified holding
+    bar on every possible later day.
     """
     if (
         len(sessions) < POLICY.max_sessions
@@ -624,9 +664,10 @@ def compare_exit_widths(
     coverage, action_digest = _bind_actions(sessions, arrivals, action_coverage, misses)
     holding = _holding_bars(sessions, arrivals, misses, bars)
     execution_digest = validate_opening_evidence(
-        names, auctions, session_hours, protection_delay, holding
+        names, auctions, session_hours, entry_convention, holding
     )
     arms: tuple[Arm, ...] = ("fixed", "scaled", "matched")
+    _require_resolved_entry_prices(arrivals, auctions, arms)
     books = [_Book(initial_cash, costs, arm, collision) for arm in arms]
     paths: list[list[SessionResult]] = [[], [], []]
     for session in sessions:
@@ -635,7 +676,15 @@ def compare_exit_widths(
             book.settle(session)
             book.accrue_distributions(coverage, session)
             decisions = book.enter(entries, auctions, session)
-            path.append(book.close_and_mark(holding, session, settlements[session], decisions))
+            path.append(
+                book.close_and_mark(
+                    holding,
+                    session,
+                    settlements[session],
+                    decisions,
+                    close_can_trigger=entry_convention.close_can_trigger,
+                )
+            )
 
     if any(book.positions for book in books):
         raise ValueError("replay ended with unliquidated positions")

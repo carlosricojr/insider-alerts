@@ -21,11 +21,15 @@ active. This research kernel runs offline.
   If the source cannot separate prices around activation, or the stop and
   target have materially different activation times, reject that path until
   its execution convention is decided and registered.
-- A known first executable print through a barrier on the entry day
-  determines the gap exit in both sensitivity paths. Preserve the
-  primary stop-first rule and target-first sensitivity for ambiguous entry
-  intervals and the existing rules for the full holding-session bars.
-  Keep the tenth-session time exit and reserve slots at submission.
+- A known first executable price through a barrier on the entry day
+  determines the gap exit in both sensitivity paths. A whole-second range
+  with multiple prices must stay inside every arm's initial barriers.
+  Preserve the primary stop-first rule and target-first sensitivity for
+  ambiguous ordering in the remaining continuous interval. A separately
+  qualified closing print can trigger only after continuous execution has
+  been evaluated, under the study's declared convention. Keep the existing
+  rules for full holding-session bars, tenth-session liquidation and slot
+  reservation at submission.
 - Record the digest of consumed opening records, effective clocks, delay
   and holding prices alongside corporate-action and settlement evidence.
   Require the complete potential holding window before simulating any

@@ -12,7 +12,7 @@ from typing import Literal
 
 import rfc8785
 
-from e07_volatility_exits.auction import Auction
+from e07_volatility_exits.auction import Auction, EntryConvention
 from e07_volatility_exits.replay import (
     ActionCoverage,
     BarKey,
@@ -156,7 +156,7 @@ def compare_with_settlement(
     *,
     action_coverage: ActionCoverage,
     opening_evidence: Mapping[BarKey, Auction],
-    protection_delay: timedelta,
+    entry_convention: EntryConvention,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
@@ -180,7 +180,7 @@ def compare_with_settlement(
         action_coverage=action_coverage,
         opening_evidence=opening_evidence,
         session_hours=hours,
-        protection_delay=protection_delay,
+        entry_convention=entry_convention,
         initial_cash=initial_cash,
         costs=costs,
         previous_session=previous_session,
