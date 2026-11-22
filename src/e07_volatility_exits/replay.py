@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -9,6 +10,8 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
+
+import rfc8785
 
 from e07_volatility_exits.features import (
     BASE_WIDTH,
@@ -52,6 +55,43 @@ POLICY = ReplayPolicy()
 
 class UnavailableExecution(ValueError):
     """An admitted or held name lacks a usable outcome observation."""
+
+
+@dataclass(frozen=True, slots=True)
+class OrdinaryCashDistribution:
+    """Verified per-share USD entitlement and pre-open cash availability."""
+
+    event_id: str
+    cash_per_share: Decimal
+    payment_date: date
+    cash_available_on: date
+
+    def __post_init__(self) -> None:
+        if (
+            not self.event_id
+            or self.event_id != self.event_id.strip()
+            or not isinstance(self.cash_per_share, Decimal)
+            or not self.cash_per_share.is_finite()
+            or self.cash_per_share <= ZERO
+            or self.cash_available_on < self.payment_date
+        ):
+            raise ValueError("invalid ordinary cash distribution")
+
+
+@dataclass(frozen=True, slots=True)
+class UnsupportedAction:
+    """A verified event that requires different execution mechanics."""
+
+    event_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.event_id or self.event_id != self.event_id.strip() or not self.reason.strip():
+            raise ValueError("unsupported action requires an event identity and reason")
+
+
+Action = OrdinaryCashDistribution | UnsupportedAction
+ActionCoverage = Mapping[BarKey, tuple[Action, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +148,7 @@ class PositionClose:
     same_bar_collision: bool
     ambiguous_collision: bool
     net_pnl: Decimal
+    cash_distributions: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +160,7 @@ class SessionResult:
     open_positions: int
     entries: tuple[EntryDecision, ...]
     exits: tuple[PositionClose, ...]
+    distribution_receivable: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +178,7 @@ class ExitReplay:
     fixed: PortfolioResult
     scaled: PortfolioResult
     matched: PortfolioResult
+    action_coverage_sha256: str
 
     @property
     def paired_daily_pnl(self) -> tuple[Decimal, ...]:
@@ -162,6 +205,7 @@ class _Position:
     entry_debit: Decimal
     policy: ReplayPolicy
     bars: list[DailyBar] = field(default_factory=list)
+    cash_distributions: Decimal = ZERO
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +287,84 @@ def _width(candidate: ReplayCandidate, arm: Arm) -> float:
     return BASE_WIDTH
 
 
+def _canonical_amount(amount: Decimal) -> str:
+    _, digits, exponent = amount.as_tuple()
+    coefficient = "".join(map(str, digits))
+    significant = coefficient.rstrip("0")
+    scale = int(exponent) + len(coefficient) - len(significant)
+    return f"{significant}e{scale}"
+
+
+def _bind_actions(
+    sessions: Sequence[date],
+    arrivals: Mapping[date, list[ReplayCandidate]],
+    coverage: ActionCoverage,
+    confirmed_auction_misses: frozenset[BarKey],
+) -> tuple[dict[BarKey, tuple[OrdinaryCashDistribution, ...]], str]:
+    """Freeze action coverage for every potential holding window before any fills."""
+    required: dict[BarKey, bool] = {}
+    for index, entry_day in enumerate(sessions):
+        holding_window = sessions[index : index + POLICY.max_sessions]
+        for candidate in arrivals.get(entry_day, []):
+            can_fill = (candidate.instrument, entry_day) not in confirmed_auction_misses
+            for held_day in holding_window:
+                key = (candidate.instrument, held_day)
+                required[key] = can_fill or required.get(key, False)
+    missing = required.keys() - coverage.keys()
+    if missing:
+        raise UnavailableExecution(
+            f"missing corporate-action coverage for {len(missing)} instrument sessions"
+        )
+
+    bound: dict[BarKey, tuple[OrdinaryCashDistribution, ...]] = {}
+    cash_events: set[tuple[str, str]] = set()
+    material = []
+    live_sessions = set(sessions)
+    for instrument, session in sorted(required):
+        key = (instrument, session)
+        events = coverage[key]
+        if any(
+            not isinstance(event, (OrdinaryCashDistribution, UnsupportedAction)) for event in events
+        ):
+            raise ValueError("unknown corporate-action type")
+        if len({event.event_id for event in events}) != len(events):
+            raise ValueError("duplicate corporate-action event in one instrument session")
+        distributions = []
+        encoded = []
+        for event in sorted(events, key=lambda event: event.event_id):
+            if isinstance(event, OrdinaryCashDistribution):
+                available = event.cash_available_on
+                if event.payment_date < session or available <= session:
+                    raise ValueError("invalid distribution timing for ex-session")
+                if available <= sessions[-1] and available not in live_sessions:
+                    raise ValueError("distribution cash availability requires an exchange session")
+                event_key = (instrument, event.event_id)
+                if event_key in cash_events:
+                    raise ValueError("duplicate distribution event for an instrument")
+                cash_events.add(event_key)
+                distributions.append(event)
+                encoded.append(
+                    [
+                        "ordinary_cash",
+                        event.event_id,
+                        _canonical_amount(event.cash_per_share),
+                        event.payment_date.isoformat(),
+                        available.isoformat(),
+                    ]
+                )
+            else:
+                if required[key]:
+                    raise UnavailableExecution(
+                        f"unsupported corporate action for {instrument} on {session}: "
+                        f"{event.event_id} ({event.reason})"
+                    )
+                encoded.append(["unsupported", event.event_id, event.reason])
+        bound[key] = tuple(distributions)
+        material.append([instrument, session.isoformat(), encoded])
+    digest = hashlib.sha256(rfc8785.dumps(["e07-replay-action-coverage-v1", material])).hexdigest()
+    return bound, digest
+
+
 @dataclass(slots=True)
 class _Book:
     cash: Decimal
@@ -251,11 +373,27 @@ class _Book:
     collision: CollisionPolicy
     positions: dict[str, _Position] = field(default_factory=dict)
     receivables: dict[date, Decimal] = field(default_factory=dict)
+    distribution_receivables: dict[date, Decimal] = field(default_factory=dict)
 
     def settle(self, session: date) -> None:
-        for due in tuple(self.receivables):
-            if due <= session:
-                self.cash += self.receivables.pop(due)
+        for pending in (self.receivables, self.distribution_receivables):
+            for due in tuple(pending):
+                if due <= session:
+                    self.cash += pending.pop(due)
+
+    def accrue_distributions(
+        self, coverage: Mapping[BarKey, tuple[OrdinaryCashDistribution, ...]], session: date
+    ) -> None:
+        for instrument, position in self.positions.items():
+            for event in coverage[instrument, session]:
+                amount = (position.quantity * event.cash_per_share).quantize(
+                    CENT, rounding=ROUND_HALF_UP
+                )
+                due = event.cash_available_on
+                self.distribution_receivables[due] = (
+                    self.distribution_receivables.get(due, ZERO) + amount
+                )
+                position.cash_distributions += amount
 
     def _commit(
         self, candidates: Sequence[ReplayCandidate]
@@ -364,12 +502,14 @@ class _Book:
                     reason,
                     collision,
                     ambiguous,
-                    proceeds - position.entry_debit,
+                    proceeds - position.entry_debit + position.cash_distributions,
+                    position.cash_distributions,
                 )
             )
             del self.positions[instrument]
 
-        unsettled = sum(self.receivables.values(), ZERO)
+        distribution_receivable = sum(self.distribution_receivables.values(), ZERO)
+        unsettled = sum(self.receivables.values(), distribution_receivable)
         return SessionResult(
             session,
             self.cash + unsettled + market_value,
@@ -378,6 +518,7 @@ class _Book:
             len(self.positions),
             entries,
             tuple(exits),
+            distribution_receivable,
         )
 
 
@@ -387,6 +528,7 @@ def compare_exit_widths(
     candidates: Sequence[ReplayCandidate],
     bars: Mapping[BarKey, DailyBar],
     *,
+    action_coverage: ActionCoverage,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
@@ -397,9 +539,13 @@ def compare_exit_widths(
 
     Sessions must include inactive dates and the complete drain period. Supply
     the last exchange session before the evaluation period to reject stale entries. The
-    caller qualifies equity identity, price continuity, and the calendar. A
-    missing bar for an admitted or held name invalidates the replay unless an
-    admission has independent proof that the opening auction could not fill it.
+    caller qualifies equity identity, price continuity, actions and the calendar.
+    Every potential holding window needs action coverage. An empty tuple
+    attests to a covered session without events. Unsupported actions in a
+    possible holding window make the comparison unavailable before replay.
+    Confirmed opening misses require independent evidence and contribute no
+    possible positions. A missing bar for a filled or held name invalidates
+    the replay.
     """
     if (
         len(sessions) < POLICY.max_sessions
@@ -416,6 +562,9 @@ def compare_exit_widths(
         raise ValueError("invalid replay calendar, capital, or collision rule")
 
     arrivals = _ranked_entries(candidates, sessions, previous_session)
+    coverage, action_digest = _bind_actions(
+        sessions, arrivals, action_coverage, confirmed_auction_misses
+    )
     arms: tuple[Arm, ...] = ("fixed", "scaled", "matched")
     books = [_Book(initial_cash, costs, arm, collision) for arm in arms]
     paths: list[list[SessionResult]] = [[], [], []]
@@ -423,10 +572,11 @@ def compare_exit_widths(
         entries = arrivals.get(session, ())
         for book, path in zip(books, paths, strict=True):
             book.settle(session)
+            book.accrue_distributions(coverage, session)
             decisions = book.enter(entries, bars, confirmed_auction_misses, session)
             path.append(book.close_and_mark(bars, session, settlements[session], decisions))
 
     if any(book.positions for book in books):
         raise ValueError("replay ended with unliquidated positions")
     fixed, scaled, matched = (PortfolioResult(initial_cash, tuple(path)) for path in paths)
-    return ExitReplay(fixed, scaled, matched)
+    return ExitReplay(fixed, scaled, matched, action_digest)

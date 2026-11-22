@@ -13,6 +13,7 @@ from typing import Literal
 import rfc8785
 
 from e07_volatility_exits.replay import (
+    ActionCoverage,
     BarKey,
     CollisionPolicy,
     ExitReplay,
@@ -152,6 +153,7 @@ def compare_with_settlement(
     candidates: Sequence[ReplayCandidate],
     bars: Mapping[BarKey, DailyBar],
     *,
+    action_coverage: ActionCoverage,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
@@ -167,6 +169,7 @@ def compare_with_settlement(
         binding.cash_release_dates,
         candidates,
         bars,
+        action_coverage=action_coverage,
         initial_cash=initial_cash,
         costs=costs,
         previous_session=previous_session,

@@ -107,6 +107,7 @@ def test_missing_session_previous_session_and_coverage_fail_closed(
             (date(2026, 11, 10), date(2026, 11, 12)),
             (),
             {},
+            action_coverage={},
             initial_cash=Decimal("475"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=date(2026, 11, 9),
@@ -222,6 +223,9 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
             sessions,
             candidates,
             bars,
+            action_coverage={
+                (candidate.instrument, day): () for candidate in candidates for day in sessions
+            },
             initial_cash=Decimal("265"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=previous,
