@@ -1,2 +1,4 @@
 # Preserve retrieved source bytes on every platform.
 *.html -text
+dtc-settlement-holidays-2026.pdf binary
+nscc-veterans-day-risk-2026.pdf binary

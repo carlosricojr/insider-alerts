@@ -1,0 +1,30 @@
+{
+  "covering_from": "2026-10-01",
+  "covering_through": "2026-12-31",
+  "historical_possession_claimed": false,
+  "observation_clock_source": "local file read completion",
+  "schedule_status": "anticipated_annual_schedule_operational_notices_unverified",
+  "sources": [
+    {
+      "artifact": "dtc-settlement-holidays-2026.pdf",
+      "bytes": 237059,
+      "published_date": "2025-10-15",
+      "retrieved_file_completed_at_utc": "2026-11-22T04:47:47.507128Z",
+      "sha256": "943e9bbb70de5ea0e074fa9942a6f08a5661a8a3f105c46326a5e8a29c39cddf",
+      "source_url": "https://www.dtcc.com/-/media/Files/pdf/2025/10/15/23036-25.pdf"
+    },
+    {
+      "artifact": "nscc-veterans-day-risk-2026.pdf",
+      "bytes": 171367,
+      "published_date": "2026-10-27",
+      "retrieved_file_completed_at_utc": "2026-11-22T04:47:47.766327Z",
+      "sha256": "bbb4dfec7877309a2d7267e8c3fe7d07fb3136f1f509df9d26a6d9185fee5d2f",
+      "source_url": "https://files.dtcc.com/download/assets/a9848/9a0314f6d24111f1afef42275106fa04"
+    }
+  ],
+  "veterans_day_notice_check": {
+    "checked_on_utc": "2026-11-22",
+    "indexed_notices": ["a9837", "25151-26", "25152-26"],
+    "status": "indexed_publication_bytes_unverified"
+  }
+}
