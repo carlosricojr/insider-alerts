@@ -1,11 +1,11 @@
-﻿# Settlement-calendar evidence for the E07 prospective replay
+# Settlement-calendar evidence for the E07 prospective replay
 
 ## Outcome
 
 Bind regular-way U.S. equity settlement and cash-release dates into
 2027 using original DTC and NSCC annual notices. Apply the extension
 through the offline replay entry points. Keep the default Q4 2026
-contract and its archived digests stable. The prospective caller opts
+contract and both legacy binding digests stable. The prospective caller opts
 into the new schedule and binds that choice before opening outcomes.
 
 ## Source and scope
@@ -37,3 +37,7 @@ entry points. Keep live runtime and rehearsal fingerprints outside the
 diff. Complete strict Python gates, exact-head review, merge and
 installed verification. The prospective trial still requires the
 Monday custody witness, input coverage, and a sealed preregistration.
+
+The legacy digest fixture was evaluated directly against the original
+settlement adapter retrieved from commit `e78f2ac` and the updated
+default binder. Both release rules returned identical digests and maps.

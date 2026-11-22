@@ -1,4 +1,4 @@
-﻿# E07 research settlement calendar through 2027
+# E07 research settlement calendar through 2027
 
 Select `schedule="through_2027"` in either settlement-aware replay entry
 point. The extension supports dates from October 1, 2026 through

@@ -8,6 +8,7 @@
   "covering_from": "2026-10-01",
   "covering_through": "2027-12-31",
   "historical_possession_claimed": false,
+  "observation_clock_source": "local file read completion",
   "published_2027_full_closures": [
     "2027-01-01",
     "2027-01-18",
@@ -54,5 +55,6 @@
       "sha256": "13506e89e673a33f34f4f9e7412ce44d46d04845cbc96aee12c0d88726dfbba0",
       "source_url": "https://files.dtcc.com/download/assets/a9854/78ba7964dc7e11f1aaaf3a4dd749b5ad"
     }
-  ]
+  ],
+  "supersedes_provenance_sha256": "b4ac67b5418995752ec80949998c29fade88f12a6fef36f369600a10df49d207"
 }
