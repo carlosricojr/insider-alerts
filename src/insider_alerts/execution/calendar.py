@@ -184,15 +184,19 @@ def parse_native_schedule(schedule: Any) -> list[tuple[date, datetime, datetime]
         raise IbkrExecutionError("CALENDAR_SCHEDULE_MALFORMED")
     found: set[date] = set()
     parsed: list[tuple[date, datetime, datetime]] = []
+    stamp = r"[0-9]{8}-[0-9]{2}:[0-9]{2}:[0-9]{2}"
     try:
         for row in rows:
-            day = datetime.strptime(str(row.refDate), "%Y%m%d").date()
-            opens = datetime.strptime(str(row.startDateTime), "%Y%m%d-%H:%M:%S").replace(
-                tzinfo=NEW_YORK
-            )
-            closes = datetime.strptime(str(row.endDateTime), "%Y%m%d-%H:%M:%S").replace(
-                tzinfo=NEW_YORK
-            )
+            ref, start, end = row.refDate, row.startDateTime, row.endDateTime
+            if not (
+                re.fullmatch(r"[0-9]{8}", ref)
+                and re.fullmatch(stamp, start)
+                and re.fullmatch(stamp, end)
+            ):
+                raise ValueError("invalid schedule date or time syntax")
+            day = datetime.strptime(ref, "%Y%m%d").date()
+            opens = datetime.strptime(start, "%Y%m%d-%H:%M:%S").replace(tzinfo=NEW_YORK)
+            closes = datetime.strptime(end, "%Y%m%d-%H:%M:%S").replace(tzinfo=NEW_YORK)
             if (
                 day.weekday() >= 5
                 or opens.date() != day
@@ -269,7 +273,10 @@ def validate_future_projection_recovery(
     # The November feed combined future short sessions with omitted valid dates.
     # Recover existing positions only. A lone anomalous row or a legacy
     # projection with a coverage gap is still outside the authorized path.
-    management_only = bool(kinds & shifted and missing)
+    window_end = min(today + timedelta(days=45), ENTRY_HORIZON_LIMIT)
+    management_only = bool(missing) and any(
+        today < day <= window_end and kind in shifted for day, kind in disagreements.items()
+    )
     if (
         not disagreements
         or any(day <= today for day in disagreements)

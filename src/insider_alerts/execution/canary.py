@@ -605,6 +605,7 @@ class CanaryRunner:
                     isinstance(schedule_evidence, dict)
                     and schedule_evidence.get("entry_basis") == PROJECTION_MANAGEMENT_ONLY
                 ):
+                    self._expire_queued_entries(datetime.now(UTC) if wall_clock_mode else now)
                     final_result = replace(
                         result,
                         live_gate=f"{PROJECTION_MANAGEMENT_ONLY};time_exits={managed.timed_exits}",
@@ -1024,6 +1025,18 @@ class CanaryRunner:
             return "unexpected_non_canary_open_order"
         return "account_ready"
 
+    def _expire_queued_entries(self, now: datetime) -> None:
+        today = now.astimezone(NEW_YORK).date().isoformat()
+        for row in self.store.rows(
+            "live_state='queued' AND entry_session<?", (today,)
+        ):
+            self.store.update(str(row["packet_id"]), live_state="entry_window_missed")
+            self.store.event(
+                "live_entry_window_missed",
+                packet_id=str(row["packet_id"]),
+                level="warning",
+            )
+
     async def _submit_due_entries(
         self,
         account: AccountSnapshot,
@@ -1033,15 +1046,7 @@ class CanaryRunner:
         enforce_wall_clock: bool,
     ) -> int:
         local = now.astimezone(NEW_YORK)
-        for row in self.store.rows(
-            "live_state='queued' AND entry_session<?", (local.date().isoformat(),)
-        ):
-            self.store.update(str(row["packet_id"]), live_state="entry_window_missed")
-            self.store.event(
-                "live_entry_window_missed",
-                packet_id=str(row["packet_id"]),
-                level="warning",
-            )
+        self._expire_queued_entries(now)
         if not (
             self.config.entry_submission_start
             <= local.time()

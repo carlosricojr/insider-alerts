@@ -61,13 +61,14 @@ The existing operational shadow book may settle using this same fallback; this d
 repair or promote the separate frozen research trial.
 
 The November 21 recovery also recognizes a structurally valid response that
-combines future short sessions on normally full or closed dates with omitted
+combines in-window future short sessions on normally full or closed dates with omitted
 future sessions. It requires complete, agreeing requested sessions through
 today and the same fresh contract-hours verification. The receipt records the
 omitted dates and `calendar_future_projection_management_only`. This mode never
 authorizes new buys. The live worker still manages holdings first and runs its
 existing bounded discovery and operational shadow settlement against the
-published calendar. An omission by itself, a contradiction on or before today,
+published calendar and marks past queued live entries as missed after broker
+reconciliation. An omission by itself, a contradiction on or before today,
 or a conflicting near-term contract-hours response still stops the cycle.
 Recheck before December 3, the earliest omitted session in the November response.
 
@@ -118,10 +119,9 @@ rows or the published fallback checked against fresh contract hours, never an as
 Same-session timed exits require same-New-York-day bounds, not entry approval or the entry-only
 60-second freshness limit. Missing/future-dated/prior-day bounds prevent their dispatch. MOC is sent only
 inside its dispatch window; after the cutoff, the existing market-exit path applies until close.
-The existing overdue recovery is unchanged: once the stored exit date is past, it can enqueue
-the existing DAY market exit outside regular hours (`outsideRth=False`). This separate emergency
-path is not subject to same-session dispatch windows. Same-session orders are not newly sent
-before open or at/after close. Each row uses the actual dispatch clock and the adapter checks
+Once the stored exit date is past, the worker can dispatch an overdue exit only
+during the validated regular session. Same-session orders also stop at the
+validated close. Each row uses the actual dispatch clock and the adapter checks
 windowed orders again after contract lookup. A boundary crossed during lookup fails the cycle
 closed with `CALENDAR_EXIT_DISPATCH_WINDOW_MISSED`: remaining rows/entries are deferred,
 `last_cycle_error` is recorded, and the next cycle retries. No manual trade is added.

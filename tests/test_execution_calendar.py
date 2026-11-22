@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -887,12 +888,13 @@ def test_shifted_december_projection_recovers_only_management(day: datetime, hou
 
 @pytest.mark.parametrize("fault", [
     "past_gap", "past_conflict", "same_day_gap", "same_day_conflict", "omissions_only",
-    "wrong_hours", "missing_hours", "shadow_only",
+    "wrong_hours", "missing_hours", "shadow_only", "unpadded_ref", "unpadded_start",
+    "unpadded_current",
 ])
 def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) -> None:
     now = NOVEMBER_PROJECTION
     hours = NOVEMBER_HOURS
-    if fault in {"same_day_gap", "same_day_conflict"}:
+    if fault in {"same_day_gap", "same_day_conflict", "unpadded_current"}:
         now = now.replace(day=23)
     response = shifted_december_schedule(now)
     if fault in {"past_gap", "same_day_gap"}:
@@ -910,12 +912,55 @@ def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) 
         hours = hours.replace("20261123:1600", "20261123:1300")
     if fault == "missing_hours":
         hours = "20261121:CLOSED;20261122:CLOSED"
+    if fault in {"unpadded_ref", "unpadded_start"}:
+        row = next(row for row in response.sessions if row.refDate == "20261204")
+        if fault == "unpadded_ref":
+            row.refDate = "2026124"
+        else:
+            row.startDateTime = "20261204-9:30:00"
+    if fault == "unpadded_current":
+        row = next(row for row in response.sessions if row.refDate == "20261123")
+        row.endDateTime = "20261123-16:0:00"
     fake = FakeIb(response, hours)
     value = broker(fake, armed=fault != "shadow_only")
     with pytest.raises(IbkrExecutionError):
         asyncio.run(value.sessions(around=now, count=120))
     assert value.schedule_evidence == {}
     assert fake.details_requested == int(fault in {"wrong_hours", "missing_hours"})
+
+
+def test_short_session_outside_window_cannot_authorize_in_window_omission() -> None:
+    response = projected_schedule()
+    response.sessions = [row for row in response.sessions if row.refDate != "20261125"]
+    response.sessions.append(SimpleNamespace(
+        refDate="20261204", startDateTime="20261204-09:30:00", endDateTime="20261204-13:00:00",
+    ))
+    fake = FakeIb(response, PROJECTION_HOURS)
+    value = broker(fake)
+    with pytest.raises(IbkrExecutionError, match="PROJECTION_RECOVERY_NOT_ELIGIBLE"):
+        asyncio.run(value.sessions(around=PROJECTION_NOW, count=120))
+    assert not value.schedule_evidence and fake.details_requested == 0
+
+
+def test_shifted_projection_blocks_direct_buy_at_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    import insider_alerts.execution.ibkr as module
+
+    now = datetime(2026, 11, 23, 9, 18, tzinfo=NEW_YORK)
+    value = broker(FakeIb(shifted_december_schedule(now), NOVEMBER_HOURS))
+    asyncio.run(value.sessions(around=now, count=120))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    def unexpected_trade_lookup(*args):
+        pytest.fail("The adapter must block before order processing")
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    monkeypatch.setattr(value, "_existing_trade", unexpected_trade_lookup)
+    with pytest.raises(IbkrExecutionError, match=PROJECTION_MANAGEMENT_ONLY):
+        asyncio.run(value.submit_market_on_open("TEST", 10, "IA-E07-TEST-ENTRY"))
 
 
 @pytest.mark.parametrize("shifted", [False, True])
@@ -938,6 +983,12 @@ def test_projection_recovery_full_cycle_keeps_protection_and_submits_overdue_exi
         live_entry_commission=0.35, live_exit_session="2026-10-13",
         oca_group=f"IA-E07-{token}-EXIT", target_order_id=201, stop_order_id=202,
     )
+    if shifted:
+        runner.store.insert_candidate(
+            replace(_signal(now), packet_id="expired-queued-packet"), session=date(2026, 11, 20),
+            rank="old", is_eligible=True, reason="eligible", prior_close=10,
+            median_dollar_volume=1_000_000, quantity=20, now=now,
+        )
     live_broker.snapshot = AccountSnapshot("ACCOUNT", 500, 300, 300, {"TEST": 20}, 2)
     live_broker.order_values = [
         BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Submitted", 0, 20, 0),
@@ -977,7 +1028,10 @@ def test_projection_recovery_full_cycle_keeps_protection_and_submits_overdue_exi
     assert live_broker.market_exits == [("TEST", 20, f"IA-E07-{token}-EXIT")]
     assert live_broker.cancelled_orders == []
     assert live_broker.entry_calls == 0
-    row = runner.store.rows()[0]
+    row = runner.store.rows("packet_id=?", ("crash-test-packet",))[0]
     assert row["live_state"] == "closing"
     assert row["timed_exit_order_id"] == 204
     assert row["live_exit_session"] == "2026-10-13"
+    if shifted:
+        expired = runner.store.rows("packet_id=?", ("expired-queued-packet",))[0]
+        assert expired["live_state"] == "entry_window_missed"
