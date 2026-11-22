@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from e07_volatility_exits.auction import Auction, AuctionFill
+from e07_volatility_exits.auction import Auction, AuctionFill, EntryPath
 from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF, ExitWidths
 from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts
 from insider_alerts.backtest.models import DailyBar
@@ -225,6 +225,7 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
         day = version.day(case.entry_day)
         assert day.opens_at is not None and day.closes_at is not None
         entry_key = (case.instrument, case.entry_day)
+        bar = bars[entry_key]
         opening[entry_key] = AuctionFill(
             "9" * 64,
             10.0,
@@ -232,7 +233,10 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
             day.opens_at + delay,
             day.opens_at + delay,
             day.closes_at,
-            bars[entry_key],
+            day.closes_at,
+            EntryPath(
+                case.symbol, case.entry_day, bar.open, bar.open, bar.low, bar.high, bar.close, False
+            ),
         )
     observed = []
     for binding in (primary, delayed):

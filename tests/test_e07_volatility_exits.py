@@ -10,7 +10,8 @@ from typing import Literal, cast
 
 import pytest
 
-from e07_volatility_exits.auction import Auction, AuctionFill, AuctionMiss
+from e07_volatility_exits.auction import Auction, AuctionFill, AuctionMiss, EntryPath
+from e07_volatility_exits.entry_path import EntryTape, TradePrint, assemble_opening_fill
 from e07_volatility_exits.features import (
     BASE_WIDTH,
     FEATURE_CUTOFF,
@@ -138,9 +139,15 @@ def _auctions(
             ),
         )
         evidence[key] = AuctionFill(
-            "5" * 64, bar.open, opened, opened + DELAY, opened + DELAY, closed, bar
+            "5" * 64, bar.open, opened, opened + DELAY, opened + DELAY, closed, closed, _path(bar)
         )
     return evidence
+
+
+def _path(bar: DailyBar) -> EntryPath:
+    return EntryPath(
+        bar.symbol, bar.trade_date, bar.open, bar.open, bar.low, bar.high, bar.close, False
+    )
 
 
 def test_auction_basis_and_protection_exclude_earlier_prints() -> None:
@@ -159,7 +166,9 @@ def test_auction_basis_and_protection_exclude_earlier_prints() -> None:
         bars,
         action_coverage=_action_coverage([candidate]),
         opening_evidence={
-            key: AuctionFill("5" * 64, 10, fill, fill + DELAY, fill + DELAY, end, protected_bar)
+            key: AuctionFill(
+                "5" * 64, 10, fill, fill + DELAY, fill + DELAY, end, end, _path(protected_bar)
+            )
         },
         session_hours=HOURS,
         protection_delay=DELAY,
@@ -190,7 +199,9 @@ def test_first_protected_print_sets_the_gap_exit(
         _bars(candidate),
         action_coverage=_action_coverage([candidate]),
         opening_evidence={
-            key: AuctionFill("5" * 64, 10, start, start + DELAY, start + DELAY, end, protected)
+            key: AuctionFill(
+                "5" * 64, 10, start, start + DELAY, start + DELAY, end, end, _path(protected)
+            )
         },
         session_hours=HOURS,
         protection_delay=DELAY,
@@ -211,7 +222,9 @@ def test_early_close_and_protection_are_checked_against_the_session_clock() -> N
     key = (candidate.instrument, day)
     bars = _bars(candidate)
     start, end = HOURS[day]
-    evidence = AuctionFill("5" * 64, 10, start, start + DELAY, start + DELAY, end, bars[key])
+    evidence = AuctionFill(
+        "5" * 64, 10, start, start + DELAY, start + DELAY, end, end, _path(bars[key])
+    )
     early_close = end - timedelta(hours=3)
     variants = [
         (evidence, "timing"),
@@ -304,7 +317,7 @@ def test_old_and_new_positions_use_one_session_close_mark() -> None:
     key = (arrival.instrument, arrival.entry_day)
     fill = opening[key]
     assert isinstance(fill, AuctionFill)
-    opening[key] = replace(fill, protected_bar=replace(fill.protected_bar, high=10.1, close=10.1))
+    opening[key] = replace(fill, path=replace(fill.path, close=10.1))
     with pytest.raises(UnavailableExecution, match="entry and holding marks disagree"):
         compare_exit_widths(
             SESSIONS,
@@ -316,6 +329,90 @@ def test_old_and_new_positions_use_one_session_close_mark() -> None:
             session_hours=HOURS,
             protection_delay=DELAY,
             initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+
+@pytest.mark.parametrize(
+    ("can_trigger", "trade_price", "expected_exit", "expected_equity"),
+    [(False, 10, None, "435"), (True, 10, "stop", "435"), (True, 11.2, "target", "495")],
+)
+def test_projected_auction_mark_is_applied_after_continuous_prices(
+    can_trigger: bool,
+    trade_price: float,
+    expected_exit: str | None,
+    expected_equity: str,
+) -> None:
+    candidate = _candidate(width=BASE_WIDTH)
+    day = candidate.entry_day
+    start, close = HOURS[day]
+    fill = start + timedelta(seconds=4)
+    prefix_end = start + timedelta(minutes=1)
+    minutes = {prefix_end + timedelta(minutes=index): None for index in range(389)}
+    tape = EntryTape(
+        "9" * 64,
+        candidate.instrument,
+        candidate.symbol,
+        day,
+        TradePrint(fill, 10),
+        start,
+        prefix_end,
+        (
+            TradePrint(fill, 8),
+            TradePrint(fill + DELAY, 9.95),
+            TradePrint(fill + DELAY, 10),
+            TradePrint(fill + timedelta(seconds=2), trade_price),
+        ),
+        minutes,
+        TradePrint(close + timedelta(seconds=2), 8),
+    )
+    evidence = assemble_opening_fill(
+        tape,
+        HOURS[day],
+        protection_delay=DELAY,
+        closing_report_grace=timedelta(seconds=3),
+        close_can_trigger=can_trigger,
+    )
+    result = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        _bars(candidate),
+        action_coverage=_action_coverage([candidate]),
+        opening_evidence={(candidate.instrument, day): evidence},
+        session_hours=HOURS,
+        protection_delay=DELAY,
+        initial_cash=CASH,
+        costs=ReplayCosts(D("0"), D("0")),
+        previous_session=HISTORY[-1],
+    ).fixed.sessions[0]
+    assert result.equity == D(expected_equity)
+    assert [exit.reason for exit in result.exits] == (
+        [] if expected_exit is None else [expected_exit]
+    )
+    assert not any(exit.same_bar_collision for exit in result.exits)
+
+
+def test_ambiguous_first_second_cannot_touch_a_barrier_even_when_entry_is_suppressed() -> None:
+    candidate = _candidate()
+    bars = _bars(candidate)
+    opening = _auctions([candidate], bars)
+    key = candidate.instrument, candidate.entry_day
+    fill = opening[key]
+    assert isinstance(fill, AuctionFill)
+    opening[key] = replace(fill, path=replace(fill.path, low=9.5, first_low=9.5))
+    with pytest.raises(UnavailableExecution, match="first protected second can touch a barrier"):
+        compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            bars,
+            action_coverage=_action_coverage([candidate]),
+            opening_evidence=opening,
+            session_hours=HOURS,
+            protection_delay=DELAY,
+            initial_cash=D("60"),
             costs=COSTS,
             previous_session=HISTORY[-1],
         )
