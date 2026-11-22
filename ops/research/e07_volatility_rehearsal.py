@@ -71,6 +71,10 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+class ClockDiscontinuity(ValueError):
+    """The wall clock disagrees with the current process's monotonic clock."""
+
+
 def checked_clock(
     clock: Callable[[], datetime], ticks: Callable[[], float]
 ) -> Callable[[], datetime]:
@@ -84,7 +88,7 @@ def checked_clock(
         timestamp(value)
         elapsed = ticks() - initial
         if value < latest or elapsed < 0 or abs((value - started).total_seconds() - elapsed) > 2:
-            raise ValueError("rehearsal clock discontinuity")
+            raise ClockDiscontinuity("rehearsal clock discontinuity")
         latest = value
         return value
 
@@ -361,6 +365,9 @@ class Evidence:
             "journal_sequence": self.records[-1]["sequence"],
             "custody": dict(custody),
             "preopen": dict(preopen),
+            "read_windows_seen": [
+                day for day in self.frozen["entries"] if f"read-window:{day}" in self.cycle
+            ],
             "daily_projections": dict(daily),
             "outcome_price_basis": "as_traded_unverified",
             "provider_result_counts": dict(
@@ -488,8 +495,6 @@ class Rehearsal:
                     continue
                 if max(signal, created) > observed:
                     raise ValueError("candidate source clock is in the future")
-                if min(signal, created) < activated:
-                    continue
                 entry = session_for(evidence.version, signal)
             except (ValueError, TypeError, AttributeError):
                 self.append(
@@ -506,7 +511,9 @@ class Rehearsal:
             if str(entry) not in evidence.frozen["entries"]:
                 continue
             reason = None
-            if row["eligible"] != 1:
+            if min(signal, created) < activated:
+                reason = "candidate_predates_activation"
+            elif row["eligible"] != 1:
                 reason = "ineligible_under_e07"
             elif row["entry_session"] != str(entry):
                 reason = "candidate_entry_session_mismatch"
@@ -742,7 +749,9 @@ class Rehearsal:
                 end=end,
                 expected_conid=job.conid,
             )
-        except (OSError, RuntimeError) as exc:
+        except ClockDiscontinuity:
+            raise
+        except Exception as exc:
             response = {"result": "source_exception", "error_type": type(exc).__name__}
         self.append(evidence, "response", intent["sha256"], response)
 
@@ -755,6 +764,15 @@ class Rehearsal:
             if evidence.records[-1]["kind"] != "seal":
                 now = self.now()
                 if now < parse(evidence.frozen["expiry"]):
+                    day = now.astimezone(calendar.NY).date()
+                    cutoff = local(day, FEATURE_CUTOFF)
+                    marker = f"read-window:{day}"
+                    if (
+                        str(day) in evidence.frozen["entries"]
+                        and cutoff - READ_WINDOW <= now < cutoff
+                        and marker not in evidence.cycle
+                    ):
+                        self.append(evidence, "cycle", marker, {"observed_at": timestamp(now)})
                     self.preopen(evidence)
                     self.capture(evidence)
                     self.preopen(evidence)
@@ -796,7 +814,27 @@ def main() -> None:
     parser.add_argument("--review-reference", default="")
     parser.add_argument("--sec-contact", default="")
     args = parser.parse_args()
-    rehearsal = Rehearsal(Path(__file__).resolve().parents[2])
+    root = Path(__file__).resolve().parents[2]
+    if args.cycle:
+        try:
+            ensure_kill_on_close_process_tree()
+            asyncio.run(Rehearsal(root).cycle())
+        except LockBusy:
+            return
+        except Exception as exc:
+            # Error summaries remain independent of the evidence journal.
+            folder = safe_path(root / FOLDER)
+            if folder.is_dir():
+                path = safe_path(folder / "worker-errors.log")
+                with path.open("a", encoding="utf-8") as file:
+                    event = {"error": type(exc).__name__, "at": timestamp(utc_now())}
+                    file.write(json.dumps(event) + "\n")
+            if sys.stderr is not None:
+                print(f"Rehearsal error: {type(exc).__name__}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        return
+
+    rehearsal = Rehearsal(root)
     if args.activate:
         rehearsal.activate(args.activate, args.review_reference, sec_contact=args.sec_contact)
     elif args.verify_installation:
@@ -810,23 +848,6 @@ def main() -> None:
         report["latest_heartbeat"] = health.get("observed_at")
         report["acquisition_issue"] = health.get("acquisition_issue")
         print(json.dumps(report, sort_keys=True))
-    else:
-        ensure_kill_on_close_process_tree()
-        try:
-            asyncio.run(rehearsal.cycle())
-        except LockBusy:
-            return
-        except Exception as exc:
-            # Error summaries remain independent of the evidence journal.
-            if rehearsal.folder.is_dir():
-                path = safe_path(rehearsal.folder / "worker-errors.log")
-                with path.open("a", encoding="utf-8") as file:
-                    file.write(
-                        json.dumps({"error": type(exc).__name__, "at": timestamp(utc_now())}) + "\n"
-                    )
-            if sys.stderr is not None:
-                print(f"Rehearsal error: {type(exc).__name__}", file=sys.stderr)
-            raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

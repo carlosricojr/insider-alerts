@@ -60,7 +60,7 @@ def system(tmp_path, monkeypatch):
         async def acquire(self, symbol, *, start, end, expected_conid):
             calls.append((symbol, start, end, expected_conid, self.budget()))
             if mode[0] == "exception":
-                raise TimeoutError("simulated source exception")
+                raise ValueError("simulated source schema exception")
             response = source_response(symbol, start, end, False, self.clock(), bound)
             response["identity"]["primary_exchange"] = "NASDAQ"
             response["symbol_resolution_changed"] = False
@@ -87,14 +87,21 @@ def system(tmp_path, monkeypatch):
 
 
 def add_case(
-    instance, clock, *, packet="candidate", cik="0000000123", entry="2026-10-27", symbol="TEST"
+    instance,
+    clock,
+    *,
+    packet="candidate",
+    cik="0000000123",
+    entry="2026-10-27",
+    symbol="TEST",
+    signal=None,
 ):
     row = dict.fromkeys(COLUMNS) | {
         "packet_id": packet,
         "accession_number": "fixture-accession",
         "cik": cik,
         "symbol": symbol,
-        "signal_at": timestamp(clock[0]),
+        "signal_at": signal or timestamp(clock[0]),
         "created_at": timestamp(clock[0]),
         "entry_session": entry,
         "eligible": 1,
@@ -363,3 +370,21 @@ def test_probe_budget_stops_at_0800_new_york(system):
     add_case(instance, clock)
     run(instance)
     assert 0 < calls[0][-1] <= 3
+
+
+def test_late_insert_with_older_signal_remains_in_exclusions(system):
+    instance, _, clock, calls, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock, signal="2026-10-26T20:59:00Z")
+    report = run(instance)
+    assert report["custody"] == {"candidate_predates_activation": 1}
+    assert not calls
+    assert run(instance)["custody"] == report["custody"]
+
+
+def test_empty_window_records_worker_availability_without_candidate_claim(system):
+    instance, _, clock, _, _ = system
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    report = run(instance)
+    assert report["read_windows_seen"] == ["2026-10-27"]
+    assert report["preopen"] == {}

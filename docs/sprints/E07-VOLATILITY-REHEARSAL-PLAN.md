@@ -24,7 +24,12 @@ Require a unique SEC issuer and venue match for a positive feature receipt.
 A read only counts as timely when its durable write returns before 09:18.
 An interrupted read loses that proof. Missing input has an explicit 10%
 fallback and remains visible in the denominator. A candidate seen after
-cutoff is recorded without reconstructing a decision it missed.
+cutoff is recorded without reconstructing a decision it missed. Cases
+first seen from 08:00 to 09:18 normally fall back unless a matching
+case already supplies an independently recorded response. Report the
+presence of the worker in each read window separately from case reads.
+The host clock is expected to be synchronized. Restart checks reject a
+clock earlier than the previous heartbeat or journal write.
 
 Post-close snapshots bind the original contract ID and document the observed
 IBKR price projection. Corporate-action and as-traded qualification are still
@@ -48,7 +53,8 @@ out of source control and status output.
 
 Verify a fresh hidden task heartbeat, the source and dependency digest, no
 cycle error, the task's registration and the unchanged live reconciliation
-cycle. After a target session verify actual pre-open observation or typed
+cycle. The limited interactive task requires a Windows logon session.
+After a target session verify actual pre-open observation or typed
 missingness and the expected daily outcomes. Rollback stops and disables
 only the rehearsal task. Retain its evidence.
 
