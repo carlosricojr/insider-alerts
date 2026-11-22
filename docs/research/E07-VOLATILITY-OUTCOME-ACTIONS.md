@@ -37,9 +37,11 @@ trade cash. Keep the as-traded trigger prices and order levels.
 
 Reorganizations, splits, delistings, discontinuities, due bills, or
 distributions that can cancel the broker protection need separately qualified
-execution mechanics. Identify them on the sessions where they can invalidate
-sizing or execution. Qualify the separate volatility lookback's close basis
-across share-changing events. IBKR leaves ordinary GTC levels unchanged and generally
+execution mechanics. Fail preflight on those events within any possible
+holding window. A confirmed auction miss requires independent evidence and
+cannot produce a position. Coverage is still required for that window.
+Qualify the separate volatility lookback's close basis across share-changing
+events. IBKR leaves ordinary GTC levels unchanged and generally
 cancels GTC orders when a distribution exceeds 3% of the prior close or when
 shares are split, exchanged or distributed. The data adapter must establish
 that protection stays in force before classifying an event as ordinary.

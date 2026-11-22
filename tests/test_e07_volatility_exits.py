@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from typing import cast
 
 import pytest
 
@@ -197,8 +198,8 @@ def test_action_preflight_requires_complete_windows_independent_of_execution() -
         )
 
 
-@pytest.mark.parametrize("offset", [0, 1])
-def test_unsupported_listing_event_blocks_a_fill_or_open_position(offset: int) -> None:
+@pytest.mark.parametrize("offset", [0, 1, 5])
+def test_unsupported_listing_event_blocks_a_possible_position_before_fills(offset: int) -> None:
     candidate = _candidate()
     coverage = _action_coverage([candidate])
     coverage[candidate.instrument, SESSIONS[offset]] = (
@@ -209,7 +210,7 @@ def test_unsupported_listing_event_blocks_a_fill_or_open_position(offset: int) -
             SESSIONS,
             SETTLEMENTS,
             [candidate],
-            _bars(candidate),
+            {},
             action_coverage=coverage,
             initial_cash=CASH,
             costs=COSTS,
@@ -254,6 +255,8 @@ def test_coverage_digest_is_order_independent_and_binds_dividend_terms() -> None
     coverage[key] = (second, first)
     assert original == result()
     assert original.fixed.sessions[1].distribution_receivable == D("2.20")
+    coverage[key] = (second, replace(first, cash_per_share=D("1E-1")))
+    assert original == result()
     coverage[key] = (second, replace(first, cash_available_on=SESSIONS[6]))
     assert original.action_coverage_sha256 != result().action_coverage_sha256
 
@@ -265,6 +268,23 @@ def test_duplicate_cash_event_across_ex_dates_is_rejected_before_replay() -> Non
     coverage[candidate.instrument, SESSIONS[1]] = (event,)
     coverage[candidate.instrument, SESSIONS[2]] = (event,)
     with pytest.raises(ValueError, match="duplicate distribution event"):
+        compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            {},
+            action_coverage=coverage,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+
+def test_action_preflight_rejects_unknown_event_types() -> None:
+    candidate = _candidate()
+    coverage = _action_coverage([candidate])
+    coverage[candidate.instrument, candidate.entry_day] = (cast(Action, object()),)
+    with pytest.raises(ValueError, match="unknown corporate-action type"):
         compare_exit_widths(
             SESSIONS,
             SETTLEMENTS,
