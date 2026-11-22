@@ -889,7 +889,7 @@ def test_shifted_december_projection_recovers_only_management(day: datetime, hou
 @pytest.mark.parametrize("fault", [
     "past_gap", "past_conflict", "same_day_gap", "same_day_conflict", "omissions_only",
     "wrong_hours", "missing_hours", "shadow_only", "unpadded_ref", "unpadded_start",
-    "unpadded_current",
+    "unpadded_current", "nonascii_hours",
 ])
 def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) -> None:
     now = NOVEMBER_PROJECTION
@@ -912,6 +912,8 @@ def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) 
         hours = hours.replace("20261123:1600", "20261123:1300")
     if fault == "missing_hours":
         hours = "20261121:CLOSED;20261122:CLOSED"
+    if fault == "nonascii_hours":
+        hours = hours.replace("0930", "093\N{ARABIC-INDIC DIGIT ZERO}")
     if fault in {"unpadded_ref", "unpadded_start"}:
         row = next(row for row in response.sessions if row.refDate == "20261204")
         if fault == "unpadded_ref":
@@ -926,7 +928,8 @@ def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) 
     with pytest.raises(IbkrExecutionError):
         asyncio.run(value.sessions(around=now, count=120))
     assert value.schedule_evidence == {}
-    assert fake.details_requested == int(fault in {"wrong_hours", "missing_hours"})
+    hours_faults = {"wrong_hours", "missing_hours", "nonascii_hours"}
+    assert fake.details_requested == int(fault in hours_faults)
 
 
 def test_short_session_outside_window_cannot_authorize_in_window_omission() -> None:

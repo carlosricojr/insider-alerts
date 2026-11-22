@@ -128,7 +128,7 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
         raise IbkrExecutionError("CALENDAR_UNSUPPORTED_YEAR")
     try:
         for entry in text.split(";"):
-            if re.fullmatch(r"\d{8}:(?:CLOSED|\d{4}-\d{8}:\d{4})", entry) is None:
+            if re.fullmatch(r"\d{8}:(?:CLOSED|\d{4}-\d{8}:\d{4})", entry, re.ASCII) is None:
                 raise ValueError("invalid hours syntax")
             day_text, hours = entry.split(":", 1)
             day = datetime.strptime(day_text, "%Y%m%d").date()
