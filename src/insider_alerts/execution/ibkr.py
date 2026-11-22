@@ -19,6 +19,7 @@ from insider_alerts.execution.calendar import (
     FALLBACK_ENTRY_EXPIRY,
     MANAGEMENT_RECOVERY_START,
     NEW_YORK,
+    PROJECTION_MANAGEMENT_ONLY,
     SOURCE,
     bounds,
     calendar_dates,
@@ -232,8 +233,9 @@ class IbkrBroker:
                 receipt = validate_contract_hours(details, contract, around)
                 receipt.update(projection_receipt)
                 today_bounds = bounds(today)
-                entry_basis = (
-                    "projection_rejected" if projection_receipt else "fallback_unavailable"
+                entry_basis = projection_receipt.get(
+                    "entry_basis",
+                    "projection_rejected" if projection_receipt else "fallback_unavailable",
                 )
             else:
                 expected = native_dates
@@ -261,8 +263,11 @@ class IbkrBroker:
                      if day == today), None,
                 )
                 entry_basis = "native"
-            future = [day for day in expected if today <= day <= ENTRY_HORIZON_LIMIT]
-            approval = entry_approval(today)
+            management_only = entry_basis == PROJECTION_MANAGEMENT_ONLY
+            future = [] if management_only else [
+                day for day in expected if today <= day <= ENTRY_HORIZON_LIMIT
+            ]
+            approval = None if management_only else entry_approval(today)
             receipt.update(
                 source=source,
                 fallback_reason=reason,
@@ -308,6 +313,8 @@ class IbkrBroker:
             or now.astimezone(NEW_YORK).date() != validated.astimezone(NEW_YORK).date()
         ):
             return "calendar_validation_stale"
+        if receipt.get("entry_basis") == PROJECTION_MANAGEMENT_ONLY:
+            return PROJECTION_MANAGEMENT_ONLY
         if (
             for_entry
             and receipt["source"] == SOURCE

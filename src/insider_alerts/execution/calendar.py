@@ -23,6 +23,7 @@ MANAGEMENT_RECOVERY_START = date(2026, 10, 1)
 ENTRY_RENEWAL_START = date(2026, 10, 15)
 FALLBACK_ENTRY_EXPIRY = date(2027, 1, 1)
 ENTRY_HORIZON_LIMIT = date(2026, 12, 31)
+PROJECTION_MANAGEMENT_ONLY = "calendar_future_projection_management_only"
 
 
 def entry_approval(day: date) -> str | None:
@@ -127,7 +128,7 @@ def validate_contract_hours(details: Any, contract: Any, around: datetime) -> di
         raise IbkrExecutionError("CALENDAR_UNSUPPORTED_YEAR")
     try:
         for entry in text.split(";"):
-            if re.fullmatch(r"\d{8}:(?:CLOSED|\d{4}-\d{8}:\d{4})", entry) is None:
+            if re.fullmatch(r"\d{8}:(?:CLOSED|\d{4}-\d{8}:\d{4})", entry, re.ASCII) is None:
                 raise ValueError("invalid hours syntax")
             day_text, hours = entry.split(":", 1)
             day = datetime.strptime(day_text, "%Y%m%d").date()
@@ -183,15 +184,19 @@ def parse_native_schedule(schedule: Any) -> list[tuple[date, datetime, datetime]
         raise IbkrExecutionError("CALENDAR_SCHEDULE_MALFORMED")
     found: set[date] = set()
     parsed: list[tuple[date, datetime, datetime]] = []
+    stamp = r"[0-9]{8}-[0-9]{2}:[0-9]{2}:[0-9]{2}"
     try:
         for row in rows:
-            day = datetime.strptime(str(row.refDate), "%Y%m%d").date()
-            opens = datetime.strptime(str(row.startDateTime), "%Y%m%d-%H:%M:%S").replace(
-                tzinfo=NEW_YORK
-            )
-            closes = datetime.strptime(str(row.endDateTime), "%Y%m%d-%H:%M:%S").replace(
-                tzinfo=NEW_YORK
-            )
+            ref, start, end = row.refDate, row.startDateTime, row.endDateTime
+            if not (
+                re.fullmatch(r"[0-9]{8}", ref)
+                and re.fullmatch(stamp, start)
+                and re.fullmatch(stamp, end)
+            ):
+                raise ValueError("invalid schedule date or time syntax")
+            day = datetime.strptime(ref, "%Y%m%d").date()
+            opens = datetime.strptime(start, "%Y%m%d-%H:%M:%S").replace(tzinfo=NEW_YORK)
+            closes = datetime.strptime(end, "%Y%m%d-%H:%M:%S").replace(tzinfo=NEW_YORK)
             if (
                 day.weekday() >= 5
                 or opens.date() != day
@@ -221,6 +226,11 @@ def native_contradictions(
             kind = "HOLIDAY_PROJECTED_OPEN"
         elif day in EARLY_CLOSES and closes.time() == time(16):
             kind = "EARLY_CLOSE_PROJECTED_REGULAR"
+        elif closes.time() == time(13):
+            kind = (
+                "HOLIDAY_PROJECTED_SHORT_SESSION" if day in HOLIDAYS
+                else "REGULAR_PROJECTED_EARLY_CLOSE"
+            )
         disagreements[day] = kind
     return disagreements
 
@@ -242,9 +252,10 @@ def validate_future_projection_recovery(
     """Reject a narrowly classified future projection, not the published calendar.
 
     The caller must separately require live authorization and fresh contract hours.
-    All published requested sessions must still exist, and all non-projected rows
-    retain native validation. Returned evidence describes rejected data, not a
-    corrected historical observation. Only the pinned 2026 calendar is used.
+    All requested sessions through today must exist and agree. The legacy
+    projection path requires complete future coverage too. A future short
+    session plus future omissions qualifies only for management. Returned
+    evidence describes rejected data, not a corrected historical observation.
     """
     today = around.astimezone(NEW_YORK).date()
     # Management authority survives entry expiry. Entry approval is separately
@@ -255,13 +266,25 @@ def validate_future_projection_recovery(
     rows = parse_native_schedule(schedule)
     disagreements = native_contradictions(rows)
     allowed = {"HOLIDAY_PROJECTED_OPEN", "EARLY_CLOSE_PROJECTED_REGULAR"}
-    if not disagreements or any(
-        day <= today or kind not in allowed for day, kind in disagreements.items()
+    shifted = {"REGULAR_PROJECTED_EARLY_CLOSE", "HOLIDAY_PROJECTED_SHORT_SESSION"}
+    kinds = set(disagreements.values())
+    found = {day for day, _, _ in rows}
+    missing = set(expected) - found
+    # The November feed combined future short sessions with omitted valid dates.
+    # Recover existing positions only. A lone anomalous row or a legacy
+    # projection with a coverage gap is still outside the authorized path.
+    window_end = min(today + timedelta(days=45), ENTRY_HORIZON_LIMIT)
+    management_only = bool(missing) and any(
+        today < day <= window_end and kind in shifted for day, kind in disagreements.items()
+    )
+    if (
+        not disagreements
+        or any(day <= today for day in disagreements)
+        or not kinds <= (allowed | shifted if management_only else allowed)
     ):
         raise IbkrExecutionError("CALENDAR_PROJECTION_RECOVERY_NOT_ELIGIBLE")
-    found = {day for day, _, _ in rows}
     past_count = sum(day < today for day in expected)
-    if not set(expected).issubset(found) or past_count < 20:
+    if past_count < 20 or (missing and (not management_only or min(missing) <= today)):
         raise IbkrExecutionError("CALENDAR_SCHEDULE_COVERAGE_MISMATCH")
     payload = {
         "zone": schedule.timeZone,
@@ -269,7 +292,7 @@ def validate_future_projection_recovery(
             (str(day), opens.isoformat(), closes.isoformat()) for day, opens, closes in rows
         ],
     }
-    return {
+    receipt = {
         "native_rejected_future_dates": ",".join(str(day) for day in sorted(disagreements)),
         "native_contradiction_kinds": json.dumps(
             {str(day): kind for day, kind in sorted(disagreements.items())}, sort_keys=True
@@ -279,3 +302,9 @@ def validate_future_projection_recovery(
         ).hexdigest(),
         "native_past_sessions_validated": str(past_count),
     }
+    if management_only:
+        receipt.update(
+            entry_basis=PROJECTION_MANAGEMENT_ONLY,
+            native_missing_future_dates=", ".join(str(day) for day in sorted(missing)),
+        )
+    return receipt

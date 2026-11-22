@@ -6,7 +6,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
-from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT
+from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT, PROJECTION_MANAGEMENT_ONLY
 from insider_alerts.execution.errors import ContractQualificationError, IbkrExecutionError
 from insider_alerts.strategy.e07 import (
     deterministic_rank,
@@ -595,19 +595,29 @@ class CanaryRunner:
             self.store.set_metadata({"cycle_phase": "auxiliary"}, now=datetime.now(UTC))
             result = await self._run_auxiliary(activation, sessions, now)
             if managed is None:
-                final_result = CycleResult(**{
-                    **asdict(result), "live_gate": "shadow_only_not_armed",
-                })
+                final_result = replace(result, live_gate="shadow_only_not_armed")
             else:
-                result = CycleResult(**{
-                    **asdict(result), "live_opened": managed.result.live_opened,
-                    "live_closed": managed.result.live_closed,
-                })
-                self.store.set_metadata({"cycle_phase": "entry_validation"}, now=datetime.now(UTC))
-                final_result = await self._submit_live_entries(
-                    result, managed, sessions, datetime.now(UTC) if wall_clock_mode else now,
-                    enforce_wall_clock=wall_clock_mode,
+                result = replace(
+                    result, live_opened=managed.result.live_opened,
+                    live_closed=managed.result.live_closed,
                 )
+                if (
+                    isinstance(schedule_evidence, dict)
+                    and schedule_evidence.get("entry_basis") == PROJECTION_MANAGEMENT_ONLY
+                ):
+                    self._expire_queued_entries(datetime.now(UTC) if wall_clock_mode else now)
+                    final_result = replace(
+                        result,
+                        live_gate=f"{PROJECTION_MANAGEMENT_ONLY};time_exits={managed.timed_exits}",
+                    )
+                else:
+                    self.store.set_metadata(
+                        {"cycle_phase": "entry_validation"}, now=datetime.now(UTC),
+                    )
+                    final_result = await self._submit_live_entries(
+                        result, managed, sessions, datetime.now(UTC) if wall_clock_mode else now,
+                        enforce_wall_clock=wall_clock_mode,
+                    )
             success_time = datetime.now(UTC)
             self.store.set_metadata(
                 {
@@ -1015,6 +1025,18 @@ class CanaryRunner:
             return "unexpected_non_canary_open_order"
         return "account_ready"
 
+    def _expire_queued_entries(self, now: datetime) -> None:
+        today = now.astimezone(NEW_YORK).date().isoformat()
+        for row in self.store.rows(
+            "live_state='queued' AND entry_session<?", (today,)
+        ):
+            self.store.update(str(row["packet_id"]), live_state="entry_window_missed")
+            self.store.event(
+                "live_entry_window_missed",
+                packet_id=str(row["packet_id"]),
+                level="warning",
+            )
+
     async def _submit_due_entries(
         self,
         account: AccountSnapshot,
@@ -1024,15 +1046,7 @@ class CanaryRunner:
         enforce_wall_clock: bool,
     ) -> int:
         local = now.astimezone(NEW_YORK)
-        for row in self.store.rows(
-            "live_state='queued' AND entry_session<?", (local.date().isoformat(),)
-        ):
-            self.store.update(str(row["packet_id"]), live_state="entry_window_missed")
-            self.store.event(
-                "live_entry_window_missed",
-                packet_id=str(row["packet_id"]),
-                level="warning",
-            )
+        self._expire_queued_entries(now)
         if not (
             self.config.entry_submission_start
             <= local.time()

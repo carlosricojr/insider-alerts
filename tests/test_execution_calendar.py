@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from ib_async import RequestError
 from insider_alerts.execution.calendar import (
     CALENDAR_SHA256,
     NEW_YORK,
+    PROJECTION_MANAGEMENT_ONLY,
     SOURCE,
     bounds,
     calendar_dates,
@@ -834,30 +836,169 @@ def test_projection_recovery_requires_twenty_past_sessions_and_actual_disagreeme
         validate_future_projection_recovery(valid, PROJECTION_NOW, 120)
 
 
+NOVEMBER_PROJECTION = datetime(2026, 11, 21, 21, 20, tzinfo=NEW_YORK)
+NOVEMBER_HOURS = (
+    "20261121:CLOSED;20261122:CLOSED;20261123:0930-20261123:1600;"
+    "20261124:0930-20261124:1600;20261125:0930-20261125:1600"
+)
+
+
+def shifted_december_schedule(around: datetime = NOVEMBER_PROJECTION) -> SimpleNamespace:
+    """Model the malformed future projection captured on November 21."""
+    end = around.date() + timedelta(days=45)
+    missing = {date(2026, 12, day) for day in (3, 10, 17, 24, 31)}
+    response = schedule_for_dates([
+        day for day in open_dates(end - timedelta(days=119), end) if day not in missing
+    ])
+    for row in response.sessions:
+        if row.refDate in {"20261204", "20261211", "20261218"}:
+            row.endDateTime = f"{row.refDate}-13:00:00"
+    response.sessions.append(SimpleNamespace(
+        refDate="20261225", startDateTime="20261225-09:30:00", endDateTime="20261225-13:00:00",
+    ))
+    return response
+
+
+@pytest.mark.parametrize("day,hours", [
+    (NOVEMBER_PROJECTION, NOVEMBER_HOURS),
+    (datetime(2026, 11, 27, 12, 31, tzinfo=NEW_YORK),
+     "20261127:0930-20261127:1300;20261128:CLOSED;20261129:CLOSED;20261130:0930-20261130:1600"),
+])
+def test_shifted_december_projection_recovers_only_management(day: datetime, hours: str) -> None:
+    response = shifted_december_schedule(day)
+    with pytest.raises(IbkrExecutionError, match="DISAGREEMENT:2026-12-04"):
+        validate_native_schedule(response)
+    fake = FakeIb(response, hours)
+    value = broker(fake)
+    expected = calendar_dates(day, 120)
+    assert asyncio.run(value.sessions(around=day, count=120)) == expected
+    assert date(2026, 12, 24) in expected and date(2026, 12, 25) not in expected
+    assert fake.details_requested == 1
+    assert value.session_bounds(day) == bounds(day.date())
+    assert value.session_bounds(day + timedelta(days=1)) is None
+    assert value.calendar_gate(day, for_entry=True) == PROJECTION_MANAGEMENT_ONLY
+    receipt = value.schedule_evidence
+    assert receipt["entry_horizon_exit"] == receipt["entry_approval_id"] == ""
+    assert receipt["native_missing_future_dates"] == (
+        "2026-12-03, 2026-12-10, 2026-12-17, 2026-12-24, 2026-12-31"
+    )
+    assert len(receipt["native_schedule_sha256"]) == 64
+    assert fake.RaiseRequestErrors is False
+
+
+@pytest.mark.parametrize("fault", [
+    "past_gap", "past_conflict", "same_day_gap", "same_day_conflict", "omissions_only",
+    "wrong_hours", "missing_hours", "shadow_only", "unpadded_ref", "unpadded_start",
+    "unpadded_current", "nonascii_hours",
+])
+def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) -> None:
+    now = NOVEMBER_PROJECTION
+    hours = NOVEMBER_HOURS
+    if fault in {"same_day_gap", "same_day_conflict", "unpadded_current"}:
+        now = now.replace(day=23)
+    response = shifted_december_schedule(now)
+    if fault in {"past_gap", "same_day_gap"}:
+        missing = "20261120" if fault == "past_gap" else "20261123"
+        response.sessions = [row for row in response.sessions if row.refDate != missing]
+    if fault in {"past_conflict", "same_day_conflict"}:
+        day = "20261120" if fault == "past_conflict" else "20261123"
+        next(row for row in response.sessions if row.refDate == day).endDateTime = f"{day}-13:00:00"
+    if fault == "omissions_only":
+        response.sessions = [row for row in response.sessions if row.refDate != "20261225"]
+        for row in response.sessions:
+            if row.refDate in {"20261204", "20261211", "20261218"}:
+                row.endDateTime = f"{row.refDate}-16:00:00"
+    if fault == "wrong_hours":
+        hours = hours.replace("20261123:1600", "20261123:1300")
+    if fault == "missing_hours":
+        hours = "20261121:CLOSED;20261122:CLOSED"
+    if fault == "nonascii_hours":
+        hours = hours.replace("0930", "093\N{ARABIC-INDIC DIGIT ZERO}")
+    if fault in {"unpadded_ref", "unpadded_start"}:
+        row = next(row for row in response.sessions if row.refDate == "20261204")
+        if fault == "unpadded_ref":
+            row.refDate = "2026124"
+        else:
+            row.startDateTime = "20261204-9:30:00"
+    if fault == "unpadded_current":
+        row = next(row for row in response.sessions if row.refDate == "20261123")
+        row.endDateTime = "20261123-16:0:00"
+    fake = FakeIb(response, hours)
+    value = broker(fake, armed=fault != "shadow_only")
+    with pytest.raises(IbkrExecutionError):
+        asyncio.run(value.sessions(around=now, count=120))
+    assert value.schedule_evidence == {}
+    hours_faults = {"wrong_hours", "missing_hours", "nonascii_hours"}
+    assert fake.details_requested == int(fault in hours_faults)
+
+
+def test_short_session_outside_window_cannot_authorize_in_window_omission() -> None:
+    response = projected_schedule()
+    response.sessions = [row for row in response.sessions if row.refDate != "20261125"]
+    response.sessions.append(SimpleNamespace(
+        refDate="20261204", startDateTime="20261204-09:30:00", endDateTime="20261204-13:00:00",
+    ))
+    fake = FakeIb(response, PROJECTION_HOURS)
+    value = broker(fake)
+    with pytest.raises(IbkrExecutionError, match="PROJECTION_RECOVERY_NOT_ELIGIBLE"):
+        asyncio.run(value.sessions(around=PROJECTION_NOW, count=120))
+    assert not value.schedule_evidence and fake.details_requested == 0
+
+
+def test_shifted_projection_blocks_direct_buy_at_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    import insider_alerts.execution.ibkr as module
+
+    now = datetime(2026, 11, 23, 9, 18, tzinfo=NEW_YORK)
+    value = broker(FakeIb(shifted_december_schedule(now), NOVEMBER_HOURS))
+    asyncio.run(value.sessions(around=now, count=120))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    def unexpected_trade_lookup(*args):
+        pytest.fail("The adapter must block before order processing")
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    monkeypatch.setattr(value, "_existing_trade", unexpected_trade_lookup)
+    with pytest.raises(IbkrExecutionError, match=PROJECTION_MANAGEMENT_ONLY):
+        asyncio.run(value.submit_market_on_open("TEST", 10, "IA-E07-TEST-ENTRY"))
+
+
+@pytest.mark.parametrize("shifted", [False, True])
 def test_projection_recovery_full_cycle_keeps_protection_and_submits_overdue_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shifted: bool,
 ) -> None:
     from insider_alerts.execution.canary import AccountSnapshot, BrokerOrder, broker_token
     from tests.test_execution_canary_adversarial import _runner, _signal
 
-    runner, live_broker = _runner(tmp_path, monkeypatch, PROJECTION_NOW)
+    now = datetime(2026, 11, 23, 10, tzinfo=NEW_YORK) if shifted else PROJECTION_NOW
+    runner, live_broker = _runner(tmp_path, monkeypatch, now)
     token = broker_token("crash-test-packet")
     runner.store.insert_candidate(
-        _signal(PROJECTION_NOW), session=date(2026, 10, 1), rank="test",
+        _signal(now), session=date(2026, 10, 1), rank="test",
         is_eligible=True, reason="eligible", prior_close=10, median_dollar_volume=1_000_000,
-        quantity=20, now=PROJECTION_NOW,
+        quantity=20, now=now,
     )
     runner.store.update(
         "crash-test-packet", live_state="open", live_quantity=20, live_entry_price=10,
         live_entry_commission=0.35, live_exit_session="2026-10-13",
         oca_group=f"IA-E07-{token}-EXIT", target_order_id=201, stop_order_id=202,
     )
+    if shifted:
+        runner.store.insert_candidate(
+            replace(_signal(now), packet_id="expired-queued-packet"), session=date(2026, 11, 20),
+            rank="old", is_eligible=True, reason="eligible", prior_close=10,
+            median_dollar_volume=1_000_000, quantity=20, now=now,
+        )
     live_broker.snapshot = AccountSnapshot("ACCOUNT", 500, 300, 300, {"TEST": 20}, 2)
     live_broker.order_values = [
         BrokerOrder(201, f"IA-E07-{token}-TARGET", "TEST", "target", "Submitted", 0, 20, 0),
         BrokerOrder(202, f"IA-E07-{token}-STOP", "TEST", "stop", "Submitted", 0, 20, 0),
     ]
-    adapter = broker(FakeIb(projected_schedule(), PROJECTION_HOURS))
+    adapter = broker(FakeIb(shifted_december_schedule(now), NOVEMBER_HOURS) if shifted
+                     else FakeIb(projected_schedule(), PROJECTION_HOURS))
 
     async def sessions(*, around: datetime, count: int = 90) -> list[date]:
         result = await adapter.sessions(around=around, count=count)
@@ -869,13 +1010,31 @@ def test_projection_recovery_full_cycle_keeps_protection_and_submits_overdue_exi
 
     monkeypatch.setattr(live_broker, "sessions", sessions)
     monkeypatch.setattr(live_broker, "calendar_gate", adapter.calendar_gate, raising=False)
+    monkeypatch.setattr(live_broker, "session_bounds", adapter.session_bounds)
     monkeypatch.setattr(runner, "_submit_due_entries", forbidden_entries)
-    result = asyncio.run(runner.cycle(PROJECTION_NOW))
-    assert result.live_gate == "calendar_fallback_entry_approval_expired;time_exits=1"
+    if shifted:
+        monkeypatch.setattr(runner, "_submit_live_entries", forbidden_entries)
+    auxiliary_calls = []
+    run_auxiliary = runner._run_auxiliary
+
+    async def record_auxiliary(*args):
+        # Normal discovery remains active so candidates age on their intended
+        # session, and the scheduled exit has already been sent at this point.
+        auxiliary_calls.append(len(live_broker.market_exits))
+        return await run_auxiliary(*args)
+
+    monkeypatch.setattr(runner, "_run_auxiliary", record_auxiliary)
+    result = asyncio.run(runner.cycle(now))
+    gate = PROJECTION_MANAGEMENT_ONLY if shifted else "calendar_fallback_entry_approval_expired"
+    assert result.live_gate == f"{gate};time_exits=1"
+    assert auxiliary_calls == [1]
     assert live_broker.market_exits == [("TEST", 20, f"IA-E07-{token}-EXIT")]
     assert live_broker.cancelled_orders == []
     assert live_broker.entry_calls == 0
-    row = runner.store.rows()[0]
+    row = runner.store.rows("packet_id=?", ("crash-test-packet",))[0]
     assert row["live_state"] == "closing"
     assert row["timed_exit_order_id"] == 204
     assert row["live_exit_session"] == "2026-10-13"
+    if shifted:
+        expired = runner.store.rows("packet_id=?", ("expired-queued-packet",))[0]
+        assert expired["live_state"] == "entry_window_missed"
