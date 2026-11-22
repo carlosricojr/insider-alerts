@@ -37,6 +37,7 @@ from insider_alerts.research.commissioning_worker import (
     implementation_digest,
 )
 from insider_alerts.sec.client import SecHttpClient, SecHttpError
+from ops.research.e07_volatility_approval import approval_database, read_approvals
 from ops.research.e07_volatility_input_audit import _history
 from ops.research.e07_volatility_rehearsal_contract import (
     DIRECTORY_URL,
@@ -46,8 +47,10 @@ from ops.research.e07_volatility_rehearsal_contract import (
     issuer_directory,
 )
 
-CONTRACT = "e07-volatility-custody-rehearsal-v1"
-FOLDER = "data/research-e07-volatility-rehearsal"
+PRIOR_CONTRACT = "e07-volatility-custody-rehearsal-v1"
+PRIOR_FOLDER = "data/research-e07-volatility-rehearsal"
+CONTRACT = "e07-volatility-custody-rehearsal-v2"
+FOLDER = "data/research-e07-volatility-rehearsal-v2"
 REHEARSAL_SESSIONS = 2
 HOLD_SESSIONS = 10
 PACE = timedelta(minutes=5)
@@ -100,6 +103,7 @@ def fingerprint(root: Path) -> str:
         Path("ops/research/e07_volatility_rehearsal.py"),
         Path("ops/research/e07_volatility_rehearsal_contract.py"),
         Path("ops/research/e07_volatility_input_audit.py"),
+        Path("ops/research/e07_volatility_approval.py"),
         Path("src/e07_volatility_exits/features.py"),
         Path("src/e07_volatility_exits/__init__.py"),
         Path("ops/windows/install-volatility-rehearsal-task.ps1"),
@@ -393,10 +397,12 @@ class Rehearsal:
         source: Callable[..., CommissioningSource] = CommissioningSource,
         directory: Callable[[str], str] = get_directory,
         network_idle: Callable[[], bool] = legacy_idle,
+        approval_db: Path | None = None,
     ) -> None:
         self.root, self.now, self.ticks = safe_path(root), checked_clock(clock, ticks), ticks
         self.folder = safe_path(self.root / FOLDER)
         self.ledger = safe_path(self.root / "data/live_canary.db")
+        self.approval_db = approval_db or self.root / Settings().database_path
         self.calendar = calendar.CalendarJournal(
             safe_path(self.root / "data/research-commissioning-v2/calendar.db")
         )
@@ -413,7 +419,6 @@ class Rehearsal:
         now = self.now()
         if version.observed_at > now or not review_reference.strip():
             raise ValueError("reviewed calendar and release reference are required")
-        agent = sec_user_agent(sec_contact)
         opening = local(first_session, FEATURE_CUTOFF)
         if opening < now + timedelta(hours=2):
             raise ValueError("first pre-open cutoff must be at least two hours away")
@@ -421,7 +426,12 @@ class Rehearsal:
         for session in entry:
             _history(version, session.day)
         final = calendar.bind(version, entry[-1].day, count=HOLD_SESSIONS).sessions[-1].day
-        observed = snapshot(self.ledger, clock=self.now)
+        observed = inventory(snapshot(self.ledger, clock=self.now))
+        entries = [str(s.day) for s in entry]
+        previous = self.unused_predecessor(observed, entries, version)
+        agent = (
+            previous[0] if previous is not None and not sec_contact else sec_user_agent(sec_contact)
+        )
         self.journal = Journal.create(
             self.journal.path,
             {
@@ -431,13 +441,44 @@ class Rehearsal:
                 "sec_user_agent": agent,
                 "review_reference": review_reference,
                 "calendar_sha256": version.digest,
-                "source_inventory": inventory(observed),
-                "activated_at": timestamp(self.now()),
-                "entries": [str(s.day) for s in entry],
+                "source_inventory": observed,
+                "approval_database": approval_database(self.approval_db),
+                "supersedes": None if previous is None else previous[1],
+                "activated_at": timestamp(now),
+                "entries": entries,
                 "expiry": timestamp(local(final + timedelta(days=1), time(8))),
             },
             clock=self.now,
         )
+
+    def unused_predecessor(
+        self, current: dict[str, Any], entries: list[str], version: calendar.Version
+    ) -> tuple[str, dict[str, str]] | None:
+        path = safe_path(self.root / PRIOR_FOLDER / "evidence.db")
+        if not path.exists():
+            return None
+        before = digest(path.read_bytes())
+        records = Journal(path).records()
+        activation = records[0]
+        frozen = activation["payload"]
+        old_inventory = frozen.get("source_inventory", {})
+        if (
+            len(records) != 1
+            or frozen.get("contract") != PRIOR_CONTRACT
+            or frozen.get("entries") != entries
+            or frozen.get("calendar_sha256") != version.digest
+            or any(
+                old_inventory.get(key) != current[key]
+                for key in ("source_path", "source_device", "source_inode", "packet_id_hashes")
+            )
+            or digest(path.read_bytes()) != before
+        ):
+            raise ValueError("predecessor rehearsal was used or its frozen coverage differs")
+        return frozen["sec_user_agent"], {
+            "contract": PRIOR_CONTRACT,
+            "activation_sha256": activation["sha256"],
+            "journal_sha256": before,
+        }
 
     def load(self) -> Evidence:
         records = self.journal.records()
@@ -613,6 +654,16 @@ class Rehearsal:
                 parsed_directory = DirectoryReceipt(
                     directory, issuer_directory(directory["payload"]["raw"])
                 )
+        packet_ids = sorted(
+            {
+                item["payload"]["row"]["packet_id"]
+                for item in due
+                if isinstance(item["payload"]["row"]["packet_id"], str)
+            }
+        )
+        approvals = read_approvals(
+            self.approval_db, evidence.frozen["approval_database"], packet_ids, self.now
+        )
         for case in due:
             entity = case["entity"]
             cutoff = parse(case["payload"]["cutoff"])
@@ -627,6 +678,9 @@ class Rehearsal:
                     parsed_directory,
                     evidence.version,
                     cutoff,
+                    approval=approvals.evidence(case["payload"]["row"], cutoff)
+                    if proof is not None and parsed_directory is not None
+                    else None,
                 )
             except (
                 ValueError,
