@@ -137,7 +137,9 @@ def _auctions(
                 datetime.combine(day, time(16), NEW_YORK),
             ),
         )
-        evidence[key] = AuctionFill("5" * 64, bar.open, opened, opened + DELAY, closed, bar)
+        evidence[key] = AuctionFill(
+            "5" * 64, bar.open, opened, opened + DELAY, opened + DELAY, closed, bar
+        )
     return evidence
 
 
@@ -156,7 +158,9 @@ def test_auction_basis_and_protection_exclude_earlier_prints() -> None:
         [candidate],
         bars,
         action_coverage=_action_coverage([candidate]),
-        opening_evidence={key: AuctionFill("5" * 64, 10, fill, fill + DELAY, end, protected_bar)},
+        opening_evidence={
+            key: AuctionFill("5" * 64, 10, fill, fill + DELAY, fill + DELAY, end, protected_bar)
+        },
         session_hours=HOURS,
         protection_delay=DELAY,
         initial_cash=CASH,
@@ -166,7 +170,7 @@ def test_auction_basis_and_protection_exclude_earlier_prints() -> None:
     assert replay.scaled.sessions[0].settled_cash == D("274.45")
     assert replay.scaled.sessions[0].exits == ()
     assert replay.scaled.sessions[9].exits[0].reason == "time"
-    assert replay.scaled.net_pnl == replay.fixed.net_pnl == D("-1.10")
+    assert replay.scaled.net_pnl == replay.fixed.net_pnl == replay.matched.net_pnl == D("-1.10")
 
 
 @pytest.mark.parametrize(("first", "reason", "pnl"), [(8.8, "stop", "-24"), (11.2, "target", "24")])
@@ -185,7 +189,9 @@ def test_first_protected_print_sets_the_gap_exit(
         [candidate],
         _bars(candidate),
         action_coverage=_action_coverage([candidate]),
-        opening_evidence={key: AuctionFill("5" * 64, 10, start, start + DELAY, end, protected)},
+        opening_evidence={
+            key: AuctionFill("5" * 64, 10, start, start + DELAY, start + DELAY, end, protected)
+        },
         session_hours=HOURS,
         protection_delay=DELAY,
         initial_cash=CASH,
@@ -205,18 +211,29 @@ def test_early_close_and_protection_are_checked_against_the_session_clock() -> N
     key = (candidate.instrument, day)
     bars = _bars(candidate)
     start, end = HOURS[day]
-    evidence = AuctionFill("5" * 64, 10, start, start + DELAY, end, bars[key])
+    evidence = AuctionFill("5" * 64, 10, start, start + DELAY, start + DELAY, end, bars[key])
     early_close = end - timedelta(hours=3)
     variants = [
         (evidence, "timing"),
         (
-            replace(evidence, last_protected_trade_at=early_close, first_protected_trade_at=start),
+            replace(evidence, protected_through=early_close - timedelta(seconds=1)),
             "timing",
         ),
         (
             replace(
-                evidence, last_protected_trade_at=early_close, filled_at=start.replace(tzinfo=None)
+                evidence,
+                protected_from=start + timedelta(seconds=2),
+                first_protected_trade_at=start + timedelta(seconds=3),
+                protected_through=early_close,
             ),
+            "timing",
+        ),
+        (
+            replace(evidence, protected_through=early_close, first_protected_trade_at=start),
+            "timing",
+        ),
+        (
+            replace(evidence, protected_through=early_close, filled_at=start.replace(tzinfo=None)),
             "aware",
         ),
         (AuctionMiss("unbound"), "source digest"),
@@ -270,6 +287,32 @@ def test_holding_coverage_is_required_before_an_early_exit() -> None:
             bars,
             action_coverage=_action_coverage([candidate]),
             opening_evidence=_auctions([candidate], bars),
+            session_hours=HOURS,
+            protection_delay=DELAY,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+
+def test_old_and_new_positions_use_one_session_close_mark() -> None:
+    previous = _candidate()
+    arrival = _candidate("b", day=SESSIONS[2], instrument=previous.instrument)
+    cases = [previous, arrival]
+    bars = _bars(*cases)
+    opening = _auctions(cases, bars)
+    key = (arrival.instrument, arrival.entry_day)
+    fill = opening[key]
+    assert isinstance(fill, AuctionFill)
+    opening[key] = replace(fill, protected_bar=replace(fill.protected_bar, high=10.1, close=10.1))
+    with pytest.raises(UnavailableExecution, match="entry and holding marks disagree"):
+        compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            cases,
+            bars,
+            action_coverage=_action_coverage(cases),
+            opening_evidence=opening,
             session_hours=HOURS,
             protection_delay=DELAY,
             initial_cash=CASH,
@@ -335,6 +378,7 @@ def test_digest_binds_holding_prices_and_opening_source() -> None:
     opening[key] = replace(evidence, source_sha256="6" * 64)
     new_source = run()
     assert prior.fixed == new_source.fixed
+    assert prior.action_coverage_sha256 == new_source.action_coverage_sha256
     assert prior.execution_evidence_sha256 != new_source.execution_evidence_sha256
     holding_key = candidate.instrument, SESSIONS[1]
     bars[holding_key] = replace(bars[holding_key], volume=10)

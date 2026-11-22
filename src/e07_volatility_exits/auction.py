@@ -29,8 +29,9 @@ class AuctionFill:
     source_sha256: str
     price: float
     filled_at: datetime
+    protected_from: datetime
     first_protected_trade_at: datetime
-    last_protected_trade_at: datetime
+    protected_through: datetime
     protected_bar: DailyBar
 
 
@@ -102,11 +103,19 @@ def validate_opening_evidence(
         if isinstance(auction, AuctionMiss):
             rows.append([*row, "miss"])
             continue
-        filled, first, last = map(
+        filled, armed, first, through = map(
             _utc,
-            (auction.filled_at, auction.first_protected_trade_at, auction.last_protected_trade_at),
+            (
+                auction.filled_at,
+                auction.protected_from,
+                auction.first_protected_trade_at,
+                auction.protected_through,
+            ),
         )
-        if not start <= filled < first <= last <= end or first - filled < protection_delay:
+        if not (
+            start <= filled < armed <= first <= through == end
+            and armed - filled == protection_delay
+        ):
             raise UnavailableExecution(
                 f"invalid auction or protected-trade timing for {instrument}"
             )
@@ -129,8 +138,9 @@ def validate_opening_evidence(
                 "fill",
                 filled.isoformat(),
                 auction.price,
+                armed.isoformat(),
                 first.isoformat(),
-                last.isoformat(),
+                through.isoformat(),
                 bar.open,
                 bar.high,
                 bar.low,
@@ -138,7 +148,7 @@ def validate_opening_evidence(
                 bar.volume,
             ]
         )
-    held = [
+    held: list[list[str | int | float]] = [
         [instrument, str(session), bar.symbol, bar.open, bar.high, bar.low, bar.close, bar.volume]
         for (instrument, session), bar in sorted(holding_bars.items())
     ]

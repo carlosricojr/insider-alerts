@@ -43,9 +43,10 @@ evidence and the regular-hours clock establish the evaluation boundary.
 ## Verification and handoff
 
 Challenge the design before implementation. Test a delayed opening, an
-activation gap, explicit misses, clock and early-close violations, all-arm
-parity for coincident prices, and independent audit digests. Run the full
-local tests and review the settled revision before merge and deployment.
+activation gap across collision rules, explicit misses, clock and early-close
+violations, fixed-arm parity for coincident prices, and independent audit
+digests. Run the full local tests and review the settled revision before merge
+and deployment.
 
 A successful software gate establishes replay behavior on the supplied
 evidence. Historical results require the qualified prices and corporate

@@ -226,7 +226,13 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
         assert day.opens_at is not None and day.closes_at is not None
         entry_key = (case.instrument, case.entry_day)
         opening[entry_key] = AuctionFill(
-            "9" * 64, 10.0, day.opens_at, day.opens_at + delay, day.closes_at, bars[entry_key]
+            "9" * 64,
+            10.0,
+            day.opens_at,
+            day.opens_at + delay,
+            day.opens_at + delay,
+            day.closes_at,
+            bars[entry_key],
         )
     observed = []
     for binding in (primary, delayed):
