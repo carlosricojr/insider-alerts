@@ -23,9 +23,29 @@ class UnavailableExecution(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class EntryConvention:
+    """One execution convention for every entry and arm in a comparison."""
+
+    protection_delay: timedelta
+    closing_report_grace: timedelta
+    close_can_trigger: bool
+
+    def __post_init__(self) -> None:
+        if not (
+            isinstance(self.protection_delay, timedelta)
+            and timedelta() < self.protection_delay < timedelta(days=1)
+            and isinstance(self.closing_report_grace, timedelta)
+            and self.closing_report_grace >= timedelta()
+            and type(self.close_can_trigger) is bool
+        ):
+            raise ValueError("invalid entry execution convention")
+
+
+@dataclass(frozen=True, slots=True)
 class EntryPath:
     """Continuous protected range and independently qualified closing price."""
 
+    instrument: str
     symbol: str
     session: date
     first_low: float
@@ -33,7 +53,6 @@ class EntryPath:
     low: float
     high: float
     close: float
-    close_can_trigger: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,14 +105,10 @@ def validate_opening_evidence(
     names: Mapping[BarKey, str],
     auctions: Mapping[BarKey, Auction],
     hours: SessionHours,
-    protection_delay: timedelta,
+    convention: EntryConvention,
     holding_bars: Mapping[BarKey, DailyBar],
 ) -> str:
     """Validate projected prices; upstream custody establishes source truth."""
-    if not isinstance(
-        protection_delay, timedelta
-    ) or not timedelta() < protection_delay < timedelta(days=1):
-        raise ValueError("opening protection delay must be positive and shorter than a day")
     rows: list[list[str | float | int]] = []
     for key, symbol in sorted(names.items()):
         instrument, session = key
@@ -134,7 +149,8 @@ def validate_opening_evidence(
         if not (
             start <= filled < armed <= first < through == end <= closing
             and closing.astimezone(NEW_YORK).date() == session
-            and armed - filled == protection_delay
+            and closing - end <= convention.closing_report_grace
+            and armed - filled == convention.protection_delay
         ):
             raise UnavailableExecution(
                 f"invalid auction or protected-trade timing for {instrument}"
@@ -143,9 +159,9 @@ def validate_opening_evidence(
         if not (
             valid_price(auction.price)
             and isinstance(path, EntryPath)
+            and path.instrument == instrument
             and path.symbol == symbol
             and path.session == session
-            and type(path.close_can_trigger) is bool
             and all(
                 valid_price(p)
                 for p in (path.first_low, path.first_high, path.low, path.high, path.close)
@@ -173,14 +189,22 @@ def validate_opening_evidence(
                 path.low,
                 path.high,
                 path.close,
-                int(path.close_can_trigger),
             ]
         )
     held: list[list[str | int | float]] = [
         [instrument, str(session), bar.symbol, bar.open, bar.high, bar.low, bar.close, bar.volume]
         for (instrument, session), bar in sorted(holding_bars.items())
     ]
-    delay_us = protection_delay // timedelta(microseconds=1)
+    unit = timedelta(microseconds=1)
     return hashlib.sha256(
-        rfc8785.dumps(["e07-execution-evidence-v2", delay_us, rows, held])
+        rfc8785.dumps(
+            [
+                "e07-execution-evidence-v2",
+                convention.protection_delay // unit,
+                convention.closing_report_grace // unit,
+                convention.close_can_trigger,
+                rows,
+                held,
+            ]
+        )
     ).hexdigest()

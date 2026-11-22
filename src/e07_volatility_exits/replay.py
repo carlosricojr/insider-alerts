@@ -6,7 +6,7 @@ import hashlib
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
@@ -16,6 +16,7 @@ from e07_volatility_exits.auction import (
     Auction,
     AuctionFill,
     AuctionMiss,
+    EntryConvention,
     EntryPath,
     SessionHours,
     valid_bar,
@@ -431,7 +432,11 @@ def _require_resolved_entry_prices(
 
 
 def _exit(
-    position: _Position, prices: DailyBar | EntryPath, collision_rule: CollisionPolicy
+    position: _Position,
+    prices: DailyBar | EntryPath,
+    collision_rule: CollisionPolicy,
+    *,
+    close_can_trigger: bool,
 ) -> tuple[float, str, bool, bool] | None:
     stop, target = position.stop, position.target
     first = prices.first_low if isinstance(prices, EntryPath) else prices.open
@@ -450,11 +455,11 @@ def _exit(
         return min(stop, first), reason, collision, ambiguous
     if target_hit:
         return max(target, first), "target", False, False
-    if isinstance(prices, EntryPath) and prices.close_can_trigger:
+    if isinstance(prices, EntryPath) and close_can_trigger:
         if prices.close <= stop:
-            return prices.close, "stop", False, False
+            return prices.close, "closing_stop", False, False
         if prices.close >= target:
-            return prices.close, "target", False, False
+            return prices.close, "closing_target", False, False
     if position.completed_sessions == POLICY.max_sessions:
         return prices.close, "time", False, False
     return None
@@ -564,6 +569,8 @@ class _Book:
         session: date,
         settlement: date,
         entries: tuple[EntryDecision, ...],
+        *,
+        close_can_trigger: bool,
     ) -> SessionResult:
         exits = []
         market_value = ZERO
@@ -575,7 +582,7 @@ class _Book:
                 else bars[instrument, session]
             )
             position.completed_sessions += 1
-            outcome = _exit(position, prices, self.collision)
+            outcome = _exit(position, prices, self.collision, close_can_trigger=close_can_trigger)
             if outcome is None:
                 market_value += _notional(position.quantity, prices.close)
                 continue
@@ -620,7 +627,7 @@ def compare_exit_widths(
     action_coverage: ActionCoverage,
     opening_evidence: Mapping[BarKey, Auction],
     session_hours: SessionHours,
-    protection_delay: timedelta,
+    entry_convention: EntryConvention,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
@@ -657,7 +664,7 @@ def compare_exit_widths(
     coverage, action_digest = _bind_actions(sessions, arrivals, action_coverage, misses)
     holding = _holding_bars(sessions, arrivals, misses, bars)
     execution_digest = validate_opening_evidence(
-        names, auctions, session_hours, protection_delay, holding
+        names, auctions, session_hours, entry_convention, holding
     )
     arms: tuple[Arm, ...] = ("fixed", "scaled", "matched")
     _require_resolved_entry_prices(arrivals, auctions, arms)
@@ -669,7 +676,15 @@ def compare_exit_widths(
             book.settle(session)
             book.accrue_distributions(coverage, session)
             decisions = book.enter(entries, auctions, session)
-            path.append(book.close_and_mark(holding, session, settlements[session], decisions))
+            path.append(
+                book.close_and_mark(
+                    holding,
+                    session,
+                    settlements[session],
+                    decisions,
+                    close_can_trigger=entry_convention.close_can_trigger,
+                )
+            )
 
     if any(book.positions for book in books):
         raise ValueError("replay ended with unliquidated positions")

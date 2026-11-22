@@ -10,8 +10,19 @@ from typing import Literal, cast
 
 import pytest
 
-from e07_volatility_exits.auction import Auction, AuctionFill, AuctionMiss, EntryPath
-from e07_volatility_exits.entry_path import EntryTape, TradePrint, assemble_opening_fill
+from e07_volatility_exits.auction import (
+    Auction,
+    AuctionFill,
+    AuctionMiss,
+    EntryConvention,
+    EntryPath,
+)
+from e07_volatility_exits.entry_path import (
+    EntryTape,
+    SecondPrices,
+    TradePrint,
+    assemble_opening_fill,
+)
 from e07_volatility_exits.features import (
     BASE_WIDTH,
     FEATURE_CUTOFF,
@@ -69,6 +80,7 @@ HOURS = {
     for day in SESSIONS
 }
 DELAY = timedelta(seconds=1)
+CONVENTION = EntryConvention(DELAY, timedelta(seconds=3), False)
 
 
 def _snapshot() -> CloseSnapshot:
@@ -139,14 +151,21 @@ def _auctions(
             ),
         )
         evidence[key] = AuctionFill(
-            "5" * 64, bar.open, opened, opened + DELAY, opened + DELAY, closed, closed, _path(bar)
+            "5" * 64,
+            bar.open,
+            opened,
+            opened + DELAY,
+            opened + DELAY,
+            closed,
+            closed,
+            _path(candidate.instrument, bar),
         )
     return evidence
 
 
-def _path(bar: DailyBar) -> EntryPath:
+def _path(instrument: str, bar: DailyBar) -> EntryPath:
     return EntryPath(
-        bar.symbol, bar.trade_date, bar.open, bar.open, bar.low, bar.high, bar.close, False
+        instrument, bar.symbol, bar.trade_date, bar.open, bar.open, bar.low, bar.high, bar.close
     )
 
 
@@ -167,11 +186,18 @@ def test_auction_basis_and_protection_exclude_earlier_prints() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence={
             key: AuctionFill(
-                "5" * 64, 10, fill, fill + DELAY, fill + DELAY, end, end, _path(protected_bar)
+                "5" * 64,
+                10,
+                fill,
+                fill + DELAY,
+                fill + DELAY,
+                end,
+                end,
+                _path(candidate.instrument, protected_bar),
             )
         },
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -200,11 +226,18 @@ def test_first_protected_print_sets_the_gap_exit(
         action_coverage=_action_coverage([candidate]),
         opening_evidence={
             key: AuctionFill(
-                "5" * 64, 10, start, start + DELAY, start + DELAY, end, end, _path(protected)
+                "5" * 64,
+                10,
+                start,
+                start + DELAY,
+                start + DELAY,
+                end,
+                end,
+                _path(candidate.instrument, protected),
             )
         },
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=ReplayCosts(D("0"), D("0")),
         previous_session=HISTORY[-1],
@@ -223,32 +256,43 @@ def test_early_close_and_protection_are_checked_against_the_session_clock() -> N
     bars = _bars(candidate)
     start, end = HOURS[day]
     evidence = AuctionFill(
-        "5" * 64, 10, start, start + DELAY, start + DELAY, end, end, _path(bars[key])
+        "5" * 64,
+        10,
+        start,
+        start + DELAY,
+        start + DELAY,
+        end,
+        end,
+        _path(candidate.instrument, bars[key]),
     )
     early_close = end - timedelta(hours=3)
+    early = replace(evidence, protected_through=early_close, closing_print_at=early_close)
     variants = [
         (evidence, "timing"),
         (
-            replace(evidence, protected_through=early_close - timedelta(seconds=1)),
+            replace(early, protected_through=early_close - timedelta(seconds=1)),
             "timing",
         ),
         (
             replace(
-                evidence,
+                early,
                 protected_from=start + timedelta(seconds=2),
                 first_protected_trade_at=start + timedelta(seconds=3),
-                protected_through=early_close,
             ),
             "timing",
         ),
         (
-            replace(evidence, protected_through=early_close, first_protected_trade_at=start),
+            replace(early, first_protected_trade_at=start),
             "timing",
         ),
         (
-            replace(evidence, protected_through=early_close, filled_at=start.replace(tzinfo=None)),
+            replace(early, filled_at=start.replace(tzinfo=None)),
             "aware",
         ),
+        (replace(early, closing_print_at=early_close + timedelta(seconds=4)), "timing"),
+        (replace(early, closing_print_at=early_close - timedelta(seconds=1)), "timing"),
+        (replace(early, path=replace(early.path, instrument="other-listing")), "protected path"),
+        (replace(early, path=replace(early.path, low=100)), "protected path"),
         (AuctionMiss("unbound"), "source digest"),
     ]
     for record, expected in variants:
@@ -261,7 +305,7 @@ def test_early_close_and_protection_are_checked_against_the_session_clock() -> N
                 action_coverage=_action_coverage([candidate]),
                 opening_evidence={key: record},
                 session_hours=HOURS | {day: (start.astimezone(UTC), early_close.astimezone(UTC))},
-                protection_delay=DELAY,
+                entry_convention=CONVENTION,
                 initial_cash=CASH,
                 costs=COSTS,
                 previous_session=HISTORY[-1],
@@ -279,7 +323,7 @@ def test_unknown_auction_fails_even_without_cash_to_enter() -> None:
             action_coverage=_action_coverage([candidate]),
             opening_evidence={},
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=D("60"),
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -301,7 +345,7 @@ def test_holding_coverage_is_required_before_an_early_exit() -> None:
             action_coverage=_action_coverage([candidate]),
             opening_evidence=_auctions([candidate], bars),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -327,7 +371,7 @@ def test_old_and_new_positions_use_one_session_close_mark() -> None:
             action_coverage=_action_coverage(cases),
             opening_evidence=opening,
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -335,12 +379,18 @@ def test_old_and_new_positions_use_one_session_close_mark() -> None:
 
 
 @pytest.mark.parametrize(
-    ("can_trigger", "trade_price", "expected_exit", "expected_equity"),
-    [(False, 10, None, "435"), (True, 10, "stop", "435"), (True, 11.2, "target", "495")],
+    ("can_trigger", "trade_price", "closing_price", "expected_exit", "expected_equity"),
+    [
+        (False, 10, 8, None, "435"),
+        (True, 10, 8, "closing_stop", "435"),
+        (True, 10, 12, "closing_target", "515"),
+        (True, 11.2, 8, "target", "495"),
+    ],
 )
 def test_projected_auction_mark_is_applied_after_continuous_prices(
     can_trigger: bool,
     trade_price: float,
+    closing_price: float,
     expected_exit: str | None,
     expected_equity: str,
 ) -> None:
@@ -350,6 +400,15 @@ def test_projected_auction_mark_is_applied_after_continuous_prices(
     fill = start + timedelta(seconds=4)
     prefix_end = start + timedelta(minutes=1)
     minutes = {prefix_end + timedelta(minutes=index): None for index in range(389)}
+    seconds: dict[datetime, SecondPrices | None] = {
+        start + timedelta(seconds=index): None for index in range(60)
+    }
+    seconds[fill] = SecondPrices(8, 8, 8, 8)
+    seconds[fill + DELAY] = SecondPrices(9.95, 10, 9.95, 10)
+    seconds[fill + timedelta(seconds=2)] = SecondPrices(
+        trade_price, trade_price, trade_price, trade_price
+    )
+    convention = replace(CONVENTION, close_can_trigger=can_trigger)
     tape = EntryTape(
         "9" * 64,
         candidate.instrument,
@@ -358,21 +417,14 @@ def test_projected_auction_mark_is_applied_after_continuous_prices(
         TradePrint(fill, 10),
         start,
         prefix_end,
-        (
-            TradePrint(fill, 8),
-            TradePrint(fill + DELAY, 9.95),
-            TradePrint(fill + DELAY, 10),
-            TradePrint(fill + timedelta(seconds=2), trade_price),
-        ),
+        seconds,
         minutes,
-        TradePrint(close + timedelta(seconds=2), 8),
+        TradePrint(close + timedelta(seconds=2), closing_price),
     )
     evidence = assemble_opening_fill(
         tape,
         HOURS[day],
-        protection_delay=DELAY,
-        closing_report_grace=timedelta(seconds=3),
-        close_can_trigger=can_trigger,
+        convention=convention,
     )
     result = compare_exit_widths(
         SESSIONS,
@@ -382,7 +434,7 @@ def test_projected_auction_mark_is_applied_after_continuous_prices(
         action_coverage=_action_coverage([candidate]),
         opening_evidence={(candidate.instrument, day): evidence},
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=convention,
         initial_cash=CASH,
         costs=ReplayCosts(D("0"), D("0")),
         previous_session=HISTORY[-1],
@@ -411,7 +463,7 @@ def test_ambiguous_first_second_cannot_touch_a_barrier_even_when_entry_is_suppre
             action_coverage=_action_coverage([candidate]),
             opening_evidence=opening,
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=D("60"),
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -436,7 +488,7 @@ def test_coincident_fill_and_protection_price_preserve_fixed_stop_first(hit_sess
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=ReplayCosts(D("0"), D("0")),
         previous_session=HISTORY[-1],
@@ -456,7 +508,7 @@ def test_digest_binds_holding_prices_and_opening_source() -> None:
     evidence = opening[key]
     assert isinstance(evidence, AuctionFill)
 
-    def run() -> ExitReplay:
+    def run(convention: EntryConvention = CONVENTION) -> ExitReplay:
         return compare_exit_widths(
             SESSIONS,
             SETTLEMENTS,
@@ -465,7 +517,7 @@ def test_digest_binds_holding_prices_and_opening_source() -> None:
             action_coverage=_action_coverage([candidate]),
             opening_evidence=opening,
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=convention,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -477,6 +529,13 @@ def test_digest_binds_holding_prices_and_opening_source() -> None:
     assert prior.fixed == new_source.fixed
     assert prior.action_coverage_sha256 == new_source.action_coverage_sha256
     assert prior.execution_evidence_sha256 != new_source.execution_evidence_sha256
+    for alternate in (
+        replace(CONVENTION, close_can_trigger=True),
+        replace(CONVENTION, closing_report_grace=timedelta(seconds=4)),
+    ):
+        changed = run(alternate)
+        assert changed.fixed == new_source.fixed
+        assert changed.execution_evidence_sha256 != new_source.execution_evidence_sha256
     holding_key = candidate.instrument, SESSIONS[1]
     bars[holding_key] = replace(bars[holding_key], volume=10)
     assert new_source.execution_evidence_sha256 != run().execution_evidence_sha256
@@ -507,7 +566,7 @@ def test_distribution_follows_overnight_ownership_even_with_an_ex_date_exit() ->
         action_coverage=coverage,
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -546,7 +605,7 @@ def test_distribution_cannot_fund_an_entry_before_its_preopen_release() -> None:
         action_coverage=coverage,
         opening_evidence=_auctions(candidates, bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=D("281.75"),
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -575,7 +634,7 @@ def test_action_preflight_requires_complete_windows_independent_of_execution() -
                 [candidate], {}, frozenset({(candidate.instrument, candidate.entry_day)})
             ),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -598,7 +657,7 @@ def test_unsupported_listing_event_blocks_a_possible_position_before_fills(offse
             action_coverage=coverage,
             opening_evidence=_auctions([candidate], {}),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -614,7 +673,7 @@ def test_unsupported_listing_event_blocks_a_possible_position_before_fills(offse
             [candidate], {}, frozenset({(candidate.instrument, candidate.entry_day)})
         ),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -639,7 +698,7 @@ def test_coverage_digest_is_order_independent_and_binds_dividend_terms() -> None
             action_coverage=coverage,
             opening_evidence=_auctions([candidate], _bars(candidate)),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -670,7 +729,7 @@ def test_duplicate_cash_event_across_ex_dates_is_rejected_before_replay() -> Non
             action_coverage=coverage,
             opening_evidence=_auctions([candidate], {}),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -690,7 +749,7 @@ def test_action_preflight_rejects_unknown_event_types() -> None:
             action_coverage=coverage,
             opening_evidence=_auctions([candidate], {}),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -724,7 +783,7 @@ def test_cash_availability_requires_pay_date_and_an_open_session() -> None:
                 action_coverage=coverage,
                 opening_evidence=_auctions([candidate], {}),
                 session_hours=HOURS,
-                protection_delay=DELAY,
+                entry_convention=CONVENTION,
                 initial_cash=CASH,
                 costs=COSTS,
                 previous_session=HISTORY[-1],
@@ -835,7 +894,7 @@ def test_replay_measures_after_cost_incremental_pnl_and_settlement() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -864,7 +923,7 @@ def test_collision_stress_keeps_an_open_through_the_stop() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -877,7 +936,7 @@ def test_collision_stress_keeps_an_open_through_the_stop() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -907,7 +966,7 @@ def test_no_close_exit_releases_a_slot_for_that_mornings_auction() -> None:
         action_coverage=_action_coverage(candidates),
         opening_evidence=_auctions(candidates, bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -930,7 +989,7 @@ def test_no_auction_fill_does_not_reassign_the_slot_with_hindsight() -> None:
         action_coverage=_action_coverage(candidates),
         opening_evidence=_auctions(candidates, bars, misses),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -959,7 +1018,7 @@ def test_missing_held_bar_is_not_a_zero_return_or_a_delayed_exit() -> None:
             action_coverage=_action_coverage([candidate]),
             opening_evidence=_auctions([candidate], bars),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -978,7 +1037,7 @@ def test_replay_rejects_after_cutoff_candidate_and_missing_settlement() -> None:
             action_coverage=_action_coverage([late]),
             opening_evidence=_auctions([late], _bars(candidate)),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -993,7 +1052,7 @@ def test_replay_rejects_after_cutoff_candidate_and_missing_settlement() -> None:
             action_coverage=_action_coverage([later]),
             opening_evidence=_auctions([later], _bars(candidate)),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -1007,7 +1066,7 @@ def test_replay_rejects_after_cutoff_candidate_and_missing_settlement() -> None:
             action_coverage={},
             opening_evidence={},
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -1031,7 +1090,7 @@ def test_sale_proceeds_wait_for_the_supplied_settlement_date() -> None:
         action_coverage=_action_coverage(candidates),
         opening_evidence=_auctions(candidates, bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=D("265"),
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1055,7 +1114,7 @@ def test_collision_stress_exercises_a_genuinely_ambiguous_bar() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1080,7 +1139,7 @@ def test_unsupported_gap_raises_instead_of_guessing_a_broker_rejection() -> None
             action_coverage=_action_coverage([candidate]),
             opening_evidence=_auctions([candidate], bars),
             session_hours=HOURS,
-            protection_delay=DELAY,
+            entry_convention=CONVENTION,
             initial_cash=D("265"),
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -1100,7 +1159,7 @@ def test_opening_execution_can_use_the_cushion_or_exceed_the_reserve() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=D("265"),
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1126,7 +1185,7 @@ def test_replay_rejects_a_stale_bootstrap_signal_or_unbound_width() -> None:
                 action_coverage=_action_coverage([invalid]),
                 opening_evidence=_auctions([invalid], _bars(candidate)),
                 session_hours=HOURS,
-                protection_delay=DELAY,
+                entry_convention=CONVENTION,
                 initial_cash=CASH,
                 costs=COSTS,
                 previous_session=HISTORY[-1],
@@ -1179,7 +1238,7 @@ def test_primary_obeys_frozen_stop_first_when_a_target_gap_reverses() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1192,7 +1251,7 @@ def test_primary_obeys_frozen_stop_first_when_a_target_gap_reverses() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1218,7 +1277,7 @@ def test_matched_arm_uses_its_own_width_and_opens_no_extra_positions() -> None:
         action_coverage=_action_coverage([candidate]),
         opening_evidence=_auctions([candidate], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1247,7 +1306,7 @@ def test_earlier_scaled_exit_changes_later_capacity_and_net_pnl() -> None:
         action_coverage=_action_coverage([first, second, third]),
         opening_evidence=_auctions([first, second, third], bars),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -1269,7 +1328,7 @@ def test_replay_mirrors_overlap_and_commission_suppression() -> None:
         action_coverage=_action_coverage([first, duplicate]),
         opening_evidence=_auctions([first, duplicate], {}),
         session_hours=HOURS,
-        protection_delay=DELAY,
+        entry_convention=CONVENTION,
         initial_cash=CASH,
         costs=one_way_cap,
         previous_session=HISTORY[-1],
@@ -1291,7 +1350,7 @@ def test_incomplete_horizon_and_duplicate_packet_are_rejected() -> None:
                 action_coverage=_action_coverage(candidates),
                 opening_evidence=_auctions(candidates, {}),
                 session_hours=HOURS,
-                protection_delay=DELAY,
+                entry_convention=CONVENTION,
                 initial_cash=CASH,
                 costs=COSTS,
                 previous_session=HISTORY[-1],

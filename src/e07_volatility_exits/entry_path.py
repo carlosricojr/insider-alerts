@@ -7,23 +7,41 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import TypeVar
 
 import rfc8785
 
-from e07_volatility_exits.auction import AuctionFill, EntryPath, UnavailableExecution, valid_price
+from e07_volatility_exits.auction import (
+    AuctionFill,
+    EntryConvention,
+    EntryPath,
+    UnavailableExecution,
+    valid_price,
+)
 from insider_alerts.backtest.signal_study import MinuteBar
 from insider_alerts.strategy.e07 import NEW_YORK
 
 SECOND = timedelta(seconds=1)
 MINUTE = timedelta(minutes=1)
+Observation = TypeVar("Observation")
 
 
 @dataclass(frozen=True, slots=True)
 class TradePrint:
-    """An eligible price timestamped at the start of its source second."""
+    """A qualified auction print at the start of its source second."""
 
     at: datetime
     price: float
+
+
+@dataclass(frozen=True, slots=True)
+class SecondPrices:
+    """Eligible extrema and the feasible first-price range in a source second."""
+
+    first_low: float
+    first_high: float
+    low: float
+    high: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,8 +49,8 @@ class EntryTape:
     """Normalized observations bound to a verified source manifest.
 
     The manifest attests the listing, source clocks, eligible conditions,
-    full auction fill and prefix pagination. Each None attests a no-trade
-    minute. Normalize source exclusions and corrections before projection.
+    full auction fill and source coverage. Each None attests a no-trade
+    interval. Normalize source exclusions and corrections before projection.
     """
 
     manifest_sha256: str
@@ -42,13 +60,13 @@ class EntryTape:
     opening: TradePrint
     prefix_start: datetime
     prefix_end: datetime
-    prefix: tuple[TradePrint, ...]
+    seconds: Mapping[datetime, SecondPrices | None]
     minutes: Mapping[datetime, MinuteBar | None]
     closing: TradePrint
 
 
 def _whole_second(clock: datetime) -> datetime:
-    if clock.utcoffset() is None or clock.microsecond:
+    if not isinstance(clock, datetime) or clock.utcoffset() is None or clock.microsecond:
         raise UnavailableExecution("entry tape requires aware whole-second source timestamps")
     return clock.astimezone(UTC)
 
@@ -59,18 +77,27 @@ def _print(trade: TradePrint) -> tuple[datetime, float]:
     return _whole_second(trade.at), trade.price
 
 
+def _grid(
+    observations: Mapping[datetime, Observation],
+    start: datetime,
+    end: datetime,
+    width: timedelta,
+    label: str,
+) -> list[tuple[datetime, Observation]]:
+    rows = sorted(
+        ((_whole_second(clock), row) for clock, row in observations.items()),
+        key=lambda item: item[0],
+    )
+    count = (end - start) // width
+    if len(rows) != count or any(at != start + index * width for index, (at, _) in enumerate(rows)):
+        raise UnavailableExecution(f"entry tape does not cover the complete {label} grid")
+    return rows
+
+
 def _minute_grid(
     tape: EntryTape, start: datetime, end: datetime
 ) -> list[tuple[datetime, MinuteBar | None]]:
-    minutes = sorted(
-        ((_whole_second(clock), bar) for clock, bar in tape.minutes.items()),
-        key=lambda item: item[0],
-    )
-    count = (end - start) // MINUTE
-    if len(minutes) != count or any(
-        at != start + index * MINUTE for index, (at, _) in enumerate(minutes)
-    ):
-        raise UnavailableExecution("entry tape does not cover the complete minute grid")
+    minutes = _grid(tape.minutes, start, end, MINUTE, "minute")
     for at, bar in minutes:
         if bar is not None and not (
             bar.symbol == tape.symbol
@@ -86,19 +113,16 @@ def assemble_opening_fill(
     tape: EntryTape,
     hours: tuple[datetime, datetime],
     *,
-    protection_delay: timedelta,
-    closing_report_grace: timedelta,
-    close_can_trigger: bool,
+    convention: EntryConvention,
 ) -> AuctionFill:
     """Combine qualified prices under caller-supplied execution conventions."""
-    if not timedelta() < protection_delay < timedelta(days=1) or closing_report_grace < timedelta():
-        raise ValueError("entry tape has an invalid delay or closing report window")
-    if type(close_can_trigger) is not bool:
-        raise ValueError("entry tape requires an explicit closing eligibility rule")
-    if (
-        not tape.instrument
-        or not tape.symbol
-        or not re.fullmatch(r"[0-9a-f]{64}", tape.manifest_sha256)
+    if not (
+        isinstance(tape.instrument, str)
+        and tape.instrument
+        and isinstance(tape.symbol, str)
+        and tape.symbol
+        and isinstance(tape.manifest_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", tape.manifest_sha256)
     ):
         raise UnavailableExecution("entry tape lacks a qualified listing or source manifest")
 
@@ -106,42 +130,54 @@ def assemble_opening_fill(
     filled_at, open_price = _print(tape.opening)
     closing_at, closing_price = _print(tape.closing)
     prefix_start, prefix_end = map(_whole_second, (tape.prefix_start, tape.prefix_end))
-    armed = filled_at + protection_delay
+    armed = filled_at + convention.protection_delay
     if not (
         opened <= filled_at < closed
         and opened <= prefix_start <= armed < prefix_end <= closed
         and not (opened.second or prefix_end.second or closed.second)
         and closed <= closing_at
-        and closing_at - closed <= closing_report_grace
+        and closing_at - closed <= convention.closing_report_grace
         and all(
             at.astimezone(NEW_YORK).date() == tape.session for at in (opened, closed, closing_at)
         )
     ):
         raise UnavailableExecution("entry tape has an invalid session or auction clock")
 
-    trades = sorted(map(_print, tape.prefix))
-    if any(not prefix_start <= at < prefix_end for at, _ in trades):
-        raise UnavailableExecution("entry tape has a print outside its prefix window")
-    if any(at < armed < at + SECOND for at, _ in trades):
+    seconds = _grid(tape.seconds, prefix_start, prefix_end, SECOND, "second")
+    populated = [(at, row) for at, row in seconds if row is not None]
+    if any(
+        not (
+            all(valid_price(p) for p in (row.low, row.first_low, row.first_high, row.high))
+            and row.low <= row.first_low <= row.first_high <= row.high
+        )
+        for _, row in populated
+    ):
+        raise UnavailableExecution("entry tape has an invalid second observation")
+    if any(at < armed < at + SECOND for at, _ in populated):
         raise UnavailableExecution("entry tape has a trade bucket straddling protection activation")
-    protected = [(at, price) for at, price in trades if at >= armed]
+    protected = [(at, row) for at, row in populated if at >= armed]
     if not protected:
         raise UnavailableExecution("entry tape is missing the first protected trade")
 
     minutes = _minute_grid(tape, prefix_end, closed)
-    first_at = protected[0][0]
-    first_prices = [price for at, price in protected if at == first_at]
-    tick_prices = [price for _, price in protected]
+    first_at, first = protected[0]
+    minute_bars = [bar for _, bar in minutes if bar is not None]
     path = EntryPath(
+        tape.instrument,
         tape.symbol,
         tape.session,
-        min(first_prices),
-        max(first_prices),
-        min([*tick_prices, *(bar.low for _, bar in minutes if bar is not None)]),
-        max([*tick_prices, *(bar.high for _, bar in minutes if bar is not None)]),
+        first.first_low,
+        first.first_high,
+        min([*(row.low for _, row in protected), *(bar.low for bar in minute_bars)]),
+        max([*(row.high for _, row in protected), *(bar.high for bar in minute_bars)]),
         closing_price,
-        close_can_trigger,
     )
+    second_rows: list[list[str | float | None]] = [
+        [at.isoformat(), None]
+        if row is None
+        else [at.isoformat(), row.first_low, row.first_high, row.low, row.high]
+        for at, row in seconds
+    ]
     minute_rows: list[list[str | float | None]] = [
         [at.isoformat(), None]
         if bar is None
@@ -150,7 +186,7 @@ def assemble_opening_fill(
     ]
     material = rfc8785.dumps(
         [
-            "e07-qualified-entry-tape-v1",
+            "e07-qualified-entry-tape-v2",
             tape.manifest_sha256,
             tape.instrument,
             tape.symbol,
@@ -161,13 +197,11 @@ def assemble_opening_fill(
             open_price,
             prefix_start.isoformat(),
             prefix_end.isoformat(),
-            [[at.isoformat(), price] for at, price in trades],
+            second_rows,
             minute_rows,
             closing_at.isoformat(),
             closing_price,
-            protection_delay // timedelta(microseconds=1),
-            closing_report_grace // timedelta(microseconds=1),
-            close_can_trigger,
+            armed.isoformat(),
         ]
     )
     return AuctionFill(

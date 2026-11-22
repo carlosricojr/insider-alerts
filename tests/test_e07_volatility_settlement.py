@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from e07_volatility_exits.auction import Auction, AuctionFill, EntryPath
+from e07_volatility_exits.auction import Auction, AuctionFill, EntryConvention, EntryPath
 from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF, ExitWidths
 from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts
 from insider_alerts.backtest.models import DailyBar
@@ -110,7 +110,7 @@ def test_missing_session_previous_session_and_coverage_fail_closed(
             {},
             action_coverage={},
             opening_evidence={},
-            protection_delay=timedelta(seconds=1),
+            entry_convention=EntryConvention(timedelta(seconds=1), timedelta(), False),
             initial_cash=Decimal("475"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=date(2026, 11, 9),
@@ -235,7 +235,14 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
             day.closes_at,
             day.closes_at,
             EntryPath(
-                case.symbol, case.entry_day, bar.open, bar.open, bar.low, bar.high, bar.close, False
+                case.instrument,
+                case.symbol,
+                case.entry_day,
+                bar.open,
+                bar.open,
+                bar.low,
+                bar.high,
+                bar.close,
             ),
         )
     observed = []
@@ -249,7 +256,7 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
                 (candidate.instrument, day): () for candidate in candidates for day in sessions
             },
             opening_evidence=opening,
-            protection_delay=delay,
+            entry_convention=EntryConvention(delay, timedelta(), False),
             initial_cash=Decimal("265"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=previous,
