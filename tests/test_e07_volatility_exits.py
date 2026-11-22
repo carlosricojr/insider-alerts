@@ -35,6 +35,7 @@ from e07_volatility_exits.features import (
     decide_widths,
     estimate_volatility,
 )
+from e07_volatility_exits.placebo import match_widths_within_session
 from e07_volatility_exits.replay import (
     COMMISSION_CAP,
     COMMISSION_RATE_CAP,
@@ -1369,3 +1370,40 @@ def test_invalid_price_basis_clock_and_cost_proxies_are_rejected() -> None:
     for flat, bps in (("NaN", "10"), ("0.76", "10"), ("0.35", "-1"), ("0.35", "10000")):
         with pytest.raises(ValueError, match="invalid replay costs"):
             ReplayCosts(D(flat), D(bps))
+
+
+def test_same_session_placebo_only_changes_the_matched_replay_book() -> None:
+    original = [_candidate("a", width=0.05), _candidate("b", instrument="102", width=0.15)]
+    day = SESSIONS[0]
+    bars = _bars(*original)
+    for case in original:
+        key = (case.instrument, day)
+        bars[key] = replace(bars[key], high=10.70)
+
+    ready = {case.packet_id: case.widths for case in original}
+    same_session = match_widths_within_session(DECISION, ready, qualified_packets=ready.keys())
+
+    def run(cases: Sequence[ReplayCandidate]) -> ExitReplay:
+        return compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            cases,
+            bars,
+            action_coverage=_action_coverage(cases),
+            opening_evidence=_auctions(cases, bars),
+            session_hours=HOURS,
+            entry_convention=CONVENTION,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+    baseline = run(original)
+    alternative = run([replace(case, widths=same_session[case.packet_id]) for case in original])
+    assert alternative.fixed == baseline.fixed
+    assert alternative.scaled == baseline.scaled
+    assert alternative.execution_evidence_sha256 == baseline.execution_evidence_sha256
+    assert baseline.matched.sessions[0].exits == ()
+    assert tuple(exit.packet_id for exit in alternative.matched.sessions[0].exits) == tuple(
+        packet for packet, widths in same_session.items() if widths.matched == 0.05
+    )
