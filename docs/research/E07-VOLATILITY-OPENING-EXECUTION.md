@@ -15,16 +15,24 @@ active. This research kernel runs offline.
 - Every candidate entry needs an immutable evidence reference before replay,
   including candidates that later compete for the two cash slots.
 - Qualify the fills and eligible price interval against the frozen exchange
-  calendar. Take the first executable price from the protected interval.
+  calendar. One explicit positive delay, frozen before outcomes, defines
+  the start of protection for all entries and arms. Take the first
+  executable price in that interval and attest coverage through the close.
   If the source cannot separate prices around activation, or the stop and
   target have materially different activation times, reject that path until
   its execution convention is decided and registered.
-- Preserve time exits, the primary stop-first convention and the
-  target-first sensitivity. A continuing position uses its qualified
-  holding-session bar. Entries cannot reuse capacity freed after submission.
-- Record the entry evidence digest with the corporate-action and settlement
-  evidence. The data adapter will preserve raw prices, latency provenance,
-  source identity, and qualified coverage for every potential holding session.
+- A known first executable print through a barrier on the entry day
+  determines the gap exit in both sensitivity paths. Preserve the
+  primary stop-first rule and target-first sensitivity for ambiguous entry
+  intervals and the existing rules for the full holding-session bars.
+  Keep the tenth-session time exit and reserve slots at submission.
+- Record the digest of consumed opening records, effective clocks, delay
+  and holding prices alongside corporate-action and settlement evidence.
+  Require the complete potential holding window before simulating any
+  book. The source adapter supplies eligible trade conditions, immutable
+  record references and complete price coverage. Delayed reopen gaps,
+  exchange close basis, tick rounding and the measured broker protection
+  convention require separate calibration before a prospective trial.
 
 SMART market-on-open routing is designed around the primary listing venue.
 The NYSE opening process can extend beyond 09:30 ET. Venue-specific auction

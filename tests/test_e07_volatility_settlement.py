@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from e07_volatility_exits.auction import Auction, AuctionFill
 from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF, ExitWidths
 from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts
 from insider_alerts.backtest.models import DailyBar
@@ -108,6 +109,8 @@ def test_missing_session_previous_session_and_coverage_fail_closed(
             (),
             {},
             action_coverage={},
+            opening_evidence={},
+            protection_delay=timedelta(seconds=1),
             initial_cash=Decimal("475"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=date(2026, 11, 9),
@@ -216,6 +219,15 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
     }
     key = (candidates[0].instrument, sessions[0])
     bars[key] = replace(bars[key], high=11.0)
+    delay = timedelta(seconds=1)
+    opening: dict[tuple[str, date], Auction] = {}
+    for case in candidates:
+        day = version.day(case.entry_day)
+        assert day.opens_at is not None and day.closes_at is not None
+        entry_key = (case.instrument, case.entry_day)
+        opening[entry_key] = AuctionFill(
+            "9" * 64, 10.0, day.opens_at, day.opens_at + delay, day.closes_at, bars[entry_key]
+        )
     observed = []
     for binding in (primary, delayed):
         result_with_binding = compare_with_settlement(
@@ -226,6 +238,8 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
             action_coverage={
                 (candidate.instrument, day): () for candidate in candidates for day in sessions
             },
+            opening_evidence=opening,
+            protection_delay=delay,
             initial_cash=Decimal("265"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=previous,
