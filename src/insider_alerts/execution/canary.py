@@ -6,7 +6,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.backtest.signal_study import DeliveredSignal, load_delivered_signals
-from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT
+from insider_alerts.execution.calendar import ENTRY_HORIZON_LIMIT, PROJECTION_MANAGEMENT_ONLY
 from insider_alerts.execution.errors import ContractQualificationError, IbkrExecutionError
 from insider_alerts.strategy.e07 import (
     deterministic_rank,
@@ -592,22 +592,32 @@ class CanaryRunner:
                     CycleResult(), sessions, datetime.now(UTC) if wall_clock_mode else now,
                     enforce_wall_clock=wall_clock_mode,
                 )
-            self.store.set_metadata({"cycle_phase": "auxiliary"}, now=datetime.now(UTC))
-            result = await self._run_auxiliary(activation, sessions, now)
-            if managed is None:
-                final_result = CycleResult(**{
-                    **asdict(result), "live_gate": "shadow_only_not_armed",
-                })
-            else:
-                result = CycleResult(**{
-                    **asdict(result), "live_opened": managed.result.live_opened,
-                    "live_closed": managed.result.live_closed,
-                })
-                self.store.set_metadata({"cycle_phase": "entry_validation"}, now=datetime.now(UTC))
-                final_result = await self._submit_live_entries(
-                    result, managed, sessions, datetime.now(UTC) if wall_clock_mode else now,
-                    enforce_wall_clock=wall_clock_mode,
+            if (
+                managed is not None
+                and isinstance(schedule_evidence, dict)
+                and schedule_evidence.get("entry_basis") == PROJECTION_MANAGEMENT_ONLY
+            ):
+                final_result = replace(
+                    managed.result,
+                    live_gate=f"{PROJECTION_MANAGEMENT_ONLY};time_exits={managed.timed_exits}",
                 )
+            else:
+                self.store.set_metadata({"cycle_phase": "auxiliary"}, now=datetime.now(UTC))
+                result = await self._run_auxiliary(activation, sessions, now)
+                if managed is None:
+                    final_result = replace(result, live_gate="shadow_only_not_armed")
+                else:
+                    result = replace(
+                        result, live_opened=managed.result.live_opened,
+                        live_closed=managed.result.live_closed,
+                    )
+                    self.store.set_metadata(
+                        {"cycle_phase": "entry_validation"}, now=datetime.now(UTC),
+                    )
+                    final_result = await self._submit_live_entries(
+                        result, managed, sessions, datetime.now(UTC) if wall_clock_mode else now,
+                        enforce_wall_clock=wall_clock_mode,
+                    )
             success_time = datetime.now(UTC)
             self.store.set_metadata(
                 {
