@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -16,6 +16,7 @@ from insider_alerts.research import calendar_v2
 from ops.research.e07_volatility_settlement import (
     DTC_SCHEDULE_SHA256,
     NSCC_VETERANS_DAY_SHA256,
+    SOURCE_STATUS,
     bind_settlement,
     compare_with_settlement,
 )
@@ -24,9 +25,11 @@ SOURCE_DIR = Path(__file__).resolve().parents[1] / "docs/research/calendar-sourc
 
 
 @pytest.fixture
-def version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> calendar_v2.Version:
+def calendar_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> calendar_v2.CalendarJournal:
     observed = datetime(2026, 10, 26, 20, tzinfo=UTC)
-    monkeypatch.setattr(calendar_v2, "_now", lambda: observed)
+    monkeypatch.setattr(calendar_v2, "_now", lambda: observed + timedelta(days=40))
     journal = tmp_path / "exchange.db"
     calendar_v2.create_journal(
         journal,
@@ -34,7 +37,12 @@ def version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> calendar_v2.Vers
         review_reference="test-fixture",
         observed_at=observed,
     )
-    return calendar_v2.CalendarJournal(journal).versions()[0]
+    return calendar_v2.CalendarJournal(journal)
+
+
+@pytest.fixture
+def version(calendar_journal: calendar_v2.CalendarJournal) -> calendar_v2.Version:
+    return calendar_journal.versions()[0]
 
 
 def test_archived_notices_are_bound_to_the_projection() -> None:
@@ -45,6 +53,7 @@ def test_archived_notices_are_bound_to_the_projection() -> None:
     path = SOURCE_DIR / "e07-cash-settlement-2026.provenance.json"
     provenance = json.loads(path.read_bytes())
     assert provenance["historical_possession_claimed"] is False
+    assert provenance["schedule_status"] == SOURCE_STATUS
     assert {source["artifact"]: source["sha256"] for source in provenance["sources"]} == expected
     for source in provenance["sources"]:
         raw = (SOURCE_DIR / source["artifact"]).read_bytes()
@@ -73,6 +82,8 @@ def test_regular_way_clearing_dates(
     )
     assert binding.settlement_dates == binding.cash_release_dates == {trade_day: settlement}
     assert binding.exchange_version == version.digest
+    assert binding.previous_session == prev
+    assert binding.source_status == "anticipated_annual_schedule_operational_notices_unverified"
     assert binding == bind_settlement(
         version, (trade_day,), previous_session=prev, release="settlement_date"
     )
@@ -135,6 +146,32 @@ def test_missing_session_previous_session_and_coverage_fail_closed(
             (date(2026, 12, 30),),
             previous_session=date(2026, 12, 29),
             release="next_exchange_open_after_settlement",
+        )
+
+
+@pytest.mark.parametrize("state", ["closed", "unknown"])
+def test_requires_clearing_evidence_for_later_exchange_exception(
+    calendar_journal: calendar_v2.CalendarJournal, state: calendar_v2.NoticeKind
+) -> None:
+    version = calendar_journal.versions()[0]
+    cutoff = datetime(2026, 11, 10, 22, tzinfo=UTC)
+    notice = calendar_v2.Notice(
+        state,
+        (date(2026, 11, 12),),
+        "synthetic exchange notice",
+        b"synthetic test fixture",
+        "https://www.nyse.com/synthetic-test",
+        cutoff.date(),
+        "test-fixture",
+    )
+    calendar_journal.append_notice(notice, expected_parent=version.digest, observed_at=cutoff)
+    corrected = calendar_journal.versions()[-1]
+    with pytest.raises(ValueError, match="settlement on 2026-11-12 requires separate"):
+        bind_settlement(
+            corrected,
+            (date(2026, 11, 10),),
+            previous_session=date(2026, 11, 9),
+            release="settlement_date",
         )
 
 

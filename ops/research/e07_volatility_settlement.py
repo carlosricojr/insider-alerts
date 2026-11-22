@@ -35,6 +35,7 @@ NON_SETTLEMENT_WEEKDAYS = (
     date(2026, 12, 25),
 )
 ONE_DAY = timedelta(days=1)
+SOURCE_STATUS = "anticipated_annual_schedule_operational_notices_unverified"
 CashRelease = Literal["settlement_date", "next_exchange_open_after_settlement"]
 
 
@@ -44,6 +45,8 @@ class SettlementBinding:
 
     digest: str
     exchange_version: str
+    previous_session: date
+    source_status: str
     release: CashRelease
     settlement_dates: Mapping[date, date] = field(hash=False)
     cash_release_dates: Mapping[date, date] = field(hash=False)
@@ -110,6 +113,11 @@ def bind_settlement(
         raise ValueError("replay requires consecutive exchange sessions and the previous session")
 
     settlements = {day: _next_settlement(day) for day in sessions}
+    # In this reviewed window, every regular settlement day is also a scheduled
+    # exchange session. An exception needs its own clearing evidence.
+    for due in sorted(set(settlements.values())):
+        if version.day(due).state != "open":
+            raise ValueError(f"settlement on {due} requires separate clearing evidence")
     cash_releases = (
         {trade: _next_exchange_open(version, due) for trade, due in settlements.items()}
         if release == "next_exchange_open_after_settlement"
@@ -119,6 +127,7 @@ def bind_settlement(
         "contract": "e07-published-regular-way-us-equity-t1-v1",
         "source_sha256": [DTC_SCHEDULE_SHA256, NSCC_VETERANS_DAY_SHA256],
         "exchange_version": version.digest,
+        "source_status": SOURCE_STATUS,
         "previous_session": str(previous_session),
         "covered_from": str(COVERED_FROM),
         "covered_through": str(COVERED_THROUGH),
@@ -129,6 +138,8 @@ def bind_settlement(
     return SettlementBinding(
         hashlib.sha256(rfc8785.dumps(material)).hexdigest(),
         version.digest,
+        previous_session,
+        SOURCE_STATUS,
         release,
         MappingProxyType(settlements),
         MappingProxyType(cash_releases),

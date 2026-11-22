@@ -3,7 +3,7 @@
   "covering_through": "2026-12-31",
   "historical_possession_claimed": false,
   "observation_clock_source": "local file read completion",
-  "schedule_status": "anticipated_holiday_schedule_projection",
+  "schedule_status": "anticipated_annual_schedule_operational_notices_unverified",
   "sources": [
     {
       "artifact": "dtc-settlement-holidays-2026.pdf",
