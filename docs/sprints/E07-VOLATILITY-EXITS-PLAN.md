@@ -74,8 +74,9 @@ the subset with an open strictly between them. Portfolio selection reserves cash
 before observing the auction. Fees and adverse slippage are charged separately
 from the modeled execution price. An auction that would consume more than the
 available settled cash needs independent broker or venue evidence and otherwise
-makes the replay unavailable. Use a reviewed securities settlement calendar
-rather than assume that every trading date settles.
+makes the replay unavailable. Bind the
+[reviewed securities settlement schedule](E07-VOLATILITY-SETTLEMENT-PLAN.md)
+and the cash-release sensitivity before replay.
 
 The replay consumes already-qualified candidate and price records. Adapter
 verification must bind the as-of candidate roster and rank, the actual close used
