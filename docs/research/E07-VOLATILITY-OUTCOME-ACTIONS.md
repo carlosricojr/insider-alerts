@@ -15,12 +15,16 @@ relevant actions. The provider adapter must bind the issuer and share class,
 complete its event pagination, resolve revisions, and preserve source, event,
 observation and effective timestamps. Feed failures, gaps, identity ambiguity
 and unresolved conflicts cannot supply a covered empty entry.
+Require coverage for every potential holding window before the first fill,
+including candidates that may be suppressed in one or more books. Preserve the
+replay's coverage digest alongside the provenance of the upstream records.
 
 Include an ordinary cash distribution only when the qualified record verifies
 its cash entitlement per share in USD under the study's frozen fee and
-withholding treatment, the exchange ex-date, and the first date the cash is
-available to a pre-open decision. Qualify the latter from broker evidence or a
-preregistered release convention. Ex-date precedes spendable availability.
+withholding treatment, the exchange ex-date, payment date and the first
+session the cash is available to a pre-open decision. Qualify availability
+from broker evidence or a preregistered release convention. Availability
+must follow the ex-date and fall on or after the payment date.
 Forbid duplicate cash event identities for a listing across the replay.
 
 Positions carried into the confirmed ex-date earn the distribution before
@@ -34,7 +38,8 @@ trade cash. Keep the as-traded trigger prices and order levels.
 Reorganizations, splits, delistings, discontinuities, due bills, or
 distributions that can cancel the broker protection need separately qualified
 execution mechanics. Identify them on the sessions where they can invalidate
-sizing or execution. IBKR leaves ordinary GTC levels unchanged and generally
+sizing or execution. Qualify the separate volatility lookback's close basis
+across share-changing events. IBKR leaves ordinary GTC levels unchanged and generally
 cancels GTC orders when a distribution exceeds 3% of the prior close or when
 shares are split, exchanged or distributed. The data adapter must establish
 that protection stays in force before classifying an event as ordinary.

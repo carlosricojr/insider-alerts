@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -27,9 +28,14 @@ from e07_volatility_exits.replay import (
     POLICY,
     RESERVE,
     SLOT_COUNT,
+    Action,
+    BarKey,
+    ExitReplay,
+    OrdinaryCashDistribution,
     ReplayCandidate,
     ReplayCosts,
     UnavailableExecution,
+    UnsupportedAction,
     compare_exit_widths,
 )
 from insider_alerts.backtest.models import DailyBar
@@ -90,6 +96,216 @@ def _bars(*candidates: ReplayCandidate) -> dict[tuple[str, date], DailyBar]:
         for day in SESSIONS
         if day >= candidate.entry_day
     }
+
+
+def _action_coverage(candidates: Sequence[ReplayCandidate]) -> dict[BarKey, tuple[Action, ...]]:
+    return {
+        (candidate.instrument, day): ()
+        for candidate in candidates
+        for day in SESSIONS
+        if day >= candidate.entry_day
+    }
+
+
+def test_distribution_follows_overnight_ownership_even_with_an_ex_date_exit() -> None:
+    candidate = _candidate()
+    bars = _bars(candidate)
+    open_day, ex_day = SESSIONS[:2]
+    bars[candidate.instrument, open_day] = DailyBar(
+        candidate.symbol, open_day, 10, 10.6, 9.9, 10, 100_000
+    )
+    bars[candidate.instrument, ex_day] = DailyBar(candidate.symbol, ex_day, 9, 9.1, 8.9, 9, 100_000)
+    coverage = _action_coverage([candidate])
+    payment = SESSIONS[-1] + timedelta(days=5)
+    coverage[candidate.instrument, open_day] = (
+        OrdinaryCashDistribution("entry-ex", D("0.10"), payment, payment),
+    )
+    coverage[candidate.instrument, ex_day] = (
+        OrdinaryCashDistribution("held-ex", D("0.12675"), payment, payment),
+    )
+
+    replay = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        action_coverage=coverage,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+
+    assert replay.scaled.sessions[0].exits[0].cash_distributions == D("0")
+    assert replay.fixed.sessions[0].distribution_receivable == D("0")
+    exit_on_ex = replay.fixed.sessions[1].exits[0]
+    assert exit_on_ex.reason == "stop"
+    assert exit_on_ex.cash_distributions == D("2.54")
+    assert replay.fixed.sessions[-1].distribution_receivable == D("2.54")
+    assert replay.fixed.sessions[-1].unsettled_cash == D("2.54")
+    assert replay.scaled.sessions[-1].distribution_receivable == D("0")
+    assert replay.fixed.net_pnl == exit_on_ex.net_pnl == D("-18.54")
+    assert replay.fixed == replay.matched
+
+
+def test_distribution_cannot_fund_an_entry_before_its_preopen_release() -> None:
+    first = _candidate(width=BASE_WIDTH)
+    before_release = _candidate("b", day=SESSIONS[2], instrument="102")
+    after_release = _candidate("c", day=SESSIONS[3], instrument="103")
+    candidates = [first, before_release, after_release]
+    bars = _bars(*candidates)
+    ex_day = SESSIONS[1]
+    bars[first.instrument, ex_day] = DailyBar(first.symbol, ex_day, 9, 9, 9, 9, 100_000)
+    coverage = _action_coverage(candidates)
+    coverage[first.instrument, ex_day] = (
+        OrdinaryCashDistribution("quarterly", D("0.10"), SESSIONS[2], SESSIONS[3]),
+    )
+
+    fixed = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        candidates,
+        bars,
+        action_coverage=coverage,
+        initial_cash=D("281.75"),
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    ).fixed
+
+    assert fixed.sessions[2].entries[0].state == "cash_suppressed"
+    assert fixed.sessions[2].settled_cash == D("260.67")
+    assert fixed.sessions[2].distribution_receivable == D("2")
+    assert fixed.sessions[3].entries[0].state == "opened"
+    assert fixed.sessions[3].distribution_receivable == D("0")
+    assert fixed.net_pnl == sum(exit.net_pnl for day in fixed.sessions for exit in day.exits)
+
+
+def test_action_preflight_requires_complete_windows_independent_of_execution() -> None:
+    candidate = _candidate()
+    coverage = _action_coverage([candidate])
+    del coverage[candidate.instrument, SESSIONS[9]]
+    with pytest.raises(UnavailableExecution, match="missing corporate-action coverage"):
+        compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            {},
+            action_coverage=coverage,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+            confirmed_auction_misses=frozenset({(candidate.instrument, candidate.entry_day)}),
+        )
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_unsupported_listing_event_blocks_a_fill_or_open_position(offset: int) -> None:
+    candidate = _candidate()
+    coverage = _action_coverage([candidate])
+    coverage[candidate.instrument, SESSIONS[offset]] = (
+        UnsupportedAction("split", "share basis changed"),
+    )
+    with pytest.raises(UnavailableExecution, match="unsupported corporate action.*split"):
+        compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            _bars(candidate),
+            action_coverage=coverage,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+    replay = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        {},
+        action_coverage=coverage,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+        confirmed_auction_misses=frozenset({(candidate.instrument, candidate.entry_day)}),
+    )
+    assert replay.fixed.net_pnl == D("0")
+
+
+def test_coverage_digest_is_order_independent_and_binds_dividend_terms() -> None:
+    candidate = _candidate()
+    coverage = _action_coverage([candidate])
+    key = candidate.instrument, SESSIONS[1]
+    first = OrdinaryCashDistribution("first", D("0.10"), SESSIONS[4], SESSIONS[5])
+    second = replace(first, event_id="second", cash_per_share=D("0.01"))
+    coverage[key] = (first, second)
+
+    def result() -> ExitReplay:
+        return compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            _bars(candidate),
+            action_coverage=coverage,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+    original = result()
+    coverage[key] = (second, first)
+    assert original == result()
+    assert original.fixed.sessions[1].distribution_receivable == D("2.20")
+    coverage[key] = (second, replace(first, cash_available_on=SESSIONS[6]))
+    assert original.action_coverage_sha256 != result().action_coverage_sha256
+
+
+def test_duplicate_cash_event_across_ex_dates_is_rejected_before_replay() -> None:
+    candidate = _candidate()
+    coverage = _action_coverage([candidate])
+    event = OrdinaryCashDistribution("id", D("0.10"), SESSIONS[3], SESSIONS[4])
+    coverage[candidate.instrument, SESSIONS[1]] = (event,)
+    coverage[candidate.instrument, SESSIONS[2]] = (event,)
+    with pytest.raises(ValueError, match="duplicate distribution event"):
+        compare_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            {},
+            action_coverage=coverage,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+
+def test_cash_availability_requires_pay_date_and_an_open_session() -> None:
+    with pytest.raises(ValueError, match="invalid ordinary cash distribution"):
+        OrdinaryCashDistribution("id", D("0.10"), SESSIONS[2], SESSIONS[1])
+    candidate = _candidate()
+    coverage = _action_coverage([candidate])
+    closed_day = SESSIONS[1] + timedelta(days=1)
+    assert closed_day not in SESSIONS
+    for event, reason in (
+        (
+            OrdinaryCashDistribution("id", D("0.10"), SESSIONS[0], SESSIONS[0]),
+            "invalid distribution timing",
+        ),
+        (
+            OrdinaryCashDistribution("id", D("0.10"), SESSIONS[1], closed_day),
+            "requires an exchange session",
+        ),
+    ):
+        coverage[candidate.instrument, SESSIONS[0]] = (event,)
+        with pytest.raises(ValueError, match=reason):
+            compare_exit_widths(
+                SESSIONS,
+                SETTLEMENTS,
+                [candidate],
+                {},
+                action_coverage=coverage,
+                initial_cash=CASH,
+                costs=COSTS,
+                previous_session=HISTORY[-1],
+            )
 
 
 def test_volatility_uses_twenty_adjacent_log_returns_from_one_vintage() -> None:
@@ -193,6 +409,7 @@ def test_replay_measures_after_cost_incremental_pnl_and_settlement() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -218,6 +435,7 @@ def test_collision_stress_keeps_an_open_through_the_stop() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -227,6 +445,7 @@ def test_collision_stress_keeps_an_open_through_the_stop() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -253,6 +472,7 @@ def test_no_close_exit_releases_a_slot_for_that_mornings_auction() -> None:
         SETTLEMENTS,
         candidates,
         bars,
+        action_coverage=_action_coverage(candidates),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -272,6 +492,7 @@ def test_no_auction_fill_does_not_reassign_the_slot_with_hindsight() -> None:
         SETTLEMENTS,
         candidates,
         bars,
+        action_coverage=_action_coverage(candidates),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -298,6 +519,7 @@ def test_missing_held_bar_is_not_a_zero_return_or_a_delayed_exit() -> None:
             SETTLEMENTS,
             [candidate],
             bars,
+            action_coverage=_action_coverage([candidate]),
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -313,6 +535,7 @@ def test_replay_rejects_after_cutoff_candidate_and_missing_settlement() -> None:
             SETTLEMENTS,
             [late],
             _bars(candidate),
+            action_coverage=_action_coverage([late]),
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -324,13 +547,21 @@ def test_replay_rejects_after_cutoff_candidate_and_missing_settlement() -> None:
             SETTLEMENTS,
             [later],
             _bars(candidate),
+            action_coverage=_action_coverage([later]),
             initial_cash=CASH,
             costs=COSTS,
             previous_session=HISTORY[-1],
         )
     with pytest.raises(ValueError, match="invalid replay calendar"):
         compare_exit_widths(
-            SESSIONS, {}, [], {}, initial_cash=CASH, costs=COSTS, previous_session=HISTORY[-1]
+            SESSIONS,
+            {},
+            [],
+            {},
+            action_coverage={},
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
         )
 
 
@@ -348,6 +579,7 @@ def test_sale_proceeds_wait_for_the_supplied_settlement_date() -> None:
         settlements,
         candidates,
         bars,
+        action_coverage=_action_coverage(candidates),
         initial_cash=D("265"),
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -368,6 +600,7 @@ def test_collision_stress_exercises_a_genuinely_ambiguous_bar() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -389,6 +622,7 @@ def test_unsupported_gap_raises_instead_of_guessing_a_broker_rejection() -> None
             SETTLEMENTS,
             [candidate],
             bars,
+            action_coverage=_action_coverage([candidate]),
             initial_cash=D("265"),
             costs=COSTS,
             previous_session=HISTORY[-1],
@@ -405,6 +639,7 @@ def test_opening_execution_can_use_the_cushion_or_exceed_the_reserve() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=D("265"),
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -427,6 +662,7 @@ def test_replay_rejects_a_stale_bootstrap_signal_or_unbound_width() -> None:
                 SETTLEMENTS,
                 [invalid],
                 _bars(candidate),
+                action_coverage=_action_coverage([invalid]),
                 initial_cash=CASH,
                 costs=COSTS,
                 previous_session=HISTORY[-1],
@@ -476,6 +712,7 @@ def test_primary_obeys_frozen_stop_first_when_a_target_gap_reverses() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -485,6 +722,7 @@ def test_primary_obeys_frozen_stop_first_when_a_target_gap_reverses() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -507,6 +745,7 @@ def test_matched_arm_uses_its_own_width_and_opens_no_extra_positions() -> None:
         SETTLEMENTS,
         [candidate],
         bars,
+        action_coverage=_action_coverage([candidate]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -532,6 +771,7 @@ def test_earlier_scaled_exit_changes_later_capacity_and_net_pnl() -> None:
         SETTLEMENTS,
         [first, second, third],
         bars,
+        action_coverage=_action_coverage([first, second, third]),
         initial_cash=CASH,
         costs=COSTS,
         previous_session=HISTORY[-1],
@@ -550,6 +790,7 @@ def test_replay_mirrors_overlap_and_commission_suppression() -> None:
         SETTLEMENTS,
         [first, duplicate],
         {},
+        action_coverage=_action_coverage([first, duplicate]),
         initial_cash=CASH,
         costs=one_way_cap,
         previous_session=HISTORY[-1],
@@ -568,6 +809,7 @@ def test_incomplete_horizon_and_duplicate_packet_are_rejected() -> None:
                 SETTLEMENTS,
                 candidates,
                 {},
+                action_coverage=_action_coverage(candidates),
                 initial_cash=CASH,
                 costs=COSTS,
                 previous_session=HISTORY[-1],
