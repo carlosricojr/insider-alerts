@@ -21,6 +21,12 @@ from insider_alerts.strategy.e07 import NEW_YORK
 SESSION_PLACEBO = "E07-VOL-EXITS-SESSION-PLACEBO-V1"
 
 
+class ConflictingListingWidths(ValueError):
+    """Only the same-session placebo is unavailable for this session."""
+
+    reason = "conflicting_listing_widths"
+
+
 def match_widths_within_session(
     cutoff: datetime,
     widths_by_packet: Mapping[str, ExitWidths],
@@ -58,7 +64,7 @@ def match_widths_within_session(
                 raise ValueError("a qualified placebo packet requires a usable forecast")
             prior = widths_by_listing.setdefault(widths.instrument, widths.scaled)
             if prior != widths.scaled:
-                raise ValueError("conflicting scaled widths for the same listing")
+                raise ConflictingListingWidths("conflicting scaled widths for the same listing")
 
     day = local_cutoff.date().isoformat()
 

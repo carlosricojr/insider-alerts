@@ -1382,6 +1382,7 @@ def test_same_session_placebo_only_changes_the_matched_replay_book() -> None:
 
     ready = {case.packet_id: case.widths for case in original}
     same_session = match_widths_within_session(DECISION, ready, qualified_packets=ready.keys())
+    assert (same_session["a"].matched, same_session["b"].matched) == (0.15, 0.05)
 
     def run(cases: Sequence[ReplayCandidate]) -> ExitReplay:
         return compare_exit_widths(
@@ -1403,7 +1404,7 @@ def test_same_session_placebo_only_changes_the_matched_replay_book() -> None:
     assert alternative.fixed == baseline.fixed
     assert alternative.scaled == baseline.scaled
     assert alternative.execution_evidence_sha256 == baseline.execution_evidence_sha256
+    assert alternative.action_coverage_sha256 == baseline.action_coverage_sha256
     assert baseline.matched.sessions[0].exits == ()
-    assert tuple(exit.packet_id for exit in alternative.matched.sessions[0].exits) == tuple(
-        packet for packet, widths in same_session.items() if widths.matched == 0.05
-    )
+    assert tuple(exit.packet_id for exit in baseline.scaled.sessions[0].exits) == ("a",)
+    assert tuple(exit.packet_id for exit in alternative.matched.sessions[0].exits) == ("b",)

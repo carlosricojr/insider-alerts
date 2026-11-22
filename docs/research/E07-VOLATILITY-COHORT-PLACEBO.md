@@ -15,8 +15,8 @@ in the scaled arm and 11.82% in the training-distribution placebo.
 The content-addressed engineering receipt
 `6bf820d86dcd56a17cfbe9688c71b5694d94cb5dc82fb8c493b0766b1614d422`
 binds the two periods and the frozen pre-open input archive. The sample
-contains nine entry sessions, at most 18 possible fills per arm, and no
-evaluated outcomes.
+contains nine entry sessions and at most 18 openings per arm. The five later
+sessions allow at most ten openings. The archive check uses pre-open inputs.
 
 ## Contract
 
@@ -40,23 +40,23 @@ Use the existing equal-cash replay entry point. Run the same-session control
 as a separate named comparison from any training-distribution control.
 Keep the original candidate roster, fixed widths and scaled widths across
 the two runs and verify the fixed and scaled books agree. Conflicting ready
-widths on a listing make this placebo unavailable. Record that reason and
-retain the original comparison intact.
+widths on a listing raise `ConflictingListingWidths`. The future runner
+records that placebo-only reason and retains the original comparison.
 
-Record the method, cutoff receipt, count of reassigned listings, assignments
+The future runner records the method, cutoff receipt, reassigned-listing count,
+assignments
 among names actually opened and the mean width of those positions in each arm.
 Matching the widths among eligible listings allows realized fills to differ.
 This is a descriptive placebo and a single deterministic draw supplies no
 confirmatory p-value. The primary comparison remains scaled versus fixed
-10% exits. Freeze the diagnostic method before enrollment.
-[Conditional randomization and exchangeability](https://academic.oup.com/jrsssb/article/80/3/551/7048447)
+10% exits. [Conditional randomization and exchangeability](https://academic.oup.com/jrsssb/article/80/3/551/7048447)
 
 The outcome-blind implementation check preserved the exact listing width
 multiset on all five later sessions and changed 31 of 38 ready listing-day
 assignments. Nine of the ten hypothetical top-ranked positions would receive
 a different width if both slots opened on every date. That count ignores
 carried positions, cash and execution. The private intake manifest at
-`23817fd39866ea08d0a56207b94bc2673f2945a5d2a6ef8156aa956cf126db93` binds the implementation and assignment digest.
+`0b41839674df203e9c8226bf26c2bbb18163200875d404650a7e3874cd038f66` binds the implementation and assignment digest.
 
 ## Verification and handoff
 

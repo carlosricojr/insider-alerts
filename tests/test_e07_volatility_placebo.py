@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from e07_volatility_exits.features import BASE_WIDTH, ExitWidths
-from e07_volatility_exits.placebo import match_widths_within_session
+from e07_volatility_exits.placebo import ConflictingListingWidths, match_widths_within_session
 from insider_alerts.strategy.e07 import NEW_YORK
 
 CUTOFF = datetime(2026, 11, 23, 9, 18, tzinfo=NEW_YORK)
@@ -48,18 +48,19 @@ def test_repeated_listings_take_one_width_and_cases_outside_the_receipt_are_unto
     sealed = frozenset(cases)
     expected = match_widths_within_session(CUTOFF, cases, qualified_packets=sealed)
     cases["duplicate"] = cases["11"]
-    cases["late"] = ExitWidths("ibkr:11", CUTOFF, BASE_WIDTH, 0.20, "late_snapshot")
-    cases["outside"] = ExitWidths("ibkr:44", CUTOFF, 0.055, 0.20, None)
+    cases["late_snapshot"] = ExitWidths("ibkr:11", CUTOFF, BASE_WIDTH, 0.20, "late_snapshot")
+    cases["outside"] = ExitWidths("ibkr:11", CUTOFF, 0.055, 0.20, None)
 
     result = match_widths_within_session(CUTOFF, cases, qualified_packets=sealed | {"duplicate"})
     assert all(result[packet] == row for packet, row in expected.items())
     assert result["duplicate"] == result["11"]
-    assert result["late"].matched == BASE_WIDTH
+    assert result["late_snapshot"].matched == BASE_WIDTH
     assert result["outside"].matched == cases["outside"].scaled
 
     cases["duplicate"] = replace(cases["11"], scaled=0.19)
-    with pytest.raises(ValueError, match="conflicting"):
+    with pytest.raises(ConflictingListingWidths) as error:
         match_widths_within_session(CUTOFF, cases, qualified_packets=sealed | {"duplicate"})
+    assert error.value.reason == "conflicting_listing_widths"
 
 
 @pytest.mark.parametrize(
@@ -103,6 +104,11 @@ def test_rejects_mixed_cohorts_and_membership_without_point_in_time_widths() -> 
             CUTOFF, {"11": replace(fallback, scaled=0.20)}, qualified_packets=set()
         )
 
-    for wrong_cutoff in (CUTOFF.replace(tzinfo=None), CUTOFF + timedelta(minutes=1)):
+    winter_offset_during_summer = datetime(2026, 7, 1, 9, 18, tzinfo=timezone(timedelta(hours=-5)))
+    for wrong_cutoff in (
+        CUTOFF.replace(tzinfo=None),
+        CUTOFF + timedelta(minutes=1),
+        winter_offset_during_summer,
+    ):
         with pytest.raises(ValueError, match="aware 09:18"):
             match_widths_within_session(wrong_cutoff, {}, qualified_packets=set())
