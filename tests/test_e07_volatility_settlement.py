@@ -10,13 +10,13 @@ import pytest
 
 from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF, ExitWidths
 from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts, compare_exit_widths
-from e07_volatility_exits.settlement import (
+from insider_alerts.backtest.models import DailyBar
+from insider_alerts.research import calendar_v2
+from ops.research.e07_volatility_settlement import (
     DTC_SCHEDULE_SHA256,
     NSCC_VETERANS_DAY_SHA256,
     bind_settlement,
 )
-from insider_alerts.backtest.models import DailyBar
-from insider_alerts.research import calendar_v2
 
 SOURCE_DIR = Path(__file__).resolve().parents[1] / "docs/research/calendar-sources"
 

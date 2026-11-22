@@ -4,7 +4,8 @@ Bind the volatility-exit replay books to a reviewed U.S. equity settlement
 schedule. The historical candidate archive spans Veterans Day, when stocks
 traded and settlement paused. The rehearsal window spans Thanksgiving.
 
-Use the validated exchange calendar for session continuity and the separate
+The adapter lives under ops/research, outside the packaged runtime. Use the
+validated exchange calendar for session continuity and the separate
 DTC regular-way schedule for settlement. Fail closed beyond the published
 October through December 2026 coverage, including the last possible sale and
 the extra session required by the sensitivity. Bind both input schedules,
