@@ -20,6 +20,11 @@ from insider_alerts.research.commissioning_receipts import inspect_receipt
 from insider_alerts.research.commissioning_window import parse, validate_manifest
 
 CONTRACT = "e07-volatility-commissioning-input-audit-v1"
+FINALIZATION_BUFFER = timedelta(minutes=1)
+
+
+class CalendarCoverageError(ValueError):
+    """An admitted case's prior sessions cannot be established."""
 
 
 def _history(version: Version, entry: date) -> tuple[set[str], datetime]:
@@ -31,12 +36,12 @@ def _history(version: Version, entry: date) -> tuple[set[str], datetime]:
         day -= timedelta(days=1)
         session = version.day(day)
         if session.state == "unknown":
-            raise ValueError("unknown calendar during forecast lookback")
+            raise CalendarCoverageError("unknown calendar during forecast lookback")
         if session.state == "open":
             if session.closes_at is None:
-                raise ValueError("missing close for an open calendar session")
+                raise CalendarCoverageError("missing close for an open calendar session")
             if finalization is None:
-                finalization = session.closes_at + timedelta(minutes=1)
+                finalization = session.closes_at + FINALIZATION_BUFFER
             dates.add(day.isoformat())
 
     if finalization is None:
@@ -46,10 +51,10 @@ def _history(version: Version, entry: date) -> tuple[set[str], datetime]:
 
 def _group_archive(
     records: Sequence[dict[str, Any]], version: Version
-) -> tuple[dict[str, dict[str, Any]], dict[str, list[tuple[datetime, dict[str, Any]]]]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[tuple[datetime, str, dict[str, Any]]]]]:
     cases: dict[str, dict[str, Any]] = {}
     attempts: dict[str, dict[str, Any]] = {}
-    receipts: dict[str, list[tuple[datetime, dict[str, Any]]]] = defaultdict(list)
+    receipts: dict[str, list[tuple[datetime, str, dict[str, Any]]]] = defaultdict(list)
     for record in records:
         if record["kind"] == "custody":
             cases.setdefault("case:" + record["entity"], record)
@@ -66,7 +71,9 @@ def _group_archive(
                 proof = inspect_receipt(attempt, record, version)
                 recorded_at = parse(record["recorded_at"])
                 for job in case_jobs:
-                    receipts[job.removesuffix("/R1")].append((recorded_at, proof))
+                    receipts[job.removesuffix("/R1")].append(
+                        (recorded_at, attempt["payload"]["symbol"], proof)
+                    )
 
     return cases, receipts
 
@@ -95,24 +102,37 @@ def audit_archive(records: Sequence[dict[str, Any]], versions: Sequence[Version]
         if not admission["symbol_valid"]:
             admitted_results["invalid_symbol"] += 1
             continue
-        expected, finalization = _history(version, entry)
+        try:
+            expected, finalization = _history(version, entry)
+        except CalendarCoverageError:
+            admitted_results["unavailable_calendar"] += 1
+            continue
+
         cutoff = datetime.combine(entry, FEATURE_CUTOFF, NY)
         available = receipts.get(key, ())
-        complete = next(
-            (
-                (recorded, proof)
-                for recorded, proof in available
-                if (
-                    proof["usable"]
-                    and expected.issubset(proof["bars"])
-                    and finalization <= parse(proof["response_at"])
-                )
-            ),
-            None,
-        )
+        case_symbol = case["payload"]["row"]["symbol"]
+        complete = None
+        missing = "no_response"
+        for recorded, symbol, proof in available:
+            if symbol != case_symbol:
+                missing = "case_symbol_mismatch"
+                continue
+            if not proof["usable"]:
+                missing = "unusable_receipt"
+                continue
+            if not expected.issubset(proof["bars"]):
+                missing = "incomplete_prior_sessions"
+                continue
+            received = parse(proof["response_at"])
+            if not finalization <= received <= recorded:
+                missing = "receipt_clock_outside_finalization"
+                continue
+            complete = recorded
+            break
+
         if complete is None:
-            result = "no_usable_complete_response" if available else "no_response"
-        elif complete[0] >= cutoff:
+            result = missing
+        elif complete >= cutoff:
             result = "first_complete_response_recorded_after_cutoff"
         elif parse(case["recorded_at"]) >= cutoff:
             result = "timely_response_case_recorded_after_cutoff"
@@ -123,6 +143,12 @@ def audit_archive(records: Sequence[dict[str, Any]], versions: Sequence[Version]
     body = {
         "contract": CONTRACT,
         "status": "descriptive_only",
+        "coverage_rule": {
+            "required_sessions": LOOKBACK_CLOSES,
+            "feature_cutoff_ny": FEATURE_CUTOFF.isoformat(),
+            "seconds_after_close": int(FINALIZATION_BUFFER.total_seconds()),
+            "journal_selection": "first_complete_matching_case_receipt",
+        },
         "scientific_reuse": "prohibited",
         "activation_sha256": records[0]["sha256"],
         "watermark_sequence": records[-1]["sequence"],

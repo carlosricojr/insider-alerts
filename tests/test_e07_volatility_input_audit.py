@@ -6,9 +6,9 @@ from datetime import date
 import pytest
 import rfc8785
 
-from e07_volatility_exits.audit_commissioning import _history, audit_archive
 from insider_alerts.research.commissioning_journal import Journal
 from insider_alerts.research.commissioning_window import parse
+from ops.research.e07_volatility_input_audit import _history, audit_archive
 from tests.test_commissioning_planner import add_candidate, evidence, job_request, respond
 from tests.test_commissioning_window import CREATED, VERSION, frozen
 
@@ -18,7 +18,7 @@ def test_archive_qualification_is_blinded_complete_and_read_only(tmp_path):
     path = tmp_path / "archived.db"
     journal = Journal.create(path, frozen(), clock=lambda: clock[0])
     clock[0] = parse("2026-10-27T11:30:00Z")
-    for index, symbol in enumerate(("GOOD", "LATE", "PART", "NONE")):
+    for index, symbol in enumerate(("GOOD", "LATE", "PART", "NONE", "WRONG", "BAD", "RETRY")):
         add_candidate(journal, clock, str(index), symbol, signal="2026-10-27T11:00:00Z")
     _, jobs, _ = evidence(journal, clock)
     initial = {
@@ -33,6 +33,25 @@ def test_archive_qualification_is_blinded_complete_and_read_only(tmp_path):
     request = job_request(initial["PART"], clock)
     respond(journal, clock, request | complete | {"required_dates": sorted(expected)[1:]})
 
+    respond(journal, clock, job_request(initial["WRONG"], clock) | complete | {"symbol": "OTHER"})
+    respond(journal, clock, job_request(initial["BAD"], clock) | complete, failure="timeout")
+    request = job_request(initial["RETRY"], clock)
+    respond(journal, clock, request | complete | {"required_dates": sorted(expected)[1:]})
+    # A retry is allowed, and older extra dates do not supply missing prior sessions.
+    older = date.fromisoformat(min(expected))
+    while VERSION.day(older).state != "open" or older.isoformat() in expected:
+        older = date.fromordinal(older.toordinal() - 1)
+    respond(
+        journal,
+        clock,
+        request
+        | complete
+        | {
+            "required_dates": [older.isoformat(), *sorted(expected)],
+            "start_date": older.isoformat(),
+        },
+    )
+
     clock[0] = parse("2026-10-27T22:00:00Z")
     respond(journal, clock, job_request(initial["LATE"], clock) | complete)
 
@@ -46,12 +65,14 @@ def test_archive_qualification_is_blinded_complete_and_read_only(tmp_path):
     result = audit_archive(records, [VERSION])
     assert result["status"] == "descriptive_only"
     assert result["scientific_reuse"] == "prohibited"
-    assert result["membership_counts"] == {"admitted": 4}
+    assert result["membership_counts"] == {"admitted": 7}
     assert result["admitted_receipt_counts"] == {
-        "response_and_case_recorded_before_cutoff": 1,
+        "response_and_case_recorded_before_cutoff": 2,
         "first_complete_response_recorded_after_cutoff": 1,
-        "no_usable_complete_response": 1,
+        "incomplete_prior_sessions": 1,
         "no_response": 1,
+        "unusable_receipt": 1,
+        "case_symbol_mismatch": 1,
     }
     assert result["watermark_sha256"] == records[-1]["sha256"]
     sha = result.pop("audit_sha256")

@@ -7,9 +7,11 @@ Read and verify the archived journal and the calendar version named by its
 activation. For every first admitted case, require a single R1 response covering
 the exact 21 prior exchange sessions, with source validation, an aware clock,
 and a finalization and journal-record timestamp before 09:18 New York. Report
-receipt coverage, recording timing and issuer-link coverage separately. The
+receipt coverage and recording timing. The archived contract does not verify
+historical issuer identity. The
 coverage command emits no prices, forecasts or outcomes. The complete archive
-chain is checked for integrity. Only R1 payloads enter qualification.
+chain is checked for integrity. Only receipts bound to a matching case's R1 job enter qualification. Provider
+bars outside the required prior sessions contribute no coverage.
 
 The coverage receipt binds the source journal watermark, frozen calendar digest
 and filter version. It never creates a research decision, qualifies retrospective
@@ -21,3 +23,9 @@ continuity and the relevant securities settlement calendar.
 Verification uses synthetic custody cases for missing, late, invalid, duplicate,
 and correctly qualified receipts, plus a read-only run against the archived
 data. Pass the full repository gates and a settled-head review before merging.
+
+
+Run the offline audit from the editable checkout with
+`uv run python -m ops.research.e07_volatility_input_audit --journal <path> --calendar <path>`.
+It lives outside production source so the frozen calendar dependency boundary
+continues to apply to runtime modules.
