@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Literal
 
 import rfc8785
 
+from e07_volatility_exits.auction import Auction
 from e07_volatility_exits.replay import (
     ActionCoverage,
     BarKey,
@@ -154,26 +155,35 @@ def compare_with_settlement(
     bars: Mapping[BarKey, DailyBar],
     *,
     action_coverage: ActionCoverage,
+    opening_evidence: Mapping[BarKey, Auction],
+    protection_delay: timedelta,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
     release: CashRelease,
-    confirmed_auction_misses: frozenset[BarKey] = frozenset(),
     collision: CollisionPolicy = "stop_first",
 ) -> SettlementReplay:
     """Use one verified session sequence for both the binding and the replay."""
     sessions = tuple(sessions)
     binding = bind_settlement(version, sessions, previous_session=previous_session, release=release)
+    hours: dict[date, tuple[datetime, datetime]] = {}
+    for day in sessions:
+        session = version.day(day)
+        if session.opens_at is None or session.closes_at is None:
+            raise ValueError(f"missing exchange hours on {day}")
+        hours[day] = (session.opens_at, session.closes_at)
     replay = compare_exit_widths(
         sessions,
         binding.cash_release_dates,
         candidates,
         bars,
         action_coverage=action_coverage,
+        opening_evidence=opening_evidence,
+        session_hours=hours,
+        protection_delay=protection_delay,
         initial_cash=initial_cash,
         costs=costs,
         previous_session=previous_session,
-        confirmed_auction_misses=confirmed_auction_misses,
         collision=collision,
     )
     return SettlementReplay(binding, replay)

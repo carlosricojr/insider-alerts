@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
-from datetime import date, datetime, time
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
 import rfc8785
 
+from e07_volatility_exits.auction import (
+    Auction,
+    AuctionFill,
+    AuctionMiss,
+    SessionHours,
+    valid_bar,
+    validate_opening_evidence,
+)
+from e07_volatility_exits.auction import BarKey as BarKey
+from e07_volatility_exits.auction import UnavailableExecution as UnavailableExecution
 from e07_volatility_exits.features import (
     BASE_WIDTH,
     FEATURE_CUTOFF,
@@ -25,7 +34,6 @@ from insider_alerts.strategy import e07
 
 Arm = Literal["fixed", "scaled", "matched"]
 CollisionPolicy = Literal["stop_first", "target_first"]
-BarKey = tuple[str, date]
 CENT = Decimal("0.01")
 ZERO = Decimal("0")
 RESERVE = Decimal("50")
@@ -51,10 +59,6 @@ class ReplayPolicy:
 
 
 POLICY = ReplayPolicy()
-
-
-class UnavailableExecution(ValueError):
-    """An admitted or held name lacks a usable outcome observation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +183,7 @@ class ExitReplay:
     scaled: PortfolioResult
     matched: PortfolioResult
     action_coverage_sha256: str
+    execution_evidence_sha256: str
 
     @property
     def paired_daily_pnl(self) -> tuple[Decimal, ...]:
@@ -203,8 +208,10 @@ class _Position:
     candidate: ReplayCandidate
     quantity: int
     entry_debit: Decimal
-    policy: ReplayPolicy
-    bars: list[DailyBar] = field(default_factory=list)
+    stop: float
+    target: float
+    protected_bar: DailyBar
+    completed_sessions: int = 0
     cash_distributions: Decimal = ZERO
 
 
@@ -220,16 +227,7 @@ def _notional(quantity: int, price: float) -> Decimal:
 
 def _bar(bars: Mapping[BarKey, DailyBar], candidate: ReplayCandidate, session: date) -> DailyBar:
     bar = bars.get((candidate.instrument, session))
-    if (
-        bar is None
-        or bar.trade_date != session
-        or bar.symbol != candidate.symbol
-        or any(
-            not math.isfinite(value) or value <= 0
-            for value in (bar.open, bar.high, bar.low, bar.close, bar.volume)
-        )
-        or not bar.low <= min(bar.open, bar.close) <= max(bar.open, bar.close) <= bar.high
-    ):
+    if bar is None or not valid_bar(bar, candidate.symbol, session):
         raise UnavailableExecution(
             f"missing or invalid execution bar for {candidate.packet_id} on {session}"
         )
@@ -277,6 +275,47 @@ def _ranked_entries(
     for session, entries in groups.items():
         entries.sort(key=lambda row: (e07.deterministic_rank(POLICY, row, session), row.packet_id))
     return groups
+
+
+def _select_auctions(
+    arrivals: Mapping[date, list[ReplayCandidate]], evidence: Mapping[BarKey, Auction]
+) -> tuple[dict[BarKey, str], dict[BarKey, Auction], frozenset[BarKey]]:
+    names: dict[BarKey, str] = {}
+    auctions: dict[BarKey, Auction] = {}
+    for day, candidates in arrivals.items():
+        for candidate in candidates:
+            key = (candidate.instrument, day)
+            if names.setdefault(key, candidate.symbol) != candidate.symbol:
+                raise UnavailableExecution("conflicting symbols for one opening execution key")
+            observation = evidence.get(key)
+            if not isinstance(observation, (AuctionFill, AuctionMiss)):
+                raise UnavailableExecution(
+                    f"missing or invalid opening evidence for {candidate.packet_id} on {day}"
+                )
+            auctions[key] = observation
+    return (
+        names,
+        auctions,
+        frozenset(
+            key for key, observation in auctions.items() if isinstance(observation, AuctionMiss)
+        ),
+    )
+
+
+def _holding_bars(
+    sessions: Sequence[date],
+    arrivals: Mapping[date, list[ReplayCandidate]],
+    misses: frozenset[BarKey],
+    bars: Mapping[BarKey, DailyBar],
+) -> dict[BarKey, DailyBar]:
+    covered = {}
+    for index, entry in enumerate(sessions):
+        for candidate in arrivals.get(entry, []):
+            if (candidate.instrument, entry) in misses:
+                continue
+            for held in sessions[index + 1 : index + POLICY.max_sessions]:
+                covered[candidate.instrument, held] = _bar(bars, candidate, held)
+    return covered
 
 
 def _width(candidate: ReplayCandidate, arm: Arm) -> float:
@@ -365,6 +404,30 @@ def _bind_actions(
     return bound, digest
 
 
+def _exit(
+    position: _Position, bar: DailyBar, collision_rule: CollisionPolicy
+) -> tuple[float, str, bool, bool] | None:
+    stop, target = position.stop, position.target
+    stop_hit, target_hit = bar.low <= stop, bar.high >= target
+    collision = stop_hit and target_hit
+    ambiguous = collision and stop < bar.open < target
+    if position.completed_sessions == 1:
+        if bar.open <= stop:
+            return bar.open, "stop", collision, False
+        if bar.open >= target:
+            return bar.open, "target", collision, False
+    if collision and collision_rule == "target_first" and bar.open > stop:
+        return max(target, bar.open), "stop_and_target_same_day_target_assumed", True, ambiguous
+    if stop_hit:
+        reason = "stop_and_target_same_day_stop_assumed" if collision else "stop"
+        return min(stop, bar.open), reason, collision, ambiguous
+    if target_hit:
+        return max(target, bar.open), "target", False, False
+    if position.completed_sessions == POLICY.max_sessions:
+        return bar.close, "time", False, False
+    return None
+
+
 @dataclass(slots=True)
 class _Book:
     cash: Decimal
@@ -430,20 +493,19 @@ class _Book:
     def enter(
         self,
         candidates: Sequence[ReplayCandidate],
-        bars: Mapping[BarKey, DailyBar],
-        confirmed_auction_misses: frozenset[BarKey],
+        auctions: Mapping[BarKey, Auction],
         session: date,
     ) -> tuple[EntryDecision, ...]:
         commitments, decisions = self._commit(candidates)
         for commitment in commitments:
             candidate = commitment.candidate
             packet = candidate.packet_id
-            if (candidate.instrument, session) in confirmed_auction_misses:
+            auction = auctions[candidate.instrument, session]
+            if isinstance(auction, AuctionMiss):
                 decisions[packet] = EntryDecision(packet, "no_auction_fill")
                 continue
 
-            entry = _bar(bars, candidate, session)
-            notional = _notional(commitment.quantity, entry.open)
+            notional = _notional(commitment.quantity, auction.price)
             debit = notional + self.costs.friction(notional)
             if debit > self.cash:
                 raise UnavailableExecution(
@@ -451,9 +513,13 @@ class _Book:
                 )
 
             width = _width(candidate, self.arm)
-            policy = replace(POLICY, stop_loss_pct=width, take_profit_pct=width)
             self.positions[candidate.instrument] = _Position(
-                candidate, commitment.quantity, debit, policy
+                candidate,
+                commitment.quantity,
+                debit,
+                auction.price * (1.0 - width),
+                auction.price * (1.0 + width),
+                auction.protected_bar,
             )
             self.cash -= debit
             decisions[packet] = EntryDecision(packet, "opened")
@@ -471,27 +537,18 @@ class _Book:
         market_value = ZERO
         for instrument, position in tuple(self.positions.items()):
             candidate = position.candidate
-            bar = _bar(bars, candidate, session)
-            position.bars.append(bar)
-            outcome = e07.evaluate_shadow(position.policy, position.bars, candidate.entry_day)
-            if outcome.exit_price is None or outcome.exit_reason is None:
+            bar = (
+                position.protected_bar
+                if position.completed_sessions == 0
+                else bars[instrument, session]
+            )
+            position.completed_sessions += 1
+            outcome = _exit(position, bar, self.collision)
+            if outcome is None:
                 market_value += _notional(position.quantity, bar.close)
                 continue
 
-            reason = outcome.exit_reason
-            price = outcome.exit_price
-            collision = reason == "stop_and_target_same_day_stop_assumed"
-            ambiguous = False
-            if collision:
-                stop, target = outcome.stop_price, outcome.target_price
-                if stop is None or target is None:
-                    raise ValueError("collision without both barriers")
-                ambiguous = stop < bar.open < target
-                # At or through the stop, the auction reaches that barrier first.
-                if self.collision == "target_first" and bar.open > stop:
-                    price = max(target, bar.open)
-                    reason = "stop_and_target_same_day_target_assumed"
-
+            price, reason, collision, ambiguous = outcome
             gross_sale = _notional(position.quantity, price)
             proceeds = gross_sale - self.costs.friction(gross_sale)
             self.receivables[settlement] = self.receivables.get(settlement, ZERO) + proceeds
@@ -529,13 +586,15 @@ def compare_exit_widths(
     bars: Mapping[BarKey, DailyBar],
     *,
     action_coverage: ActionCoverage,
+    opening_evidence: Mapping[BarKey, Auction],
+    session_hours: SessionHours,
+    protection_delay: timedelta,
     initial_cash: Decimal,
     costs: ReplayCosts,
     previous_session: date,
-    confirmed_auction_misses: frozenset[BarKey] = frozenset(),
     collision: CollisionPolicy = "stop_first",
 ) -> ExitReplay:
-    """Replay three books with the same arrivals, costs, and opening fill proxy.
+    """Replay three books with the same qualified execution evidence.
 
     Sessions must include inactive dates and the complete drain period. Supply
     the last exchange session before the evaluation period to reject stale entries. The
@@ -543,9 +602,8 @@ def compare_exit_widths(
     Every potential holding window needs action coverage. An empty tuple
     attests to a covered session without events. Unsupported actions in a
     possible holding window make the comparison unavailable before replay.
-    Confirmed opening misses require independent evidence and contribute no
-    possible positions. A missing bar for a filled or held name invalidates
-    the replay.
+    An opening miss requires independent evidence. Require protected prices
+    on the entry day and a qualified holding bar on every possible later day.
     """
     if (
         len(sessions) < POLICY.max_sessions
@@ -562,8 +620,11 @@ def compare_exit_widths(
         raise ValueError("invalid replay calendar, capital, or collision rule")
 
     arrivals = _ranked_entries(candidates, sessions, previous_session)
-    coverage, action_digest = _bind_actions(
-        sessions, arrivals, action_coverage, confirmed_auction_misses
+    names, auctions, misses = _select_auctions(arrivals, opening_evidence)
+    coverage, action_digest = _bind_actions(sessions, arrivals, action_coverage, misses)
+    holding = _holding_bars(sessions, arrivals, misses, bars)
+    execution_digest = validate_opening_evidence(
+        names, auctions, session_hours, protection_delay, holding
     )
     arms: tuple[Arm, ...] = ("fixed", "scaled", "matched")
     books = [_Book(initial_cash, costs, arm, collision) for arm in arms]
@@ -573,10 +634,10 @@ def compare_exit_widths(
         for book, path in zip(books, paths, strict=True):
             book.settle(session)
             book.accrue_distributions(coverage, session)
-            decisions = book.enter(entries, bars, confirmed_auction_misses, session)
-            path.append(book.close_and_mark(bars, session, settlements[session], decisions))
+            decisions = book.enter(entries, auctions, session)
+            path.append(book.close_and_mark(holding, session, settlements[session], decisions))
 
     if any(book.positions for book in books):
         raise ValueError("replay ended with unliquidated positions")
     fixed, scaled, matched = (PortfolioResult(initial_cash, tuple(path)) for path in paths)
-    return ExitReplay(fixed, scaled, matched, action_digest)
+    return ExitReplay(fixed, scaled, matched, action_digest, execution_digest)
