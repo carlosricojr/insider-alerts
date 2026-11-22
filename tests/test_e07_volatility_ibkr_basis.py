@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,7 @@ from ib_async import RequestError
 
 from e07_volatility_exits.ibkr_basis import BasisAudit, BasisRequest, audit_basis, sha256
 from insider_alerts.strategy.e07 import NEW_YORK
+from ops.research import e07_volatility_ibkr_basis as recorder
 from ops.research.e07_volatility_ibkr_basis import CLIENT_ID, capture_basis, publish_basis
 
 CLOSE = datetime(2026, 11, 27, 13, 0, tzinfo=NEW_YORK)
@@ -45,6 +47,9 @@ class Gateway:
         self.daily_problem: Exception | None = None
         self.tape_problem: Exception | None = None
         self.conid = 42
+        self.venue = "NASDAQ"
+        self.routing = "SMART"
+        self.cleanup_problem: Exception | None = None
 
     async def connectAsync(self, *args: Any) -> None:
         self.events.append(("connect", *args))
@@ -65,7 +70,8 @@ class Gateway:
                     localSymbol="ABC",
                     secType="STK",
                     currency="USD",
-                    primaryExchange="NASDAQ",
+                    primaryExchange=self.venue,
+                    exchange=self.routing,
                 )
             )
         ]
@@ -95,6 +101,8 @@ class Gateway:
 
     def disconnect(self) -> None:
         self.events.append(("disconnect",))
+        if self.cleanup_problem is not None:
+            raise self.cleanup_problem
 
 
 def run_capture(gateway: Gateway, **kwargs: Any) -> bytes:
@@ -140,6 +148,7 @@ def test_pre_split_bars_conflict_with_raw_tape_and_stay_unmodified(tmp_path: Pat
     ("pages", "reason"),
     [
         ([[]], "closing_tape_empty"),
+        ([[tick(2, 94.39)], []], "closing_window_unbracketed"),
         ([[tick(2, 94.39)], [tick(15, 94.39, conditions="")]], "closing_window_unbracketed"),
         (
             [[tick(1, 94.39)], [tick(1, 94.39), tick(16, 94.39)]],
@@ -163,9 +172,10 @@ def test_distinguishes_unavailable_sources(pages: list[list[Any]], reason: str) 
     assert evaluate(run_capture(Gateway(94.39, pages))).reason == reason
 
 
-def test_reported_primary_print_is_required() -> None:
+@pytest.mark.parametrize("attribute", ["unreported", "pastLimit"])
+def test_reported_primary_print_is_required(attribute: str) -> None:
     auction = tick(2, 94.39)
-    auction.tickAttribLast.unreported = True
+    setattr(auction.tickAttribLast, attribute, True)
     raw = run_capture(Gateway(94.39, [[auction, tick(16, 94.39)]]))
     assert evaluate(raw).reason == "unsupported_primary_closing_trade"
 
@@ -193,11 +203,24 @@ def test_partial_error_is_archived_not_reclassified_as_empty(
     assert gateway.events[-1] == ("disconnect",)
 
 
-def test_wrong_contract_stops_before_price_requests() -> None:
+@pytest.mark.parametrize(
+    ("field", "value"), [("conid", 99), ("venue", "NYSE"), ("routing", "NYSE")]
+)
+def test_wrong_contract_stops_before_price_requests(field: str, value: object) -> None:
     gateway = Gateway(94.39, [])
-    gateway.conid = 99
+    setattr(gateway, field, value)
     assert evaluate(run_capture(gateway)).reason == "contract_LookupError"
     assert [event[0] for event in gateway.events] == ["connect", "details", "disconnect"]
+
+
+@pytest.mark.parametrize("venue", ["NYSE", "AMEX"])
+def test_non_nasdaq_primary_close_matches_its_own_venue(venue: str) -> None:
+    gateway = Gateway(94.39, [[tick(1, 94.39, venue, " 6 "), tick(16, 94.39)]])
+    gateway.venue = venue
+    plan = replace(PLAN, primary_venue=venue)
+    raw = asyncio.run(capture_basis(plan, clock=lambda: CLOCK, factory=lambda: gateway))
+    audit = audit_basis(plan, raw, expected_sha256=sha256(raw), report_grace=GRACE)
+    assert audit.state == "close_prices_agree"
 
 
 def test_wrong_hash_and_listing_are_rejected() -> None:
@@ -217,6 +240,7 @@ def test_wrong_hash_and_listing_are_rejected() -> None:
     [
         lambda row: row["daily"]["query"].update(rth=False),
         lambda row: row["closing_pages"][0]["query"].update(rth=True),
+        lambda row: row["closing_pages"][0]["query"].update(exchange="NYSE"),
         lambda row: row["closing_pages"][0].update(sent_at="2026-11-28T06:59:00+00:00"),
     ],
 )
@@ -242,6 +266,84 @@ def test_revision_links_original_and_corrupt_address_is_never_replaced(tmp_path:
     with pytest.raises(ValueError, match="conflicts"):
         publish_basis(tmp_path, old)
     assert original.read_bytes() == b"corrupt"
+
+
+def test_missing_daily_bar_and_invalid_daily_range_are_unresolved() -> None:
+    capture = run_capture(Gateway(94.39, [[tick(1, 94.39), tick(16, 94.39)]]))
+    record = json.loads(capture)
+    record["daily"]["rows"][0]["low"] = "96"
+    assert evaluate(rfc8785.dumps(record)).reason == "invalid_daily_ohlc"
+    record["daily"]["rows"] = []
+    assert evaluate(rfc8785.dumps(record)).reason == "daily_session_missing_or_ambiguous"
+
+
+def test_incorrect_source_or_revision_binding_is_rejected() -> None:
+    raw = run_capture(Gateway(94.39, [[tick(1, 94.39), tick(16, 94.39)]]))
+    record = json.loads(raw)
+    assert record["recorder_sha256"] == recorder.recorder_sha256()
+    record["supersedes"] = "malformed"
+    with pytest.raises(ValueError, match="invalid prior"):
+        evaluate(rfc8785.dumps(record))
+    record["supersedes"] = None
+    record["connection"]["client_id"] = 0
+    with pytest.raises(ValueError, match="source identity"):
+        evaluate(rfc8785.dumps(record))
+
+
+def test_extra_tape_page_after_proven_coverage_is_rejected() -> None:
+    raw = run_capture(Gateway(94.39, [[tick(1, 94.39), tick(16, 94.39)]]))
+    record = json.loads(raw)
+    record["closing_pages"].append(record["closing_pages"][0])
+    with pytest.raises(ValueError, match="unexpected page"):
+        evaluate(rfc8785.dumps(record))
+
+
+def test_cleanup_failure_retains_the_transferred_rows() -> None:
+    gateway = Gateway(94.39, [[tick(1, 94.39), tick(16, 94.39)]])
+    gateway.cleanup_problem = OSError("simulated disconnect issue")
+    raw = run_capture(gateway)
+    record = json.loads(raw)
+    assert evaluate(raw).reason == "disconnect_error"
+    assert record["closing_pages"] and record["daily"]
+
+
+def test_cli_validates_the_plan_and_links_an_existing_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan_bytes = rfc8785.dumps(PLAN.record())
+    plan = publish_basis(tmp_path / "plans", plan_bytes)
+    archive = tmp_path / "receipts"
+    old = publish_basis(archive, run_capture(Gateway(94.39, [[]])))
+    gateway = Gateway(94.39, [[tick(1, 94.39), tick(16, 94.39)]])
+
+    async def simulated_capture(plan: BasisRequest, *, supersedes: str) -> bytes:
+        assert plan == PLAN and supersedes == old.stem
+        return await capture_basis(
+            plan, clock=lambda: CLOCK, factory=lambda: gateway, supersedes=supersedes
+        )
+
+    args = [
+        "recorder",
+        "--control-plan",
+        str(plan),
+        "--plan-sha256",
+        "0" * 64,
+        "--archive",
+        str(archive),
+        "--supersedes",
+        old.stem,
+    ]
+    monkeypatch.setattr(recorder, "capture_basis", simulated_capture)
+    monkeypatch.setattr(sys, "argv", args)
+    with pytest.raises(ValueError, match="plan digest"):
+        recorder.main()
+    assert not gateway.events
+
+    args[4] = plan.stem
+    recorder.main()
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["state"] == "close_prices_agree"
+    assert json.loads(Path(summary["receipt"]).read_bytes())["supersedes"] == old.stem
 
 
 def test_off_hours_and_completed_historical_session_hold_before_connecting() -> None:

@@ -16,9 +16,14 @@ from typing import Any, TypeVar
 
 import rfc8785
 
+from e07_volatility_exits import ibkr_basis
 from e07_volatility_exits.ibkr_basis import (
+    CLIENT_ID,
+    HOST,
     ONE_SECOND,
     PAGE_LIMIT,
+    PORT,
+    ROUTING_EXCHANGE,
     RULE_SHA256,
     SCHEMA,
     SCOPE,
@@ -34,10 +39,15 @@ from insider_alerts.execution.observer import safe_path
 from insider_alerts.research.commissioning_source import SYMBOL_MAP, broker_category, error_message
 from insider_alerts.strategy.e07 import NEW_YORK
 
-HOST = "127.0.0.1"
-PORT = 4001
-CLIENT_ID = 22954
 T = TypeVar("T")
+
+
+def recorder_sha256() -> str:
+    """Bind the capture and receipt-reader source at observation time."""
+    modules = (Path(__file__), Path(ibkr_basis.__file__))
+    return sha256(
+        rfc8785.dumps([sha256(path.read_bytes().replace(b"\r\n", b"\n")) for path in modules])
+    )
 
 
 def utc_now() -> datetime:
@@ -114,6 +124,7 @@ async def capture_basis(
         "ended_by": deadline.isoformat(),
         "supersedes": supersedes,
         "sdk_version": version("ib_async"),
+        "recorder_sha256": recorder_sha256(),
         "connection": {"host": HOST, "port": PORT, "client_id": CLIENT_ID, "server_version": None},
         "contract": None,
         "daily": None,
@@ -149,7 +160,7 @@ async def capture_basis(
         record["connection"]["server_version"] = ib.client.serverVersion()
 
         stage = "contract"
-        expected = Contract(conId=request.conid, exchange="SMART")
+        expected = Contract(conId=request.conid, exchange=ROUTING_EXCHANGE)
         details, _, acquired = await receive(lambda: ib.reqContractDetailsAsync(expected), 8)
         if len(details) != 1:
             raise LookupError("pinned contract unavailable or ambiguous")
@@ -161,6 +172,7 @@ async def capture_basis(
             "security_type": contract.secType,
             "currency": contract.currency,
             "primary_venue": contract.primaryExchange,
+            "routing_exchange": contract.exchange,
             "historical_issuer_identity_verified": False,
             "observed_at": acquired.isoformat(),
         }
@@ -170,6 +182,7 @@ async def capture_basis(
             or contract.secType != "STK"
             or contract.currency != "USD"
             or contract.primaryExchange != request.primary_venue
+            or contract.exchange != ROUTING_EXCHANGE
         ):
             raise LookupError("pinned contract does not match the requested listing")
         # The SDK normally returns an empty list on its own timeout. The outer
@@ -222,14 +235,20 @@ async def capture_basis(
             "reason": broker_category(exc.code, exc.message),
             "detail": error_message(exc.message),
         }
-    except (OSError, RuntimeError, LookupError, ValueError) as exc:
+    except (OSError, RuntimeError, LookupError, ValueError, AttributeError, TypeError) as exc:
         record["issue"] = {
             "stage": stage,
             "reason": f"{stage}_{type(exc).__name__}",
             "detail": error_message(str(exc)),
         }
     finally:
-        ib.disconnect()
+        try:
+            ib.disconnect()
+        except (OSError, RuntimeError) as exc:
+            detail = error_message(str(exc))
+            record["cleanup_issue"] = detail
+            if record["issue"] is None:
+                record["issue"] = {"stage": stage, "reason": "disconnect_error", "detail": detail}
     record["finished_at"] = now().isoformat()
     return rfc8785.dumps(record)
 

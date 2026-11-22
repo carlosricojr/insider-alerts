@@ -23,7 +23,8 @@ native bars and no returned pre-split closing window on the current contract.
 Use one canonical custody payload for a requested listing-session. It
 describes a pinned broker contract, independently provided listing identity
 and calendar binding, source observation clocks, the full SDK daily response,
-and the bounded Time & Sales replies. Observe before processing and record
+and the bounded Time & Sales replies. Bind the recorder fingerprint, SDK
+version, Gateway identity and SMART routing. Observe before processing and record
 the SDK object fields relevant to qualification, including the auction price,
 size, exchange, sale conditions and attributes. Store canonical bytes under
 their digest with create-only semantics. Record partial or failed capture
@@ -68,9 +69,15 @@ agreement, conflicting closes, or an explicit unresolved reason. Keep the
 receipt for every attempted control. Later study activation must separately
 govern capture pacing, provider availability and treatment of missingness.
 
-The live Gateway controls returned the expected states on all five sessions
+The Gateway recorder and reader returned all seven expected dispositions
 outside the E07 roster. Sandisk and KLA differed before and agreed after
-their splits. Enhanced Group's pre-split tape stayed unresolved.
+their splits. Enhanced Group's NYSE pre-split tape stayed unresolved and
+its post-split closes matched. Energy Fuels matched on NYSE American.
+The content-addressed control manifest
+`84df16aa3077ac30bb535692a82d2e47babdfed55fc8fe8d901f3af1a44c04fa`
+in the private research intake binds the plan and source receipt for each
+observation to the recorder and auction rule. The archived receipts contain
+broker data and stay outside the repository.
 
 ## Verification and handoff
 

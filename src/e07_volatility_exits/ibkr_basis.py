@@ -15,8 +15,12 @@ import rfc8785
 from insider_alerts.research.commissioning_source import SYMBOL_MAP
 from insider_alerts.strategy.e07 import NEW_YORK
 
-SCHEMA = "e07-ibkr-price-basis-sdk-v1"
+SCHEMA = "e07-ibkr-price-basis-sdk-v2"
 SCOPE = "research_price_basis_control"
+HOST = "127.0.0.1"
+PORT = 4001
+CLIENT_ID = 22954
+ROUTING_EXCHANGE = "SMART"
 TICK_COUNT = 1_000
 PAGE_LIMIT = 2
 ONE_SECOND = timedelta(seconds=1)
@@ -152,6 +156,7 @@ def _rows(
 
 def daily_query(request: BasisRequest) -> dict[str, Any]:
     return {
+        "exchange": ROUTING_EXCHANGE,
         "end_utc": request.daily_end.isoformat(),
         "duration": "1 D",
         "bar_size": "1 day",
@@ -163,6 +168,7 @@ def daily_query(request: BasisRequest) -> dict[str, Any]:
 
 def tick_query(start: datetime) -> dict[str, Any]:
     return {
+        "exchange": ROUTING_EXCHANGE,
         "from_epoch_s": int(start.timestamp()),
         "number": TICK_COUNT,
         "series": "TRADES",
@@ -220,7 +226,8 @@ def _auction_close(
                 found.append(_positive(row["price"]))
                 _positive(row["size"])
         if last is None:
-            raise _Unresolved("closing_tape_empty")
+            reason = "closing_tape_empty" if index == 0 else "closing_window_unbracketed"
+            raise _Unresolved(reason)
         if last > request.through:
             if index != len(pages) - 1:
                 raise ValueError("unexpected page after closing coverage")
@@ -259,6 +266,19 @@ def audit_basis(
         deadline = _observation_clock(record["ended_by"])
         if not (request.daily_end <= started <= finished and started < deadline):
             raise ValueError("price-basis capture predates the finished session")
+        previous_receipt = record["supersedes"]
+        if previous_receipt is not None and (
+            not is_digest(previous_receipt) or previous_receipt == expected_sha256
+        ):
+            raise ValueError("invalid prior price-basis receipt")
+        connection = record["connection"]
+        if (
+            not is_digest(record["recorder_sha256"])
+            or connection["host"] != HOST
+            or connection["port"] != PORT
+            or connection["client_id"] != CLIENT_ID
+        ):
+            raise ValueError("price-basis source identity is missing or mismatched")
         if record["issue"] is not None:
             issue = record["issue"]
             if not isinstance(issue["reason"], str) or not issue["reason"]:
@@ -266,7 +286,7 @@ def audit_basis(
             return BasisAudit(expected_sha256, "unresolved", issue["reason"])
         identity = record["contract"]
         sdk = record["sdk_version"]
-        server = record["connection"]["server_version"]
+        server = connection["server_version"]
         if not isinstance(sdk, str) or not sdk or type(server) is not int or server <= 0:
             raise ValueError("receipt SDK or server identity is missing")
 
@@ -277,6 +297,7 @@ def audit_basis(
             or identity["security_type"] != "STK"
             or identity["currency"] != "USD"
             or identity["primary_venue"] != request.primary_venue
+            or identity["routing_exchange"] != ROUTING_EXCHANGE
             or identity["historical_issuer_identity_verified"] is not False
         ):
             raise _Unresolved("pinned_contract_mismatch")
