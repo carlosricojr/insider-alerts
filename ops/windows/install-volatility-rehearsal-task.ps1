@@ -13,8 +13,9 @@ if ((Resolve-Path -LiteralPath $action.WorkingDirectory).Path -ne $repoRoot -or
     (Resolve-Path -LiteralPath $action.Execute).Path -ne $pythonExe -or
     $action.Arguments -notmatch '^\s*-m\s+insider_alerts\.cli\s+ops\s+live-canary\b' -or
     $action.Arguments -match '(?i)--ledger-path(?:\s|=)' -or
+    $action.Arguments -match '(?i)--database-path(?:\s|=)' -or
     $action.Arguments -match '(?i)--client-id(?:\s+|=)\s*179(?:\s|$)') {
-    throw "Research must use the verified live task checkout and default ledger."
+    throw "Research must use the verified live task checkout and default ledger and approval database."
 }
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     throw "Rehearsal task already exists."

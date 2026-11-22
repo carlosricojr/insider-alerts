@@ -47,18 +47,15 @@ def issuer_directory(text: str) -> dict[str, set[tuple[int, str]]]:
 
 def issuer_matches(
     directory: dict[str, set[tuple[int, str]]],
-    row: dict[str, Any],
+    symbol: str,
+    issuer_cik: int,
     identity: dict[str, Any],
 ) -> bool:
-    symbol = row["symbol"].replace("-", ".")
-    cik = str(row["cik"])
-    if not cik.isascii() or not cik.isdigit() or len(cik) > 10:
-        return False
-    listing = directory.get(symbol, set())
+    listing = directory.get(symbol.replace("-", "."), set())
     if len(listing) != 1:
         return False
     issuer, venue = next(iter(listing))
-    return issuer == int(cik) and identity["primary_exchange"] in VENUES.get(venue, set())
+    return issuer == issuer_cik and identity["primary_exchange"] in VENUES.get(venue, set())
 
 
 def bar_proof(
@@ -98,6 +95,8 @@ def decision_material(
     directory: DirectoryReceipt | None,
     version: Version,
     cutoff: datetime,
+    *,
+    approval: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Bind the first complete input response and classify identity separately."""
     result = {"case_sha256": case["case_sha256"], "fallback_width": BASE_WIDTH}
@@ -120,7 +119,16 @@ def decision_material(
         return result | {"reason": "issuer_directory_outside_window"}
 
     result["directory_sha256"] = directory.record["sha256"]
-    if not issuer_matches(directory.index, case["row"], response["payload"]["identity"]):
+    if approval is None or "reason" in approval:
+        reason = "approval_copy_missing" if approval is None else approval["reason"]
+        return result | {"reason": reason}
+    result["issuer_approval"] = approval
+    if not issuer_matches(
+        directory.index,
+        approval["issuer_symbol"],
+        approval["issuer_cik"],
+        response["payload"]["identity"],
+    ):
         return result | {"reason": "issuer_venue_unverified"}
 
     close = version.day(date.fromisoformat(dates[-1])).closes_at

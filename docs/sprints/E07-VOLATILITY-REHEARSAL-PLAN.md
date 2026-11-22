@@ -36,6 +36,24 @@ IBKR price projection. Corporate-action and as-traded qualification are still
 required before these observations can enter a separate historical evaluation.
 Keep this rehearsal out of any confirmatory sample.
 
+## Issuer attribution in v2
+
+The live ledger's CIK routes the filing. Read the issuer CIK and symbol
+from the immutable approved payload in the live source database. Use a
+single bounded read-only snapshot before 09:18. Retain the approval identity,
+timestamps and digests with the independent SEC directory and broker proof.
+Missing or conflicting attribution leaves the fixed-width fallback. The
+price request keys and broker pacing keep their original behavior.
+
+For this correction, verify and pause only the existing hidden rehearsal
+task before the fast-forward. V2 uses a sibling journal. Activation verifies
+that v1 contains only its activation and has the same target sessions,
+calendar and candidate inventory. It links the hashes and reuses the
+original SEC contact. The old files remain available. After v2 activation,
+verify the existing task is still bound to that checkout and resume it,
+using the same hidden action. If the predecessor has observations, preserve
+it and stop the cutover.
+
 ## Deployment and handoff
 
 Deploy only from clean synced `main` after exact-head review. Verify the

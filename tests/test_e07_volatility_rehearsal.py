@@ -11,9 +11,13 @@ import pytest
 
 from insider_alerts.execution.observer import COLUMNS
 from insider_alerts.research import calendar_v2
+from insider_alerts.research.commissioning_custody import inventory, snapshot
+from insider_alerts.research.commissioning_journal import Journal, digest
 from insider_alerts.research.commissioning_source import timestamp
 from insider_alerts.research.commissioning_window import parse
+from insider_alerts.review.queue import ensure_review_tables
 from ops.research import e07_volatility_rehearsal as runtime
+from ops.research.e07_volatility_approval import approval_database, read_approvals
 from ops.research.e07_volatility_rehearsal_contract import issuer_directory
 from tests.test_commissioning_worker import source_response
 from tests.test_research_calendar_v2 import PDF
@@ -39,6 +43,8 @@ def system(tmp_path, monkeypatch):
     with closing(sqlite3.connect(ledger)) as conn, conn:
         conn.execute(f"CREATE TABLE candidates({','.join(COLUMNS)}, forbidden_outcomes)")
         conn.execute("CREATE TABLE metadata(key,value)")
+    review_db = ledger.parent / "insider_alerts.db"
+    ensure_review_tables(str(review_db))
     calendar_path = ledger.parent / "research-commissioning-v2/calendar.db"
     calendar_path.parent.mkdir()
     (calendar_path.parent / "network-lock.db").touch()
@@ -82,6 +88,7 @@ def system(tmp_path, monkeypatch):
             source=Source,
             directory=lambda _: DIRECTORY,
             network_idle=lambda: True,
+            approval_db=review_db,
         )
 
     instance = make()
@@ -98,10 +105,17 @@ def add_case(
     entry="2026-10-27",
     symbol="TEST",
     signal=None,
+    issuer=None,
+    approval=True,
+    approval_symbol=None,
+    approval_time=None,
+    form="4",
 ):
+    accession = f"{packet}-accession"
+    packet_id = f"{accession}|{cik}|{form}"
     row = dict.fromkeys(COLUMNS) | {
-        "packet_id": packet,
-        "accession_number": "fixture-accession",
+        "packet_id": packet_id,
+        "accession_number": accession,
         "cik": cik,
         "symbol": symbol,
         "signal_at": signal or timestamp(clock[0]),
@@ -115,6 +129,26 @@ def add_case(
             f"INSERT INTO candidates VALUES ({placeholders})",
             [*(row[key] for key in COLUMNS), "OUTCOME_NOT_IN_PROJECTION"],
         )
+    if approval:
+        approved = approval_time or row["signal_at"]
+        payload = {
+            "issuer_cik": cik if issuer is None else issuer,
+            "issuer_symbol": symbol if approval_symbol is None else approval_symbol,
+            "irrelevant": "DO_NOT_RETAIN_RAW_APPROVAL",
+        }
+        with closing(sqlite3.connect(instance.approval_db)) as conn, conn:
+            conn.execute(
+                "INSERT INTO review_packets "
+                "(packet_id, accession_number, cik, form_type, payload_json, "
+                "created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (packet_id, accession, cik, form, json.dumps(payload), approved, approved),
+            )
+            conn.execute(
+                "UPDATE review_packets SET status='approve', decision_json=? WHERE packet_id=?",
+                (json.dumps({"packet_id": packet_id, "decision": "approve"}), packet_id),
+            )
+    return row
 
 
 def run(instance):
@@ -193,7 +227,7 @@ def test_interrupted_preopen_read_is_never_resealed(system, monkeypatch):
 def test_mismatched_issuer_keeps_raw_receipt_and_uses_fallback(system):
     instance, _, clock, _, _ = system
     clock[0] = parse("2026-10-27T11:00:00Z")
-    add_case(instance, clock, cik="99999")
+    add_case(instance, clock, issuer="99999")
     run(instance)
     clock[0] = parse("2026-10-27T13:17:00Z")
     assert run(instance)["preopen"] == {"issuer_venue_unverified": 1}
@@ -307,10 +341,10 @@ def test_one_bad_case_does_not_abandon_other_durable_reads(system, monkeypatch):
     run(instance)
     actual = runtime.decision_material
 
-    def material(case, *args):
-        if case["row"]["packet_id"] == "bad":
+    def material(case, *args, **kwargs):
+        if case["row"]["packet_id"].startswith("bad-accession|"):
             raise ValueError("candidate-level schema failure")
-        return actual(case, *args)
+        return actual(case, *args, **kwargs)
 
     monkeypatch.setattr(runtime, "decision_material", material)
     clock[0] = parse("2026-10-27T13:17:00Z")
@@ -420,3 +454,121 @@ def test_construction_failure_reports_worker_error(system, monkeypatch):
     assert exc.value.code == 1
     report = json.loads((instance.folder / "worker-errors.log").read_bytes())
     assert report["error"] == "ValueError"
+
+
+def test_owner_routed_amendment_uses_its_original_issuer_and_does_not_copy_raw_payload(system):
+    instance, _, clock, _, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    row = add_case(instance, clock, cik="0000000999", issuer="0000000123", form="4/A")
+    run(instance)
+    source_before = instance.approval_db.read_bytes()
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    assert run(instance)["preopen"] == {"features_observed": 1}
+    packet_evidence = next(
+        record["payload"]["issuer_approval"]
+        for record in instance.journal.records()
+        if record["entity"].startswith("read:")
+    )
+    assert packet_evidence["issuer_cik"] == 123
+    assert packet_evidence["routing_cik"] == row["cik"]
+    assert packet_evidence["form_type"] == "4/A"
+    assert packet_evidence["read_at"] == timestamp(clock[0])
+    assert len(packet_evidence["approval_sha256"]) == 64
+    assert instance.approval_db.read_bytes() == source_before
+    assert "DO_NOT_RETAIN_RAW_APPROVAL" not in str(instance.journal.records())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"approval": False}, "approval_copy_missing"),
+        ({"approval_symbol": "OTHER"}, "approval_symbol_mismatch"),
+        ({"issuer": "0000000000"}, "approval_issuer_cik_invalid"),
+        ({"issuer": "123BAD"}, "approval_issuer_cik_invalid"),
+        ({"approval_time": "2026-10-27T11:01:00Z"}, "approval_copy_clock_mismatch"),
+    ],
+)
+def test_approval_errors_leave_fixed_width_with_raw_price_receipt(system, overrides, reason):
+    instance, _, clock, _, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock, **overrides)
+    run(instance)
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    assert run(instance)["preopen"] == {reason: 1}
+    payload = next(
+        record["payload"]
+        for record in instance.journal.records()
+        if record["entity"].startswith("read:")
+    )
+    assert payload["fallback_width"] == 0.10 and len(payload["bar_digests"]) == 21
+    assert "issuer_linked" not in payload
+
+
+def test_approval_digest_ignores_mutable_capture_job_work_state(system):
+    instance, _, clock, _, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    case = add_case(instance, clock)
+    cutoff = parse("2026-10-27T13:18:00Z")
+    source = instance.approval_db
+    identity = approval_database(source)
+    first = read_approvals(source, identity, [case["packet_id"]], instance.now)
+    with closing(sqlite3.connect(source)) as db, db:
+        db.execute("UPDATE research_capture_jobs SET attempt_count=1, status='retry'")
+    clock[0] += timedelta(minutes=1)
+    next_read = read_approvals(source, identity, [case["packet_id"]], instance.now)
+    first_proof = first.evidence(case, cutoff)
+    next_proof = next_read.evidence(case, cutoff)
+    assert next_proof["read_at"] != first_proof["read_at"]
+    assert next_proof["approval_sha256"] == first_proof["approval_sha256"]
+
+
+def test_approval_database_replacement_fails_isolated(system):
+    instance, _, clock, _, _ = system
+    clock[0] = parse("2026-10-27T11:00:00Z")
+    add_case(instance, clock)
+    run(instance)
+    another_db = instance.approval_db.with_suffix(".replacement.db")
+    ensure_review_tables(str(another_db))
+    instance.approval_db = another_db
+    clock[0] = parse("2026-10-27T13:17:00Z")
+    assert run(instance)["preopen"] == {"approval_source_replaced": 1}
+
+
+def test_v2_references_unused_v1_without_rewriting_it(system):
+    instance, make, _, _, _ = system
+    current = instance.load()
+    old = current.frozen | {"contract": runtime.PRIOR_CONTRACT}
+    old_path = instance.root / runtime.PRIOR_FOLDER / "evidence.db"
+    prior = Journal.create(old_path, old, clock=instance.now)
+    original_bytes = old_path.read_bytes()
+    fresh = make()
+    fresh.folder = instance.folder.with_name("new-rehearsal-fixture")
+    fresh.journal = Journal(fresh.folder / "evidence.db", clock=fresh.now)
+    fresh.activate(date.fromisoformat(old["entries"][0]), "new-fixture")
+    frozen = fresh.load().frozen
+    assert frozen["supersedes"] == {
+        "contract": runtime.PRIOR_CONTRACT,
+        "activation_sha256": prior.records()[0]["sha256"],
+        "journal_sha256": digest(original_bytes),
+    }
+    assert frozen["sec_user_agent"] == old["sec_user_agent"]
+    assert old_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("kind", ["different_inventory", "different_calendar", "used"])
+def test_v2_declines_incompatible_or_used_predecessor(system, kind):
+    instance, _, _, _, _ = system
+    current = instance.load()
+    old = current.frozen | {"contract": runtime.PRIOR_CONTRACT}
+    base = inventory(snapshot(instance.ledger, clock=instance.now))
+    if kind == "different_inventory":
+        old["source_inventory"] = base | {"packet_id_hashes": ["f" * 64]}
+    if kind == "different_calendar":
+        old["calendar_sha256"] = "e" * 64
+    prior = Journal.create(
+        instance.root / runtime.PRIOR_FOLDER / "evidence.db", old, clock=instance.now
+    )
+    if kind == "used":
+        prior.append("cycle", "prior-test", {})
+    with pytest.raises(ValueError, match="predecessor rehearsal was used or its frozen"):
+        instance.unused_predecessor(base, current.frozen["entries"], current.version)
