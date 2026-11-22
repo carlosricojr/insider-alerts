@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import Literal
 
 import rfc8785
 
@@ -16,6 +17,7 @@ from insider_alerts.strategy.e07 import NEW_YORK
 
 BarKey = tuple[str, date]
 SessionHours = Mapping[date, tuple[datetime, datetime]]
+ProtectionRounding = Literal["unrounded", "cent"]
 
 
 class UnavailableExecution(ValueError):
@@ -29,6 +31,7 @@ class EntryConvention:
     protection_delay: timedelta
     closing_report_grace: timedelta
     close_can_trigger: bool
+    protection_rounding: ProtectionRounding = "unrounded"
 
     def __post_init__(self) -> None:
         if not (
@@ -37,6 +40,8 @@ class EntryConvention:
             and isinstance(self.closing_report_grace, timedelta)
             and self.closing_report_grace >= timedelta()
             and type(self.close_can_trigger) is bool
+            and type(self.protection_rounding) is str
+            and self.protection_rounding in ("unrounded", "cent")
         ):
             raise ValueError("invalid entry execution convention")
 
@@ -196,10 +201,15 @@ def validate_opening_evidence(
         for (instrument, session), bar in sorted(holding_bars.items())
     ]
     unit = timedelta(microseconds=1)
+    domain = (
+        "e07-execution-evidence-v2-cent-protection"
+        if convention.protection_rounding == "cent"
+        else "e07-execution-evidence-v2"
+    )
     return hashlib.sha256(
         rfc8785.dumps(
             [
-                "e07-execution-evidence-v2",
+                domain,
                 convention.protection_delay // unit,
                 convention.closing_report_grace // unit,
                 convention.close_can_trigger,

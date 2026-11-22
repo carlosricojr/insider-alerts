@@ -16,6 +16,7 @@ from e07_volatility_exits.auction import (
     AuctionMiss,
     EntryConvention,
     EntryPath,
+    ProtectionRounding,
 )
 from e07_volatility_exits.entry_path import (
     EntryTape,
@@ -53,11 +54,12 @@ from e07_volatility_exits.replay import (
     ReplayCosts,
     UnavailableExecution,
     UnsupportedAction,
+    _protective_levels,
     compare_exit_widths,
     compare_primary_exit_widths,
 )
 from insider_alerts.backtest.models import DailyBar
-from insider_alerts.execution.canary import CanaryConfig
+from insider_alerts.execution.canary import CanaryConfig, round_stock_price
 from insider_alerts.strategy.e07 import NEW_YORK, deterministic_rank, evaluate_shadow
 
 D = Decimal
@@ -1532,3 +1534,168 @@ def test_primary_completes_when_only_the_matched_book_cannot_afford_a_fill() -> 
         UnavailableExecution, match=f"fills exceed settled cash on {gapped.entry_day}"
     ):
         compare_exit_widths(SESSIONS, SETTLEMENTS, candidates, bars, **inputs)
+
+
+def test_cent_rounding_matches_live_requested_protective_prices() -> None:
+    config = CanaryConfig(source_db="unused.db")
+    assert config.stop_loss_pct == config.take_profit_pct == BASE_WIDTH
+    widths = tuple(n / 100 for n in range(5, 21)) + (0.0537, 0.1379)
+    prices = tuple(cents / 100 for cents in range(200, 20_001)) + (0.19, 1.01, 12345.67, 1e300)
+    for price in prices:
+        for width in widths:
+            assert _protective_levels(price, width, "cent") == (
+                round_stock_price(price * (1.0 - width)),
+                round_stock_price(price * (1.0 + width)),
+            )
+
+
+def test_cent_rounding_reaches_the_live_requested_stop_and_binds_the_convention() -> None:
+    candidate = _candidate(width=0.15)
+    bars = _bars(candidate)
+    key = candidate.instrument, candidate.entry_day
+    bars[key] = replace(bars[key], open=10.05, high=10.10, low=9.05, close=10.0)
+    opening = _auctions([candidate], bars)
+    original_bars = dict(bars)
+    original_opening = dict(opening)
+    inputs = dict(
+        action_coverage=_action_coverage([candidate]),
+        opening_evidence=opening,
+        session_hours=HOURS,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    raw = compare_primary_exit_widths(
+        SESSIONS, SETTLEMENTS, [candidate], bars, entry_convention=CONVENTION, **inputs
+    )
+    cent = replace(CONVENTION, protection_rounding="cent")
+    primary = compare_primary_exit_widths(
+        SESSIONS, SETTLEMENTS, [candidate], bars, entry_convention=cent, **inputs
+    )
+    diagnostic = compare_exit_widths(
+        SESSIONS, SETTLEMENTS, [candidate], bars, entry_convention=cent, **inputs
+    )
+    diagnostic.require_primary_agreement(primary)
+    assert not raw.fixed.sessions[0].exits
+    assert raw.fixed.sessions[9].exits[0].reason == "time"
+    assert raw.fixed.net_pnl == D("-2.10")
+    assert primary.fixed.sessions[0].exits[0].reason == "stop"
+    assert primary.fixed.net_pnl == D("-21.08")
+    assert primary.scaled == raw.scaled
+    assert diagnostic.fixed == diagnostic.matched
+    assert raw.action_coverage_sha256 == primary.action_coverage_sha256
+    assert (
+        raw.execution_evidence_sha256
+        == "d0370eb5090e517efff1506b154cc07013977d90a8b21de4068ec2afee47e38d"
+    )
+    assert (
+        primary.execution_evidence_sha256
+        == "9996a31e09e046afaa811180717d0194088dac1099d8ede3da9e977643ae23d2"
+    )
+    assert bars == original_bars
+    assert opening == original_opening
+
+
+@pytest.mark.parametrize("scaled_has_target", [True, False])
+def test_cent_rounding_reaches_the_exact_target_for_scaled_and_matched_arms(
+    scaled_has_target: bool,
+) -> None:
+    candidate = _candidate(width=0.15 if scaled_has_target else 0.20)
+    candidate = replace(
+        candidate, widths=replace(candidate.widths, matched=0.20 if scaled_has_target else 0.15)
+    )
+    bars = _bars(candidate)
+    key = candidate.instrument, candidate.entry_day
+    bars[key] = replace(bars[key], open=10.03, high=11.53, low=10.0, close=10.03)
+    inputs = dict(
+        action_coverage=_action_coverage([candidate]),
+        opening_evidence=_auctions([candidate], bars),
+        session_hours=HOURS,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    raw = compare_exit_widths(
+        SESSIONS, SETTLEMENTS, [candidate], bars, entry_convention=CONVENTION, **inputs
+    )
+    rounded = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        entry_convention=replace(CONVENTION, protection_rounding="cent"),
+        **inputs,
+    )
+    raw_book = raw.scaled if scaled_has_target else raw.matched
+    rounded_book = rounded.scaled if scaled_has_target else rounded.matched
+    assert not raw_book.sessions[0].exits
+    assert rounded_book.sessions[0].exits[0].reason == "target"
+    assert rounded_book.net_pnl == D("28.87")
+
+
+@pytest.mark.parametrize("compare", [compare_exit_widths, compare_primary_exit_widths])
+def test_cent_rounding_affects_first_second_ambiguity_even_without_cash(
+    compare: Callable[..., ExitReplay | PrimaryExitReplay],
+) -> None:
+    candidate = _candidate(width=0.15)
+    bars = _bars(candidate)
+    key = candidate.instrument, candidate.entry_day
+    bars[key] = replace(bars[key], open=10.05, high=10.10, low=9.05)
+    opening = _auctions([candidate], bars)
+    fill = opening[key]
+    assert isinstance(fill, AuctionFill)
+    opening[key] = replace(fill, path=replace(fill.path, first_low=9.05, first_high=9.06))
+    inputs = dict(
+        action_coverage=_action_coverage([candidate]),
+        opening_evidence=opening,
+        session_hours=HOURS,
+        initial_cash=D("60"),
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    raw = compare(SESSIONS, SETTLEMENTS, [candidate], bars, entry_convention=CONVENTION, **inputs)
+    assert raw.fixed.sessions[0].entries[0].state == "cash_suppressed"
+    with pytest.raises(UnavailableExecution, match="first protected second can touch a barrier"):
+        compare(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            bars,
+            entry_convention=replace(CONVENTION, protection_rounding="cent"),
+            **inputs,
+        )
+
+
+@pytest.mark.parametrize(
+    ("price", "rounding"),
+    [(0.039, "cent"), (0.003, "cent"), (1.7e308, "unrounded"), (1.7e308, "cent")],
+)
+def test_invalid_protection_levels_fail_closed_before_any_position(
+    price: float, rounding: ProtectionRounding
+) -> None:
+    candidate = _candidate()
+    bars = _bars(candidate)
+    opening = _auctions([candidate], bars)
+    key = candidate.instrument, candidate.entry_day
+    fill = opening[key]
+    assert isinstance(fill, AuctionFill)
+    opening[key] = replace(fill, price=price)
+    with pytest.raises(UnavailableExecution, match="protective levels must be finite and bracket"):
+        compare_primary_exit_widths(
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            bars,
+            action_coverage=_action_coverage([candidate]),
+            opening_evidence=opening,
+            session_hours=HOURS,
+            entry_convention=replace(CONVENTION, protection_rounding=rounding),
+            initial_cash=D("60"),
+            costs=COSTS,
+            previous_session=HISTORY[-1],
+        )
+
+
+def test_entry_convention_rejects_unknown_protective_rounding() -> None:
+    with pytest.raises(ValueError, match="invalid entry execution convention"):
+        replace(CONVENTION, protection_rounding=cast(ProtectionRounding, "arbitrary_grid"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from e07_volatility_exits.auction import (
     AuctionMiss,
     EntryConvention,
     EntryPath,
+    ProtectionRounding,
     SessionHours,
     valid_bar,
     validate_opening_evidence,
@@ -435,29 +437,41 @@ def _bind_actions(
     return bound, digest
 
 
-def _barriers(price: float, width: float) -> tuple[float, float]:
-    return price * (1.0 - width), price * (1.0 + width)
+def _protective_levels(
+    price: float, width: float, rounding: ProtectionRounding
+) -> tuple[float, float]:
+    stop, target = price * (1.0 - width), price * (1.0 + width)
+    if rounding == "cent":
+        # Preserve the canary's requested-price rule without importing live execution.
+        stop, target = round(stop + 1e-12, 2), round(target + 1e-12, 2)
+    if not (0 < stop < price < target and math.isfinite(target)):
+        raise UnavailableExecution("protective levels must be finite and bracket the fill")
+    return stop, target
 
 
-def _require_resolved_entry_prices(
+def _resolve_entry_levels(
     arrivals: Mapping[date, list[ReplayCandidate]],
     auctions: Mapping[BarKey, Auction],
     arms: tuple[Arm, ...],
-) -> None:
+    rounding: ProtectionRounding,
+) -> dict[tuple[str, Arm], tuple[float, float]]:
+    levels = {}
     for day, candidates in arrivals.items():
         for candidate in candidates:
             auction = auctions[candidate.instrument, day]
-            if (
-                isinstance(auction, AuctionMiss)
-                or auction.path.first_low == auction.path.first_high
-            ):
+            if isinstance(auction, AuctionMiss):
                 continue
             for arm in arms:
-                stop, target = _barriers(auction.price, _width(candidate, arm))
-                if auction.path.first_low <= stop or auction.path.first_high >= target:
+                stop, target = _protective_levels(auction.price, _width(candidate, arm), rounding)
+                path = auction.path
+                if path.first_low != path.first_high and (
+                    path.first_low <= stop or path.first_high >= target
+                ):
                     raise UnavailableExecution(
                         f"first protected second can touch a barrier for {candidate.packet_id}"
                     )
+                levels[candidate.packet_id, arm] = (stop, target)
+    return levels
 
 
 def _exit(
@@ -561,6 +575,7 @@ class _Book:
         candidates: Sequence[ReplayCandidate],
         auctions: Mapping[BarKey, Auction],
         session: date,
+        levels: Mapping[tuple[str, Arm], tuple[float, float]],
     ) -> tuple[EntryDecision, ...]:
         commitments, decisions = self._commit(candidates)
         for commitment in commitments:
@@ -578,7 +593,7 @@ class _Book:
                     f"auction fills exceed settled cash on {session}; broker outcome required"
                 )
 
-            stop, target = _barriers(auction.price, _width(candidate, self.arm))
+            stop, target = levels[packet, self.arm]
             self.positions[candidate.instrument] = _Position(
                 candidate,
                 commitment.quantity,
@@ -770,7 +785,7 @@ def _compare_books(
     execution_digest = validate_opening_evidence(
         names, auctions, session_hours, entry_convention, holding
     )
-    _require_resolved_entry_prices(arrivals, auctions, arms)
+    levels = _resolve_entry_levels(arrivals, auctions, arms, entry_convention.protection_rounding)
     books = [_Book(initial_cash, costs, arm, collision) for arm in arms]
     paths: list[list[SessionResult]] = [[] for _ in books]
     for session in sessions:
@@ -778,7 +793,7 @@ def _compare_books(
         for book, path in zip(books, paths, strict=True):
             book.settle(session)
             book.accrue_distributions(coverage, session)
-            decisions = book.enter(entries, auctions, session)
+            decisions = book.enter(entries, auctions, session, levels)
             path.append(
                 book.close_and_mark(
                     holding,
