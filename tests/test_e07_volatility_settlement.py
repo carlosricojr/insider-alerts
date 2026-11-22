@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 
 from e07_volatility_exits.features import BASE_WIDTH, FEATURE_CUTOFF, ExitWidths
-from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts, compare_exit_widths
+from e07_volatility_exits.replay import ReplayCandidate, ReplayCosts
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research import calendar_v2
 from ops.research.e07_volatility_settlement import (
     DTC_SCHEDULE_SHA256,
     NSCC_VETERANS_DAY_SHA256,
     bind_settlement,
+    compare_with_settlement,
 )
 
 SOURCE_DIR = Path(__file__).resolve().parents[1] / "docs/research/calendar-sources"
@@ -82,9 +83,13 @@ def test_missing_session_previous_session_and_coverage_fail_closed(
     version: calendar_v2.Version,
 ) -> None:
     with pytest.raises(ValueError, match="consecutive exchange sessions"):
-        bind_settlement(
+        compare_with_settlement(
             version,
             (date(2026, 11, 10), date(2026, 11, 12)),
+            (),
+            {},
+            initial_cash=Decimal("475"),
+            costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=date(2026, 11, 9),
             release="settlement_date",
         )
@@ -167,15 +172,18 @@ def test_replay_gates_cash_on_the_holiday_and_extra_session_stress(
     bars[key] = replace(bars[key], high=11.0)
     observed = []
     for binding in (primary, delayed):
-        result = compare_exit_widths(
+        result_with_binding = compare_with_settlement(
+            version,
             sessions,
-            binding.cash_release_dates,
             candidates,
             bars,
             initial_cash=Decimal("265"),
             costs=ReplayCosts(Decimal("0"), Decimal("0")),
             previous_session=previous,
+            release=binding.release,
         )
+        assert result_with_binding.settlement.digest == binding.digest
+        result = result_with_binding.replay
         observed.append(tuple(row.entries[0].state for row in result.fixed.sessions[:4]))
         assert result.fixed.sessions[0].unsettled_cash == Decimal("220")
     assert observed[0][:3] == ("opened", "cash_suppressed", "opened")

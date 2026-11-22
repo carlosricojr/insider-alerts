@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Literal
 
 import rfc8785
 
+from e07_volatility_exits.replay import (
+    BarKey,
+    CollisionPolicy,
+    ExitReplay,
+    ReplayCandidate,
+    ReplayCosts,
+    compare_exit_widths,
+)
+from insider_alerts.backtest.models import DailyBar
 from insider_alerts.research.calendar_v2 import Version
 
 # The source bytes, observation times and scope are documented in calendar-sources.
@@ -35,8 +45,14 @@ class SettlementBinding:
     digest: str
     exchange_version: str
     release: CashRelease
-    settlement_dates: Mapping[date, date]
-    cash_release_dates: Mapping[date, date]
+    settlement_dates: Mapping[date, date] = field(hash=False)
+    cash_release_dates: Mapping[date, date] = field(hash=False)
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementReplay:
+    settlement: SettlementBinding
+    replay: ExitReplay
 
 
 def _next_settlement(trade_day: date) -> date:
@@ -117,3 +133,33 @@ def bind_settlement(
         MappingProxyType(settlements),
         MappingProxyType(cash_releases),
     )
+
+
+def compare_with_settlement(
+    version: Version,
+    sessions: Sequence[date],
+    candidates: Sequence[ReplayCandidate],
+    bars: Mapping[BarKey, DailyBar],
+    *,
+    initial_cash: Decimal,
+    costs: ReplayCosts,
+    previous_session: date,
+    release: CashRelease,
+    confirmed_auction_misses: frozenset[BarKey] = frozenset(),
+    collision: CollisionPolicy = "stop_first",
+) -> SettlementReplay:
+    """Use one verified session sequence for both the binding and the replay."""
+    sessions = tuple(sessions)
+    binding = bind_settlement(version, sessions, previous_session=previous_session, release=release)
+    replay = compare_exit_widths(
+        sessions,
+        binding.cash_release_dates,
+        candidates,
+        bars,
+        initial_cash=initial_cash,
+        costs=costs,
+        previous_session=previous_session,
+        confirmed_auction_misses=confirmed_auction_misses,
+        collision=collision,
+    )
+    return SettlementReplay(binding, replay)

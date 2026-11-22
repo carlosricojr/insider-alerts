@@ -7,7 +7,7 @@ excluding October 12, November 11, November 26 and December 25. The adapter
 gets exchange-open days from a separate verified equity calendar.
 
 - DTC notice 23036-25, published October 15, 2025, was retrieved November 22,
-  2026 at 04:47:47.507128 UTC. It supplies the annual holiday schedule.
+  2026 at 04:47:47.507128 UTC. It supplies the anticipated annual holiday schedule.
   October 12 and November 11 have some DTC services and no settlement.
   November 26 and December 25 are full DTC closures. The archived byte count is
   237,059 and the SHA-256 is
@@ -24,7 +24,11 @@ gets exchange-open days from a separate verified equity calendar.
 
 The observation clock is local file retrieval. Historical possession is
 unverified. This projection assumes ordinary clearing service on unlisted
-weekdays. A later verified closure or correction requires a new reviewed
+weekdays. The individual DTC/NSCC operational notices are absent from the
+archived inputs. The DTCC index lists NSCC notice a9837 and DTC notices
+25151-26 and 25152-26 for Veterans Day, but their direct publication bytes
+could not be verified for this release. Treat the resulting dates as a
+published schedule projection. A later verified closure or correction requires a new reviewed
 version with a supersession reference. An extension requires supporting
 sources through the last mapped cash-release date. A calendar date is a
 model input for cash reuse. Broker credit time requires separate evidence.

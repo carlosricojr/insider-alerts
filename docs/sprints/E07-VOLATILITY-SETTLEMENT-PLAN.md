@@ -6,10 +6,12 @@ traded and settlement paused. The rehearsal window spans Thanksgiving.
 
 The adapter lives under ops/research, outside the packaged runtime. Use the
 validated exchange calendar for session continuity and the separate
-DTC regular-way schedule for settlement. Fail closed beyond the published
-October through December 2026 coverage, including the last possible sale and
+DTC regular-way schedule for settlement. Fail closed beyond the reviewed
+October through December 2026 subset, including the last possible sale and
 the extra session required by the sensitivity. Bind both input schedules,
 the exact dates and the cash-release convention in the output digest.
+The operator replay entry point builds that binding from the exact session
+list it runs and returns it with the result.
 
 The primary proxy makes proceeds available before the open on settlement
 day. A fixed sensitivity moves availability to the first exchange session
