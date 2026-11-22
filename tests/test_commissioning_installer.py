@@ -12,11 +12,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler installation boundary")
+@pytest.mark.parametrize("kind", ["commissioning", "volatility"])
 @pytest.mark.parametrize("failure", ["none", "branch", "existing", "verification", "canary_args"])
-def test_installer_checks_deployment_and_registers_only_hidden_bounded_task(tmp_path, failure):
-    installer = tmp_path / "ops/windows/install-commissioning-task.ps1"
+def test_installer_checks_deployment_and_registers_only_hidden_bounded_task(
+    tmp_path, failure, kind
+):
+    legacy = kind == "commissioning"
+    name = "install-commissioning-task.ps1" if legacy else "install-volatility-rehearsal-task.ps1"
+    module = (
+        "-m insider_alerts.research.commissioning_worker"
+        if legacy
+        else "-m ops.research.e07_volatility_rehearsal"
+    )
+    installer = tmp_path / "ops/windows" / name
     installer.parent.mkdir(parents=True)
-    shutil.copyfile(ROOT / "ops/windows/install-commissioning-task.ps1", installer)
+    shutil.copyfile(ROOT / "ops/windows" / name, installer)
     pythonw = tmp_path / ".venv/Scripts/pythonw.exe"
     pythonw.parent.mkdir(parents=True)
     pythonw.touch()  # Start-Process is mocked below; never execute this placeholder.
@@ -25,7 +35,8 @@ def test_installer_checks_deployment_and_registers_only_hidden_bounded_task(tmp_
     evidence.touch()
     # Exercise the real installer with only OS/process/git effects replaced.
     # No real scheduled task or subprocess can be registered/launched here.
-    script = r"""
+    script = (
+        r"""
 $ErrorActionPreference = 'Stop'
 $global:commissioningTestRoot = '__ROOT__'
 $global:commissioningTestFailure = '__FAILURE__'
@@ -54,7 +65,7 @@ function Start-Process {
   param($FilePath, $WindowStyle, [switch]$Wait, [switch]$PassThru, $WorkingDirectory, $ArgumentList)
   if ($WindowStyle -ne 'Hidden' -or -not $Wait -or -not $PassThru -or
       $FilePath -notlike '*pythonw.exe' -or $WorkingDirectory -ne $global:commissioningTestRoot -or
-      $ArgumentList -ne '-m insider_alerts.research.commissioning_worker --verify-installation') {
+      $ArgumentList -ne '__MODULE__ --verify-installation') {
     throw 'Unsafe installation verification process'
   }
   $global:commissioningTestVerified = $true
@@ -94,7 +105,7 @@ function Start-ScheduledTask {
 }
 $problem = $null
 try {
-  & (Join-Path $global:commissioningTestRoot 'ops\windows\install-commissioning-task.ps1') `
+  & (Join-Path $global:commissioningTestRoot 'ops\windows\__INSTALLER__') `
     -Start | Out-Null
 }
 catch { $problem = $_.Exception.Message }
@@ -102,7 +113,11 @@ catch { $problem = $_.Exception.Message }
   Error=$problem; Registered=$global:commissioningTestRegistered
   Verified=$global:commissioningTestVerified; Started=$global:commissioningTestStarted
 } | ConvertTo-Json -Depth 8 -Compress
-""".replace("__ROOT__", str(tmp_path).replace("'", "''")).replace("__FAILURE__", failure)
+""".replace("__ROOT__", str(tmp_path).replace("'", "''"))
+        .replace("__FAILURE__", failure)
+        .replace("__MODULE__", module)
+        .replace("__INSTALLER__", name)
+    )
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
@@ -118,12 +133,16 @@ catch { $problem = $_.Exception.Message }
         return
     assert not observed["Error"] and observed["Verified"] and observed["Started"]
     registered = observed["Registered"]
-    assert registered["TaskName"] == "Insider Alerts Research Commissioning V2"
+    assert registered["TaskName"] == (
+        "Insider Alerts Research Commissioning V2"
+        if legacy
+        else "Insider Alerts E07 Volatility Rehearsal"
+    )
     assert registered["Action"]["Execute"] == str(pythonw)
-    assert registered["Action"]["Arguments"] == "-m insider_alerts.research.commissioning_worker"
+    assert registered["Action"]["Arguments"] == (module if legacy else f"{module} --cycle")
     assert registered["Settings"] == {
         "Hidden": True,
-        "MultipleInstances": "Parallel",
+        "MultipleInstances": "Parallel" if legacy else "IgnoreNew",
         "Seconds": 120,
     }
     assert registered["Principal"] == {"LogonType": "Interactive", "RunLevel": "Limited"}
