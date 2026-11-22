@@ -76,7 +76,9 @@ def _candidate(
         instrument,
         day,
         10.0,
-        ExitWidths(width, BASE_WIDTH, None),
+        ExitWidths(
+            instrument, datetime.combine(day, time(9, 18), NEW_YORK), width, BASE_WIDTH, None
+        ),
     )
 
 
@@ -128,7 +130,7 @@ def test_missing_volatility_preserves_fixed_width_in_both_challengers() -> None:
         assert estimate.daily is None
         assert estimate.missing == reason
         assert decide_widths(calibration, estimate, "packet") == ExitWidths(
-            BASE_WIDTH, BASE_WIDTH, reason
+            "101", DECISION, BASE_WIDTH, BASE_WIDTH, reason
         )
 
 
@@ -149,8 +151,8 @@ def test_width_calibration_is_deterministic_and_bounded() -> None:
     fitted = calibrate_exits([1, 0.01, 0.02])
     assert fitted.daily_reference == 0.02
     assert fitted.matched_widths == (MIN_WIDTH, BASE_WIDTH, MAX_WIDTH)
-    quiet = decide_widths(fitted, VolatilityEstimate(0.001, None), "packet")
-    volatile = decide_widths(fitted, VolatilityEstimate(0.5, None), "packet")
+    quiet = decide_widths(fitted, VolatilityEstimate("101", DECISION, 0.001, None), "packet")
+    volatile = decide_widths(fitted, VolatilityEstimate("101", DECISION, 0.5, None), "packet")
     assert quiet.scaled == MIN_WIDTH
     assert volatile.scaled == MAX_WIDTH
     assert quiet.matched == volatile.matched
@@ -185,7 +187,13 @@ def test_replay_measures_after_cost_incremental_pnl_and_settlement() -> None:
     day = SESSIONS[0]
     bars[(candidate.instrument, day)] = DailyBar(candidate.symbol, day, 10, 10.6, 9.6, 10, 100_000)
     result = compare_exit_widths(
-        SESSIONS, SETTLEMENTS, [candidate], bars, initial_cash=CASH, costs=COSTS
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
     )
     assert result.scaled.sessions[0].exits[0].reason == "target"
     assert result.scaled.sessions[0].settled_cash == D("274.45")
@@ -204,7 +212,13 @@ def test_collision_stress_keeps_an_open_through_the_stop() -> None:
     day = SESSIONS[1]
     bars[(candidate.instrument, day)] = DailyBar(candidate.symbol, day, 9, 11, 8, 10, 100_000)
     primary = compare_exit_widths(
-        SESSIONS, SETTLEMENTS, [candidate], bars, initial_cash=CASH, costs=COSTS
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
     )
     stress = compare_exit_widths(
         SESSIONS,
@@ -213,6 +227,7 @@ def test_collision_stress_keeps_an_open_through_the_stop() -> None:
         bars,
         initial_cash=CASH,
         costs=COSTS,
+        previous_session=HISTORY[-1],
         collision="target_first",
     )
     assert primary.fixed.net_pnl == primary.scaled.net_pnl == D("-21.08")
@@ -232,7 +247,13 @@ def test_no_close_exit_releases_a_slot_for_that_mornings_auction() -> None:
     day = SESSIONS[1]
     bars[(first.instrument, day)] = DailyBar(first.symbol, day, 10, 11, 10, 10, 100_000)
     fixed = compare_exit_widths(
-        SESSIONS, SETTLEMENTS, candidates, bars, initial_cash=CASH, costs=COSTS
+        SESSIONS,
+        SETTLEMENTS,
+        candidates,
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
     ).fixed
     assert fixed.sessions[1].entries[0].state == "capacity_suppressed"
     assert fixed.sessions[1].exits[0].reason == "target"
@@ -251,6 +272,7 @@ def test_no_auction_fill_does_not_reassign_the_slot_with_hindsight() -> None:
         bars,
         initial_cash=CASH,
         costs=COSTS,
+        previous_session=HISTORY[-1],
         confirmed_auction_misses=misses,
     ).fixed
     assert [(entry.packet_id, entry.state) for entry in fixed.sessions[0].entries] == [
@@ -270,7 +292,13 @@ def test_missing_held_bar_is_not_a_zero_return_or_a_delayed_exit() -> None:
     del bars[(candidate.instrument, SESSIONS[1])]
     with pytest.raises(UnavailableExecution, match=SESSIONS[1].isoformat()):
         compare_exit_widths(
-            SESSIONS, SETTLEMENTS, [candidate], bars, initial_cash=CASH, costs=COSTS
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            bars,
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
         )
 
 
@@ -279,15 +307,29 @@ def test_replay_rejects_after_cutoff_candidate_and_missing_settlement() -> None:
     late = replace(candidate, signal_at=datetime.combine(SESSIONS[0], time(9, 20), NEW_YORK))
     with pytest.raises(ValueError, match="invalid replay candidate"):
         compare_exit_widths(
-            SESSIONS, SETTLEMENTS, [late], _bars(candidate), initial_cash=CASH, costs=COSTS
+            SESSIONS,
+            SETTLEMENTS,
+            [late],
+            _bars(candidate),
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
         )
     later = replace(candidate, entry_day=SESSIONS[1])
     with pytest.raises(ValueError, match="invalid replay candidate"):
         compare_exit_widths(
-            SESSIONS, SETTLEMENTS, [later], _bars(candidate), initial_cash=CASH, costs=COSTS
+            SESSIONS,
+            SETTLEMENTS,
+            [later],
+            _bars(candidate),
+            initial_cash=CASH,
+            costs=COSTS,
+            previous_session=HISTORY[-1],
         )
     with pytest.raises(ValueError, match="invalid replay calendar"):
-        compare_exit_widths(SESSIONS, {}, [], {}, initial_cash=CASH, costs=COSTS)
+        compare_exit_widths(
+            SESSIONS, {}, [], {}, initial_cash=CASH, costs=COSTS, previous_session=HISTORY[-1]
+        )
 
 
 def test_sale_proceeds_wait_for_the_supplied_settlement_date() -> None:
@@ -300,7 +342,13 @@ def test_sale_proceeds_wait_for_the_supplied_settlement_date() -> None:
     bars[(initial.instrument, first)] = DailyBar(initial.symbol, first, 10, 11, 10, 11, 100_000)
     settlements = SETTLEMENTS | {first: SESSIONS[2]}
     fixed = compare_exit_widths(
-        SESSIONS, settlements, candidates, bars, initial_cash=D("265"), costs=COSTS
+        SESSIONS,
+        settlements,
+        candidates,
+        bars,
+        initial_cash=D("265"),
+        costs=COSTS,
+        previous_session=HISTORY[-1],
     ).fixed
     assert fixed.sessions[0].open_positions == 0
     assert fixed.sessions[1].unsettled_cash == fixed.sessions[0].unsettled_cash
@@ -320,6 +368,7 @@ def test_collision_stress_exercises_a_genuinely_ambiguous_bar() -> None:
         bars,
         initial_cash=CASH,
         costs=COSTS,
+        previous_session=HISTORY[-1],
         collision="target_first",
     )
     assert stress.fixed.net_pnl == D("18.88")
@@ -334,7 +383,13 @@ def test_unsupported_gap_raises_instead_of_guessing_a_broker_rejection() -> None
     bars[(candidate.instrument, day)] = DailyBar(candidate.symbol, day, 20, 20, 20, 20, 100_000)
     with pytest.raises(UnavailableExecution, match="fills exceed settled cash"):
         compare_exit_widths(
-            SESSIONS, SETTLEMENTS, [candidate], bars, initial_cash=D("265"), costs=COSTS
+            SESSIONS,
+            SETTLEMENTS,
+            [candidate],
+            bars,
+            initial_cash=D("265"),
+            costs=COSTS,
+            previous_session=HISTORY[-1],
         )
 
 
@@ -344,7 +399,96 @@ def test_opening_execution_can_use_the_cushion_or_exceed_the_reserve() -> None:
     day = SESSIONS[0]
     bars[(candidate.instrument, day)] = DailyBar(candidate.symbol, day, 11, 11, 11, 11, 100_000)
     result = compare_exit_widths(
-        SESSIONS, SETTLEMENTS, [candidate], bars, initial_cash=D("265"), costs=COSTS
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        initial_cash=D("265"),
+        costs=COSTS,
+        previous_session=HISTORY[-1],
     )
     assert result.fixed.sessions[0].entries[0].state == "opened"
     assert result.fixed.sessions[0].settled_cash == D("44.43")
+
+
+def test_replay_rejects_a_stale_bootstrap_signal_or_unbound_width() -> None:
+    candidate = _candidate()
+    stale = replace(candidate, signal_at=PREVIOUS_CLOSE - timedelta(hours=8))
+    wrong_name = replace(candidate, widths=replace(candidate.widths, instrument="wrong"))
+    late_width = replace(
+        candidate, widths=replace(candidate.widths, cutoff=DECISION + timedelta(minutes=1))
+    )
+    for invalid in (stale, wrong_name, late_width):
+        with pytest.raises(ValueError, match="invalid replay candidate"):
+            compare_exit_widths(
+                SESSIONS,
+                SETTLEMENTS,
+                [invalid],
+                _bars(candidate),
+                initial_cash=CASH,
+                costs=COSTS,
+                previous_session=HISTORY[-1],
+            )
+
+
+def test_feature_requires_the_previous_close_and_registered_cutoff() -> None:
+    snapshot = _snapshot()
+    with pytest.raises(ValueError, match="feature cutoff"):
+        estimate_volatility(
+            "101",
+            DECISION + timedelta(minutes=1),
+            HISTORY,
+            snapshot,
+            previous_session_close=PREVIOUS_CLOSE,
+        )
+    with pytest.raises(ValueError, match="ordered calendar"):
+        estimate_volatility(
+            "101",
+            DECISION,
+            HISTORY,
+            snapshot,
+            previous_session_close=PREVIOUS_CLOSE + timedelta(days=1),
+        )
+    finalized = replace(snapshot, received_at=PREVIOUS_CLOSE + timedelta(minutes=1))
+    assert (
+        estimate_volatility(
+            "101",
+            DECISION,
+            HISTORY,
+            finalized,
+            previous_session_close=PREVIOUS_CLOSE,
+        ).daily
+        is not None
+    )
+
+
+def test_primary_obeys_frozen_stop_first_when_a_target_gap_reverses() -> None:
+    candidate = _candidate()
+    bars = _bars(candidate)
+    day = SESSIONS[1]
+    bars[(candidate.instrument, day)] = DailyBar(
+        candidate.symbol, day, 11.2, 11.5, 8.5, 10, 100_000
+    )
+    primary = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    stress = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+        collision="target_first",
+    )
+    assert primary.fixed.net_pnl == D("-21.08")
+    assert stress.fixed.net_pnl == D("22.88")
+    assert primary.fixed.sessions[1].exits[0].same_bar_collision
+    assert not primary.fixed.sessions[1].exits[0].ambiguous_collision

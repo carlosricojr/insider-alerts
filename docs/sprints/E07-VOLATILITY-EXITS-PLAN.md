@@ -66,7 +66,8 @@ candidate rank and cash constraints. The fitted width distribution comes from
 the development prefix, so its distribution can differ from scaled widths in a
 later volatility regime.
 
-The primary fill proxy follows E07's daily-bar stop-first rule. The collision
+The primary fill proxy follows E07's daily-bar stop-first rule even when a
+bar first opens at the target and subsequently touches the stop. The collision
 sensitivity honors an opening print at or through the stop and otherwise uses
 the target if both barriers are reached. Count bars touching both barriers and
 the subset with an open strictly between them. Portfolio selection reserves cash
@@ -86,7 +87,8 @@ result is conditional on this execution model and its stress checks.
 
 The independent design and implementation challenges found that late or mixed
 observations could create a false forecast, and that an open through the stop
-must remain a stop in the collision sensitivity. The isolated kernel validates
+must remain a stop in the collision sensitivity. Widths bind the instrument and the fixed 09:18 New York feature cutoff.
+The isolated kernel validates
 the official prior close, the bar observation clock, and the first executable
 session within the supplied calendar. Capital and exit fixtures test independent
 book occupancy, no hindsight replacement, realized cash checks, T+1 availability,

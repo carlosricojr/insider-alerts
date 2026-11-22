@@ -10,7 +10,13 @@ from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
-from e07_volatility_exits.features import BASE_WIDTH, MAX_WIDTH, MIN_WIDTH, ExitWidths
+from e07_volatility_exits.features import (
+    BASE_WIDTH,
+    FEATURE_CUTOFF,
+    MAX_WIDTH,
+    MIN_WIDTH,
+    ExitWidths,
+)
 from insider_alerts.backtest.models import DailyBar
 from insider_alerts.strategy import e07
 
@@ -187,10 +193,11 @@ def _bar(bars: Mapping[BarKey, DailyBar], candidate: ReplayCandidate, session: d
 
 
 def _ranked_entries(
-    candidates: Sequence[ReplayCandidate], sessions: Sequence[date]
+    candidates: Sequence[ReplayCandidate], sessions: Sequence[date], previous_session: date
 ) -> dict[date, list[ReplayCandidate]]:
     groups: dict[date, list[ReplayCandidate]] = defaultdict(list)
     allowed = set(sessions[: len(sessions) - POLICY.max_sessions + 1])
+    cohort_calendar = (previous_session, *sessions)
     seen: set[str] = set()
     for candidate in candidates:
         if (
@@ -201,9 +208,15 @@ def _ranked_entries(
             or not candidate.instrument
             or candidate.entry_day not in allowed
             or candidate.signal_at.utcoffset() is None
-            or e07.entry_session(POLICY, candidate.signal_at, sessions, now=candidate.signal_at)
+            or e07.entry_session(
+                POLICY, candidate.signal_at, cohort_calendar, now=candidate.signal_at
+            )
             != candidate.entry_day
             or not POLICY.min_price <= candidate.planning_close <= POLICY.max_price
+            or candidate.widths.instrument != candidate.instrument
+            or candidate.widths.cutoff.utcoffset() is None
+            or candidate.widths.cutoff
+            != datetime.combine(candidate.entry_day, FEATURE_CUTOFF, e07.NEW_YORK)
             or not MIN_WIDTH <= candidate.widths.scaled <= MAX_WIDTH
             or not MIN_WIDTH <= candidate.widths.matched <= MAX_WIDTH
             or (
@@ -376,18 +389,21 @@ def compare_exit_widths(
     *,
     initial_cash: Decimal,
     costs: ReplayCosts,
+    previous_session: date,
     confirmed_auction_misses: frozenset[BarKey] = frozenset(),
     collision: CollisionPolicy = "stop_first",
 ) -> ExitReplay:
     """Replay three books with the same arrivals, costs, and opening fill proxy.
 
-    Sessions must include inactive dates and the complete drain period. The
+    Sessions must include inactive dates and the complete drain period. Supply
+    the last exchange session before the evaluation period to reject stale entries. The
     caller qualifies equity identity, price continuity, and the calendar. A
     missing bar for an admitted or held name invalidates the replay unless an
     admission has independent proof that the opening auction could not fill it.
     """
     if (
         len(sessions) < POLICY.max_sessions
+        or previous_session >= sessions[0]
         or list(sessions) != sorted(set(sessions))
         or any(
             session not in settlements or settlements[session] <= session for session in sessions
@@ -399,7 +415,7 @@ def compare_exit_widths(
     ):
         raise ValueError("invalid replay calendar, capital, or collision rule")
 
-    arrivals = _ranked_entries(candidates, sessions)
+    arrivals = _ranked_entries(candidates, sessions, previous_session)
     arms: tuple[Arm, ...] = ("fixed", "scaled", "matched")
     books = [_Book(initial_cash, costs, arm, collision) for arm in arms]
     paths: list[list[SessionResult]] = [[], [], []]

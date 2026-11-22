@@ -7,7 +7,7 @@ import math
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from itertools import pairwise
 from typing import Literal
 
@@ -17,6 +17,7 @@ LOOKBACK_CLOSES = 21
 BASE_WIDTH = 0.10
 MIN_WIDTH = 0.05
 MAX_WIDTH = 0.20
+FEATURE_CUTOFF = time(9, 18)
 CONTROL_DOMAIN = b"E07-VOL-EXITS-V1|matched-width|"
 
 MissingVolatility = Literal[
@@ -41,6 +42,8 @@ class CloseSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class VolatilityEstimate:
+    instrument: str
+    cutoff: datetime
     daily: float | None
     missing: MissingVolatility | None
 
@@ -62,39 +65,42 @@ def estimate_volatility(
     """
     if not instrument or decision_at.utcoffset() is None:
         raise ValueError("a qualified instrument and aware decision clock are required")
+    local_cutoff = decision_at.astimezone(NEW_YORK)
+    if local_cutoff.time() != FEATURE_CUTOFF:
+        raise ValueError("expected the 09:18 New York feature cutoff")
     sessions = tuple(completed_sessions)
     if (
         len(sessions) != LOOKBACK_CLOSES
         or sessions != tuple(sorted(set(sessions)))
         or previous_session_close.utcoffset() is None
         or sessions[-1] != previous_session_close.astimezone(NEW_YORK).date()
-        or sessions[-1] >= decision_at.astimezone(NEW_YORK).date()
+        or sessions[-1] >= local_cutoff.date()
     ):
         raise ValueError("expected an ordered calendar of 21 prior completed sessions")
 
     if snapshot is None:
-        return VolatilityEstimate(None, "no_snapshot")
+        return VolatilityEstimate(instrument, decision_at, None, "no_snapshot")
     if snapshot.instrument != instrument:
-        return VolatilityEstimate(None, "instrument_mismatch")
+        return VolatilityEstimate(instrument, decision_at, None, "instrument_mismatch")
     finalized_at = previous_session_close.astimezone(UTC) + timedelta(minutes=1)
     if snapshot.received_at.utcoffset() is None:
-        return VolatilityEstimate(None, "invalid_snapshot_clock")
+        return VolatilityEstimate(instrument, decision_at, None, "invalid_snapshot_clock")
     received_at = snapshot.received_at.astimezone(UTC)
     if received_at < finalized_at:
-        return VolatilityEstimate(None, "invalid_snapshot_clock")
+        return VolatilityEstimate(instrument, decision_at, None, "invalid_snapshot_clock")
     if received_at >= decision_at.astimezone(UTC):
-        return VolatilityEstimate(None, "late_snapshot")
+        return VolatilityEstimate(instrument, decision_at, None, "late_snapshot")
     if tuple(session for session, _ in snapshot.closes) != sessions:
-        return VolatilityEstimate(None, "missing_or_unexpected_sessions")
+        return VolatilityEstimate(instrument, decision_at, None, "missing_or_unexpected_sessions")
 
     closes = tuple(close for _, close in snapshot.closes)
     if any(not math.isfinite(close) or close <= 0.0 for close in closes):
-        return VolatilityEstimate(None, "invalid_close")
+        return VolatilityEstimate(instrument, decision_at, None, "invalid_close")
     logs = tuple(math.log(close) for close in closes)
     sigma = statistics.stdev(later - earlier for earlier, later in pairwise(logs))
     if sigma == 0.0:
-        return VolatilityEstimate(None, "zero_volatility")
-    return VolatilityEstimate(sigma, None)
+        return VolatilityEstimate(instrument, decision_at, None, "zero_volatility")
+    return VolatilityEstimate(instrument, decision_at, sigma, None)
 
 
 def _width(sigma: float, reference: float) -> float:
@@ -131,6 +137,8 @@ def calibrate_exits(development: Sequence[float]) -> ExitCalibration:
 
 @dataclass(frozen=True, slots=True)
 class ExitWidths:
+    instrument: str
+    cutoff: datetime
     scaled: float
     matched: float
     missing: MissingVolatility | None
@@ -146,12 +154,16 @@ def decide_widths(
         raise ValueError("canonical packet identity is required")
     sigma = estimate.daily
     if sigma is None and estimate.missing is not None:
-        return ExitWidths(BASE_WIDTH, BASE_WIDTH, estimate.missing)
+        return ExitWidths(
+            estimate.instrument, estimate.cutoff, BASE_WIDTH, BASE_WIDTH, estimate.missing
+        )
     if sigma is None or not math.isfinite(sigma) or sigma <= 0 or estimate.missing is not None:
         raise ValueError("inconsistent volatility estimate")
 
     draw = int.from_bytes(hashlib.sha256(CONTROL_DOMAIN + packet_id.encode("utf-8")).digest())
     return ExitWidths(
+        estimate.instrument,
+        estimate.cutoff,
         _width(sigma, calibration.daily_reference),
         calibration.matched_widths[draw % len(calibration.matched_widths)],
         None,
