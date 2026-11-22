@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     )
 
     sec_rss_url: str = Field(
-        default="https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&start=-1&count=40&output=rss",
+        default="https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&start=0&count=40&output=rss",
         alias="SEC_RSS_URL",
     )
     sec_user_agent: str = Field(

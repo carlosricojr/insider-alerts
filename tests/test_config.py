@@ -50,6 +50,10 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.notification_transport_policy_path == (
         "docs/research/contracts/notification-transport-v1.json"
     )
+    assert settings.sec_rss_url == (
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4"
+        "&start=0&count=40&output=rss"
+    )
     assert settings.sec_rate_limit_per_second == 5.0
     assert settings.market_context_enabled is False
     assert settings.market_data_timeout_seconds == 10.0
@@ -82,6 +86,11 @@ def test_config_loads_ib_gateway_from_env_file(tmp_path, monkeypatch) -> None:
     assert settings.ib_gateway_port == 4999
     assert settings.insider_ib_client_id == 222
 
+
+def test_config_preserves_an_explicit_sec_rss_feed(monkeypatch) -> None:
+    alternate_feed = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=80"
+    monkeypatch.setenv("SEC_RSS_URL", alternate_feed)
+    assert Settings(_env_file=None).sec_rss_url == alternate_feed
 
 def test_config_rejects_inverted_market_data_retry_bounds() -> None:
     with pytest.raises(ValidationError, match="cannot exceed"):
