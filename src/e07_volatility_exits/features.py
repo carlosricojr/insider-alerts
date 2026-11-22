@@ -68,12 +68,16 @@ def estimate_volatility(
     local_cutoff = decision_at.astimezone(NEW_YORK)
     if local_cutoff.time() != FEATURE_CUTOFF:
         raise ValueError("expected the 09:18 New York feature cutoff")
+    if previous_session_close.utcoffset() is None:
+        raise ValueError("previous session close requires an aware clock")
+    local_close = previous_session_close.astimezone(NEW_YORK)
+    if not time(13) <= local_close.time() <= time(16):
+        raise ValueError("previous session close outside supported regular-hours range")
     sessions = tuple(completed_sessions)
     if (
         len(sessions) != LOOKBACK_CLOSES
         or sessions != tuple(sorted(set(sessions)))
-        or previous_session_close.utcoffset() is None
-        or sessions[-1] != previous_session_close.astimezone(NEW_YORK).date()
+        or sessions[-1] != local_close.date()
         or sessions[-1] >= local_cutoff.date()
     ):
         raise ValueError("expected an ordered calendar of 21 prior completed sessions")

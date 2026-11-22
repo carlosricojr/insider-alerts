@@ -10,6 +10,7 @@ import pytest
 
 from e07_volatility_exits.features import (
     BASE_WIDTH,
+    FEATURE_CUTOFF,
     MAX_WIDTH,
     MIN_WIDTH,
     CloseSnapshot,
@@ -175,6 +176,7 @@ def test_replay_parameters_match_frozen_live_defaults() -> None:
     ):
         assert getattr(POLICY, key) == getattr(live, key)
     assert live.max_live_slots == SLOT_COUNT
+    assert live.entry_submission_start == FEATURE_CUTOFF
     assert float(RESERVE) == live.cash_reserve
     assert float(CUSHION) - 1 == pytest.approx(live.market_order_cushion)
     assert float(COMMISSION_CAP) == live.max_one_way_commission
@@ -492,3 +494,95 @@ def test_primary_obeys_frozen_stop_first_when_a_target_gap_reverses() -> None:
     assert stress.fixed.net_pnl == D("22.88")
     assert primary.fixed.sessions[1].exits[0].same_bar_collision
     assert not primary.fixed.sessions[1].exits[0].ambiguous_collision
+
+
+def test_matched_arm_uses_its_own_width_and_opens_no_extra_positions() -> None:
+    candidate = _candidate(width=0.05)
+    candidate = replace(candidate, widths=replace(candidate.widths, matched=0.075))
+    bars = _bars(candidate)
+    day = SESSIONS[0]
+    bars[(candidate.instrument, day)] = DailyBar(candidate.symbol, day, 10, 10.8, 9.8, 10, 100_000)
+    result = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [candidate],
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    assert result.matched.sessions[0].exits[0].reason == "target"
+    assert result.matched.net_pnl == D("13.88")
+    assert result.scaled.net_pnl == D("8.89")
+    assert result.fixed.net_pnl == D("-1.10")
+    assert sum(result.scaled_vs_matched_daily_pnl) == D("-4.99")
+
+
+def test_earlier_scaled_exit_changes_later_capacity_and_net_pnl() -> None:
+    first = _candidate()
+    second = _candidate("b", instrument="102")
+    third = _candidate("c", day=SESSIONS[1], instrument="103")
+    bars = _bars(first, second, third)
+    first_day = SESSIONS[0]
+    next_day = SESSIONS[1]
+    bars[first.instrument, first_day] = DailyBar(first.symbol, first_day, 10, 10.6, 10, 10, 100_000)
+    bars[third.instrument, next_day] = DailyBar(third.symbol, next_day, 10, 10.6, 10, 10, 100_000)
+    result = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [first, second, third],
+        bars,
+        initial_cash=CASH,
+        costs=COSTS,
+        previous_session=HISTORY[-1],
+    )
+    assert result.fixed.sessions[1].entries[0].state == "capacity_suppressed"
+    assert result.scaled.sessions[1].entries[0].state == "opened"
+    assert result.paired_daily_pnl[1] == D("8.89")
+
+
+def test_replay_mirrors_overlap_and_commission_suppression() -> None:
+    first = replace(_candidate(), planning_close=110)
+    duplicate = replace(first, packet_id="b")
+    one_way_cap = ReplayCosts(COMMISSION_CAP, D(0))
+    portfolio = compare_exit_widths(
+        SESSIONS,
+        SETTLEMENTS,
+        [first, duplicate],
+        {},
+        initial_cash=CASH,
+        costs=one_way_cap,
+        previous_session=HISTORY[-1],
+    ).fixed
+    assert [entry.state for entry in portfolio.sessions[0].entries] == [
+        "commission_suppressed",
+        "overlap_suppressed",
+    ]
+
+
+def test_incomplete_horizon_and_duplicate_packet_are_rejected() -> None:
+    for candidates in ([_candidate(day=SESSIONS[-9])], [_candidate(), _candidate()]):
+        with pytest.raises(ValueError, match="invalid replay candidate"):
+            compare_exit_widths(
+                SESSIONS,
+                SETTLEMENTS,
+                candidates,
+                {},
+                initial_cash=CASH,
+                costs=COSTS,
+                previous_session=HISTORY[-1],
+            )
+
+
+def test_invalid_price_basis_clock_and_cost_proxies_are_rejected() -> None:
+    with pytest.raises(ValueError, match="outside supported regular-hours"):
+        estimate_volatility(
+            "101",
+            DECISION,
+            HISTORY,
+            _snapshot(),
+            previous_session_close=PREVIOUS_CLOSE.replace(hour=0),
+        )
+    for flat, bps in (("NaN", "10"), ("0.76", "10"), ("0.35", "-1"), ("0.35", "10000")):
+        with pytest.raises(ValueError, match="invalid replay costs"):
+            ReplayCosts(D(flat), D(bps))
