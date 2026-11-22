@@ -99,6 +99,9 @@ def audit_archive(records: Sequence[dict[str, Any]], versions: Sequence[Version]
             continue
 
         entry = date.fromisoformat(admission["entry_session"])
+        if version.day(entry).state != "open":
+            admitted_results["invalid_entry_session"] += 1
+            continue
         if not admission["symbol_valid"]:
             admitted_results["invalid_symbol"] += 1
             continue

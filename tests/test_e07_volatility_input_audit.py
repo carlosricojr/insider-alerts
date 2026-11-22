@@ -30,17 +30,26 @@ def test_archive_qualification_is_blinded_complete_and_read_only(tmp_path):
     request = job_request(initial["GOOD"], clock)
     complete = {"required_dates": sorted(expected), "start_date": min(expected)}
     respond(journal, clock, request | complete)
+    older = date.fromisoformat(min(expected))
+    while VERSION.day(older).state != "open" or older.isoformat() in expected:
+        older = date.fromordinal(older.toordinal() - 1)
     request = job_request(initial["PART"], clock)
-    respond(journal, clock, request | complete | {"required_dates": sorted(expected)[1:]})
+    respond(
+        journal,
+        clock,
+        request
+        | complete
+        | {
+            "required_dates": [older.isoformat(), *sorted(expected)[1:]],
+            "start_date": older.isoformat(),
+        },
+    )
 
     respond(journal, clock, job_request(initial["WRONG"], clock) | complete | {"symbol": "OTHER"})
     respond(journal, clock, job_request(initial["BAD"], clock) | complete, failure="timeout")
     request = job_request(initial["RETRY"], clock)
     respond(journal, clock, request | complete | {"required_dates": sorted(expected)[1:]})
     # A retry is allowed, and older extra dates do not supply missing prior sessions.
-    older = date.fromisoformat(min(expected))
-    while VERSION.day(older).state != "open" or older.isoformat() in expected:
-        older = date.fromordinal(older.toordinal() - 1)
     respond(
         journal,
         clock,

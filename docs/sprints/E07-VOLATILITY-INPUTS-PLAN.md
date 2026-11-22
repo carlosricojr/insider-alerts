@@ -14,7 +14,7 @@ chain is checked for integrity. Only receipts bound to a matching case's R1 job 
 bars outside the required prior sessions contribute no coverage.
 
 The coverage receipt binds the source journal watermark, frozen calendar digest
-and filter version. It never creates a research decision, qualifies retrospective
+and the versioned coverage rule and parameters. It never creates a research decision, qualifies retrospective
 issuer identity from a ticker match, or changes a broker subscription. Prospective
 custody still needs the actual input digest and a durable decision read before
 the relevant cutoff. For the historical replay, also verify outcome price
@@ -22,7 +22,8 @@ continuity and the relevant securities settlement calendar.
 
 Verification uses synthetic custody cases for missing, late, invalid, duplicate,
 and correctly qualified receipts, plus a read-only run against the archived
-data. Pass the full repository gates and a settled-head review before merging.
+data. Pass the full repository gates, strict typing of the offline script, and a
+settled-head review before merging.
 
 
 Run the offline audit from the editable checkout with
