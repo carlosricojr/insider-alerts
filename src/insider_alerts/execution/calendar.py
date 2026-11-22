@@ -248,9 +248,10 @@ def validate_future_projection_recovery(
     """Reject a narrowly classified future projection, not the published calendar.
 
     The caller must separately require live authorization and fresh contract hours.
-    All published requested sessions must still exist, and all non-projected rows
-    retain native validation. Returned evidence describes rejected data, not a
-    corrected historical observation. Only the pinned 2026 calendar is used.
+    All requested sessions through today must exist and agree. The legacy
+    projection path requires complete future coverage too. A future short
+    session plus future omissions qualifies only for management. Returned
+    evidence describes rejected data, not a corrected historical observation.
     """
     today = around.astimezone(NEW_YORK).date()
     # Management authority survives entry expiry. Entry approval is separately

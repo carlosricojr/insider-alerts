@@ -885,22 +885,27 @@ def test_shifted_december_projection_recovers_only_management(day: datetime, hou
     assert fake.RaiseRequestErrors is False
 
 
-@pytest.mark.parametrize("fault", ["past_gap", "past_conflict", "same_day_gap", "wrong_hours",
-                                 "missing_hours", "shadow_only"])
+@pytest.mark.parametrize("fault", [
+    "past_gap", "past_conflict", "same_day_gap", "same_day_conflict", "omissions_only",
+    "wrong_hours", "missing_hours", "shadow_only",
+])
 def test_shifted_projection_keeps_nonfuture_and_corroboration_gates(fault: str) -> None:
     now = NOVEMBER_PROJECTION
     hours = NOVEMBER_HOURS
-    if fault == "same_day_gap":
+    if fault in {"same_day_gap", "same_day_conflict"}:
         now = now.replace(day=23)
-        hours = NOVEMBER_HOURS
     response = shifted_december_schedule(now)
     if fault in {"past_gap", "same_day_gap"}:
         missing = "20261120" if fault == "past_gap" else "20261123"
         response.sessions = [row for row in response.sessions if row.refDate != missing]
-    if fault == "past_conflict":
-        next(row for row in response.sessions if row.refDate == "20261120").endDateTime = (
-            "20261120-13:00:00"
-        )
+    if fault in {"past_conflict", "same_day_conflict"}:
+        day = "20261120" if fault == "past_conflict" else "20261123"
+        next(row for row in response.sessions if row.refDate == day).endDateTime = f"{day}-13:00:00"
+    if fault == "omissions_only":
+        response.sessions = [row for row in response.sessions if row.refDate != "20261225"]
+        for row in response.sessions:
+            if row.refDate in {"20261204", "20261211", "20261218"}:
+                row.endDateTime = f"{row.refDate}-16:00:00"
     if fault == "wrong_hours":
         hours = hours.replace("20261123:1600", "20261123:1300")
     if fault == "missing_hours":
@@ -954,12 +959,21 @@ def test_projection_recovery_full_cycle_keeps_protection_and_submits_overdue_exi
     monkeypatch.setattr(live_broker, "session_bounds", adapter.session_bounds)
     monkeypatch.setattr(runner, "_submit_due_entries", forbidden_entries)
     if shifted:
-        async def forbidden_auxiliary(*args: object, **kwargs: object) -> None:
-            pytest.fail("management-only recovery must not run discovery or shadow settlement")
-        monkeypatch.setattr(runner, "_run_auxiliary", forbidden_auxiliary)
+        monkeypatch.setattr(runner, "_submit_live_entries", forbidden_entries)
+    auxiliary_calls = []
+    run_auxiliary = runner._run_auxiliary
+
+    async def record_auxiliary(*args):
+        # Normal discovery remains active so candidates age on their intended
+        # session, and the scheduled exit has already been sent at this point.
+        auxiliary_calls.append(len(live_broker.market_exits))
+        return await run_auxiliary(*args)
+
+    monkeypatch.setattr(runner, "_run_auxiliary", record_auxiliary)
     result = asyncio.run(runner.cycle(now))
     gate = PROJECTION_MANAGEMENT_ONLY if shifted else "calendar_fallback_entry_approval_expired"
     assert result.live_gate == f"{gate};time_exits=1"
+    assert auxiliary_calls == [1]
     assert live_broker.market_exits == [("TEST", 20, f"IA-E07-{token}-EXIT")]
     assert live_broker.cancelled_orders == []
     assert live_broker.entry_calls == 0

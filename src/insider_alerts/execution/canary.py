@@ -592,25 +592,24 @@ class CanaryRunner:
                     CycleResult(), sessions, datetime.now(UTC) if wall_clock_mode else now,
                     enforce_wall_clock=wall_clock_mode,
                 )
-            if (
-                managed is not None
-                and isinstance(schedule_evidence, dict)
-                and schedule_evidence.get("entry_basis") == PROJECTION_MANAGEMENT_ONLY
-            ):
-                final_result = replace(
-                    managed.result,
-                    live_gate=f"{PROJECTION_MANAGEMENT_ONLY};time_exits={managed.timed_exits}",
-                )
+            self.store.set_metadata({"cycle_phase": "auxiliary"}, now=datetime.now(UTC))
+            result = await self._run_auxiliary(activation, sessions, now)
+            if managed is None:
+                final_result = replace(result, live_gate="shadow_only_not_armed")
             else:
-                self.store.set_metadata({"cycle_phase": "auxiliary"}, now=datetime.now(UTC))
-                result = await self._run_auxiliary(activation, sessions, now)
-                if managed is None:
-                    final_result = replace(result, live_gate="shadow_only_not_armed")
-                else:
-                    result = replace(
-                        result, live_opened=managed.result.live_opened,
-                        live_closed=managed.result.live_closed,
+                result = replace(
+                    result, live_opened=managed.result.live_opened,
+                    live_closed=managed.result.live_closed,
+                )
+                if (
+                    isinstance(schedule_evidence, dict)
+                    and schedule_evidence.get("entry_basis") == PROJECTION_MANAGEMENT_ONLY
+                ):
+                    final_result = replace(
+                        result,
+                        live_gate=f"{PROJECTION_MANAGEMENT_ONLY};time_exits={managed.timed_exits}",
                     )
+                else:
                     self.store.set_metadata(
                         {"cycle_phase": "entry_validation"}, now=datetime.now(UTC),
                     )

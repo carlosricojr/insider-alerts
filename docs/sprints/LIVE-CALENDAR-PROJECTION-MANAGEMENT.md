@@ -10,10 +10,11 @@ future short-session contradiction with future omissions. Require complete,
 consistent requested sessions through today and the existing corroboration of
 today and the next open date using fresh LiquidHours. Keep the validated NYSE
 session clock and bounded calendar for existing positions. Mark this mode in
-the receipt, exclude it from entry authorization, and run only live management
-while it is active. Preserve existing native and previously approved fallback
-paths. Reject structural errors, missing historical or same-day rows, and
-missing or conflicting near-term contract hours.
+the receipt and exclude it from entry authorization. Continue bounded
+operational discovery and shadow settlement on the existing published-calendar
+path so signals retain their normal discovery cadence during recovery. Preserve
+existing native and previously approved fallback paths. Reject structural errors,
+missing historical or same-day rows, and missing or conflicting near-term hours.
 
 Verify the captured response shape and negative boundary cases, including the
 November 27 early close, then run local and hosted gates, independent review,

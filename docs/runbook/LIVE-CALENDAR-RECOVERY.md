@@ -60,6 +60,17 @@ place a separate manual trade. The implementation plan is
 The existing operational shadow book may settle using this same fallback; this does not
 repair or promote the separate frozen research trial.
 
+The November 21 recovery also recognizes a structurally valid response that
+combines future short sessions on normally full or closed dates with omitted
+future sessions. It requires complete, agreeing requested sessions through
+today and the same fresh contract-hours verification. The receipt records the
+omitted dates and `calendar_future_projection_management_only`. This mode never
+authorizes new buys. The live worker still manages holdings first and runs its
+existing bounded discovery and operational shadow settlement against the
+published calendar. An omission by itself, a contradiction on or before today,
+or a conflicting near-term contract-hours response still stops the cycle.
+Recheck before December 3, the earliest omitted session in the November response.
+
 ## October 15 entry renewal
 
 The operator explicitly approved resolving the entry blocker and session-close-relative
