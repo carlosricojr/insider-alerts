@@ -73,3 +73,7 @@ version-conflict handling, and complete decision-time provenance. No journal or
 scheduled task is installed by this release.
 
 The volatility-exit replay has a separate [settlement calendar projection](E07-CASH-SETTLEMENT-2026.md) with a bounded clearing schedule.
+
+The [extended E07 settlement projection](E07-CASH-SETTLEMENT-2027.md) uses
+the DTC and NSCC notices through 2027. Its three unresolved limited-service
+dates require separate equity-settlement evidence.

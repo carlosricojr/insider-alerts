@@ -1,0 +1,58 @@
+{
+  "base_schedule": "e07-cash-settlement-2026.provenance.json",
+  "base_source_sha256": [
+    "943e9bbb70de5ea0e074fa9942a6f08a5661a8a3f105c46326a5e8a29c39cddf",
+    "bbb4dfec7877309a2d7267e8c3fe7d07fb3136f1f509df9d26a6d9185fee5d2f"
+  ],
+  "contract": "e07-published-regular-way-us-equity-t1-v2",
+  "covering_from": "2026-10-01",
+  "covering_through": "2027-12-31",
+  "historical_possession_claimed": false,
+  "published_2027_full_closures": [
+    "2027-01-01",
+    "2027-01-18",
+    "2027-02-15",
+    "2027-05-31",
+    "2027-07-05",
+    "2027-09-06",
+    "2027-11-25"
+  ],
+  "published_2027_limited_unresolved": [
+    "2027-03-26",
+    "2027-06-18",
+    "2027-12-24"
+  ],
+  "published_2027_no_settlement_services": [
+    "2027-10-11",
+    "2027-11-11"
+  ],
+  "schedule_status": "anticipated_annual_schedule_limited_equity_settlement_unresolved",
+  "source_index": "https://www.dtcc.com/legal/important-notices",
+  "source_index_query": "2027 Holiday Schedule",
+  "source_status_by_period": {
+    "2026_q4": "anticipated_annual_schedule_operational_notices_unverified",
+    "2027": "anticipated_annual_schedule_limited_equity_settlement_unresolved"
+  },
+  "sources": [
+    {
+      "artifact": "dtc-settlement-holidays-2027.pdf",
+      "bytes": 213218,
+      "notice": "25243-26",
+      "published_date": "2026-11-09",
+      "retrieved_file_completed_at_utc": "2026-11-22T10:01:36.359137Z",
+      "service": "DTC Settlement",
+      "sha256": "d857405c9a32650bf75e2321eb3e50ffca10bb718b674b3c8f342cf22815336b",
+      "source_url": "https://files.dtcc.com/download/assets/25243-26/1bc95d78dc7f11f1bddf0ae2e4272629"
+    },
+    {
+      "artifact": "nscc-equity-clearing-holidays-2027.pdf",
+      "bytes": 200023,
+      "notice": "a9854",
+      "published_date": "2026-11-09",
+      "retrieved_file_completed_at_utc": "2026-11-22T10:01:36.354314Z",
+      "service": "NSCC Equity Clearing",
+      "sha256": "13506e89e673a33f34f4f9e7412ce44d46d04845cbc96aee12c0d88726dfbba0",
+      "source_url": "https://files.dtcc.com/download/assets/a9854/78ba7964dc7e11f1aaaf3a4dd749b5ad"
+    }
+  ]
+}
