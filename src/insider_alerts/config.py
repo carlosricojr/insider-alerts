@@ -88,6 +88,18 @@ class Settings(BaseSettings):
 
     database_path: str = Field(default="data/insider_alerts.db", alias="DATABASE_PATH")
 
+    @field_validator("sec_rss_cutover_at", mode="before")
+    @classmethod
+    def parse_sec_rss_cutover(cls, value: object) -> datetime | None:
+        if value is None or isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("SEC RSS cutover must be an ISO 8601 datetime") from exc
+        raise ValueError("SEC RSS cutover must be an ISO 8601 datetime")
+
     @field_validator("sec_rss_cutover_at")
     @classmethod
     def normalize_sec_rss_cutover(cls, value: datetime | None) -> datetime | None:

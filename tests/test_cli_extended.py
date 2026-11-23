@@ -2155,6 +2155,26 @@ def test_cli_ops_backtest_requires_both_dates(monkeypatch) -> None:
     assert "must provide both --start-date and --end-date" in result.stderr
 
 
+def test_cli_ops_backtest_blocks_bootstrap_at_live_sec_cutover(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = cli.Settings(
+        _env_file=None,
+        DATABASE_PATH=str(tmp_path / "live.db"),
+        SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00Z",
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+
+    def unexpected_backfill(*args: object, **kwargs: object) -> None:
+        pytest.fail("the guarded database must never start historical bootstrap")
+
+    monkeypatch.setattr(cli, "backfill_form4_filings", unexpected_backfill)
+    result = CliRunner().invoke(cli.app, ["ops", "backtest"])
+
+    assert result.exit_code == 2
+    assert "Historical SEC bootstrap is blocked by SEC_RSS_CUTOVER_AT" in result.stderr
+
+
 def test_cli_ops_backtest_bootstraps_when_default_window_has_no_signals(monkeypatch) -> None:
     runner = CliRunner()
     signal = SignalEvent(

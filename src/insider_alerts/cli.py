@@ -2521,6 +2521,14 @@ def ops_backtest(
     )
     should_bootstrap = coverage_gap_detected or not signals
     if should_bootstrap:
+        if settings.sec_rss_cutover_at is not None:
+            typer.secho(
+                "Historical SEC bootstrap is blocked by SEC_RSS_CUTOVER_AT. "
+                "Use an isolated research database and configuration without the live cutoff.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
         try:
             backfill_result: BackfillResult = backfill_form4_filings(
                 settings,

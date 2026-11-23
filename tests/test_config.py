@@ -183,6 +183,12 @@ def test_config_cutover_requires_a_timezone() -> None:
         Settings(_env_file=None, SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00")
 
 
+@pytest.mark.parametrize("value", ["20261123", "1732300000", 1732300000])
+def test_config_cutover_rejects_numeric_timestamps(value: str | int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, SEC_RSS_CUTOVER_AT=value)  # type: ignore[arg-type]
+
+
 def test_config_normalizes_sec_rss_cutover_to_utc() -> None:
     settings = Settings(_env_file=None, SEC_RSS_CUTOVER_AT="2026-02-11T01:01:00.123456-05:00")
     assert settings.sec_rss_cutover_at == datetime(2026, 2, 11, 6, 1, 0, 123456, tzinfo=UTC)

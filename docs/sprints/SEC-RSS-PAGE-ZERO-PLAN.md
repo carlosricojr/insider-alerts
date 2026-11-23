@@ -21,6 +21,9 @@ new approval can be interpreted by the live consumer at its new approval
 time. Require an approved cutover that excludes stale source rows and
 unprocessed backlog from the live path. Preserve the outage as a gap.
 Historical recovery from the master index is a separate research action.
+When this boundary is active and a backtest needs historical bootstrap,
+the command reports the conflict before backfilling. Run historical
+bootstrap with a separate research database and configuration.
 
 ## Verification and handoff
 
@@ -32,8 +35,8 @@ rehearsal and operator cutover constraints are satisfied.
 
 ## Forward-only recovery option
 
-Configure an explicit timezone-aware UTC acceptance boundary only for an
-approved recovery. Apply the same lower bound and a current observation
+Configure an explicit timezone-aware ISO 8601 acceptance boundary only for
+an approved recovery. Apply the same UTC lower bound and a current observation
 upper bound to fresh RSS admissions, the XML and review queues and the
 automated pending-packet read. Evaluate each queue predicate before its
 limit and use the exact original RSS accession, CIK and form type to
