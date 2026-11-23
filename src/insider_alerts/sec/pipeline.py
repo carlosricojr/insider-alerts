@@ -105,16 +105,20 @@ def run_sec_poll_once(settings: Settings, *, max_items: int, dry_run: bool) -> P
     observed_at = datetime.now(UTC)
     cutoff_at = settings.sec_rss_cutover_at
     parsed = parse_form4_rss_with_diagnostics(
-        rss_text, max_items=max_items, require_timezone=cutoff_at is not None
+        rss_text,
+        max_items=max_items if cutoff_at is None else None,
+        require_timezone=cutoff_at is not None,
     )
     refs = parsed.refs
+    cutover_excluded = 0
     if cutoff_at is not None:
-        refs = [
+        eligible = [
             ref
             for ref in refs
             if within_rss_cutover(ref.filed_at, cutoff_at=cutoff_at, observed_at=observed_at)
         ]
-    cutover_excluded = len(parsed.refs) - len(refs)
+        cutover_excluded = len(refs) - len(eligible)
+        refs = eligible[:max_items]
 
     if dry_run:
         return PollResult(

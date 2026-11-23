@@ -57,4 +57,7 @@ Before any later approved rollout, verify both the SEC ingestion and
 automatic review processes load the same settings. The corrected URL
 must replace the explicit production override at that point. Keep the
 configured lower bound in effect so old rows cannot reappear by restart
-or token refresh.
+or token refresh. Verify the cutoff logged by each worker. The fixed
+boundary excludes records from the initial outage. For a later outage,
+measure its source gap and establish a new approved forward boundary
+during recovery before re-enabling automatic review.

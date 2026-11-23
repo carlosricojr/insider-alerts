@@ -3506,10 +3506,11 @@ def test_cli_automatic_review_applies_rss_cutover_with_external_ingestion(
         SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00Z",
     )
     observed = []
+    list_pending = cli.list_pending_review_packets
 
     def pending(db_path, *, limit, rss_cutover_at):  # type: ignore[no-untyped-def]
         observed.append((db_path, limit, rss_cutover_at))
-        return []
+        return list_pending(db_path, limit=limit, rss_cutover_at=rss_cutover_at)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "list_pending_review_packets", pending)
@@ -3532,3 +3533,4 @@ def test_cli_automatic_review_applies_rss_cutover_with_external_ingestion(
     )
     assert result.exit_code == 0, result.output
     assert observed == [(settings.database_path, 7, settings.sec_rss_cutover_at)]
+    assert "cutover_at=2026-02-11T06:01:00+00:00" in result.output

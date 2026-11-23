@@ -690,13 +690,23 @@ def test_rss_cutover_filters_precise_acceptance_time(httpx_mock: HTTPXMock, tmp_
     page = '<feed xmlns="http://www.w3.org/2005/Atom">' + "".join(entries) + "</feed>"
     httpx_mock.add_response(url=settings.sec_rss_url, text=page, is_reusable=True)
 
-    dry_run = run_sec_poll_once(settings, max_items=20, dry_run=True)
+    dry_run = run_sec_poll_once(settings, max_items=1, dry_run=True)
+    assert dry_run.fetched == 1
     assert not Path(settings.database_path).exists()
+    limited = run_sec_poll_once(settings, max_items=1, dry_run=False)
+    assert limited.fetched == limited.inserted == 1
+    assert limited.cutover_excluded == dry_run.cutover_excluded == 3
+    with closing(sqlite3.connect(settings.database_path)) as db:
+        assert db.execute("SELECT filed_at FROM filings").fetchall() == [
+            ("2026-02-11T06:01:00.000001+00:00",)
+        ]
+
     result = run_sec_poll_once(settings, max_items=20, dry_run=False)
     assert result.source_items_seen == len(times)
     assert result.source_invalid_items == 2
-    assert result.cutover_excluded == dry_run.cutover_excluded == 3
-    assert result.fetched == dry_run.fetched == result.inserted == 2
+    assert result.cutover_excluded == 3
+    assert result.fetched == 2
+    assert result.inserted == result.skipped_existing == 1
     with closing(sqlite3.connect(settings.database_path)) as db:
         admitted = db.execute("SELECT filed_at FROM filings ORDER BY filed_at").fetchall()
     assert admitted == [
@@ -778,6 +788,9 @@ def test_rss_cutover_checks_existing_rows_before_stage_limits(
             ),
         ],
     ).inserted == 4
+    assert [ref.accession_number for ref in list_filings_missing_xml(path, limit=1)] == [
+        "0000320193-26-000017"
+    ]
     assert [
         ref.accession_number
         for ref in list_filings_missing_xml(path, limit=1, rss_cutover_at=cutoff)
@@ -795,4 +808,18 @@ def test_rss_cutover_checks_existing_rows_before_stage_limits(
     # Keep the same accession and form but remove the exact originating CIK.
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE review_packets SET cik='0000000001' WHERE accession_number=?", (fresh,))
+    assert list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff) == []
+
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "UPDATE review_packets SET cik='0000320193', form_type='4/A' WHERE accession_number=?",
+            (fresh,),
+        )
+    assert list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff) == []
+
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE review_packets SET form_type='4' WHERE accession_number=?", (fresh,))
+        db.execute(
+            "UPDATE filings SET source='sec_master_index' WHERE accession_number=?", (fresh,)
+        )
     assert list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff) == []

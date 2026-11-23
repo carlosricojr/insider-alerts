@@ -1,6 +1,7 @@
+from datetime import UTC, datetime
 from functools import lru_cache
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AUTOPILOT_IB_REQUEST_TIMEOUT_SECONDS = 10.0
@@ -86,6 +87,16 @@ class Settings(BaseSettings):
     insider_ib_client_id: int = Field(default=171, alias="INSIDER_IB_CLIENT_ID", ge=0)
 
     database_path: str = Field(default="data/insider_alerts.db", alias="DATABASE_PATH")
+
+    @field_validator("sec_rss_cutover_at")
+    @classmethod
+    def normalize_sec_rss_cutover(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return value.astimezone(UTC)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("SEC RSS cutover must be representable in UTC") from exc
 
     @model_validator(mode="after")
     def validate_retry_bounds(self) -> "Settings":

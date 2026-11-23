@@ -609,6 +609,11 @@ def list_pending_review_packets(
         conn.row_factory = sqlite3.Row
         cutover_filter = ""
         if rss_cutover_at is not None:
+            # An external ingestion worker may not have initialized its schema yet.
+            if conn.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='filings'"
+            ).fetchone() is None:
+                return []
             bind_rss_cutover(conn, rss_cutover_at)
             source_boundary = form4_source_boundary_sql("f")
             cutover_filter = f"""

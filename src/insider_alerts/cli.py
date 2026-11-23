@@ -3426,6 +3426,7 @@ def ops_sec_ingestion(
             source_invalid_items=poll_result.source_invalid_items,
             cutover_excluded=poll_result.cutover_excluded,
         )
+        cutoff = settings.sec_rss_cutover_at
         cycle_message = (
             "ops SEC ingestion cycle completed "
             f"(fetched={cycle.fetched}, inserted={cycle.inserted}, "
@@ -3433,6 +3434,7 @@ def ops_sec_ingestion(
             f"source_items_seen={cycle.source_items_seen}, "
             f"source_boundary_rejected={cycle.source_boundary_rejected}, "
             f"source_invalid_items={cycle.source_invalid_items}, "
+            f"cutover_at={cutoff.isoformat() if cutoff is not None else 'unset'}, "
             f"cutover_excluded={cycle.cutover_excluded}, "
             f"enrich_scanned={cycle.enriched_scanned}, "
             f"enrich_updated={cycle.enriched_updated}, "
@@ -4331,6 +4333,7 @@ def ops_autopilot(
             source_invalid_items=poll_result.source_invalid_items,
             cutover_excluded=poll_result.cutover_excluded,
         )
+        cutoff = settings.sec_rss_cutover_at
         cycle_message = (
             "ops autopilot cycle completed "
             f"(fetched={cycle.fetched}, inserted={cycle.inserted}, "
@@ -4338,6 +4341,7 @@ def ops_autopilot(
             f"source_items_seen={cycle.source_items_seen}, "
             f"source_boundary_rejected={cycle.source_boundary_rejected}, "
             f"source_invalid_items={cycle.source_invalid_items}, "
+            f"cutover_at={cutoff.isoformat() if cutoff is not None else 'unset'}, "
             f"cutover_excluded={cycle.cutover_excluded}, "
             f"enrich_scanned={cycle.enriched_scanned}, enrich_updated={cycle.enriched_updated}, "
             f"enqueue_processed={cycle.enqueue_processed}, "
