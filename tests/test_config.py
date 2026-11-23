@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
@@ -22,6 +24,7 @@ def test_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("NOTIFICATION_TRANSPORT_DB", raising=False)
     monkeypatch.delenv("NOTIFICATION_TRANSPORT_POLICY_PATH", raising=False)
     monkeypatch.delenv("SEC_RSS_URL", raising=False)
+    monkeypatch.delenv("SEC_RSS_CUTOVER_AT", raising=False)
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     monkeypatch.delenv("SEC_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("SEC_RATE_LIMIT_PER_SECOND", raising=False)
@@ -50,6 +53,11 @@ def test_config_defaults(monkeypatch) -> None:
     assert settings.notification_transport_policy_path == (
         "docs/research/contracts/notification-transport-v1.json"
     )
+    assert settings.sec_rss_url == (
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4"
+        "&start=0&count=40&output=rss"
+    )
+    assert settings.sec_rss_cutover_at is None
     assert settings.sec_rate_limit_per_second == 5.0
     assert settings.market_context_enabled is False
     assert settings.market_data_timeout_seconds == 10.0
@@ -82,6 +90,11 @@ def test_config_loads_ib_gateway_from_env_file(tmp_path, monkeypatch) -> None:
     assert settings.ib_gateway_port == 4999
     assert settings.insider_ib_client_id == 222
 
+
+def test_config_preserves_an_explicit_sec_rss_feed(monkeypatch) -> None:
+    alternate_feed = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=80"
+    monkeypatch.setenv("SEC_RSS_URL", alternate_feed)
+    assert Settings(_env_file=None).sec_rss_url == alternate_feed
 
 def test_config_rejects_inverted_market_data_retry_bounds() -> None:
     with pytest.raises(ValidationError, match="cannot exceed"):
@@ -162,3 +175,27 @@ def test_config_rejects_inverted_sec_retry_bounds() -> None:
             SEC_RETRY_MIN_SECONDS=2,
             SEC_RETRY_MAX_SECONDS=1,
         )
+
+
+
+def test_config_cutover_requires_a_timezone() -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        Settings(_env_file=None, SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00")
+
+
+@pytest.mark.parametrize("value", ["20261123", "1732300000", 1732300000])
+def test_config_cutover_rejects_numeric_timestamps(value: str | int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, SEC_RSS_CUTOVER_AT=value)  # type: ignore[arg-type]
+
+
+def test_config_normalizes_sec_rss_cutover_to_utc() -> None:
+    settings = Settings(_env_file=None, SEC_RSS_CUTOVER_AT="2026-02-11T01:01:00.123456-05:00")
+    assert settings.sec_rss_cutover_at == datetime(2026, 2, 11, 6, 1, 0, 123456, tzinfo=UTC)
+    assert settings.sec_rss_cutover_at is not None
+    assert settings.sec_rss_cutover_at.tzinfo is UTC
+
+
+def test_config_rejects_sec_rss_cutover_outside_utc_range() -> None:
+    with pytest.raises(ValidationError, match="representable in UTC"):
+        Settings(_env_file=None, SEC_RSS_CUTOVER_AT="0001-01-01T00:00:00+01:00")

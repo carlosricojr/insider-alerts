@@ -67,7 +67,7 @@ def _extract_link(parent: ET.Element) -> str | None:
     return None
 
 
-def _parse_datetime(value: str | None) -> datetime | None:
+def _parse_datetime(value: str | None, *, require_timezone: bool) -> datetime | None:
     if value is None:
         return None
     value = value.strip()
@@ -81,8 +81,11 @@ def _parse_datetime(value: str | None) -> datetime | None:
         except ValueError:
             return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
+        return None if require_timezone else dt.replace(tzinfo=UTC)
+    try:
+        return dt.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _normalize_accession(value: str) -> str | None:
@@ -169,6 +172,7 @@ def parse_form4_rss_with_diagnostics(
     xml_text: str,
     *,
     max_items: int | None = None,
+    require_timezone: bool = False,
 ) -> RssParseResult:
     try:
         root = ET.fromstring(xml_text)
@@ -213,7 +217,7 @@ def parse_form4_rss_with_diagnostics(
             invalid_items += 1
             continue
 
-        filed_at = _parse_datetime(pub_date)
+        filed_at = _parse_datetime(pub_date, require_timezone=require_timezone)
         if filed_at is None:
             invalid_items += 1
             continue

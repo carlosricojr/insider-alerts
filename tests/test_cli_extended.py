@@ -2155,6 +2155,26 @@ def test_cli_ops_backtest_requires_both_dates(monkeypatch) -> None:
     assert "must provide both --start-date and --end-date" in result.stderr
 
 
+def test_cli_ops_backtest_blocks_bootstrap_at_live_sec_cutover(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = cli.Settings(
+        _env_file=None,
+        DATABASE_PATH=str(tmp_path / "live.db"),
+        SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00Z",
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+
+    def unexpected_backfill(*args: object, **kwargs: object) -> None:
+        pytest.fail("the guarded database must never start historical bootstrap")
+
+    monkeypatch.setattr(cli, "backfill_form4_filings", unexpected_backfill)
+    result = CliRunner().invoke(cli.app, ["ops", "backtest"])
+
+    assert result.exit_code == 2
+    assert "Historical SEC bootstrap is blocked by SEC_RSS_CUTOVER_AT" in result.stderr
+
+
 def test_cli_ops_backtest_bootstraps_when_default_window_has_no_signals(monkeypatch) -> None:
     runner = CliRunner()
     signal = SignalEvent(
@@ -3494,3 +3514,43 @@ def test_recent_alerted_event_keys_only_returns_recent_approvals(tmp_path) -> No
 def test_recent_alerted_event_keys_survives_missing_table(tmp_path) -> None:
     # A brand-new DB must degrade to "nothing suppressed", never crash the cycle.
     assert cli._recent_alerted_event_keys(str(tmp_path / "absent.db")) == set()
+
+
+
+def test_cli_automatic_review_applies_rss_cutover_with_external_ingestion(
+    monkeypatch, tmp_path: Path
+) -> None:
+    settings = cli.Settings(
+        _env_file=None,
+        DATABASE_PATH=str(tmp_path / "cutover.db"),
+        SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00Z",
+    )
+    observed = []
+    list_pending = cli.list_pending_review_packets
+
+    def pending(db_path, *, limit, rss_cutover_at):  # type: ignore[no-untyped-def]
+        observed.append((db_path, limit, rss_cutover_at))
+        return list_pending(db_path, limit=limit, rss_cutover_at=rss_cutover_at)
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "list_pending_review_packets", pending)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ops",
+            "autopilot",
+            "--once",
+            "--decision-engine",
+            "rules",
+            "--no-sec-ingestion",
+            "--decision-limit",
+            "7",
+            "--output-log",
+            str(tmp_path / "autopilot.log"),
+            "--error-log",
+            str(tmp_path / "autopilot.err.log"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert observed == [(settings.database_path, 7, settings.sec_rss_cutover_at)]
+    assert "cutover_at=2026-02-11T06:01:00+00:00" in result.output

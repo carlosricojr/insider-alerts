@@ -1,5 +1,7 @@
 import sqlite3
-from datetime import UTC, date, datetime
+from contextlib import closing
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -7,13 +9,18 @@ from pytest_httpx import HTTPXMock
 
 from insider_alerts.config import Settings
 from insider_alerts.review.market_context import MarketSnapshot
+from insider_alerts.review.queue import list_pending_review_packets
 from insider_alerts.sec.models import FilingRef
 from insider_alerts.sec.pipeline import (
     enqueue_review_packets,
     enrich_filings_with_xml_url,
     run_sec_poll_once,
 )
-from insider_alerts.sec.store import update_form4_xml_url, upsert_filing_refs
+from insider_alerts.sec.store import (
+    list_filings_missing_xml,
+    update_form4_xml_url,
+    upsert_filing_refs,
+)
 
 
 def _seed_ref(
@@ -655,3 +662,164 @@ def test_enqueue_review_packets_excludes_legacy_false_rss_before_limit(
     assert result.processed == 1
     assert result.enqueued == 1
     assert [str(request.url) for request in httpx_mock.get_requests()] == [valid_xml_url]
+
+
+
+def test_rss_cutover_filters_precise_acceptance_time(httpx_mock: HTTPXMock, tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        DATABASE_PATH=str(tmp_path / "cutover.sqlite3"),
+        SEC_RSS_CUTOVER_AT="2026-02-11T06:01:00.000001Z",
+    )
+    times = (
+        "2026-02-10T23:59:59Z",
+        "2026-02-11T01:01:00-05:00",
+        "2026-02-11T01:01:00.000001-05:00",
+        "2026-02-11T06:01:01Z",
+        "2099-02-11T06:01:01Z",
+        "2026-02-11T06:01:01",
+        "0001-01-01T00:00:00+01:00",
+    )
+    entries = [
+        f"""<entry><title>4 - Control (0000320193)</title>
+        <id>0000320193-26-{index:06d}</id><updated>{at}</updated>
+        <link href="https://www.sec.gov/Archives/edgar/data/320193/{index}/form4.xml" />
+        <category term="4" /></entry>"""
+        for index, at in enumerate(times)
+    ]
+    page = '<feed xmlns="http://www.w3.org/2005/Atom">' + "".join(entries) + "</feed>"
+    httpx_mock.add_response(url=settings.sec_rss_url, text=page, is_reusable=True)
+
+    dry_run = run_sec_poll_once(settings, max_items=1, dry_run=True)
+    assert dry_run.fetched == 1
+    assert not Path(settings.database_path).exists()
+    limited = run_sec_poll_once(settings, max_items=1, dry_run=False)
+    assert limited.fetched == limited.inserted == 1
+    assert limited.cutover_excluded == dry_run.cutover_excluded == 3
+    with closing(sqlite3.connect(settings.database_path)) as db:
+        assert db.execute("SELECT filed_at FROM filings").fetchall() == [
+            ("2026-02-11T06:01:00.000001+00:00",)
+        ]
+
+    result = run_sec_poll_once(settings, max_items=20, dry_run=False)
+    assert result.source_items_seen == len(times)
+    assert result.source_invalid_items == 2
+    assert result.cutover_excluded == 3
+    assert result.fetched == 2
+    assert result.inserted == result.skipped_existing == 1
+    with closing(sqlite3.connect(settings.database_path)) as db:
+        admitted = db.execute("SELECT filed_at FROM filings ORDER BY filed_at").fetchall()
+    assert admitted == [
+        ("2026-02-11T06:01:00.000001+00:00",),
+        ("2026-02-11T06:01:01+00:00",),
+    ]
+
+
+def test_rss_cutover_checks_existing_rows_before_stage_limits(
+    httpx_mock: HTTPXMock, tmp_path
+) -> None:
+    path = str(tmp_path / "cutover.sqlite3")
+    cutoff = datetime(2026, 2, 11, 6, 1, 0, 1, tzinfo=UTC)
+    legacy = Settings(_env_file=None, DATABASE_PATH=path, MARKET_CONTEXT_ENABLED=False)
+    guarded = Settings(
+        _env_file=None,
+        DATABASE_PATH=path,
+        MARKET_CONTEXT_ENABLED=False,
+        SEC_RSS_CUTOVER_AT=cutoff,
+    )
+    xml_url = "https://www.sec.gov/Archives/edgar/data/320193/000032019326000123/form4.xml"
+    xml = Path("tests/fixtures_form4.xml").read_text(encoding="utf-8")
+    httpx_mock.add_response(url=xml_url, text=xml, is_reusable=True)
+
+    stale = "0000320193-26-000010"
+    _seed_ref(
+        path, accession_number=stale,
+        filed_at=cutoff - timedelta(microseconds=1), xml_url=xml_url,
+    )
+    assert enqueue_review_packets(legacy, limit=1).enqueued == 1
+    fresh = "0000320193-26-000013"
+    published_after_insert = "0000320193-26-000015"
+    for accession, filed_at in (
+        ("0000320193-26-000011", cutoff - timedelta(microseconds=1)),
+        ("0000320193-26-000012", cutoff.replace(tzinfo=None)),
+        (fresh, cutoff),
+        ("0000320193-26-000014", datetime(2099, 2, 11, tzinfo=UTC)),
+        (published_after_insert, cutoff + timedelta(seconds=20)),
+    ):
+        _seed_ref(path, accession_number=accession, filed_at=filed_at, xml_url=xml_url)
+
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "UPDATE filings SET created_at = '2026-02-11 06:01:00' "
+            "WHERE accession_number IN (?, ?)",
+            (fresh, published_after_insert),
+        )
+
+    # Model an older filing and one valid filing still waiting for XML enrichment.
+    enrichment_ref = FilingRef(
+        source="sec_rss",
+        cik="0000320193",
+        accession_number="0000320193-26-000016",
+        form_type="4",
+        filed_at=cutoff,
+        filing_detail_url=xml_url,
+        primary_doc_url=None,
+        raw_rss_entry={"title": "4 - Control"},
+    )
+    assert upsert_filing_refs(
+        path,
+        [
+            enrichment_ref,
+            replace(
+                enrichment_ref,
+                accession_number="0000320193-26-000017",
+                filed_at=datetime(2099, 2, 11, tzinfo=UTC),
+            ),
+            replace(
+                enrichment_ref,
+                accession_number="0000320193-26-000018",
+                filed_at=cutoff - timedelta(microseconds=1),
+            ),
+            replace(
+                enrichment_ref,
+                accession_number="0000320193-26-000019",
+                filed_at=cutoff + timedelta(seconds=1),
+                source="sec_master_index",
+            ),
+        ],
+    ).inserted == 4
+    assert [ref.accession_number for ref in list_filings_missing_xml(path, limit=1)] == [
+        "0000320193-26-000017"
+    ]
+    assert [
+        ref.accession_number
+        for ref in list_filings_missing_xml(path, limit=1, rss_cutover_at=cutoff)
+    ] == [enrichment_ref.accession_number]
+
+    assert enqueue_review_packets(guarded, limit=1).enqueued == 1
+    assert [row["accession_number"] for row in list_pending_review_packets(path, limit=1)] == [
+        stale
+    ]
+    assert [
+        row["accession_number"]
+        for row in list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff)
+    ] == [fresh]
+
+    # Keep the same accession and form but remove the exact originating CIK.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE review_packets SET cik='0000000001' WHERE accession_number=?", (fresh,))
+    assert list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff) == []
+
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "UPDATE review_packets SET cik='0000320193', form_type='4/A' WHERE accession_number=?",
+            (fresh,),
+        )
+    assert list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff) == []
+
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE review_packets SET form_type='4' WHERE accession_number=?", (fresh,))
+        db.execute(
+            "UPDATE filings SET source='sec_master_index' WHERE accession_number=?", (fresh,)
+        )
+    assert list_pending_review_packets(path, limit=1, rss_cutover_at=cutoff) == []
